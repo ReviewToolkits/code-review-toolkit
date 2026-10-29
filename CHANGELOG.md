@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-10-29
+
+### Documentation
+
+- **Component counts and inventories brought back in line with the tree** — 18 agents, 8 commands,
+  16 scripts, which `test_release_discipline` already enforced while the prose drifted. `CLAUDE.md`
+  gains the four unlisted scripts (`check_typing`, `run_lint_rules`, `check_known_findings`,
+  `diff_findings`), the three unlisted commands, and a rewritten *Known gaps* (five corpora, 82/101
+  shapes confirmed, 39/101 executable, `known-issues` done). The plugin README gains the `lint` and
+  `typing` aspects, sections for `audit`/`known-issues`/`prior-art`, rows for `lint-rule-triager`,
+  `typing-integrity-auditor` and `test-investigation-agent`, and a structure tree generated from the
+  directory. `marketplace.json` moves from 1.3.0 and "14 agents and 4 commands" to the plugin's
+  version. Install instructions point at `ReviewToolkits/code-review-toolkit` (#50).
+
 ### Added — four shapes from the coverage.py v3 run, every instance verified before it was written
 
 - **`env-flag-parsed-as-strict-int`** [FIX] — a debug toggle read as `bool(int(os.getenv(...)))`. The
