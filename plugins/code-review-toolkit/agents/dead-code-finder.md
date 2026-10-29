@@ -170,3 +170,30 @@ For each finding, rate your **confidence** that it's genuinely dead:
 - **CONSIDER**: Medium-confidence dead code that should be verified before removal — potentially dynamically referenced functions, imports that might be re-exports
 - **POLICY**: Decisions about dead code management (e.g., establish a policy on commented-out code, set up automated unused import removal)
 - **ACCEPTABLE**: Unused imports that serve as re-exports, functions referenced only via plugin/registration systems, code kept intentionally for reference
+
+## Running the script
+
+These rules apply to every script call this agent makes.
+
+- **Timeout.** Give the Bash call `timeout: 300000` (5 min). The 120 s default kills the script on
+  large projects. If it may run longer still, use `run_in_background` and wait for the completion
+  notification rather than polling.
+- **A private output location.** Other agents run the toolkit's scripts concurrently in `parallel`
+  mode, so never write to a fixed path. Create a directory of your own and keep stdout and stderr
+  apart, in one Bash call:
+
+  ```bash
+  d=$(mktemp -d "${TMPDIR:-/tmp}/crt-dead-code-finder.XXXXXX") && echo "$d" &&
+  python <plugin_root>/scripts/find_dead_symbols.py [scope] [options] > "$d/out.json" 2> "$d/out.err"; echo "exit=$?"
+  ```
+
+  Each Bash call is a fresh shell: a `$$` suffix or a shell variable does not survive into the next
+  call. Reuse the literal path `echo` printed.
+- **Forward `--max-files N`** when the caller gave one, and say so in the report whenever the
+  envelope's `files_capped` is true.
+- **Check before you read.** A non-zero `exit` or an empty `out.json` means the run did not
+  succeed. Read `out.err`, and any `status`, `failure_reason` or `error` field in `out.json` — some
+  scripts report their failure there, as JSON, with nothing on stderr.
+- **Do not retry a script that timed out or failed.** Answer the same question with Grep and Read,
+  and state in the report that the script did not complete. A run that failed is never "no
+  findings".
