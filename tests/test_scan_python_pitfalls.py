@@ -240,6 +240,48 @@ class TestBlockingInAsync(unittest.TestCase):
         src = "import time\ndef f():\n    time.sleep(1)\n"
         self.assertNotIn("blocking-call-in-async-function", shapes(src))
 
+    def test_nested_sync_def_offloaded_to_executor_is_silent(self):
+        # The recommended fix itself: the closure runs in a worker thread.
+        src = (
+            "import asyncio, time\n"
+            "async def f():\n"
+            "    def work():\n"
+            "        time.sleep(1)\n"
+            "    await asyncio.get_running_loop().run_in_executor(None, work)\n"
+        )
+        self.assertNotIn("blocking-call-in-async-function", shapes(src))
+
+    def test_lambda_offloaded_to_executor_is_silent(self):
+        src = (
+            "import asyncio, time\n"
+            "async def f(loop):\n"
+            "    await loop.run_in_executor(None, lambda: time.sleep(1))\n"
+        )
+        self.assertNotIn("blocking-call-in-async-function", shapes(src))
+
+    def test_direct_call_still_found_beside_nested_def(self):
+        src = (
+            "import time\n"
+            "async def f():\n"
+            "    def work():\n"
+            "        time.sleep(1)\n"
+            "    time.sleep(2)\n"
+        )
+        hits = [x for x in scan(src) if x["shape"] == "blocking-call-in-async-function"]
+        self.assertEqual([x["line"] for x in hits], [5])
+
+    def test_nested_async_def_reported_once(self):
+        src = (
+            "import time\n"
+            "async def outer():\n"
+            "    async def inner():\n"
+            "        time.sleep(1)\n"
+            "    await inner()\n"
+        )
+        hits = [x for x in scan(src) if x["shape"] == "blocking-call-in-async-function"]
+        self.assertEqual(len(hits), 1)
+        self.assertIn("inner()", hits[0]["message"])
+
 
 class TestUnawaitedCoroutine(unittest.TestCase):
     def test_bare_call_to_local_coroutine(self):
