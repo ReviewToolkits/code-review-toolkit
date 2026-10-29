@@ -112,6 +112,22 @@ class TestAgentWiring(unittest.TestCase):
                     "never run.",
                 )
 
+    def test_every_script_backed_agent_has_run_instructions(self):
+        # Without them an agent takes the 120 s Bash default, shares a fixed temp
+        # path with agents running in parallel, and retries a timed-out script —
+        # or reads a failed run's empty output as "no findings".
+        invocation = re.compile(r"<plugin_root>/scripts/(\w+\.py)")
+        for name in _agent_names():
+            text = (_AGENTS / f"{name}.md").read_text(encoding="utf-8")
+            script = invocation.search(text)
+            if script is None:
+                continue
+            with self.subTest(agent=name):
+                self.assertIn("\n## Running the script\n", text)
+                self.assertIn("timeout: 300000", text)
+                self.assertIn(f'mktemp -d "${{TMPDIR:-/tmp}}/crt-{name}.XXXXXX"', text)
+                self.assertIn(f"scripts/{script.group(1)} [scope]", text)
+
 
 class TestCatalogReferencesResolve(unittest.TestCase):
     """The shape catalog points at agents and scripts; both must exist."""

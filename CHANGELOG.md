@@ -29,6 +29,19 @@ codebase**, found by mutation rather than by reading — coverage.py's `files.py
 patches `os.path.normcase` into a tautology. The mutant survives on both tracer cores; the inverse
 mutant kills 92 tests, proving non-equivalence. Catalog **97 → 101 shapes**.
 
+### Enhanced
+
+- **Every script-backed agent now says how to run its script** — a `## Running the script` section
+  ported from ft-review-toolkit. It sets a 300000 ms Bash timeout (`run_in_background` beyond that)
+  and gives each run a private `mktemp -d` directory with stdout and stderr in separate files, so
+  agents in `parallel` mode cannot overwrite each other. It also requires checking the exit status
+  and the JSON `status`/`error` fields before reading output, and forbids retrying a failed script:
+  fall back to Grep/Read and say the run did not complete, never "no findings". It deliberately
+  departs from ft's `$$` file suffix: each Bash tool call is a fresh shell, so `$$` changes between
+  the call that writes the file and the call that reads it. `informed-explore`'s briefing moves
+  off its fixed `/tmp/informed_briefing.md` the same way. A release-discipline test now fails if a
+  script-backed agent lacks the section (#48).
+
 ### Fixed
 
 - **`blocking-call-in-async-function` flagged blocking calls inside nested sync `def`s and

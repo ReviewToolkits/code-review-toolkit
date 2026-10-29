@@ -44,10 +44,13 @@ every later agent.
 
 ### Phase 1.5: Build the informed briefing ← the step that makes this command different
 
-Generate the briefing once, then hand it to every agent:
+Generate the briefing once, then hand it to every agent. Write it to a fresh directory, not a fixed
+path, so two concurrent runs cannot overwrite each other's briefing; reuse the literal path `echo`
+prints, because each Bash call is a fresh shell:
 
 ```bash
-python <plugin_root>/scripts/build_informed_briefing.py [scope] > /tmp/informed_briefing.md
+d=$(mktemp -d "${TMPDIR:-/tmp}/crt-informed-explore.XXXXXX") && echo "$d" &&
+python <plugin_root>/scripts/build_informed_briefing.py [scope] > "$d/briefing.md"; echo "exit=$?"
 ```
 
 For a per-agent briefing scoped to just the shapes that agent owns (shorter, more focused):
