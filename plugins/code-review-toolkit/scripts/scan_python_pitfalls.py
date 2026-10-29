@@ -875,10 +875,10 @@ def _check_blocking_in_async(tree: ast.AST) -> list[dict]:
     for fn in ast.walk(tree):
         if not isinstance(fn, ast.AsyncFunctionDef):
             continue
-        for node in ast.walk(fn):
-            # Do not descend into nested synchronous defs.
-            if isinstance(node, ast.FunctionDef) and node is not fn:
-                continue
+        # A nested def or lambda is its own scope: a blocking call there runs wherever
+        # that callable is invoked (often an executor), not on this coroutine. A nested
+        # async def is scanned in its own right by the outer walk.
+        for node in _walk_same_scope(fn):
             if not isinstance(node, ast.Call):
                 continue
             name = _call_name(node)
