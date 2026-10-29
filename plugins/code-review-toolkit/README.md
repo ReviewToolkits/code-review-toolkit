@@ -4,7 +4,7 @@ A comprehensive collection of specialized agents for exploring and analyzing exi
 
 ## Overview
 
-This plugin bundles 16 expert analysis agents and 5 commands. Each agent focuses on a specific aspect of code quality and is designed for codebase-scale analysis — scanning entire modules or projects rather than reviewing diffs.
+This plugin bundles 18 expert analysis agents and 8 commands. Each agent focuses on a specific aspect of code quality and is designed for codebase-scale analysis — scanning entire modules or projects rather than reviewing diffs.
 
 ### Key Design Principles
 
@@ -21,7 +21,7 @@ This is the recommended method. It registers the repository as a Claude Code mar
 
 ```bash
 # Add the marketplace (one-time)
-claude plugin marketplace add devdanzin/code-review-toolkit
+claude plugin marketplace add ReviewToolkits/code-review-toolkit
 
 # Install the plugin
 claude plugin install code-review-toolkit@code-review-toolkit
@@ -34,7 +34,7 @@ claude plugin marketplace update
 ### Local install (for development or testing)
 
 ```bash
-git clone https://github.com/devdanzin/code-review-toolkit.git
+git clone https://github.com/ReviewToolkits/code-review-toolkit.git
 cd code-review-toolkit
 ```
 
@@ -56,7 +56,7 @@ Copy the `plugins/code-review-toolkit/` directory to one of:
 Load the plugin for a single session using `--plugin-dir` — nothing is persisted:
 
 ```bash
-git clone https://github.com/devdanzin/code-review-toolkit.git
+git clone https://github.com/ReviewToolkits/code-review-toolkit.git
 claude --plugin-dir code-review-toolkit/plugins/code-review-toolkit
 ```
 
@@ -77,7 +77,7 @@ No third-party Python packages are required — all scripts use only the standar
 The primary command. Runs the foundational context providers (architecture-mapper + git-history-context) first, then dispatches selected agents with both structural and temporal context.
 
 ```bash
-# Full exploration (all 16 agents)
+# Full exploration (all 18 agents)
 /code-review-toolkit:explore
 
 # Specific directory
@@ -90,7 +90,7 @@ The primary command. Runs the foundational context providers (architecture-mappe
 /code-review-toolkit:explore . all summary
 ```
 
-**Aspects**: `architecture`, `history-context`, `history`, `history-full`, `consistency`, `complexity`, `tests`, `pitfalls`, `errors`, `docs`, `project-docs`, `types`, `dead-code`, `tech-debt`, `test-invariants`, `patterns`, `api`, `all`
+**Aspects**: `architecture`, `history-context`, `history`, `history-full`, `consistency`, `complexity`, `tests`, `pitfalls`, `lint`, `errors`, `docs`, `project-docs`, `types`, `typing`, `dead-code`, `tech-debt`, `test-invariants`, `patterns`, `api`, `all`
 
 **Options**: `deep` (full detail), `summary` (top-level only), `parallel` (concurrent agents), `--runs N` (independent naive passes, deduplicated), `--informed-reruns` (with `--runs 3`, the third pass targets adjacent code and siblings of what runs 1–2 confirmed)
 
@@ -143,6 +143,21 @@ Quick health dashboard — all agents in summary mode, producing a scored table 
 /code-review-toolkit:health
 ```
 
+### `/code-review-toolkit:audit [scope]`
+
+Release-gating audit: runs every scanner, requires a machine-readable sign-off line, and **blocks**
+on an incomplete run. This turns the toolkit from exploratory into gating.
+
+### `/code-review-toolkit:known-issues [scope] --catalog <catalog.tsv>`
+
+Cross-references a catalog of previously found findings against a fresh scan, so a fix, or a
+regression after a revert, is detected. Static and drift-tolerant: no repros are run.
+
+### `/code-review-toolkit:prior-art [finding | findings.json]`
+
+Searches the project's tracker before a finding is called novel. It refutes wrong findings, and it
+turns "file a new issue" into "comment on the existing one" when the issue is already reported.
+
 ## Agents
 
 ### Tier 1: Foundational
@@ -162,6 +177,9 @@ Quick health dashboard — all agents in summary mode, producing a scored table 
 | **pattern-consistency-checker** | Same concern solved different ways across modules | New |
 | **python-pitfall-scanner** | Concrete correctness defects: mutable defaults, late-binding closures, `except` ordering, `return`-in-`finally`, asyncio pitfalls, mutation-during-iteration | New |
 | **silent-failure-hunter** | Swallowed exceptions, bare except, silent error patterns | silent-failure-hunter |
+| **lint-rule-triager** | Defect-grade ruff rules in explicit tiers, merged with the shape catalog; harvests rules with no shape yet | New |
+| **typing-integrity-auditor** | mypy-provable defects, and annotations silently degraded to `Any` by phantom `TYPE_CHECKING` imports | New |
+| **test-investigation-agent** | Tests read as invariant specifications, checked against untested paths and analogous code | New |
 | **git-history-analyzer** | Fix completeness, similar bug detection, churn×quality risk matrix, historical context | New |
 
 ### Tier 3: Specific Concerns
@@ -247,7 +265,7 @@ All agents use `model: opus` for highest analysis quality. Each agent:
 | **Discovery** | Knows what changed | Must discover structure first |
 | **Output** | All findings shown | Ranked, capped, drill-down available |
 | **Architecture** | Not needed (small diff) | Foundation for all analysis |
-| **Agents** | 6 | 14 |
+| **Agents** | 6 | 18 |
 | **Use when** | Before creating a PR | Exploring, planning cleanup, health checks |
 
 ## Tips
@@ -275,25 +293,45 @@ code-review-toolkit/
 │   ├── documentation-auditor.md
 │   ├── git-history-analyzer.md
 │   ├── git-history-context.md
+│   ├── lint-rule-triager.md
 │   ├── pattern-consistency-checker.md
 │   ├── project-docs-auditor.md
+│   ├── python-pitfall-scanner.md
 │   ├── silent-failure-hunter.md
 │   ├── tech-debt-inventory.md
 │   ├── test-coverage-analyzer.md
-│   └── type-design-analyzer.md
+│   ├── test-investigation-agent.md
+│   ├── type-design-analyzer.md
+│   └── typing-integrity-auditor.md
 ├── commands/
+│   ├── audit.md
 │   ├── explore.md
 │   ├── health.md
 │   ├── hotspots.md
-│   └── map.md
+│   ├── informed-explore.md
+│   ├── known-issues.md
+│   ├── map.md
+│   └── prior-art.md
+├── data/
+│   ├── python_bug_shapes.json
+│   └── python_non_bugs.md
 └── scripts/
     ├── analyze_history.py
     ├── analyze_imports.py
+    ├── build_informed_briefing.py
+    ├── check_known_findings.py
+    ├── check_typing.py
     ├── collect_debt.py
     ├── correlate_tests.py
     ├── count_types.py
+    ├── diff_findings.py
+    ├── extract_test_invariants.py
     ├── find_dead_symbols.py
-    └── measure_complexity.py
+    ├── measure_complexity.py
+    ├── run_external_tools.py
+    ├── run_lint_rules.py
+    ├── scan_common.py
+    └── scan_python_pitfalls.py
 ```
 
 ## Author

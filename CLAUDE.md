@@ -65,9 +65,9 @@ code-review-toolkit/
 ├── CHANGELOG.md                     # Keep a Changelog format
 ├── plugins/code-review-toolkit/
 │   ├── .claude-plugin/plugin.json
-│   ├── agents/                      # 16 agent prompt definitions (markdown)
-│   ├── commands/                    # 5 command definitions (markdown)
-│   ├── scripts/                     # 12 Python scripts (the core code)
+│   ├── agents/                      # 18 agent prompt definitions (markdown)
+│   ├── commands/                    # 8 command definitions (markdown)
+│   ├── scripts/                     # 16 Python scripts (the core code)
 │   └── data/                        # bug-shape catalog + FP taxonomy
 └── tests/                           # unittest suite
 ```
@@ -82,7 +82,7 @@ candidates, and prints JSON to stdout.
 | Script | Purpose |
 |---|---|
 | `scan_common.py` | **Shared utilities — every other script imports from here** |
-| `scan_python_pitfalls.py` | Correctness defects; 38 checks mapping 1:1 to `data/python_bug_shapes.json` (2 of them project-level) |
+| `scan_python_pitfalls.py` | Correctness defects; 39 checks mapping 1:1 to `data/python_bug_shapes.json` (2 of them project-level) |
 | `analyze_imports.py` | Import graph, module boundaries, circular dependencies |
 | `analyze_history.py` | Git history: churn, co-change, fix density |
 | `measure_complexity.py` | Per-function complexity metrics |
@@ -92,6 +92,10 @@ candidates, and prints JSON to stdout.
 | `collect_debt.py` | TODO/FIXME/HACK inventory with git-blame aging |
 | `extract_test_invariants.py` | Extracts assertions as invariant specs |
 | `run_external_tools.py` | ruff / mypy / vulture / coverage integration |
+| `run_lint_rules.py` | Pinned, tiered ruff selection: defect-grade rules only, merged with the shape catalog |
+| `check_typing.py` | mypy on the project's own config, plus a `--disallow-any-unimported` phantom-import pass |
+| `check_known_findings.py` | Cross-references a catalog of known findings against a fresh scan (`known-issues`) |
+| `diff_findings.py` | Diffs two report directories — the false-positive regression gate |
 | `build_informed_briefing.py` | Assembles the informed-explore briefing from `data/` |
 
 **Dependency graph:** `scan_common.py` is at the center; every other script imports from it. No
@@ -131,13 +135,15 @@ is the calibration loop.**
 
 ### Agents
 
-16 markdown files with YAML frontmatter (name, description) plus a structured prompt. Agents contain
+18 markdown files with YAML frontmatter (name, description) plus a structured prompt. Agents contain
 no analysis logic — they run a script, read the JSON, then do the qualitative review the script
 cannot. Scripts find candidates (with a real false-positive rate); agents confirm or dismiss them.
 
 Seven agents are **qualitative** (no backing script — they use Grep/Read directly):
 api-surface-reviewer, consistency-auditor, documentation-auditor, git-history-analyzer,
-pattern-consistency-checker, project-docs-auditor, silent-failure-hunter.
+pattern-consistency-checker, project-docs-auditor, silent-failure-hunter. The other eleven are
+script-backed, and each ends with a `## Running the script` section (timeout, private `mktemp -d`
+output, no retry after a failure); `test_release_discipline` fails if a new one omits it.
 
 ### Commands
 
@@ -146,6 +152,9 @@ pattern-consistency-checker, project-docs-auditor, silent-failure-hunter.
 - `map` — architecture only, fast
 - `health` — scored dashboard, all agents in summary mode
 - `hotspots` — complexity + dead code + debt, ranked
+- `audit` — release-gating: every scanner, a machine-readable sign-off, BLOCK on an incomplete run
+- `known-issues` — cross-references a catalog of earlier findings against a fresh scan
+- `prior-art` — searches the project's tracker before a finding is called novel
 
 ### Classification system
 
@@ -194,20 +203,21 @@ Every finding is tagged:
 
 Tracked honestly so the next session does not have to re-derive them:
 
-1. **Two validation runs** (`reports/idlelib_v1/`, `reports/pyrepl_v1/`), against sibling toolkits'
-   1–67. They are deliberately complementary — idlelib is mature and careful, `_pyrepl` is young and
-   takes chances — and `_pyrepl` exercised parts of the catalog idlelib never touched, including two
-   real scanner bugs idlelib could not surface. An async-heavy target is the right next one.
-2. **21 of 40 shapes are `confirmed`; 19 remain `documented`.** Over half the catalog is now grounded
-   in this toolkit's own findings rather than in documented semantics alone.
-3. ~~All 14 bug shapes owned by one agent~~ **Done** — `python-pitfall-scanner` now owns them, backed
-   by `scan_python_pitfalls.py`, so every shape is executable rather than prompt-only.
-4. **Companion findings repository exists but holds only idlelib.** `~/projects/code-review-findings`
-   was created with the 26 idlelib findings; the `_pyrepl` findings still live only in
-   `reports/pyrepl_v1/` and need migrating into a `cpython-pyrepl/` subdirectory. The
-   `.code-review/findings.json` schema written by `informed-explore` is wire-compatible with that
-   repo's `project-local/findings.json`, so a project's accumulated memory lifts over unchanged.
-5. **`known-issues` command not implemented.** It needs a regression catalog, which needs gap 1.
+1. **Five validation corpora** (`reports/`): idlelib (v1–v4), `_pyrepl`, coverage.py (v1–v3),
+   asyncio and tkinter. They are deliberately different — idlelib is mature and careful, `_pyrepl`
+   is young and takes chances, coverage.py is a large third-party project. None is a threaded
+   *application*: asyncio is library code, and the catalog has no threading shapes (lock
+   discipline, check-then-act, lock ordering). A threading-heavy application is the right next one.
+2. **82 of 101 shapes are `confirmed`; 19 remain `documented`.** Most of the catalog is grounded in
+   this toolkit's own findings rather than in documented semantics alone.
+3. **39 of 101 shapes are executable.** `scan_python_pitfalls.py` implements 39 (37 per-file, 2
+   project-level). The rest are `implementable` or `agent-only` — `detectability` in the catalog
+   says which.
+4. **The companion findings repository is `devdanzin/code-review-findings`** (`coveragepy/`,
+   `cpython-idlelib/`, `cpython-pyrepl/`). The `.code-review/findings.json` schema written by
+   `informed-explore` is wire-compatible with its `project-local/findings.json`, so a project's
+   accumulated memory lifts over unchanged.
+5. ~~`known-issues` command not implemented~~ **Done** — `check_known_findings.py`.
 
 ## Workflow
 - Use `/task-workflow <description>` for the issue → branch → code → test → commit → PR → merge cycle
