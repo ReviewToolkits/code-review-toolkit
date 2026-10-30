@@ -595,6 +595,57 @@ class TestHistoryCrossingAttribution(unittest.TestCase):
         self.assertEqual(hotspots[0]["verdict"], "unknown")
         self.assertEqual(hotspots[0]["fix_commits_unattributed"], 2)
 
+    def _rewritten_nested_helper(self, recent: bool):
+        # A complex nested helper, written in one commit and never fixed.
+        body = "".join(f"        x{i} = {i}\n" for i in range(9))
+        v1 = "def outer():\n    def helper():\n        return 0\n    return helper\n"
+        v2 = (
+            "def outer():\n    def helper():\n"
+            + body
+            + "        return x0\n    return helper\n"
+        )
+        date = "2026-01-10T12:00:00+00:00" if recent else "2025-01-10T12:00:00+00:00"
+        with GitTempProject(
+            [
+                {
+                    "files": {"m.py": v1},
+                    "message": "Add outer",
+                    "date": "2024-06-01T12:00:00+00:00",
+                },
+                {"files": {"m.py": v2}, "message": "Rework the helper", "date": date},
+            ]
+        ) as root:
+            start = v2.splitlines().index("    def helper():") + 1
+            end = start + 10
+            hotspots = [_hotspot("m.py", "outer.helper", start, end, score=10.0)]
+            meta = mod.cross_with_history(
+                hotspots,
+                root,
+                since="2000-01-01",
+                recent_since=mod.datetime.fromisoformat("2025-12-01T00:00:00+00:00"),
+            )
+        return hotspots[0], meta
+
+    def test_recently_rewritten_nested_function_is_not_settled(self):
+        hotspot, meta = self._rewritten_nested_helper(recent=True)
+        self.assertEqual(hotspot["fix_commits_2y"], 0)
+        self.assertEqual(hotspot["recent_commits"], 1)
+        self.assertEqual(hotspot["lines_added_recent"], 10)
+        self.assertGreaterEqual(hotspot["recent_share"], 0.5)
+        self.assertEqual(hotspot["verdict"], "recent-churn")
+        self.assertEqual(meta["recent_window"]["commits_seen"], 1)
+
+    def test_old_rewrite_still_settles(self):
+        hotspot, meta = self._rewritten_nested_helper(recent=False)
+        self.assertEqual(hotspot["recent_commits"], 0)
+        self.assertEqual(hotspot["verdict"], "settled")
+        self.assertEqual(meta["recent_window"]["commits_seen"], 0)
+
+    def test_recent_churn_never_hides_active_risk(self):
+        self.assertEqual(mod.verdict_for(3, 9.0, recent_share=1.0), "active-risk")
+        self.assertEqual(mod.verdict_for(0, 9.0, recent_share=0.2), "settled")
+        self.assertEqual(mod.verdict_for(0, 5.0, recent_share=0.6), "recent-churn")
+
     def test_project_in_a_repo_subdirectory(self):
         v1 = "def f():\n    return 1\n"
         with GitTempProject(

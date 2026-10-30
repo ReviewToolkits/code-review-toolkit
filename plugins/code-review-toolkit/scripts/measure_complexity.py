@@ -19,6 +19,7 @@ import ast
 import json
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -488,6 +489,12 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
 # a fix touched at that commit. This caps the parses; past it the remaining
 # fix commits are counted as unattributed and the affected verdicts say so.
 MAX_HISTORY_PARSES = 1500
+# Commits per `git show` call when fetching the diffs the crossing needs.
+_SHOW_BATCH = 100
+# A function at least this share of whose current lines were added within the
+# last RECENT_DAYS is new code: too young for a low fix count to mean anything.
+RECENT_DAYS = 90
+RECENT_SHARE = 0.5
 
 
 def _git_prefix(project_root: Path, timeout: int = 10) -> str | None:
@@ -508,14 +515,20 @@ def _git_prefix(project_root: Path, timeout: int = 10) -> str | None:
     return out.stdout.strip()
 
 
-def _fix_commit_diffs(
+def _history_commits(
     project_root: Path,
     since: str,
     paths: list[str],
     key_types: dict[str, str] | None = None,
+    recent_cutoff: datetime | None = None,
     timeout: int = 120,
-) -> list[tuple[str, list[dict]]] | None:
-    """The fix commits since `since` that touch `paths`, with their parsed diffs.
+) -> list[dict] | None:
+    """Commits since `since` that touch `paths` and matter to the crossing.
+
+    Those are the fix commits, plus every commit at or after `recent_cutoff`
+    (any type), each with its parsed diff: {"sha", "date", "is_fix",
+    "recent", "diffs"}. The subjects are listed first, without patches, and
+    only the commits kept are diffed.
 
     Returns None when history is unavailable (not a repo, git missing, a
     timeout) so the caller can say so rather than reporting zero fix commits
@@ -526,23 +539,78 @@ def _fix_commit_diffs(
     Conventional Commits types, word-boundary keywords). The substring test
     used before counted "prefixes" as a fix.
     """
-    cmd = [
-        "git",
-        "-c",
-        "core.quotepath=off",
-        "log",
-        f"--since={since}",
-        "--no-merges",
-        "--format=%x00%H%x00%s",
-        "-p",
-        *DIFF_OPTIONS,
-        "--",
-        *paths,
-    ]
+    listing = _git(
+        [
+            "log",
+            f"--since={since}",
+            "--no-merges",
+            "--format=%H%x00%cI%x00%s",
+            "--",
+            *paths,
+        ],
+        project_root,
+        timeout,
+    )
+    if listing is None:
+        return None
+    commits: list[dict] = []
+    for line in listing.splitlines():
+        sha, cdate, subject = (line.split("\x00") + ["", ""])[:3]
+        if not sha:
+            continue
+        is_fix = classify_commit(subject, key_types) == "fix"
+        recent = False
+        if recent_cutoff is not None:
+            try:
+                recent = datetime.fromisoformat(cdate) >= recent_cutoff
+            except ValueError:
+                recent = False
+        if is_fix or recent:
+            commits.append(
+                {"sha": sha, "date": cdate, "is_fix": is_fix, "recent": recent}
+            )
+
+    by_sha: dict[str, list[dict]] = {}
+    for batch_start in range(0, len(commits), _SHOW_BATCH):
+        batch = [c["sha"] for c in commits[batch_start : batch_start + _SHOW_BATCH]]
+        out = _git(
+            [
+                "-c",
+                "core.quotepath=off",
+                "show",
+                "--format=%x00%H",
+                *DIFF_OPTIONS,
+                *batch,
+                "--",
+                *paths,
+            ],
+            project_root,
+            timeout,
+        )
+        if out is None:
+            return None
+        sha = ""
+        body: list[str] = []
+        for line in out.splitlines():
+            if line.startswith("\x00"):
+                if sha:
+                    by_sha[sha] = parse_unified_diff(body)
+                sha, body = line[1:].strip(), []
+            else:
+                body.append(line)
+        if sha:
+            by_sha[sha] = parse_unified_diff(body)
+    for commit in commits:
+        commit["diffs"] = by_sha.get(commit["sha"], [])
+    return commits
+
+
+def _git(args: list[str], cwd: Path, timeout: int) -> str | None:
+    """stdout of a git command, or None if it could not run or failed."""
     try:
         out = subprocess.run(
-            cmd,
-            cwd=str(project_root),
+            ["git", *args],
+            cwd=str(cwd),
             capture_output=True,
             text=True,
             errors="replace",
@@ -552,28 +620,21 @@ def _fix_commit_diffs(
         return None
     if out.returncode != 0:
         return None
+    return out.stdout
 
-    commits: list[tuple[str, list[dict]]] = []
-    sha = ""
-    is_fix = False
-    body: list[str] = []
 
-    def flush() -> None:
-        if sha and is_fix:
-            commits.append((sha, parse_unified_diff(body)))
-
-    for line in out.stdout.splitlines():
-        if line.startswith("\x00"):
-            flush()
-            parts = line.split("\x00")
-            sha = parts[1] if len(parts) > 1 else ""
-            subject = parts[2] if len(parts) > 2 else ""
-            is_fix = classify_commit(subject, key_types) == "fix"
-            body = []
-        elif is_fix:
-            body.append(line)
-    flush()
-    return commits
+def _fix_commit_diffs(
+    project_root: Path,
+    since: str,
+    paths: list[str],
+    key_types: dict[str, str] | None = None,
+    timeout: int = 120,
+) -> list[tuple[str, list[dict]]] | None:
+    """The fix commits since `since` that touch `paths`, with their parsed diffs."""
+    commits = _history_commits(project_root, since, paths, key_types, None, timeout)
+    if commits is None:
+        return None
+    return [(c["sha"], c["diffs"]) for c in commits if c["is_fix"]]
 
 
 # Two independent fix commits to the same function inside two years is a real
@@ -584,8 +645,10 @@ ACTIVE_RISK_FIXES = 2
 HIGH_COMPLEXITY_SCORE = 8.0
 
 
-def verdict_for(fix_commits: int, score: float) -> str:
-    """Cross a complexity score with a fix count.
+def verdict_for(
+    fix_commits: int, score: float, recent_share: float | None = None
+) -> str:
+    """Cross a complexity score with a fix count and recent rewriting.
 
     `active-risk` is gated on the FIX HISTORY ALONE, deliberately not on the
     complexity score as well. Requiring both inverts the ranking all over again:
@@ -596,9 +659,18 @@ def verdict_for(fix_commits: int, score: float) -> str:
     Complexity decides `settled` vs `quiet`; history decides `active-risk`.
     `settled` is the actionable one -- it says DEPRIORITIZE, which is the
     opposite of what a complexity ranking alone would say.
+
+    `recent-churn` comes before both: when at least RECENT_SHARE of the
+    function's current lines were added in the last RECENT_DAYS, a low fix
+    count only says the code is young. On a validation project a nested
+    helper with the top score, almost entirely rewritten that quarter, was
+    labelled `settled` (deprioritize), and it held a reproduced bug.
+    `recent_share` is None when it was not measured.
     """
     if fix_commits >= ACTIVE_RISK_FIXES:
         return "active-risk"
+    if recent_share is not None and recent_share >= RECENT_SHARE:
+        return "recent-churn"
     if score >= HIGH_COMPLEXITY_SCORE:
         return "settled"
     return "quiet"
@@ -609,6 +681,7 @@ def cross_with_history(
     project_root: Path,
     since: str = "2 years ago",
     key_types: dict[str, str] | None = None,
+    recent_since: datetime | None = None,
 ) -> dict:
     """Annotate hotspots with fix density and a verdict.
 
@@ -625,10 +698,12 @@ def cross_with_history(
     basename, reported a function with two fix commits as `quiet` with 0
     fixes on a validation project.
     """
+    if recent_since is None:
+        recent_since = datetime.now().astimezone() - timedelta(days=RECENT_DAYS)
     prefix = _git_prefix(project_root)
     paths = sorted({h["qualified_name"].split("::")[0] for h in hotspots})
     history = (
-        _fix_commit_diffs(project_root, since, paths, key_types)
+        _history_commits(project_root, since, paths, key_types, recent_since)
         if prefix is not None and paths
         else None
     )
@@ -636,6 +711,10 @@ def cross_with_history(
         for h in hotspots:
             h["fix_commits_2y"] = None
             h["fix_density"] = None
+            h["recent_commits"] = None
+            h["lines_added_recent"] = None
+            h["lines_changed_recent"] = None
+            h["recent_share"] = None
             h["verdict"] = "unknown"
         return {
             "history_available": False,
@@ -651,18 +730,31 @@ def cross_with_history(
     wanted = {prefix + p: p for p in paths}
     fixes: dict[tuple[str, str], set[str]] = {}
     unattributed: dict[str, set[str]] = {}
+    # (file, qualname) -> [recent commits, lines added, lines removed]
+    recent: dict[tuple[str, str], list] = {}
+    recent_unattributed: dict[str, set[str]] = {}
     with BlobFunctionIndex(project_root, max_parses=MAX_HISTORY_PARSES) as index:
-        for sha, file_diffs in history:
-            for file_diff in file_diffs:
+        for commit in history:
+            sha = commit["sha"]
+            for file_diff in commit["diffs"]:
                 rel = wanted.get(file_diff["path"])
                 if rel is None:
                     continue
                 touched = attribute_file_diff(file_diff, index)
                 if touched is None:
-                    unattributed.setdefault(rel, set()).add(sha)
+                    if commit["is_fix"]:
+                        unattributed.setdefault(rel, set()).add(sha)
+                    if commit["recent"]:
+                        recent_unattributed.setdefault(rel, set()).add(sha)
                     continue
-                for qual in touched:
-                    fixes.setdefault((rel, qual), set()).add(sha)
+                for qual, (added, removed) in touched.items():
+                    if commit["is_fix"]:
+                        fixes.setdefault((rel, qual), set()).add(sha)
+                    if commit["recent"]:
+                        entry = recent.setdefault((rel, qual), [set(), 0, 0])
+                        entry[0].add(sha)
+                        entry[1] += added
+                        entry[2] += removed
         parses, cap_reached = index.parses, index.exhausted
 
     for h in hotspots:
@@ -674,6 +766,12 @@ def cross_with_history(
         missing = len(unattributed.get(rel, ()))
         if missing:
             h["fix_commits_unattributed"] = missing
+        r_shas, r_added, r_removed = recent.get((rel, name), (set(), 0, 0))
+        h["recent_commits"] = len(r_shas)
+        h["lines_added_recent"] = r_added
+        h["lines_changed_recent"] = r_added + r_removed
+        # Share of the function's current span added in the recent window.
+        h["recent_share"] = round(min(r_added / length, 1.0), 2)
 
     ranked = sorted(hotspots, key=lambda h: -(h["fix_commits_2y"] or 0))
     for rank, h in enumerate(ranked, 1):
@@ -682,7 +780,10 @@ def cross_with_history(
     fix_counts = sorted(h["fix_commits_2y"] for h in hotspots)
     median = fix_counts[len(fix_counts) // 2] if fix_counts else 0
     for h in hotspots:
+        rel = h["qualified_name"].partition("::")[0]
         missing = h.get("fix_commits_unattributed", 0)
+        verdict = verdict_for(h["fix_commits_2y"], h["score"], h["recent_share"])
+        recent_missing = len(recent_unattributed.get(rel, ()))
         if h["fix_commits_2y"] < ACTIVE_RISK_FIXES <= h["fix_commits_2y"] + missing:
             # The unattributed fixes could tip it into active-risk: `quiet` or
             # `settled` here would be an unmeasured value posing as a clean one.
@@ -691,8 +792,15 @@ def cross_with_history(
                 f"{missing} fix commit(s) to this file could not be attributed "
                 "to a function"
             )
+        elif verdict in ("settled", "quiet") and recent_missing:
+            # Unattributed recent commits could make it `recent-churn`.
+            h["verdict"] = "unknown"
+            h["verdict_reason"] = (
+                f"{recent_missing} recent commit(s) to this file could not be "
+                "attributed to a function"
+            )
         else:
-            h["verdict"] = verdict_for(h["fix_commits_2y"], h["score"])
+            h["verdict"] = verdict
 
     all_unattributed: set[str] = set()
     for shas in unattributed.values():
@@ -700,7 +808,7 @@ def cross_with_history(
     return {
         "history_available": True,
         "since": since,
-        "fix_commits_seen": len(history),
+        "fix_commits_seen": sum(1 for c in history if c["is_fix"]),
         "median_fix_commits_per_hotspot": median,
         "active_risk_threshold": ACTIVE_RISK_FIXES,
         "attribution": (
@@ -712,10 +820,19 @@ def cross_with_history(
         "file_versions_parsed": parses,
         "fix_commits_unattributed": len(all_unattributed),
         "parse_cap_reached": cap_reached,
+        "recent_window": {
+            "since": recent_since.isoformat(timespec="seconds"),
+            "days": RECENT_DAYS,
+            "recent_churn_share": RECENT_SHARE,
+            "commits_seen": sum(1 for c in history if c["recent"]),
+        },
         "note": (
             "`settled` means high complexity and low fix density -- deprioritize "
             "it, and say so. Complexity alone ranked coverage.py's files in "
-            "almost the reverse of their fix history."
+            "almost the reverse of their fix history. `recent-churn` means at "
+            "least half of the function's current lines were added inside the "
+            "recent window: a low fix count there says the code is young, not "
+            "that it is safe."
         ),
     }
 
