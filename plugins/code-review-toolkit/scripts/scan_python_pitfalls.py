@@ -1885,18 +1885,26 @@ def _check_error_reported_below_warning(tree: ast.AST) -> list[dict]:
                 quiet.append(name)
         if loud or not quiet:
             continue
-        out.append(
-            _finding(
-                "error-reported-below-warning",
-                "CONSIDER",
-                "medium",
-                node,
-                f"the only report of this failure is {quiet[0]}(...), which default "
-                f"logging configuration discards",
-                "an operator running with defaults sees nothing; use warning/exception "
-                "if the condition is actionable",
-            )
+        finding = _finding(
+            "error-reported-below-warning",
+            "CONSIDER",
+            "medium",
+            node,
+            f"the only report of this failure is {quiet[0]}(...), which default "
+            f"logging configuration discards",
+            "an operator running with defaults sees nothing; use warning/exception "
+            "if the condition is actionable",
         )
+        # The caller is told: a rejection returned as `{"ok": False, ...}` or
+        # an error response is reported, and INFO is the right level for it.
+        if any(
+            isinstance(n, ast.Return) and _is_error_result(n.value)
+            for n in _walk_same_scope(node)
+        ):
+            finding["suppressed"] = "returns-error-result"
+        elif _carries_exception(node):
+            finding["suppressed"] = "exception-carried-as-value"
+        out.append(finding)
     return out
 
 

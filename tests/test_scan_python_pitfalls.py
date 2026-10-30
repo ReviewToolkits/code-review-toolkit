@@ -836,6 +836,37 @@ class TestErrorReportedBelowWarning(unittest.TestCase):
         self.assertNotIn("error-reported-below-warning", shapes(src))
 
 
+class TestErrorReportedBelowWarningDifferential(unittest.TestCase):
+    shape = "error-reported-below-warning"
+
+    def test_rejection_returned_as_error_result_is_suppressed(self):
+        src = (
+            "import logging\nlog = logging.getLogger(__name__)\n"
+            "def create(name):\n    try:\n        validate(name)\n"
+            "    except ValueError as e:\n        log.info('rejected %s: %s', name, e)\n"
+            "        if 'exists' in str(e):\n"
+            "            return {'ok': False, 'code': 'conflict', 'error': str(e)}\n"
+            "        return {'ok': False, 'code': 'invalid', 'error': str(e)}\n"
+            "    return {'ok': True}\n"
+        )
+        with TempProject({"mod.py": src}) as root:
+            result = mod.analyze(str(root / "mod.py"))
+        self.assertNotIn(self.shape, [f["shape"] for f in result["findings"]])
+        self.assertEqual(
+            result["summary"]["suppressed_by_differential"][self.shape],
+            {"returns-error-result": 1},
+        )
+
+    def test_returning_a_default_is_still_flagged(self):
+        src = (
+            "import logging\nlog = logging.getLogger(__name__)\n"
+            "def load(path):\n    try:\n        return read(path)\n"
+            "    except OSError:\n        log.info('cannot read %s', path)\n"
+            "        return {}\n"
+        )
+        self.assertIn(self.shape, shapes(src))
+
+
 class TestExceptInLoopWithoutExit(unittest.TestCase):
     def test_swallow_in_while_true_is_flagged(self):
         src = (
