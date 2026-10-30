@@ -50,6 +50,62 @@ _MAGIC_METHODS = frozenset({
 })
 
 
+# Decorators that wrap a function without registering it anywhere. Any OTHER
+# decorator (`@app.get(...)`, `@validator`, `@pytest.fixture`, `@click.command`)
+# may be how the framework finds and calls it, so a method carrying one is
+# excluded rather than reported as dead.
+_INERT_DECORATORS = frozenset({
+    "staticmethod", "classmethod", "property", "cached_property",
+    "abstractmethod", "override", "final", "overload", "contextmanager",
+    "asynccontextmanager", "cache", "lru_cache", "wraps", "total_ordering",
+})
+
+# Base classes whose subclasses' ordinary methods are NOT framework hooks.
+# Any other base defined outside the project (`uvicorn.Server`,
+# `ast.NodeVisitor`, `threading.Thread`, `logging.Handler`, an SDK's
+# `BaseClient`) may call a method the project never names: an override of a
+# hook is invoked by the framework, so it is excluded, not reported.
+_INERT_BASES = frozenset({
+    "object", "ABC", "Protocol", "Generic", "NamedTuple", "TypedDict",
+    "Enum", "IntEnum", "StrEnum", "Flag", "IntFlag",
+    "Exception", "BaseException",
+    "dict", "list", "set", "frozenset", "tuple", "str", "int", "float", "bytes",
+})
+
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _dotted(node: ast.AST) -> str:
+    """`a.b.c` for a Name/Attribute chain, the callee for a Call, else ''."""
+    if isinstance(node, ast.Call):
+        return _dotted(node.func)
+    if isinstance(node, ast.Subscript):  # Generic[T], Protocol[T]
+        return _dotted(node.value)
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        inner = _dotted(node.value)
+        return f"{inner}.{node.attr}" if inner else node.attr
+    return ""
+
+
+def _decorator_kind(decorators: list[ast.expr]) -> str | None:
+    """None when every decorator is inert, else why the method is excluded."""
+    for dec in decorators:
+        name = _dotted(dec)
+        last = name.rsplit(".", 1)[-1]
+        if last in ("setter", "getter", "deleter") and not isinstance(dec, ast.Call):
+            return "property_accessor"
+        if last not in _INERT_DECORATORS:
+            return "decorated"
+    return None
+
+
+def _is_inert_base(name: str) -> bool:
+    last = name.rsplit(".", 1)[-1]
+    return last in _INERT_BASES or last.endswith(("Error", "Exception", "Warning"))
+
+
 def _alias_line(alias: ast.alias, node: ast.stmt) -> int:
     """The line of the imported NAME, which is the line ruff (F401) reports.
 
@@ -69,6 +125,15 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
         "defined_symbols": [],
         "referenced_names": set(),
         "all_declaration": None,
+        # Class name -> dotted names of its bases (and `metaclass=`), so a
+        # method can be recognised as a possible override of a framework hook.
+        "class_bases": {},
+        # Identifier-like string constants: `getattr(obj, "pause_job")`
+        # names a method no Name/Attribute node ever mentions.
+        "string_refs": set(),
+        # Literal prefixes of computed getattr names: `getattr(self, f"cmd_{x}")`
+        # can reach any method whose name starts with `cmd_`.
+        "dispatch_prefixes": set(),
         "is_init": filepath.name == "__init__.py",
         "is_test": (
             filepath.name.startswith("test_")
@@ -159,6 +224,7 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
                 "is_test_method": node.name.startswith("test"),
                 "is_magic": node.name in _MAGIC_METHODS,
                 "is_debugging_pragma": debugging_pragma(node),
+                "decorator_kind": _decorator_kind(node.decorator_list),
             })
         elif isinstance(node, ast.ClassDef):
             result["defined_symbols"].append({
@@ -167,6 +233,13 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
                 "line": node.lineno,
                 "is_public": not node.name.startswith("_"),
             })
+            bases = [_dotted(b) or "<expr>" for b in node.bases]
+            bases += [
+                _dotted(k.value) or "<expr>"
+                for k in node.keywords
+                if k.arg == "metaclass"
+            ]
+            result["class_bases"].setdefault(node.name, []).extend(bases)
             # Class methods.
             for child in ast.iter_child_nodes(node):
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -178,6 +251,8 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
                         "is_test_method": child.name.startswith("test"),
                         "is_magic": child.name in _MAGIC_METHODS,
                         "class": node.name,
+                        "decorator_kind": _decorator_kind(child.decorator_list),
+                        "is_debugging_pragma": debugging_pragma(child),
                     })
 
     # Collect all referenced names (everything used, not just defined).
@@ -196,6 +271,32 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
     collector = _NameCollector()
     collector.visit(tree)
     result["referenced_names"] = collector.names
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if _IDENTIFIER.fullmatch(node.value):
+                result["string_refs"].add(node.value)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in ("getattr", "hasattr")
+            and len(node.args) >= 2
+        ):
+            name_arg = node.args[1]
+            prefix = None
+            if isinstance(name_arg, ast.JoinedStr) and name_arg.values:
+                first = name_arg.values[0]
+                if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                    prefix = first.value
+            elif (
+                isinstance(name_arg, ast.BinOp)
+                and isinstance(name_arg.op, ast.Add)
+                and isinstance(name_arg.left, ast.Constant)
+                and isinstance(name_arg.left.value, str)
+            ):
+                prefix = name_arg.left.value
+            if prefix:
+                result["dispatch_prefixes"].add(prefix)
 
     return result
 
@@ -237,38 +338,126 @@ def find_unused_imports(file_analysis: dict) -> list[dict]:
     return unused
 
 
-def find_unreferenced_symbols(
-    all_files: list[dict],
-    external_refs: set[str] | None = None,
-) -> list[dict]:
-    """Find functions/classes that are defined but never referenced anywhere.
+_SETUP_TEARDOWN = frozenset({
+    "setUp", "tearDown", "setUpClass", "tearDownClass",
+    "setUpModule", "tearDownModule",
+})
 
-    ``external_refs`` carries names referenced OUTSIDE the scanned tree -- an
-    entry point in setup.py, a public helper used only by tests, an API shown in
-    the docs. Without it, reviewing a package on its own reports every such
-    symbol as dead.
+
+def _framework_classes(all_files: list[dict]) -> set[str]:
+    """Classes with a non-inert base defined outside the project, directly or
+    through project classes. Their methods may be hooks a framework calls.
+
+    A base resolves to a project class only when its name (or, for `a.b.C`,
+    its qualifier) is not imported from outside the project: `class
+    Server(uvicorn.Server)` is a subclass of uvicorn's class, not of itself.
     """
-    # Build a set of all names referenced across all files.
-    global_refs: set[str] = set(external_refs or ())
+    tops: set[str] = set()
     for fa in all_files:
-        global_refs |= fa["referenced_names"]
-
-    # Also collect all imported names to mark as "referenced".
+        parts = Path(fa["file"]).with_suffix("").parts
+        tops.update(parts)
+    project_classes: set[str] = set()
     for fa in all_files:
-        for imp in fa["imports"]:
-            # The target name being imported counts as a reference.
-            if imp["is_from"]:
-                # from X import Y — Y is referenced.
-                parts = imp["module"].rsplit(".", 1)
-                if len(parts) > 1:
-                    global_refs.add(parts[1])
+        project_classes.update(fa.get("class_bases", {}))
 
-    unreferenced = []
+    def is_internal_module(module: str) -> bool:
+        return module.startswith(".") or module.split(".")[0] in tops
+
+    # class -> list of (project class it inherits from | None, base as written)
+    edges: dict[str, list[tuple[str | None, str]]] = {}
+    for fa in all_files:
+        imported = {imp["local_name"]: imp["module"] for imp in fa["imports"]}
+        for cls, names in fa.get("class_bases", {}).items():
+            for base in names:
+                head, _, _rest = base.partition(".")
+                last = base.rsplit(".", 1)[-1]
+                if "." in base:
+                    internal = head in imported and is_internal_module(imported[head])
+                elif base in imported:
+                    internal = is_internal_module(imported[base])
+                else:
+                    internal = base != cls
+                target = last if internal and last in project_classes else None
+                edges.setdefault(cls, []).append((target, base))
+
+    memo: dict[str, bool] = {}
+
+    def external(cls: str, seen: frozenset[str]) -> bool:
+        if cls in memo:
+            return memo[cls]
+        hit = False
+        for target, base in edges.get(cls, ()):
+            if target is None:
+                hit = not _is_inert_base(base)
+            elif target not in seen:
+                hit = external(target, seen | {target})
+            if hit:
+                break
+        memo[cls] = hit
+        return hit
+
+    return {cls for cls in edges if external(cls, frozenset({cls}))}
+
+
+def _candidates(
+    all_files: list[dict], excluded: dict[str, int] | None = None
+):
+    """Yield (file_analysis, symbol, bare_name) for every symbol the dead-code
+    checks may report, counting each method left out in *excluded* by reason.
+
+    Methods were once skipped wholesale ("too noisy") while the summary still
+    read `unreferenced_symbols: 0`. They are now checked, minus the shapes a
+    name-reference scan cannot see: dunders and `_sunder_` hooks, methods in
+    test files, methods behind a registering decorator, overrides in classes
+    that inherit from a framework, and names a computed `getattr` can reach.
+    """
+    framework = _framework_classes(all_files)
+    prefixes: set[str] = set()
+    for fa in all_files:
+        prefixes |= fa.get("dispatch_prefixes", set())
+
+    def skip(reason: str) -> None:
+        if excluded is not None:
+            excluded[reason] = excluded.get(reason, 0) + 1
+
     for fa in all_files:
         all_decl = fa["all_declaration"]
         for sym in fa["defined_symbols"]:
             name = sym["name"]
             bare_name = name.split(".")[-1]  # For methods, just the method name.
+            is_method = sym["type"] == "method"
+
+            if is_method:
+                if bare_name.startswith("__") and bare_name.endswith("__"):
+                    skip("dunder")
+                    continue
+                if (
+                    len(bare_name) > 2
+                    and bare_name.startswith("_")
+                    and bare_name.endswith("_")
+                ):
+                    skip("sunder_hook")
+                    continue
+                if fa["is_test"]:
+                    skip("test_file")
+                    continue
+                if sym.get("decorator_kind"):
+                    skip(sym["decorator_kind"])
+                    continue
+                if sym.get("class") in framework:
+                    skip("framework_base")
+                    continue
+                if any(bare_name.startswith(p) for p in prefixes):
+                    skip("dynamic_dispatch")
+                    continue
+                if sym.get("is_debugging_pragma"):
+                    skip("debugging_pragma")
+                    continue
+                if all_decl and bare_name in all_decl:
+                    skip("in_all")
+                    continue
+                yield fa, sym, bare_name
+                continue
 
             # Skip magic methods — called implicitly.
             if sym.get("is_magic"):
@@ -280,14 +469,7 @@ def find_unreferenced_symbols(
             if all_decl and bare_name in all_decl:
                 continue
             # Skip setUp/tearDown/setUpClass/tearDownClass.
-            if bare_name in (
-                "setUp", "tearDown", "setUpClass", "tearDownClass",
-                "setUpModule", "tearDownModule",
-            ):
-                continue
-            # Skip if it's a method — we only flag unreferenced top-level
-            # functions and classes (method-level is too noisy).
-            if sym["type"] == "method":
+            if bare_name in _SETUP_TEARDOWN:
                 continue
             # Skip if the file has a __main__ guard and this could be an entry point.
             if fa["has_main_guard"] and sym["type"] == "function":
@@ -296,25 +478,113 @@ def find_unreferenced_symbols(
             # from a debugger. Unreferenced is its normal state, not a defect.
             if sym.get("is_debugging_pragma"):
                 continue
+            yield fa, sym, bare_name
 
-            # Check if name appears anywhere in the codebase.
-            if bare_name not in global_refs:
-                confidence = "high"
-                # Lower confidence if the name looks like it could be
-                # dynamically dispatched.
-                if sym["type"] == "class" and sym["is_public"]:
-                    confidence = "medium"  # Classes may be instantiated dynamically.
 
-                unreferenced.append({
-                    "file": fa["file"],
-                    "line": sym["line"],
-                    "name": name,
-                    "type": sym["type"],
-                    "is_public": sym.get("is_public", False),
-                    "confidence": confidence,
-                })
+def _split_refs(all_files: list[dict]) -> tuple[set[str], set[str]]:
+    """(production, test) names referenced by the scanned files, including
+    identifier-like string constants (`getattr(obj, "name")`)."""
+    prod: set[str] = set()
+    test: set[str] = set()
+    for fa in all_files:
+        bucket = test if fa["is_test"] else prod
+        bucket |= fa["referenced_names"]
+        bucket |= fa.get("string_refs", set())
+        # from X import Y -- Y is referenced.
+        for imp in fa["imports"]:
+            if imp["is_from"]:
+                parts = imp["module"].rsplit(".", 1)
+                if len(parts) > 1:
+                    bucket.add(parts[1])
+    return prod, test
 
+
+def _method_confidence(sym: dict) -> str:
+    # A private method with no reference anywhere has no caller outside the
+    # class either; a public one may be API used by code outside the project.
+    return "medium" if not sym["is_public"] else "low"
+
+
+def find_unreferenced_symbols(
+    all_files: list[dict],
+    external_refs: set[str] | None = None,
+    *,
+    test_refs: set[str] | None = None,
+    doc_refs: set[str] | None = None,
+    excluded: dict[str, int] | None = None,
+) -> list[dict]:
+    """Find functions, classes and methods defined but never referenced anywhere.
+
+    ``external_refs`` carries names referenced OUTSIDE the scanned tree -- an
+    entry point in setup.py, a public helper used only by tests, an API shown in
+    the docs. Without it, reviewing a package on its own reports every such
+    symbol as dead. ``test_refs`` and ``doc_refs`` are the same, split by
+    origin; for this check every origin counts as a use.
+    """
+    prod, test = _split_refs(all_files)
+    global_refs = (
+        prod | test | set(external_refs or ()) | set(test_refs or ())
+        | set(doc_refs or ())
+    )
+
+    unreferenced = []
+    for fa, sym, bare_name in _candidates(all_files, excluded):
+        if bare_name in global_refs:
+            continue
+        if sym["type"] == "method":
+            confidence = _method_confidence(sym)
+        elif sym["type"] == "class" and sym["is_public"]:
+            confidence = "medium"  # Classes may be instantiated dynamically.
+        else:
+            confidence = "high"
+        unreferenced.append({
+            "file": fa["file"],
+            "line": sym["line"],
+            "name": sym["name"],
+            "type": sym["type"],
+            "is_public": sym.get("is_public", False),
+            "confidence": confidence,
+        })
     return unreferenced
+
+
+def find_test_only_symbols(
+    all_files: list[dict],
+    external_refs: set[str] | None = None,
+    *,
+    test_refs: set[str] | None = None,
+    doc_refs: set[str] | None = None,
+) -> list[dict]:
+    """Production symbols whose only references are in tests.
+
+    A mention in a test used to count as a use, so production code kept alive
+    only by its own tests was invisible: a read helper whose last production
+    caller was refactored away, kept alive by the tests written for it. These
+    are not dead -- removing one means editing tests, and it may be deliberate
+    API -- so they are a category of their own rather than
+    `unreferenced_symbols`.
+    """
+    prod, test = _split_refs(all_files)
+    prod |= set(external_refs or ())
+    test |= set(test_refs or ())
+    docs = set(doc_refs or ())
+
+    test_only = []
+    for fa, sym, bare_name in _candidates(all_files):
+        if fa["is_test"] or bare_name in prod or bare_name not in test:
+            continue
+        if sym.get("decorator_kind"):
+            continue  # registered by its decorator: that is a production use
+        test_only.append({
+            "file": fa["file"],
+            "line": sym["line"],
+            "name": sym["name"],
+            "type": sym["type"],
+            "is_public": sym.get("is_public", False),
+            "mentioned_in_docs": bare_name in docs,
+            "confidence": "medium",
+        })
+    return test_only
 
 
 def find_orphan_files(
@@ -436,6 +706,21 @@ def find_commented_code(filepath: Path, project_root: Path) -> list[dict]:
     return blocks
 
 
+# Where references from outside the scanned tree come from, by kind.
+_TEST_SCOPES = ("conftest.py", "tests", "test")
+_DOC_SCOPES = ("doc", "Doc", "docs")
+_PRODUCTION_SCOPES = ("setup.py", "scripts", "tools", "bin", "benchmarks", "examples")
+
+
+def base_of(extra: Path, project_root: Path, scan_root: Path) -> Path:
+    """The search base *extra* was found under (the scanned tree's parent wins:
+    it is the deeper of the two)."""
+    for base in (scan_root.parent, project_root):
+        if extra.is_relative_to(base) and extra != base:
+            return base
+    return project_root
+
+
 def main() -> None:
     max_files = 0  # 0 = no limit
     positional: list[str] = []
@@ -467,17 +752,20 @@ def main() -> None:
     # doc/ shows documented APIs. Scoping references to the scanned tree alone
     # reported 9 unreferenced symbols for coverage.py of which 9 were referenced
     # elsewhere in the repo. Collect references from the wider project without
-    # analysing those files as subjects.
-    external_refs: set[str] = set()
+    # analysing those files as subjects -- keeping their ORIGIN, because a symbol
+    # referenced only by tests is a finding of its own (`referenced_only_from_tests`).
+    external_refs: set[str] = set()  # production: setup.py, scripts/, ...
+    test_refs: set[str] = set()
+    doc_refs: set[str] = set()
     external_scopes: list[str] = []
+    scope_kinds: dict[str, str] = {}
     if scan_root != project_root:
         package = scan_root.name
         # Search the project root AND the scanned tree's own parent: CPython puts
         # Lib/test/ and Doc/ beside Lib/<package>/, not at the repository root.
         candidates: list[Path] = []
         for base in (project_root, scan_root.parent):
-            for name in ("setup.py", "conftest.py", "tests", "test", "doc", "Doc",
-                         "docs"):
+            for name in (*_TEST_SCOPES, *_DOC_SCOPES, *_PRODUCTION_SCOPES):
                 extra = base / name
                 if not extra.exists():
                     continue
@@ -493,14 +781,25 @@ def main() -> None:
                 if extra not in candidates:
                     candidates.append(extra)
         for extra in candidates:
+            top = extra.relative_to(base_of(extra, project_root, scan_root)).parts[0]
+            kind = (
+                "test" if top in _TEST_SCOPES
+                else "docs" if top in _DOC_SCOPES
+                else "production"
+            )
+            bucket = {"test": test_refs, "docs": doc_refs}.get(kind, external_refs)
             paths = (
                 [extra] if extra.is_file() else sorted(discover_python_files(extra))
             )
             for path in paths:
                 if path in all_files:
                     continue
-                external_refs |= analyze_file(path, project_root)["referenced_names"]
-            external_scopes.append(str(extra.relative_to(project_root)))
+                ext = analyze_file(path, project_root)
+                bucket |= ext["referenced_names"]
+                bucket |= ext["string_refs"]
+            scope = str(extra.relative_to(project_root))
+            external_scopes.append(scope)
+            scope_kinds[scope] = kind
         # Documentation and packaging metadata reference symbols as plain text.
         for name in ("setup.py", "doc", "Doc", "docs"):
             extra = project_root / name
@@ -512,25 +811,42 @@ def main() -> None:
                 else [q for q in extra.rglob("*") if q.is_file() and q.suffix in
                       (".rst", ".md", ".txt", ".cfg", ".toml")]
             )
+            bucket = external_refs if name == "setup.py" else doc_refs
             for path in texts:
                 try:
                     body = path.read_text(encoding="utf-8", errors="replace")
                 except OSError:
                     continue
-                external_refs |= set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", body))
+                bucket |= set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", body))
 
     # Find issues (before converting sets to lists).
     unused_imports: list[dict] = []
     for fa in file_analyses:
         unused_imports.extend(find_unused_imports(fa))
 
-    unreferenced = find_unreferenced_symbols(file_analyses, external_refs)
+    excluded_methods: dict[str, int] = {}
+    unreferenced = find_unreferenced_symbols(
+        file_analyses,
+        external_refs,
+        test_refs=test_refs,
+        doc_refs=doc_refs,
+        excluded=excluded_methods,
+    )
+    test_only = find_test_only_symbols(
+        file_analyses, external_refs, test_refs=test_refs, doc_refs=doc_refs
+    )
+    methods_defined = sum(
+        1 for fa in file_analyses for sym in fa["defined_symbols"]
+        if sym["type"] == "method"
+    )
 
     # Drop per-file referenced_names to free memory.
     for fa in file_analyses:
         fa.pop("referenced_names", None)
 
-    orphans = find_orphan_files(file_analyses, project_root, external_refs)
+    orphans = find_orphan_files(
+        file_analyses, project_root, external_refs | test_refs | doc_refs
+    )
 
     commented_code: list[dict] = []
     for f in all_files:
@@ -546,6 +862,7 @@ def main() -> None:
         + [u for u in unreferenced if u["confidence"] == "medium"]
         + orphans
     )
+    low_confidence = [u for u in unreferenced if u["confidence"] == "low"]
 
     output = {
         "project_root": str(project_root),
@@ -556,14 +873,25 @@ def main() -> None:
         "summary": {
             "unused_imports": len(unused_imports),
             "unreferenced_symbols": len(unreferenced),
+            # Methods are checked; these say how many were, and how many were
+            # left out and why, so an empty list is never mistaken for "every
+            # method is used".
+            "methods_checked": True,
+            "methods_defined": methods_defined,
+            "methods_excluded": sum(excluded_methods.values()),
+            "methods_excluded_by_reason": dict(sorted(excluded_methods.items())),
+            "referenced_only_from_tests": len(test_only),
             "external_reference_scopes": external_scopes,
+            "external_reference_scope_kinds": scope_kinds,
             "orphan_files": len(orphans),
             "commented_code_blocks": len(commented_code),
             "high_confidence_items": len(high_confidence),
             "medium_confidence_items": len(medium_confidence),
+            "low_confidence_items": len(low_confidence),
         },
         "unused_imports": unused_imports,
         "unreferenced_symbols": unreferenced,
+        "referenced_only_from_tests": test_only,
         "orphan_files": orphans,
         "commented_code_blocks": commented_code,
     }
