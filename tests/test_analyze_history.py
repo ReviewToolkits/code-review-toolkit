@@ -867,5 +867,155 @@ class TestCommitterDateWindow(unittest.TestCase):
         self.assertEqual(commits[0]["committer_date"], "2025-01-01T12:00:00+00:00")
 
 
+# Three versions of one file. v2 changes b(); v3 prepends three lines, so v2's
+# hunk (post-image line 5) sits inside a() at HEAD.
+_V1 = "def a():\n    return 1\n\ndef b():\n    return 2\n"
+_V2 = "def a():\n    return 1\n\ndef b():\n    return 3\n"
+_V3 = "def z():\n    return 0\n\n" + _V2
+_GROWING = [
+    {"files": {"m.py": _V1}, "message": "Add a and b"},
+    {"files": {"m.py": _V2}, "message": "Fix b"},
+    {"files": {"m.py": _V3}, "message": "Add z"},
+]
+
+
+class TestFunctionAttributionAtCommit(unittest.TestCase):
+    """Hunks are attributed to the function that held those
+    lines AT THAT COMMIT, keyed by qualified name; lines_changed counts lines."""
+
+    def _churn(self, commits):
+        with GitTempProject(commits) as root:
+            result = mod.analyze([str(root), *_WINDOW])
+        churn = {(f["file"], f["function"]): f for f in result["function_churn"]}
+        return result, churn
+
+    def test_old_hunk_is_not_credited_to_whatever_sits_there_now(self):
+        result, churn = self._churn(_GROWING)
+        # HEAD-line mapping credited "Fix b" to a().
+        self.assertEqual(churn[("m.py", "a")]["commits"], 1)
+        self.assertEqual(churn[("m.py", "b")]["commits"], 2)
+        self.assertEqual(churn[("m.py", "z")]["commits"], 1)
+        fix = result["recent_fixes"][0]
+        self.assertEqual(fix["functions_modified"], [{"function": "b", "file": "m.py"}])
+        self.assertTrue(fix["functions_modified_complete"])
+
+    def test_lines_changed_counts_lines_not_length(self):
+        _, churn = self._churn(_GROWING)
+        b = churn[("m.py", "b")]
+        # Created (2 lines added), then one line replaced (+1 -1).
+        self.assertEqual((b["lines_added"], b["lines_removed"]), (3, 1))
+        self.assertEqual(b["lines_changed"], 4)
+        self.assertEqual(b["current_length"], 2)
+        self.assertEqual((b["line_start"], b["line_end"]), (7, 8))
+
+    def test_pure_deletion_is_attributed(self):
+        before = "def f():\n    x = 1\n    y = 2\n    return x\n"
+        after = "def f():\n    x = 1\n    return x\n"
+        _, churn = self._churn(
+            [
+                {"files": {"m.py": before}, "message": "Add f"},
+                {"files": {"m.py": after}, "message": "Drop y"},
+            ]
+        )
+        f = churn[("m.py", "f")]
+        self.assertEqual(f["commits"], 2)
+        self.assertEqual(f["lines_removed"], 1)
+
+    def test_nested_handler_is_credited_not_its_factory(self):
+        v1 = (
+            "def build_router():\n"
+            "    def handler():\n"
+            "        return 1\n"
+            "    return handler\n"
+        )
+        v2 = v1.replace("return 1", "return 2")
+        _, churn = self._churn(
+            [
+                {"files": {"r.py": v1}, "message": "Add router"},
+                {"files": {"r.py": v2}, "message": "Change handler"},
+            ]
+        )
+        self.assertEqual(churn[("r.py", "build_router.handler")]["commits"], 2)
+        self.assertEqual(churn[("r.py", "build_router")]["commits"], 1)
+
+    def test_same_method_name_in_two_classes_is_two_entries(self):
+        v1 = (
+            "class A:\n    def run(self):\n        return 1\n\n"
+            "class B:\n    def run(self):\n        return 1\n"
+        )
+        v2 = v1[: v1.rindex("return 1")] + "return 2\n"
+        _, churn = self._churn(
+            [
+                {"files": {"m.py": v1}, "message": "Add A and B"},
+                {"files": {"m.py": v2}, "message": "Change B.run"},
+            ]
+        )
+        self.assertEqual(churn[("m.py", "A.run")]["commits"], 1)
+        self.assertEqual(churn[("m.py", "B.run")]["commits"], 2)
+
+    def test_deleted_function_is_reported_as_gone(self):
+        _, churn = self._churn(
+            [
+                {"files": {"m.py": _V1}, "message": "Add a and b"},
+                {"files": {"m.py": "def a():\n    return 1\n"}, "message": "Remove b"},
+            ]
+        )
+        b = churn[("m.py", "b")]
+        self.assertFalse(b["exists_at_head"])
+        self.assertIsNone(b["line_start"])
+        self.assertTrue(churn[("m.py", "a")]["exists_at_head"])
+
+    def test_unparseable_version_is_counted_not_hidden(self):
+        result, _ = self._churn(
+            [
+                {"files": {"m.py": _V1}, "message": "Add a and b"},
+                {"files": {"m.py": "def a(:\n"}, "message": "Break it"},
+            ]
+        )
+        meta = result["function_attribution"]
+        self.assertEqual(meta["file_versions_unparseable"], 1)
+        self.assertEqual(meta["files_unattributed"], 1)
+        self.assertTrue(any("INCOMPLETE" in n for n in result["notes"]))
+
+    def test_parse_cap_leaves_commits_unattributed(self):
+        old_cap = mod._MAX_BLOB_PARSES
+        mod._MAX_BLOB_PARSES = 1
+        try:
+            result, _ = self._churn(_GROWING)
+        finally:
+            mod._MAX_BLOB_PARSES = old_cap
+        meta = result["function_attribution"]
+        self.assertTrue(meta["parse_cap_reached"])
+        self.assertGreater(meta["commits_unattributed"] + meta["files_unattributed"], 0)
+        self.assertTrue(any("INCOMPLETE" in n for n in result["notes"]))
+
+    def test_diff_parser_reads_blobs_and_hunks(self):
+        diff = [
+            "diff --git a/m.py b/m.py",
+            "index " + "1" * 40 + ".." + "2" * 40 + " 100644",
+            "--- a/m.py",
+            "+++ b/m.py",
+            "@@ -3,0 +4,2 @@ def f():",
+            "+    x = 1",
+            "+++ b/not-a-header",
+            "@@ -9 +10 @@",
+        ]
+        (entry,) = mod.parse_unified_diff(diff)
+        self.assertEqual(entry["path"], "m.py")
+        self.assertEqual(entry["old_blob"], "1" * 40)
+        self.assertEqual(entry["hunks"], [(3, 0, 4, 2), (9, 1, 10, 1)])
+
+    def test_qualified_boundaries(self):
+        source = (
+            "class C:\n    def m(self):\n        def inner():\n            pass\n"
+            "if True:\n    def guarded():\n        pass\n"
+        )
+        with TempProject({"mod.py": source}) as root:
+            quals = [
+                b["qualname"] for b in mod.get_function_boundaries(root / "mod.py")
+            ]
+        self.assertEqual(sorted(quals), ["C.m", "C.m.inner", "guarded"])
+
+
 if __name__ == "__main__":
     unittest.main()

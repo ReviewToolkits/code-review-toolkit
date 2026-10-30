@@ -201,6 +201,10 @@ _SCRIPT_TIMEOUT = 300  # 5 minutes
 _MAX_DIFF_LINES_FIX = 150
 _MAX_DIFF_LINES_REFACTOR = 80
 _FUNCTION_COUNT_THRESHOLD = 500
+# Each historical file version is parsed once to find its functions. This caps
+# the parses per run; past it, the remaining commits are left unattributed and
+# the output says so.
+_MAX_BLOB_PARSES = 4000
 
 
 def tracker_key_prefix(key: str) -> str:
@@ -492,26 +496,395 @@ def _relative_scope(scan_root: Path, project_root: Path) -> str:
         return "."
 
 
+def iter_qualified_defs(tree: ast.AST):
+    """Yield (qualname, node, enclosing_kinds) for every function at any depth.
+
+    The qualname mirrors `__qualname__` without `<locals>`: `Class.method`,
+    `outer.inner`, `factory.Handler.get`. enclosing_kinds lists "class" /
+    "function" for each enclosing scope, outermost first. measure_complexity
+    uses the same names, so the two scripts' function keys agree.
+    """
+    stack: list[tuple[ast.AST, str, tuple[str, ...]]] = [(tree, "", ())]
+    while stack:
+        node, prefix, kinds = stack.pop()
+        found: list[tuple[ast.AST, str, tuple[str, ...]]] = []
+        todo = list(ast.iter_child_nodes(node))
+        while todo:
+            child = todo.pop(0)
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qual = prefix + child.name
+                yield qual, child, kinds
+                found.append((child, qual + ".", kinds + ("function",)))
+            elif isinstance(child, ast.ClassDef):
+                found.append((child, prefix + child.name + ".", kinds + ("class",)))
+            else:
+                # Defs inside if/try/with/for blocks belong to this scope.
+                todo[0:0] = list(ast.iter_child_nodes(child))
+        stack.extend(reversed(found))
+
+
+def def_start_line(node: ast.AST) -> int:
+    """First line of a def, counting its decorators."""
+    decorators = getattr(node, "decorator_list", [])
+    return min([d.lineno for d in decorators] + [node.lineno])
+
+
+def function_spans(source: str) -> list[tuple[str, int, int]] | None:
+    """(qualname, first_line, last_line) for every function; None if unparseable."""
+    try:
+        tree = ast.parse(source.removeprefix("﻿"))
+    except (SyntaxError, ValueError):
+        return None
+    return [
+        (qual, def_start_line(node), getattr(node, "end_lineno", None) or node.lineno)
+        for qual, node, _ in iter_qualified_defs(tree)
+    ]
+
+
 def get_function_boundaries(filepath: Path) -> list[dict]:
     """Parse a Python file with AST and return function/method boundaries."""
     try:
         source = filepath.read_text(encoding="utf-8", errors="replace")
-        tree = ast.parse(source, filename=str(filepath))
-    except (SyntaxError, OSError):
+    except OSError:
         return []
+    spans = function_spans(source)
+    if spans is None:
+        return []
+    return [
+        {
+            "name": qual.rsplit(".", 1)[-1],
+            "qualname": qual,
+            "line_start": start,
+            "line_end": end,
+        }
+        for qual, start, end in spans
+    ]
 
-    functions: list[dict] = []
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            end_lineno = getattr(node, "end_lineno", node.lineno)
-            functions.append(
-                {
-                    "name": node.name,
-                    "line_start": node.lineno,
-                    "line_end": end_lineno,
-                }
+
+class _FileVersion:
+    """One historical version of a file: its functions and line ownership.
+
+    `owners[line]` is the index into `names` of the INNERMOST function
+    containing that line, or -1. A change inside a nested route handler is
+    credited to the handler, not to the router factory around it.
+    """
+
+    __slots__ = ("names", "owners", "spans")
+
+    def __init__(self, spans: list[tuple[str, int, int]]) -> None:
+        self.spans = spans
+        self.names = [qual for qual, _, _ in spans]
+        last = max((end for _, _, end in spans), default=0)
+        self.owners = [-1] * (last + 2)
+        # Outer spans first, so a nested span overwrites its parent's lines.
+        for idx in sorted(range(len(spans)), key=lambda i: (spans[i][1], -spans[i][2])):
+            _, start, end = spans[idx]
+            for line in range(start, end + 1):
+                self.owners[line] = idx
+
+    def owner(self, line: int) -> str | None:
+        if 0 <= line < len(self.owners) and self.owners[line] >= 0:
+            return self.names[self.owners[line]]
+        return None
+
+
+class BlobFunctionIndex:
+    """Parse historical file versions on demand, via one `git cat-file --batch`.
+
+    Versions are keyed by blob id, so a version shared by consecutive commits
+    (the post-image of one is the pre-image of the next) is parsed once.
+    """
+
+    def __init__(self, git_root: Path, max_parses: int | None = None) -> None:
+        self._git_root = git_root
+        self._proc: subprocess.Popen[bytes] | None = None
+        self._cache: dict[str, _FileVersion | None] = {}
+        self.max_parses = _MAX_BLOB_PARSES if max_parses is None else max_parses
+        self.parses = 0
+        self.unparseable = 0
+        self.unreadable = 0
+        self.broken = False
+
+    @property
+    def exhausted(self) -> bool:
+        return self.broken or self.parses >= self.max_parses
+
+    def _read_blob(self, blob: str) -> str | None:
+        if self._proc is None:
+            try:
+                self._proc = subprocess.Popen(
+                    ["git", "cat-file", "--batch"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    cwd=str(self._git_root),
+                )
+            except OSError:
+                self.broken = True
+                return None
+        proc = self._proc
+        assert proc.stdin is not None and proc.stdout is not None
+        try:
+            proc.stdin.write(blob.encode("ascii") + b"\n")
+            proc.stdin.flush()
+            header = proc.stdout.readline()
+            parts = header.split()
+            if len(parts) != 3:
+                if not header:
+                    self.broken = True
+                return None
+            size = int(parts[2])
+            data = proc.stdout.read(size)
+            proc.stdout.read(1)  # trailing newline
+        except (OSError, ValueError):
+            self.broken = True
+            return None
+        return data.decode("utf-8", errors="replace")
+
+    def get(self, blob: str | None) -> _FileVersion | None:
+        if not blob or not blob.strip("0"):
+            return None  # absent side of an add/delete
+        if blob in self._cache:
+            return self._cache[blob]
+        if self.exhausted:
+            return None
+        source = self._read_blob(blob)
+        version: _FileVersion | None = None
+        if source is None:
+            self.unreadable += 1
+        else:
+            self.parses += 1
+            spans = function_spans(source)
+            if spans is None:
+                self.unparseable += 1
+            else:
+                version = _FileVersion(spans)
+        if len(self._cache) > 512:
+            self._cache.clear()
+        self._cache[blob] = version
+        return version
+
+    def close(self) -> None:
+        if self._proc is not None:
+            try:
+                if self._proc.stdin:
+                    self._proc.stdin.close()
+                self._proc.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                self._proc.kill()
+            if self._proc.stdout:
+                self._proc.stdout.close()
+            self._proc = None
+
+    def __enter__(self):  # unannotated: typing.Self needs 3.11
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
+# Diff options that keep the output parseable whatever the user's git config
+# says (color.ui=always, diff.noprefix, an external diff driver, quoted paths).
+DIFF_OPTIONS = [
+    "--no-color",
+    "--no-ext-diff",
+    "--full-index",
+    "-U0",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+]
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+_INDEX_RE = re.compile(r"^index ([0-9a-f]+)\.\.([0-9a-f]+)")
+
+
+def parse_unified_diff(lines: Iterable[str]) -> list[dict]:
+    """Parse `-U0 --full-index` diff text into per-file hunk lists.
+
+    Each entry: {"path", "old_path", "old_blob", "new_blob", "hunks"}, where
+    hunks are (old_start, old_count, new_start, new_count). `path` is the
+    post-image path (the pre-image path for a deletion).
+    """
+    files: list[dict] = []
+    current: dict | None = None
+    in_header = False
+    for line in lines:
+        line = line.rstrip("\n")
+        if line.startswith("diff --git "):
+            current = {
+                "path": None,
+                "old_path": None,
+                "old_blob": None,
+                "new_blob": None,
+                "hunks": [],
+            }
+            files.append(current)
+            in_header = True
+            continue
+        if current is None:
+            continue
+        if in_header:
+            index = _INDEX_RE.match(line)
+            if index:
+                current["old_blob"], current["new_blob"] = index.groups()
+            elif line.startswith("--- "):
+                current["old_path"] = line[6:] if line.startswith("--- a/") else None
+            elif line.startswith("+++ "):
+                current["path"] = line[6:] if line.startswith("+++ b/") else None
+        hunk = _HUNK_RE.match(line)
+        if hunk:
+            in_header = False
+            old_start, old_count, new_start, new_count = hunk.groups()
+            current["hunks"].append(
+                (
+                    int(old_start),
+                    1 if old_count is None else int(old_count),
+                    int(new_start),
+                    1 if new_count is None else int(new_count),
+                )
             )
-    return functions
+    for entry in files:
+        if entry["path"] is None:
+            entry["path"] = entry["old_path"]
+    return [f for f in files if f["path"]]
+
+
+def attribute_file_diff(
+    file_diff: dict,
+    index: BlobFunctionIndex,
+) -> dict[str, list[int]] | None:
+    """Map one file's hunks onto the functions they touched AT THAT COMMIT.
+
+    Added lines are looked up in the post-image, removed lines in the
+    pre-image, each parsed from the blob the diff names. Returns
+    {qualname: [lines_added, lines_removed]}, or None when a version the hunks
+    need could not be parsed (so the caller can count it as unattributed
+    rather than as "touched no function").
+    """
+    hunks = file_diff["hunks"]
+    need_new = any(nc for _, _, _, nc in hunks)
+    need_old = any(oc for _, oc, _, _ in hunks)
+    post = index.get(file_diff["new_blob"]) if need_new else None
+    pre = index.get(file_diff["old_blob"]) if need_old else None
+    has_new = bool(file_diff["new_blob"] and file_diff["new_blob"].strip("0"))
+    has_old = bool(file_diff["old_blob"] and file_diff["old_blob"].strip("0"))
+    if (need_new and has_new and post is None) or (
+        need_old and has_old and pre is None
+    ):
+        return None
+    touched: dict[str, list[int]] = {}
+    for old_start, old_count, new_start, new_count in hunks:
+        if post is not None:
+            for line in range(new_start, new_start + new_count):
+                name = post.owner(line)
+                if name:
+                    touched.setdefault(name, [0, 0])[0] += 1
+        if pre is not None:
+            for line in range(old_start, old_start + old_count):
+                name = pre.owner(line)
+                if name:
+                    touched.setdefault(name, [0, 0])[1] += 1
+    return touched
+
+
+def git_toplevel(path: Path) -> Path:
+    """The repository's top-level directory (diff paths are relative to it)."""
+    try:
+        result = _run_git(["rev-parse", "--show-toplevel"], path, timeout=10)
+    except (subprocess.TimeoutExpired, OSError):
+        return path
+    if result.returncode != 0 or not result.stdout.strip():
+        return path
+    return Path(result.stdout.strip()).resolve()
+
+
+def attribute_commit(
+    commit_hash: str,
+    paths: list[str],
+    git_root: Path,
+    index: BlobFunctionIndex,
+) -> dict[str, dict[str, list[int]] | None] | None:
+    """Per path, {qualname: [added, removed]} for one commit (None per path
+    that could not be attributed). Returns None if `git show` failed."""
+    if not paths:
+        return {}
+    wanted = set(paths)
+    # A huge commit would overflow the argument list; filter afterwards instead.
+    pathspec = paths if len(paths) <= 200 else []
+    try:
+        result = _run_git(
+            [
+                "-c",
+                "core.quotepath=off",
+                "show",
+                "--format=",
+                *DIFF_OPTIONS,
+                commit_hash,
+                "--",
+                *pathspec,
+            ],
+            git_root,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    if result.returncode != 0:
+        return None
+    per_path: dict[str, dict[str, list[int]] | None] = {}
+    for file_diff in parse_unified_diff(result.stdout.splitlines()):
+        if file_diff["path"] in wanted:
+            per_path[file_diff["path"]] = attribute_file_diff(file_diff, index)
+    return per_path
+
+
+class CommitAttributor:
+    """Lazily attribute commits to functions, caching per commit."""
+
+    def __init__(self, git_root: Path) -> None:
+        self.git_root = git_root
+        self.index = BlobFunctionIndex(git_root)
+        self._cache: dict[str, dict[str, dict[str, list[int]] | None] | None] = {}
+        self.commits_attributed = 0
+        self.commits_skipped = 0
+        self.files_unattributed = 0
+
+    def get(self, commit: dict) -> dict[str, dict[str, list[int]] | None] | None:
+        sha = commit["hash"]
+        if sha in self._cache:
+            return self._cache[sha]
+        paths = [f for f in commit["files"] if f.endswith(".py")]
+        if not paths:
+            self._cache[sha] = {}
+            return self._cache[sha]
+        if self.index.exhausted or _check_script_timeout():
+            self.commits_skipped += 1
+            return None
+        attr = attribute_commit(sha, paths, self.git_root, self.index)
+        if attr is None:
+            self.commits_skipped += 1
+        else:
+            self.commits_attributed += 1
+            self.files_unattributed += sum(1 for v in attr.values() if v is None)
+        self._cache[sha] = attr
+        return attr
+
+    def meta(self) -> dict:
+        return {
+            "method": (
+                "each diff hunk is mapped onto the function that contained "
+                "those lines in that commit's own version of the file "
+                "(post-image for added lines, pre-image for removed lines); "
+                "a nested function is credited instead of its enclosing one"
+            ),
+            "commits_attributed": self.commits_attributed,
+            "commits_unattributed": self.commits_skipped,
+            "file_versions_parsed": self.index.parses,
+            "file_versions_unparseable": self.index.unparseable,
+            "files_unattributed": self.files_unattributed,
+            "parse_cap": self.index.max_parses,
+            "parse_cap_reached": self.index.parses >= self.index.max_parses,
+        }
+
+    def close(self) -> None:
+        self.index.close()
 
 
 def compute_function_churn_level2(
@@ -519,13 +892,34 @@ def compute_function_churn_level2(
     scan_root: Path,
     project_root: Path,
     max_files: int = 0,
+    attributor: CommitAttributor | None = None,
 ) -> list[dict]:
-    """Level 2: Map diff hunks to function boundaries using AST.
+    """Level 2: map each commit's hunks onto the functions of THAT commit.
 
-    Analyzes already-parsed commits to map file changes to functions.
+    The old implementation mapped every historical hunk onto function
+    boundaries parsed from HEAD. On a file that more than doubled in the
+    window, old hunks landed in unrelated functions: one method was credited
+    with 9 commits instead of 1, and the most-changed one was under-counted.
     """
-    # Build function boundaries for all Python files in scope.
-    file_functions: dict[str, list[dict]] = {}
+    git_root = attributor.git_root if attributor else git_toplevel(project_root)
+    owned = attributor is None
+    if attributor is None:
+        attributor = CommitAttributor(git_root)
+    try:
+        return _function_churn(commits, scan_root, git_root, max_files, attributor)
+    finally:
+        if owned:
+            attributor.close()
+
+
+def _function_churn(
+    commits: list[dict],
+    scan_root: Path,
+    git_root: Path,
+    max_files: int,
+    attributor: CommitAttributor,
+) -> list[dict]:
+    # The in-scope Python files that exist at HEAD, keyed by repo path.
     if scan_root.is_file():
         py_files = [scan_root] if scan_root.suffix == ".py" else []
     else:
@@ -542,88 +936,74 @@ def compute_function_churn_level2(
         "build",
         "dist",
     }
-    filtered_py: list[Path] = []
+    allowed: list[str] = []
     for pf in py_files:
         try:
-            rel_parts = set(pf.relative_to(project_root).parts)
+            parts = pf.relative_to(git_root).parts
         except ValueError:
             continue
-        if rel_parts & exclude:
+        if set(parts) & exclude or any(p.endswith(".egg-info") for p in parts):
             continue
-        if any(
-            part.endswith(".egg-info") for part in pf.relative_to(project_root).parts
-        ):
-            continue
-        filtered_py.append(pf)
+        allowed.append(pf.relative_to(git_root).as_posix())
 
-    if max_files > 0 and len(filtered_py) > max_files:
-        filtered_py = filtered_py[:max_files]
-
-    for pf in filtered_py:
-        rel_path = str(pf.relative_to(project_root))
-        boundaries = get_function_boundaries(pf)
-        if boundaries:
-            file_functions[rel_path] = boundaries
-
-    if not file_functions:
+    if max_files > 0 and len(allowed) > max_files:
+        allowed = allowed[:max_files]
+    allowed_set = set(allowed)
+    if not allowed_set:
         return []
 
-    # For each commit, get the diff and map hunks to functions.
+    # (file, qualname) -> commits, lines added, lines removed.
     func_commits: dict[tuple[str, str], set[str]] = defaultdict(set)
+    func_lines: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
 
     for commit in commits:
-        if _check_script_timeout():
-            break
-        for file_path in commit["files"]:
-            if file_path not in file_functions:
+        if not any(f in allowed_set for f in commit["files"]):
+            continue
+        attr = attributor.get(commit)
+        if not attr:
+            continue
+        for file_path, touched in attr.items():
+            if file_path not in allowed_set or not touched:
                 continue
-            try:
-                diff_result = _run_git(
-                    ["show", "--format=", "-U0", commit["hash"], "--", file_path],
-                    project_root,
-                )
-                if diff_result.returncode != 0:
-                    continue
-            except subprocess.TimeoutExpired:
-                continue
+            for qual, (added, removed) in touched.items():
+                key = (file_path, qual)
+                func_commits[key].add(commit["hash"])
+                func_lines[key][0] += added
+                func_lines[key][1] += removed
 
-            # Parse diff hunks to find changed line ranges.
-            changed_lines: set[int] = set()
-            for line in diff_result.stdout.splitlines():
-                hunk_match = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", line)
-                if hunk_match:
-                    start = int(hunk_match.group(1))
-                    count = int(hunk_match.group(2)) if hunk_match.group(2) else 1
-                    changed_lines.update(range(start, start + count))
+    # Where each function is today, for the files that appear in the result.
+    head_spans: dict[str, dict[str, tuple[int, int]]] = {}
+    for file_path in {fp for fp, _ in func_commits}:
+        spans = get_function_boundaries(git_root / file_path)
+        head_spans[file_path] = {
+            b["qualname"]: (b["line_start"], b["line_end"]) for b in spans
+        }
 
-            # Map changed lines to functions.
-            for func in file_functions[file_path]:
-                func_range = set(range(func["line_start"], func["line_end"] + 1))
-                if changed_lines & func_range:
-                    key = (file_path, func["name"])
-                    func_commits[key].add(commit["hash"])
-
-    # Build result.
     results: list[dict] = []
-    for (file_path, func_name), commit_hashes in func_commits.items():
-        # Find function boundaries in current version.
-        boundaries = file_functions.get(file_path, [])
-        func_info = next((f for f in boundaries if f["name"] == func_name), None)
-        lines_changed = 0
-        if func_info:
-            lines_changed = func_info["line_end"] - func_info["line_start"] + 1
+    for (file_path, qual), commit_hashes in func_commits.items():
+        added, removed = func_lines[(file_path, qual)]
+        span = head_spans.get(file_path, {}).get(qual)
         results.append(
             {
-                "function": func_name,
+                "function": qual,
                 "file": file_path,
-                "line_start": func_info["line_start"] if func_info else 0,
-                "line_end": func_info["line_end"] if func_info else 0,
+                "line_start": span[0] if span else None,
+                "line_end": span[1] if span else None,
+                "exists_at_head": span is not None,
                 "commits": len(commit_hashes),
-                "lines_changed": lines_changed,
+                # Lines added plus lines removed inside this function, summed
+                # over the window. (Until 1.14 this field held the function's
+                # current length; that is now `current_length`.)
+                "lines_changed": added + removed,
+                "lines_added": added,
+                "lines_removed": removed,
+                "current_length": span[1] - span[0] + 1 if span else None,
             }
         )
 
-    results.sort(key=lambda x: x["commits"], reverse=True)
+    results.sort(
+        key=lambda x: (-x["commits"], -x["lines_changed"], x["file"], x["function"])
+    )
     return results
 
 
@@ -642,77 +1022,78 @@ def get_commit_details(
     project_root: Path,
     scan_root: Path,
     max_diff_lines: int,
+    attributor: CommitAttributor | None = None,
 ) -> list[dict]:
-    """Get detailed info for commits of a specific type."""
+    """Get detailed info for commits of a specific type.
+
+    `functions_modified` names the functions each commit touched in its own
+    version of each file (see CommitAttributor), so a function that has since
+    moved or been deleted is still named, and an unrelated function now
+    sitting at the old line numbers is not. `functions_modified_complete` is
+    False when a file could not be attributed (unparseable at that commit, or
+    the attribution budget ran out).
+    """
     typed_commits = [c for c in commits if c["type"] == commit_type]
     results: list[dict] = []
 
     rel_scope = _relative_scope(scan_root, project_root)
+    owned = attributor is None
+    if attributor is None:
+        attributor = CommitAttributor(git_toplevel(project_root))
 
-    for commit in typed_commits:
-        if _check_script_timeout():
-            break
-        # Get the diff.
-        diff_args = ["show", "--format=", "--patch", commit["hash"], "--"]
-        if rel_scope != ".":
-            diff_args.append(rel_scope)
-        try:
-            diff_result = _run_git(diff_args, project_root)
-            diff_text = diff_result.stdout if diff_result.returncode == 0 else ""
-        except subprocess.TimeoutExpired:
-            diff_text = "[diff unavailable: git show timed out]"
+    try:
+        for commit in typed_commits:
+            if _check_script_timeout():
+                break
+            # Get the diff.
+            diff_args = [
+                "show",
+                "--format=",
+                "--patch",
+                "--no-color",
+                "--no-ext-diff",
+                commit["hash"],
+                "--",
+            ]
+            if rel_scope != ".":
+                diff_args.append(rel_scope)
+            try:
+                diff_result = _run_git(diff_args, project_root)
+                diff_text = diff_result.stdout if diff_result.returncode == 0 else ""
+            except subprocess.TimeoutExpired:
+                diff_text = "[diff unavailable: git show timed out]"
 
-        diff_text = _truncate_diff(diff_text, max_diff_lines)
+            diff_text = _truncate_diff(diff_text, max_diff_lines)
 
-        # Map to functions if possible.
-        functions_modified: list[dict] = []
-        for file_path in commit["files"]:
-            full_path = project_root / file_path
-            if full_path.suffix == ".py" and full_path.exists():
-                boundaries = get_function_boundaries(full_path)
-                # Parse the diff to find which functions were modified.
-                try:
-                    func_diff = _run_git(
-                        ["show", "--format=", "-U0", commit["hash"], "--", file_path],
-                        project_root,
-                    )
-                    if func_diff.returncode == 0:
-                        changed_lines: set[int] = set()
-                        for line in func_diff.stdout.splitlines():
-                            hunk = re.match(
-                                r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", line
-                            )
-                            if hunk:
-                                start = int(hunk.group(1))
-                                count = int(hunk.group(2)) if hunk.group(2) else 1
-                                changed_lines.update(range(start, start + count))
-                        for func in boundaries:
-                            func_range = set(
-                                range(func["line_start"], func["line_end"] + 1)
-                            )
-                            if changed_lines & func_range:
-                                functions_modified.append(
-                                    {
-                                        "function": func["name"],
-                                        "file": file_path,
-                                    }
-                                )
-                except subprocess.TimeoutExpired:
-                    pass
+            functions_modified: list[dict] = []
+            attr = attributor.get(commit)
+            complete = attr is not None
+            for file_path, touched in (attr or {}).items():
+                if touched is None:
+                    complete = False
+                    continue
+                for qual in touched:
+                    functions_modified.append({"function": qual, "file": file_path})
 
-        results.append(
-            {
-                "commit": commit["hash"],
-                "commit_short": commit["hash"][:7],
-                "message": commit["message"],
-                "date": commit["date"],
-                "committer_date": commit.get("committer_date", commit["date"]),
-                "author": commit["author"],
-                "files": commit["files"],
-                "functions_modified": functions_modified,
-                "diff": diff_text,
-            }
-        )
+            results.append(
+                {
+                    "commit": commit["hash"],
+                    "commit_short": commit["hash"][:7],
+                    "message": commit["message"],
+                    "date": commit["date"],
+                    "committer_date": commit.get("committer_date", commit["date"]),
+                    "author": commit["author"],
+                    "type_source": commit.get("type_source"),
+                    "keys": commit.get("keys", []),
+                    "files": commit["files"],
+                    "functions_modified": functions_modified,
+                    "functions_modified_complete": complete,
+                    "diff": diff_text,
+                }
+            )
+    finally:
+        if owned:
+            attributor.close()
 
     return results
 
@@ -959,36 +1340,58 @@ def analyze(argv: list[str] | None = None) -> dict:
         classified_by[commit.get("type_source") or "none"] += 1
         authors.add(commit["author"])
 
-    # Function-level churn.
-    function_churn: list[dict] = []
-    function_churn_note: str | None = None
-    if args["no_function"] or _check_script_timeout():
-        function_churn_note = (
-            "Function-level churn skipped (--no-function flag or performance fallback)"
-        )
-    else:
-        # Count total functions to decide strategy.
-        function_churn = compute_function_churn_level2(
-            commits,
-            scan_root,
-            project_root,
-            max_files=args["max_files"],
-        )
-        if _check_script_timeout():
+    git_root = git_toplevel(project_root)
+    attributor = CommitAttributor(git_root)
+    try:
+        # Function-level churn.
+        function_churn: list[dict] = []
+        function_churn_note: str | None = None
+        if args["no_function"] or _check_script_timeout():
             function_churn_note = (
-                "Function-level churn partially computed (script timeout)"
+                "Function-level churn skipped (--no-function flag or performance "
+                "fallback)"
             )
+        else:
+            function_churn = compute_function_churn_level2(
+                commits,
+                scan_root,
+                project_root,
+                max_files=args["max_files"],
+                attributor=attributor,
+            )
+            if _check_script_timeout():
+                function_churn_note = (
+                    "Function-level churn partially computed (script timeout)"
+                )
 
-    # Get recent fixes, features, refactors.
-    recent_fixes = get_commit_details(
-        commits, "fix", project_root, scan_root, _MAX_DIFF_LINES_FIX
-    )
-    recent_features = get_commit_details(
-        commits, "feature", project_root, scan_root, _MAX_DIFF_LINES_FIX
-    )
-    recent_refactors = get_commit_details(
-        commits, "refactor", project_root, scan_root, _MAX_DIFF_LINES_REFACTOR
-    )
+        # Get recent fixes, features, refactors.
+        recent_fixes = get_commit_details(
+            commits,
+            "fix",
+            project_root,
+            scan_root,
+            _MAX_DIFF_LINES_FIX,
+            attributor,
+        )
+        recent_features = get_commit_details(
+            commits,
+            "feature",
+            project_root,
+            scan_root,
+            _MAX_DIFF_LINES_FIX,
+            attributor,
+        )
+        recent_refactors = get_commit_details(
+            commits,
+            "refactor",
+            project_root,
+            scan_root,
+            _MAX_DIFF_LINES_REFACTOR,
+            attributor,
+        )
+    finally:
+        attributor.close()
+    attribution_meta = attributor.meta()
 
     # Co-change clusters.
     co_change_clusters = compute_co_change_clusters(commits)
@@ -1021,6 +1424,7 @@ def analyze(argv: list[str] | None = None) -> dict:
         "tracker_keys": summarize_tracker_keys(commits),
         "file_churn": file_churn,
         "function_churn": function_churn,
+        "function_attribution": attribution_meta,
         "recent_fixes": recent_fixes,
         "recent_features": recent_features,
         "recent_refactors": recent_refactors,
@@ -1028,6 +1432,17 @@ def analyze(argv: list[str] | None = None) -> dict:
         "notes": [],
     }
 
+    if (
+        attribution_meta["commits_unattributed"]
+        or attribution_meta["files_unattributed"]
+    ):
+        result["notes"].append(
+            f"Function attribution is INCOMPLETE: "
+            f"{attribution_meta['commits_unattributed']} commit(s) and "
+            f"{attribution_meta['files_unattributed']} file change(s) could not "
+            "be mapped to functions (timeout, parse cap, or a file version that "
+            "does not parse). Function counts are lower bounds."
+        )
     unknown = commits_by_type.get("unknown", 0)
     if commits and unknown / len(commits) > 0.15:
         result["notes"].append(
