@@ -1220,6 +1220,111 @@ class TestTransitiveBlockingInAsync(unittest.TestCase):
         self.assertEqual([f["confidence"] for f in found], ["low"])
 
 
+class TestSlotReleasedOnEveryExit(unittest.TestCase):
+    shape = "slot-acquired-before-the-try-that-releases-it"
+
+    def test_await_between_acquire_and_try(self):
+        src = """
+        async def handle(gate, limiter, request):
+            slot = gate.take_slot(request)
+            decision = await limiter.charge(request)
+            if not decision.allowed:
+                slot.release()
+                raise RuntimeError("limited")
+            try:
+                return await request.run()
+            finally:
+                slot.release()
+        """
+        found = of(scan(src), self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertEqual((found[0]["line"], found[0]["confidence"]), (3, "high"))
+
+    def test_try_right_after_acquire_is_silent(self):
+        src = """
+        import threading
+        sem = threading.Semaphore(4)
+
+        async def handle(gate, request):
+            slot = gate.take_slot(request)
+            if slot is None:
+                raise RuntimeError("busy")
+            try:
+                return await request.run()
+            finally:
+                slot.release()
+
+        def work(job):
+            sem.acquire()
+            try:
+                job()
+            finally:
+                sem.release()
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+    def test_release_only_in_except_exception_around_an_await(self):
+        src = """
+        async def download(gate, request, export):
+            slot, refused = gate.admit(request)
+            if refused is not None:
+                return refused
+            try:
+                path = await export(request)
+            except ValueError:
+                slot.release()
+                return None
+            except Exception:
+                slot.release()
+                raise
+            request.on_close(slot.release)
+            return path
+        """
+        found = of(scan(src), self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertIn("CancelledError", found[0]["message"])
+
+    def test_except_base_exception_is_silent(self):
+        src = """
+        async def download(gate, request, export):
+            slot = gate.admit(request)
+            try:
+                path = await export(request)
+            except BaseException:
+                slot.release()
+                raise
+            request.on_close(slot.release)
+            return path
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+    def test_call_between_acquire_and_hand_off(self):
+        src = """
+        def admit(gate, quota, request):
+            slot, refused = gate.admit(request)
+            if refused is not None:
+                return None, refused
+            limited = quota.charge(request)
+            if limited is not None:
+                slot.release()
+                return None, limited
+            return slot, None
+        """
+        found = of(scan(src), self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["confidence"], "medium")
+        self.assertIn("line 6", found[0]["message"])
+
+    def test_a_resource_never_released_here_is_not_a_slot(self):
+        src = """
+        def build(factory, log):
+            conn = factory.open()
+            conn.configure()
+            return conn
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+
 class TestSignalHandlers(unittest.TestCase):
     shape = "signal-handler-does-real-work"
 

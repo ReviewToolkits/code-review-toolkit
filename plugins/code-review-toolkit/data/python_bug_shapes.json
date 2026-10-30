@@ -2291,6 +2291,25 @@
       "detectability": "agent-only"
     },
     {
+      "id": "slot-acquired-before-the-try-that-releases-it",
+      "title": "A slot or semaphore taken, then a call that can raise or be cancelled before the try that releases it",
+      "agent": "concurrency-auditor",
+      "severity": "FIX",
+      "pattern": "`slot = take_slot(); decision = await charge(...); try: ... finally: slot.release()`: the statements between the acquire and the `try` can raise (or, in a coroutine, be cancelled), and nothing releases the slot then. Two variants of the same leak: the release lives only in `except Exception:` handlers around an `await` (CancelledError is a BaseException and skips them), or there is no try at all and the release / hand-off happens only on the straight-line path.",
+      "guarded_twin": "Open the `try` immediately after the acquire and release in `finally`, unless ownership was explicitly handed off (a flag set just before returning, or a release callback registered last). A sibling handler that already does this is the twin.",
+      "hunt": "For every counter, slot or semaphore acquire, list each statement between it and the `try` that releases it, and every exit after it (exception, CancelledError, early return). Check the hand-off path too: a release scheduled in a response background task does not run if the request is cancelled first.",
+      "expected": "every admitted request releases its slot exactly once, on every exit.",
+      "caught_as": "SILENT until the cap is reached; then a permanent 429/503 for a client or the whole instance until restart.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "Python docs, asyncio.CancelledError (a BaseException subclass since 3.8, so `except Exception` does not catch it)"
+      ],
+      "differential": "Not a leak when the statements in between cannot raise, when the slot is not taken on the path that raises (`if slot is None: raise Busy()`), or when an outer `try` (in the caller) releases it. The scanner skips explicit `raise`/`return` exits for that reason; check them by hand.",
+      "detected_by": "scan_concurrency.py",
+      "detectability": "implemented"
+    },
+    {
       "id": "cleanup-inside-try-triggers-rollback",
       "title": "Post-success cleanup inside the `try` whose `except` rolls the operation back",
       "agent": "silent-failure-hunter",

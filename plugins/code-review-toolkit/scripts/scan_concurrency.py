@@ -17,7 +17,9 @@ module boundaries:
    ``acquire(timeout=...)`` result, lock-order cycles (from nested ``with``
    blocks AND from calls made while holding a lock), a non-reentrant lock taken
    again through a call chain (including a read-to-write upgrade on a project's
-   own reader/writer lock), and ``Condition`` misuse.
+   own reader/writer lock), ``Condition`` misuse, and a slot or semaphore taken
+   before the ``try`` that releases it (or released only in ``except
+   Exception``, which cancellation skips).
 3. Forbidden work in a critical region, followed through the project call graph:
    blocking calls while holding a lock, ``await`` while holding a thread lock,
    ``async def`` code that calls a sync project function which blocks or takes a
@@ -2935,6 +2937,303 @@ def _check_signal_handlers(p: Project, s: Summaries) -> list[dict]:
     return out
 
 
+# Calls that cannot plausibly raise or suspend between an acquire and its try.
+_SAFE_CALLS = frozenset(
+    {
+        "len",
+        "isinstance",
+        "issubclass",
+        "any",
+        "all",
+        "repr",
+        "id",
+        "type",
+        "bool",
+        "str",
+        "getattr",
+        "hasattr",
+        "min",
+        "max",
+        "sorted",
+        "list",
+        "dict",
+        "tuple",
+        "set",
+        "frozenset",
+        "range",
+        "enumerate",
+        "zip",
+        "time.monotonic",
+        "time.time",
+        "time.perf_counter",
+    }
+)
+_SAFE_METHODS = frozenset(
+    {
+        "get",
+        "items",
+        "keys",
+        "values",
+        "copy",
+        "format",
+        "join",
+        "split",
+        "strip",
+        "lower",
+        "upper",
+        "startswith",
+        "endswith",
+        "append",
+        "add",
+        "setdefault",
+    }
+)
+
+
+def _releases(node: ast.AST, res: str) -> bool:
+    """Does *node* (not a nested def) call `<res>.release(...)`?"""
+    for sub in [node, *_walk_scope(node)]:
+        if (
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Attribute)
+            and sub.func.attr == "release"
+            and _text(sub.func.value) == res
+        ):
+            return True
+    return False
+
+
+def _risky_expr(p: Project, func: Func, node: ast.AST) -> ast.AST | None:
+    """The first `await` or call in *node* that can raise or suspend."""
+    mod = p.modules[func.module]
+    for sub in [node, *_walk_scope(node)]:
+        if isinstance(sub, ast.Await):
+            return sub
+        if not isinstance(sub, ast.Call):
+            continue
+        name = p.qualify(mod, sub.func)
+        method = ""
+        receiver = ""
+        if isinstance(sub.func, ast.Attribute):
+            method = sub.func.attr
+            receiver = (_dotted(sub.func.value) or "").split(".")[-1]
+        if name in _SAFE_CALLS or method in _SAFE_METHODS:
+            continue
+        if re.search(r"(Error|Exception)$", name or method):
+            continue  # building the exception a guard raises
+        if method in _LOG_METHODS and _LOG_RECEIVERS.match(receiver):
+            continue
+        return sub
+    return None
+
+
+def _risky_in(
+    p: Project, func: Func, stmts: list[ast.stmt], res: str
+) -> ast.AST | None:
+    """The first statement-level hazard in *stmts* before *res* is released."""
+    for st in stmts:
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(st, ast.If):
+            found = _risky_expr(p, func, st.test)
+            # `if slot is None: raise Busy()`: a branch on the resource itself is
+            # the not-taken path (or its own release), not a hazard.
+            if found is None and res not in {
+                n.id for n in ast.walk(st.test) if isinstance(n, ast.Name)
+            }:
+                found = _risky_in(p, func, st.body, res) or _risky_in(
+                    p, func, st.orelse, res
+                )
+        elif isinstance(st, (ast.With, ast.AsyncWith)):
+            found = next(
+                (
+                    n
+                    for item in st.items
+                    if (n := _risky_expr(p, func, item.context_expr))
+                ),
+                None,
+            ) or _risky_in(p, func, st.body, res)
+        elif isinstance(st, (ast.For, ast.AsyncFor, ast.While)):
+            header = st.test if isinstance(st, ast.While) else st.iter
+            found = _risky_expr(p, func, header) or _risky_in(p, func, st.body, res)
+        elif isinstance(st, ast.Try):
+            if _releases_in(st.finalbody, res):
+                return None
+            found = _risky_in(p, func, st.body, res)
+        else:
+            # An explicit exit is a path of its own (often the not-acquired one);
+            # the hazard this looks for is an exception nobody planned for.
+            if _releases(st, res) or isinstance(st, (ast.Return, ast.Raise)):
+                return None
+            found = _risky_expr(p, func, st)
+        if found is not None:
+            return found
+    return None
+
+
+def _releases_in(stmts: list[ast.stmt], res: str) -> bool:
+    return any(_releases(st, res) for st in stmts)
+
+
+def _catches_cancellation(handler: ast.ExceptHandler) -> bool:
+    if handler.type is None:
+        return True
+    types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    return any(
+        _dotted(t).split(".")[-1] in ("BaseException", "CancelledError") for t in types
+    )
+
+
+def _acquired_resources(st: ast.stmt, released: set[str]) -> list[str]:
+    """`x = take_slot()`, `x, err = gate()`, `sem.acquire()`: what *st* takes,
+    when the function releases it somewhere (`x.release()`)."""
+    if (
+        isinstance(st, ast.Expr)
+        and isinstance(st.value, ast.Call)
+        and isinstance(st.value.func, ast.Attribute)
+        and st.value.func.attr == "acquire"
+        and not st.value.args
+        and not st.value.keywords
+    ):
+        res = _text(st.value.func.value)
+        return [res] if res in released else []
+    value = getattr(st, "value", None)
+    if isinstance(value, ast.Await):
+        value = value.value
+    if not isinstance(st, (ast.Assign, ast.AnnAssign)) or not isinstance(
+        value, ast.Call
+    ):
+        return []
+    targets = st.targets if isinstance(st, ast.Assign) else [st.target]
+    names: list[str] = []
+    for tgt in targets:
+        elts = tgt.elts if isinstance(tgt, (ast.Tuple, ast.List)) else [tgt]
+        names.extend(e.id for e in elts if isinstance(e, ast.Name))
+    return [n for n in names if n in released]
+
+
+def _stmt_lists(fn: ast.FunctionDef | ast.AsyncFunctionDef):
+    """Every statement list in *fn*'s own scope."""
+    stack: list[list[ast.stmt]] = [fn.body]
+    while stack:
+        stmts = stack.pop()
+        yield stmts
+        for st in stmts:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            for name in ("body", "orelse", "finalbody"):
+                sub = getattr(st, name, None)
+                if isinstance(sub, list) and sub and isinstance(sub[0], ast.stmt):
+                    stack.append(sub)
+            for handler in getattr(st, "handlers", []):
+                stack.append(handler.body)
+            for case in getattr(st, "cases", []):
+                stack.append(case.body)
+
+
+def _check_slot_release(p: Project) -> list[dict]:
+    """slot-acquired-before-the-try-that-releases-it."""
+    out: list[dict] = []
+    for func in p.funcs.values():
+        released = {
+            _text(n.func.value)
+            for n in ast.walk(func.node)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "release"
+        }
+        if not released:
+            continue
+        for stmts in _stmt_lists(func.node):
+            for i, st in enumerate(stmts):
+                for res in _acquired_resources(st, released):
+                    finding = _slot_verdict(p, func, st, stmts[i + 1 :], res)
+                    if finding is not None:
+                        out.append(finding)
+    return out
+
+
+def _slot_verdict(
+    p: Project, func: Func, acq: ast.stmt, rest: list[ast.stmt], res: str
+) -> dict | None:
+    shape = "slot-acquired-before-the-try-that-releases-it"
+    risk: ast.AST | None = None
+    for st in rest:
+        if isinstance(st, ast.Try):
+            if _releases_in(st.finalbody, res):
+                if risk is None:
+                    return None
+                return _finding(
+                    shape,
+                    "FIX",
+                    "high" if isinstance(risk, ast.Await) else "medium",
+                    func,
+                    acq,
+                    f"{res} is taken at line {acq.lineno}, but the try whose `finally` "
+                    f"releases it starts at line {st.lineno}; line {risk.lineno} can raise "
+                    f"or be cancelled first, and then nothing releases it",
+                    "open the try immediately after the acquire (or move the acquire to just "
+                    "before it); every exit between them leaks the slot until restart",
+                )
+            handlers = [h for h in st.handlers if _releases_in(h.body, res)]
+            if handlers:
+                awaited = _first_await(st.body)
+                if (
+                    func.is_async
+                    and awaited is not None
+                    and not any(_catches_cancellation(h) for h in st.handlers)
+                ):
+                    return _finding(
+                        shape,
+                        "FIX",
+                        "medium",
+                        func,
+                        acq,
+                        f"{res} is released only in `except` handlers that do not catch "
+                        f"CancelledError (a BaseException): cancelling the `await` at line "
+                        f"{awaited.lineno} skips them and leaks it",
+                        "release in `finally` (guarded by a flag set once ownership is handed "
+                        "off), or add `except BaseException: release(); raise`",
+                    )
+                return None
+        if not isinstance(st, ast.Try) and _releases(st, res) and _is_simple(st):
+            break  # released on the straight-line path
+        if isinstance(st, ast.Return) and res in {
+            n.id for n in ast.walk(st) if isinstance(n, ast.Name)
+        }:
+            break  # handed off to the caller
+        if risk is None:
+            risk = _risky_in(p, func, [st], res)
+        if isinstance(st, (ast.Return, ast.Raise)):
+            break
+    if risk is None:
+        return None
+    return _finding(
+        shape,
+        "FIX",
+        "high" if isinstance(risk, ast.Await) else "medium",
+        func,
+        acq,
+        f"{res} is taken at line {acq.lineno} and released (or handed off) only on the "
+        f"straight-line path: line {risk.lineno} can raise or be cancelled first, and no "
+        f"try/finally covers it",
+        "wrap everything after the acquire in try/finally (release unless ownership was "
+        "handed off), or use a context manager",
+    )
+
+
+def _is_simple(st: ast.stmt) -> bool:
+    return isinstance(st, (ast.Expr, ast.Assign, ast.AnnAssign, ast.AugAssign))
+
+
+def _first_await(stmts: list[ast.stmt]) -> ast.AST | None:
+    for st in stmts:
+        for sub in [st, *_walk_scope(st)]:
+            if isinstance(sub, ast.Await):
+                return sub
+    return None
+
+
 # --------------------------------------------------------------------------
 # Driver
 # --------------------------------------------------------------------------
@@ -2952,6 +3251,7 @@ _CHECKS = (
     "await-while-holding-thread-lock",
     "transitive-blocking-call-in-async",
     "signal-handler-does-real-work",
+    "slot-acquired-before-the-try-that-releases-it",
 )
 
 
@@ -3011,6 +3311,9 @@ def analyze(
         ),
         "signal-handler-does-real-work": lambda: _check_signal_handlers(
             project, summaries
+        ),
+        "slot-acquired-before-the-try-that-releases-it": lambda: _check_slot_release(
+            project
         ),
     }
     # Some checks produce two shapes; run each producer once if either is selected.
