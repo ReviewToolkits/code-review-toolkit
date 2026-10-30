@@ -104,6 +104,95 @@ each transport in-process (e.g. the SDK over a test client and over the embedded
 prints the differences. Transport divergence is where API defects concentrate, because each
 transport is tested on its own and nobody compares them.
 
+Start from this harness rather than writing one from scratch. Fill in the three marked parts,
+save it in your private directory, and run it against an exported copy of the project:
+
+```python
+"""Run each case through every transport and print where the outcomes diverge."""
+import pathlib
+import sys
+import tempfile
+
+EXPORT = "/path/to/export"  # an exported copy, never the checkout
+sys.path.insert(0, EXPORT)
+import mypkg  # FILL IN: the package under review
+assert mypkg.__file__.startswith(EXPORT), mypkg.__file__
+
+# Per-call noise that would make every case "differ". Extend with --ignore-keys a,b.
+IGNORE_KEYS = {"request_id", "trace_id", "timestamp", "took_ms"}
+
+
+def make_transports(tmp: pathlib.Path) -> dict:
+    """FILL IN: one client per transport, each over its own fresh state."""
+    from fastapi.testclient import TestClient  # e.g. an HTTP app plus its SDK
+
+    app = mypkg.create_app(state_dir=tmp / "remote")
+    return {
+        "remote": mypkg.Client(transport=TestClient(app)),
+        "local": mypkg.EmbeddedClient(state_dir=tmp / "local"),
+    }
+
+
+# FILL IN: (label, method, args, kwargs). Run in order on each transport, so a case can
+# depend on the ones before it. The error cases are where transports diverge most.
+CASES = [
+    ("create", "create_item", ("a",), {}),
+    ("create again", "create_item", ("a",), {}),
+    ("get missing", "get_item", ("nope",), {}),
+    ("bad limit", "list_items", (), {"limit": -1}),
+    ("empty name", "create_item", ("",), {}),
+]
+
+
+def shape(value):
+    if hasattr(value, "model_dump"):
+        value = value.model_dump()
+    elif hasattr(value, "__dict__") and not isinstance(value, type):
+        value = vars(value)
+    if isinstance(value, dict):
+        return tuple(sorted(k for k in value if k not in IGNORE_KEYS))
+    if isinstance(value, (list, tuple)):
+        return ("seq", len(value), shape(value[0]) if value else None)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return type(value).__name__
+
+
+def outcome(fn, args, kwargs):
+    """Normalise one call: the exception (class, code) or the return (type, shape)."""
+    try:
+        value = fn(*args, **kwargs)
+    except Exception as exc:  # the exception is the outcome being compared
+        code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+        return ("raises", type(exc).__name__, code)
+    return ("returns", type(value).__name__, shape(value))
+
+
+def main(argv):
+    if "--ignore-keys" in argv:
+        IGNORE_KEYS.update(argv[argv.index("--ignore-keys") + 1].split(","))
+    with tempfile.TemporaryDirectory() as tmp:
+        transports = make_transports(pathlib.Path(tmp))
+        names = list(transports)
+        print("   case".ljust(24) + "".join(n.ljust(44) for n in names))
+        diverged = 0
+        for label, method, args, kwargs in CASES:
+            got = {n: outcome(getattr(c, method), args, kwargs) for n, c in transports.items()}
+            differs = len({repr(v) for v in got.values()}) > 1
+            diverged += differs
+            row = "".join(repr(got[n])[:42].ljust(44) for n in names)
+            print(("!! " if differs else "   ") + label[:20].ljust(21) + row)
+        print(f"{diverged}/{len(CASES)} cases diverge")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
+```
+
+Each `!!` row is a candidate. Decide which transport is right from the documented contract
+(OpenAPI schema, SDK docstrings, README), not from the majority. Two transports that agree can
+both be wrong.
+
 ### 6c. REST/OpenAPI surface (if applicable)
 
 For an HTTP API, compare the documented contract (OpenAPI schema, docs) with behavior:
