@@ -3,6 +3,7 @@
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
+from typing import ClassVar
 
 from helpers import TempProject, import_script
 
@@ -450,6 +451,89 @@ class TestConfigDebt(unittest.TestCase):
             self.out["summary"]["config_debt"],
             {"pins": 4, "routine_caps": 1, "suppressions": 5, "ci": 3, "markers": 1},
         )
+
+
+class TestTrackerKeyResolution(unittest.TestCase):
+    """Done marks, changelog-only history and keys that live on branches."""
+
+    FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "ROADMAP.md": (
+            "| key | item | target |\n|---|---|---|\n"
+            "| ABC-1 | ~~Faster index~~ | v1.0 |\n"
+            "| ABC-2 | Plugin registry | v1.6 |\n"
+            "| ABC-4 | ~~Bulk export (needs ABC-2 first)~~ | v1.0 |\n"
+            "| ABC-6 | Docs site | v2.0 |\n"
+            "\n"
+            "- [x] ABC-8 ticked item, see ABC-9\n"
+            "- [ ] ABC-9 open item\n"
+        ),
+        "CHANGELOG.md": "## 1.0\n- ABC-6 first slice shipped\n- ABC-50 old fix\n",
+    }
+
+    def _tracker(self, files=None):
+        with TempProject(files or self.FILES) as root:
+            return _run_main([str(root), "--key-regex", r"\bABC-\d+\b"])["tracker_keys"]
+
+    def test_struck_task_cell_marks_the_row_key_done(self):
+        tk = self._tracker()
+        self.assertEqual(tk["open_in_planning_docs"], ["ABC-2", "ABC-9"])
+
+    def test_a_struck_row_does_not_close_a_key_it_only_mentions(self):
+        keys = {k["key"]: k for k in self._tracker()["keys"]}
+        self.assertTrue(keys["ABC-4"]["struck_through"])
+        self.assertFalse(keys["ABC-2"]["struck_through"])
+        self.assertTrue(keys["ABC-8"]["struck_through"])
+        self.assertFalse(keys["ABC-9"]["struck_through"])
+
+    def test_open_row_with_a_changelog_mention_is_a_conflicting_signal(self):
+        self.assertEqual(self._tracker()["conflicting_signals"], ["ABC-6"])
+
+    def test_changelog_only_keys_are_collapsed(self):
+        tk = self._tracker()
+        self.assertEqual(tk["changelog_only_keys"], ["ABC-50"])
+        self.assertNotIn("ABC-50", [k["key"] for k in tk["keys"]])
+        self.assertEqual(tk["summary"]["keys_only_in_changelog"], 1)
+        self.assertEqual(tk["summary"]["keys_total"], 7)
+
+    def test_branches_not_searched_without_git(self):
+        tk = self._tracker()
+        self.assertFalse(tk["unmerged_branches_searched"])
+        self.assertIsNone(tk["branch_only"])
+        self.assertIsNone(tk["summary"]["branch_only"])
+
+    def test_key_only_on_an_unmerged_branch(self):
+        import subprocess
+
+        def git(root, *args):
+            subprocess.run(
+                ["git", "-c", "user.name=T", "-c", "user.email=t@t", *args],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+
+        with TempProject(self.FILES) as root:
+            git(root, "init", "-q", "-b", "main")
+            git(root, "add", "-A")
+            git(root, "commit", "-q", "-m", "roadmap; ABC-1 shipped")
+            git(root, "checkout", "-q", "-b", "feat/retry")
+            git(
+                root, "commit", "-q", "--allow-empty", "-m", "fix: ABC-77 retry backoff"
+            )
+            git(root, "commit", "-q", "--allow-empty", "-m", "ABC-2: wip")
+            git(root, "checkout", "-q", "main")
+            tk = _run_main([str(root), "--key-regex", r"\bABC-\d+\b"])["tracker_keys"]
+        self.assertTrue(tk["unmerged_branches_searched"])
+        (only,) = tk["branch_only"]
+        self.assertEqual(
+            (only["key"], only["commits"], only["refs"]),
+            ("ABC-77", 1, ["feat/retry"]),
+        )
+        keys = {k["key"]: k for k in tk["keys"]}
+        self.assertEqual(keys["ABC-2"]["unmerged_commits"], 1)
+        self.assertEqual(keys["ABC-1"]["unmerged_commits"], 0)
+        self.assertEqual(keys["ABC-1"]["commits"], 1)
 
 
 if __name__ == "__main__":

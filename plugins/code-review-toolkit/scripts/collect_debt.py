@@ -215,6 +215,33 @@ _MAX_DOC_BYTES = 2_000_000
 _MAX_REFS_PER_KEY = 20
 _GIT_LOG_MAX_COUNT = 20000
 _STRIKE = re.compile(r"~~(.+?)~~")
+# A ticked task-list item (`- [x] ABC-3 ...`) is done.
+_TICKED_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+\[[xX]\]\s")
+_STRUCK_CELL = re.compile(r"^~~.+~~$")
+
+
+def _row_keys(line: str, pattern: re.Pattern[str]) -> tuple[set[str], bool]:
+    """``(keys the line is about, whether it marks them done)``.
+
+    A table row is about the keys in its first key-bearing cell; other keys
+    in the row are cross-references. Roadmaps often strike the TASK cell
+    rather than the key (`| ABC-1 | ~~Faster index~~ | v1.0 |`), which only
+    `~~ABC-1~~` used to recognise, so such done rows read as open. A ticked
+    task-list item is about its first key.
+    """
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        cells = [c.strip() for c in stripped.strip("|").split("|")]
+        for index, cell in enumerate(cells):
+            own = {m.group(0) for m in pattern.finditer(cell)}
+            if own:
+                others = cells[:index] + cells[index + 1 :]
+                return own, any(_STRUCK_CELL.match(c) for c in others if c)
+        return set(), False
+    if _TICKED_ITEM.match(line):
+        first = pattern.search(line)
+        return ({first.group(0)} if first else set()), True
+    return set(), False
 
 
 def _doc_files(project_root: Path) -> list[Path]:
@@ -281,19 +308,25 @@ def _python_comment_lines(path: Path) -> list[tuple[int, str]]:
     return out
 
 
-def _git_log_mentions(project_root: Path, pattern: re.Pattern[str]) -> dict | None:
-    """``{key: {"commits": n, "last_date": iso}}`` from one local `git log` pass.
+def _git_log_mentions(
+    project_root: Path, pattern: re.Pattern[str], *, unmerged: bool = False
+) -> dict | None:
+    """``{key: {"commits": n, "last_date": iso, "refs": set}}`` from one local
+    `git log` pass over HEAD -- or, with *unmerged*, over the commits on local
+    and remote branches that HEAD does not contain (``refs`` names them).
 
     Returns None when git is unavailable or fails, so the caller can say the
     lookup was not made rather than report zero commits.
     """
+    scope = ["--branches", "--remotes", "--not", "HEAD", "--source"] if unmerged else []
     try:
         result = subprocess.run(
             [
                 "git",
                 "log",
+                *scope,
                 f"--max-count={_GIT_LOG_MAX_COUNT}",
-                "--format=%aI%x00%s%x00%b%x1e",
+                "--format=%S%x00%aI%x00%s%x00%b%x1e",
             ],
             capture_output=True,
             text=True,
@@ -308,14 +341,18 @@ def _git_log_mentions(project_root: Path, pattern: re.Pattern[str]) -> dict | No
     mentions: dict[str, dict] = {}
     for record in result.stdout.split("\x1e"):
         parts = record.strip("\n").split("\x00")
-        if len(parts) < 2:
+        if len(parts) < 3:
             continue
-        date = parts[0]
-        for key in {m.group(0) for m in pattern.finditer(" ".join(parts[1:]))}:
-            entry = mentions.setdefault(key, {"commits": 0, "last_date": None})
+        ref, date = parts[0], parts[1]
+        for key in {m.group(0) for m in pattern.finditer(" ".join(parts[2:]))}:
+            entry = mentions.setdefault(
+                key, {"commits": 0, "last_date": None, "refs": set()}
+            )
             entry["commits"] += 1
             # git log is newest-first, so the first date seen is the latest.
             entry["last_date"] = entry["last_date"] or date
+            if unmerged and ref:
+                entry["refs"].add(ref)
     return mentions
 
 
@@ -350,6 +387,9 @@ def collect_tracker_keys(
                 "in_changelog": False,
                 "in_planning_doc": False,
                 "struck_through": False,
+                "non_changelog_doc_refs": 0,
+                "own_rows": 0,
+                "own_row_struck": False,
                 "code_refs": [],
                 "doc_refs": [],
             },
@@ -383,12 +423,20 @@ def collect_tracker_keys(
                 for span in _STRIKE.finditer(line)
                 for m in pattern.finditer(span.group(1))
             }
+            own, row_done = _row_keys(line, pattern)
+            if row_done:
+                struck |= own
             for match in pattern.finditer(line):
                 key = match.group(0)
                 item = entry(key)
                 item["doc_ref_count"] += 1
                 item["in_changelog"] |= is_changelog
                 item["in_planning_doc"] |= is_planning
+                if not is_changelog:
+                    item["non_changelog_doc_refs"] += 1
+                if key in own:
+                    item["own_rows"] += 1
+                    item["own_row_struck"] |= key in struck
                 item["struck_through"] |= key in struck
                 if len(item["doc_refs"]) < _MAX_REFS_PER_KEY:
                     item["doc_refs"].append(
@@ -400,7 +448,17 @@ def collect_tracker_keys(
                         }
                     )
 
+    for item in keys.values():
+        # A key with a row of its own is done when that row says so; a strike
+        # through text that merely mentions it in passing is not its status.
+        if item.pop("own_rows"):
+            item["struck_through"] = item["own_row_struck"]
+        del item["own_row_struck"]
+
     git = _git_log_mentions(project_root, pattern) if use_git else None
+    unmerged = (
+        _git_log_mentions(project_root, pattern, unmerged=True) if use_git else None
+    )
     for key, item in keys.items():
         found = (git or {}).get(key)
         # None, not 0, when git was not searched: unmeasured is not "no commits".
@@ -408,6 +466,40 @@ def collect_tracker_keys(
             found["commits"] if found else (0 if git is not None else None)
         )
         item["last_commit_date"] = found["last_date"] if found else None
+        on_branches = (unmerged or {}).get(key)
+        item["unmerged_commits"] = (
+            on_branches["commits"]
+            if on_branches
+            else (0 if unmerged is not None else None)
+        )
+        item["unmerged_refs"] = sorted(on_branches["refs"])[:10] if on_branches else []
+
+    # Keys that only commits on unmerged branches mention: work that exists
+    # nowhere on this branch -- not in code, docs or its history.
+    branch_only = [
+        {
+            "key": key,
+            "commits": found["commits"],
+            "refs": sorted(found["refs"])[:10],
+            "last_commit_date": found["last_date"],
+        }
+        for key, found in sorted(
+            (unmerged or {}).items(), key=lambda kv: _natural_key(kv[0])
+        )
+        if key not in keys and key not in (git or {})
+    ]
+
+    # A key whose every mention is a changelog line is history, not debt;
+    # on a GitHub project nearly every `#NNN` key is one.
+    changelog_only = [
+        k
+        for k in keys.values()
+        if not k["code_ref_count"]
+        and k["in_changelog"]
+        and not k["non_changelog_doc_refs"]
+    ]
+    for k in changelog_only:
+        del keys[k["key"]]
 
     ordered = sorted(keys.values(), key=lambda k: _natural_key(k["key"]))
     open_in_code = [
@@ -423,17 +515,33 @@ def collect_tracker_keys(
         for k in ordered
         if k["in_planning_doc"] and not k["in_changelog"] and not k["struck_through"]
     ]
+    # Open in a planning doc, yet a changelog mentions it: the row may be
+    # stale, or the changelog may record only part of the work. Read both.
+    conflicting_signals = [
+        k["key"]
+        for k in ordered
+        if k["in_planning_doc"] and k["in_changelog"] and not k["struck_through"]
+    ]
     return {
         "regex": pattern.pattern,
         "doc_files_scanned": [str(p.relative_to(project_root)) for p in docs],
+        "doc_scope": (
+            "docs are read from the project root and docs/ whatever the scan "
+            "scope; code citations come from the scanned files only"
+        ),
         "git_log_searched": git is not None,
+        "unmerged_branches_searched": unmerged is not None,
         "summary": {
-            "keys_total": len(ordered),
+            "keys_total": len(ordered) + len(changelog_only),
+            "keys_only_in_changelog": len(changelog_only),
             "keys_cited_in_code": sum(1 for k in ordered if k["code_ref_count"]),
-            "keys_in_changelog": sum(1 for k in ordered if k["in_changelog"]),
+            "keys_in_changelog": sum(1 for k in ordered if k["in_changelog"])
+            + len(changelog_only),
             "keys_struck_through": sum(1 for k in ordered if k["struck_through"]),
             "open_in_code": len(open_in_code),
             "open_in_planning_docs": len(open_in_planning_docs),
+            "conflicting_signals": len(conflicting_signals),
+            "branch_only": None if unmerged is None else len(branch_only),
         },
         # Cited in code, but no changelog entry, strike-through or commit
         # mentions it: the keyed equivalent of an open TODO.
@@ -442,6 +550,15 @@ def collect_tracker_keys(
         # no changelog: planned work still open. `doc_refs[].text` carries the
         # row, which usually names the target version.
         "open_in_planning_docs": open_in_planning_docs,
+        "conflicting_signals": conflicting_signals,
+        # Mentioned only by commits on branches not merged into HEAD (local
+        # and remote): null when the branches were not searched.
+        "branch_only": None if unmerged is None else branch_only,
+        # Keys whose every mention is in a changelog; their detail is omitted.
+        "changelog_only_keys": [
+            k["key"]
+            for k in sorted(changelog_only, key=lambda k: _natural_key(k["key"]))
+        ],
         "keys": ordered,
     }
 
