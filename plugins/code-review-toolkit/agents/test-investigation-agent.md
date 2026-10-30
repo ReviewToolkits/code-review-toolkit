@@ -31,6 +31,10 @@ Parse the JSON output. Key fields:
 - `bug_fix_tests[]`: Tests associated with bug-fix commits (highest signal)
 - `untested_similar_functions[]`: Functions similar to tested ones but with no tests
 - `summary`: Aggregate statistics
+- `status`, `test_discovery`, `warnings`: where the tests came from. When the scope (e.g. `pkg/`) holds no tests, the script
+  takes them from the project's pytest `testpaths` or a `tests/`/`test/` directory and says so in `warnings`
+  (`test_discovery.method` is then `pytest_testpaths` or `conventional_dir`). `status: "no_tests_found"` means no test
+  file was found anywhere: report that the extraction did not run, never "no invariants"
 
 The script handles the mechanical work (AST parsing, assertion extraction, name-similarity matching). You handle the judgment work: Is this invariant meaningful? Is the similar function truly analogous? Is the violation real?
 

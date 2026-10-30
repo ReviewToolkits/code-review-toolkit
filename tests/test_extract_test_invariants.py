@@ -305,5 +305,69 @@ class TestAnalyze(unittest.TestCase):
             self.assertNotIn("test_no_assertions", functions)
 
 
+class TestDiscoverTestsOutsideScope(unittest.TestCase):
+    """Tests beside the scanned package are found, and the output says so."""
+
+    _SRC = "def parse(text):\n    return text\n"
+    _TEST = (
+        "from pkg.core import parse\n"
+        "\n"
+        "def test_parse_empty():\n"
+        "    assert parse('') == ''\n"
+    )
+
+    def test_sibling_tests_dir_used_for_package_scope(self):
+        with TempProject({
+            "pkg/__init__.py": "",
+            "pkg/core.py": self._SRC,
+            "tests/test_core.py": self._TEST,
+        }) as root:
+            result = mod.analyze(str(root / "pkg"))
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["summary"]["test_files"], 1)
+        self.assertEqual(result["summary"]["total_test_functions"], 1)
+        self.assertEqual(
+            result["test_discovery"],
+            {"method": "conventional_dir", "roots": ["tests"]},
+        )
+        self.assertEqual(len(result["warnings"]), 1)
+        self.assertIn("tests", result["warnings"][0])
+        # Source functions stay limited to the scan root.
+        self.assertEqual(result["summary"]["source_files"], 2)
+
+    def test_pytest_testpaths_config_is_honoured(self):
+        with TempProject({
+            "pkg/__init__.py": "",
+            "pkg/core.py": self._SRC,
+            "pytest.ini": "[pytest]\ntestpaths = spec\n",
+            "spec/check_core.py": self._TEST,
+        }) as root:
+            result = mod.analyze(str(root / "pkg"))
+        self.assertEqual(result["test_discovery"]["method"], "pytest_testpaths")
+        self.assertEqual(result["test_discovery"]["roots"], ["spec"])
+        self.assertEqual(result["summary"]["total_test_functions"], 1)
+
+    def test_no_tests_anywhere_is_flagged(self):
+        with TempProject({
+            "pkg/__init__.py": "",
+            "pkg/core.py": self._SRC,
+        }) as root:
+            result = mod.analyze(str(root / "pkg"))
+        self.assertEqual(result["status"], "no_tests_found")
+        self.assertEqual(result["summary"]["test_files"], 0)
+        self.assertEqual(len(result["warnings"]), 1)
+
+    def test_tests_under_scan_root_need_no_warning(self):
+        with TempProject({
+            "pkg/__init__.py": "",
+            "pkg/core.py": self._SRC,
+            "tests/test_core.py": self._TEST,
+        }) as root:
+            result = mod.analyze(str(root))
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["test_discovery"]["method"], "scan_root")
+        self.assertEqual(result["warnings"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

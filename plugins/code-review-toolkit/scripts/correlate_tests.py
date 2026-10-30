@@ -237,6 +237,114 @@ def _read_test_imports(filepath: Path, project_root: Path) -> list[str]:
     return modules
 
 
+def pytest_testpaths(project_root: Path) -> list[Path]:
+    """Directories named by the project's pytest `testpaths` setting.
+
+    Reads the first pytest config pytest itself would use: `pytest.ini`,
+    `pyproject.toml` (`[tool.pytest.ini_options]`), `tox.ini`, `setup.cfg`.
+    Returns only entries that exist as directories; globs are expanded.
+    """
+    import configparser
+
+    raw: list[str] | None = None
+    for name, section in (
+        ("pytest.ini", "pytest"),
+        ("pyproject.toml", None),
+        ("tox.ini", "pytest"),
+        ("setup.cfg", "tool:pytest"),
+    ):
+        path = project_root / name
+        if not path.is_file():
+            continue
+        if section is None:
+            try:
+                import tomllib
+            except ImportError:  # Python 3.10: no TOML parser in the stdlib.
+                continue
+            try:
+                data = tomllib.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            opts = data.get("tool", {}).get("pytest", {}).get("ini_options")
+            if opts is None:
+                continue
+            value = opts.get("testpaths", [])
+            raw = [value] if isinstance(value, str) else list(value)
+            break
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            parser.read(path, encoding="utf-8")
+        except (configparser.Error, OSError, UnicodeDecodeError):
+            continue
+        if not parser.has_section(section):
+            continue
+        raw = parser.get(section, "testpaths", fallback="").split()
+        break
+
+    dirs: list[Path] = []
+    for entry in raw or []:
+        for match in sorted(project_root.glob(str(entry))):
+            if match.is_dir() and match not in dirs:
+                dirs.append(match)
+    return dirs
+
+
+def find_external_tests(
+    scan_root: Path, project_root: Path
+) -> tuple[list[Path], list[str], str | None]:
+    """Find the project's tests when none live under *scan_root*.
+
+    Returns `(test_files, roots, how)`: the test files, the directories they
+    came from (relative to the project root), and `"pytest_testpaths"` or
+    `"conventional_dir"` (`None` when nothing was found). The pytest
+    `testpaths` setting wins; otherwise `tests/`, `test/` and `testing/` are
+    tried at the project root and beside the scanned tree (CPython keeps
+    `Lib/test/` beside `Lib/_pyrepl/`). A subdirectory dedicated to the
+    scanned package is preferred: scanning all of CPython's Lib/test to review
+    one package would be both slow and wrong.
+    """
+    package = scan_root.name
+
+    def narrowed(root: Path) -> Path:
+        targets = [
+            root / f"test_{package}",
+            root / f"test_{package.lstrip('_')}",
+            root / package,
+        ]
+        return next((c for c in targets if c.is_dir()), root)
+
+    configured = pytest_testpaths(project_root)
+    if configured:
+        files: list[Path] = []
+        roots: list[str] = []
+        for root in configured:
+            candidate = narrowed(root)
+            found = sorted(discover_python_files(candidate))
+            if found:
+                # Everything under a configured test path is test code, even
+                # where the directory is not named `test`/`tests`.
+                files.extend(f for f in found if f not in files)
+                roots.append(str(candidate.relative_to(project_root)))
+        if files:
+            return files, roots, "pytest_testpaths"
+
+    for base in (project_root, scan_root.parent):
+        for name in ("tests", "test", "testing"):
+            root = base / name
+            if not root.is_dir():
+                continue
+            candidate = narrowed(root)
+            found = sorted(discover_python_files(candidate))
+            _, discovered = classify_files(found, project_root)
+            if discovered:
+                return (
+                    discovered,
+                    [str(candidate.relative_to(project_root))],
+                    "conventional_dir",
+                )
+    return [], [], None
+
+
 def module_name(path: Path, project_root: Path) -> str:
     """Dotted import name of *path*, rooted at its topmost package.
 
@@ -362,32 +470,10 @@ def main() -> None:
     # reads as a finding about the project when it is an artefact of the scope.
     external_test_roots: list[str] = []
     if not test_files and scan_root != project_root:
-        package = scan_root.name
-        # Search the project root AND the scanned tree's own parent: CPython puts
-        # `Lib/test/` beside `Lib/_pyrepl/`, not at the repository root.
-        for base in (project_root, scan_root.parent):
-            for name in ("tests", "test", "testing"):
-                root = base / name
-                if not root.is_dir():
-                    continue
-                # Prefer a subdirectory dedicated to this package -- scanning all
-                # of CPython's Lib/test to review one package would be both slow
-                # and wrong.
-                targets = [
-                    root / f"test_{package}",
-                    root / f"test_{package.lstrip('_')}",
-                    root / package,
-                ]
-                candidate = next((c for c in targets if c.is_dir()), root)
-                found = sorted(discover_python_files(candidate))
-                _, discovered = classify_files(found, project_root)
-                if not discovered:
-                    continue
-                test_files.extend(discovered)
-                external_test_roots.append(str(candidate.relative_to(project_root)))
-                break
-            if external_test_roots:
-                break
+        discovered, external_test_roots, _ = find_external_tests(
+            scan_root, project_root
+        )
+        test_files.extend(discovered)
 
     # Analyze source files.
     source_info: dict[str, dict] = {}

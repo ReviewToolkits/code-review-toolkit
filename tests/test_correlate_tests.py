@@ -433,6 +433,39 @@ class TestImportCorrelation(unittest.TestCase):
         self.assertNotIn("src/lib/extra.py", out["untested_sources"])
 
 
+class TestExternalTestDiscovery(unittest.TestCase):
+    """A package scope finds the project's tests outside it."""
+
+    def test_pytest_testpaths_preferred(self):
+        with TempProject({
+            "pkg/__init__.py": "",
+            "pkg/core.py": "def f():\n    pass\n",
+            "checks/core_checks.py": (
+                "from pkg.core import f\n\ndef test_f():\n    f()\n"
+            ),
+            # A conventional dir that pytest would NOT collect.
+            "tests/test_core.py": "def test_other():\n    pass\n",
+        }) as root:
+            # TempProject writes its own pyproject.toml; replace it.
+            (root / "pyproject.toml").write_text(
+                '[project]\nname = "x"\n'
+                '[tool.pytest.ini_options]\ntestpaths = ["checks"]\n',
+                encoding="utf-8",
+            )
+            out = _run_main(root / "pkg")
+        self.assertEqual(out["summary"]["external_test_roots"], ["checks"])
+        self.assertNotIn("pkg/core.py", out["untested_sources"])
+
+    def test_conventional_dir_without_config(self):
+        with TempProject({
+            "pkg/__init__.py": "",
+            "pkg/core.py": "def f():\n    pass\n",
+            "tests/test_core.py": "def test_f():\n    pass\n",
+        }) as root:
+            out = _run_main(root / "pkg")
+        self.assertEqual(out["summary"]["external_test_roots"], ["tests"])
+
+
 class TestModuleNames(unittest.TestCase):
     def test_package_rooted_names(self):
         with TempProject({

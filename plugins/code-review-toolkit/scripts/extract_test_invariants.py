@@ -23,6 +23,7 @@ from scan_common import (  # noqa: E402
     discover_python_files,
     find_project_root,
 )
+from correlate_tests import find_external_tests  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +593,35 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
 
     source_files, test_files = classify_files(all_files, project_root)
 
+    # A package is usually reviewed on its own (`pkg/`) while its tests live
+    # beside it (`tests/`). Finding none under the scan root must not read as
+    # "this project has no invariants": look where the project keeps its
+    # tests, and say where they came from. Source functions stay limited to
+    # the scan root.
+    warnings: list[str] = []
+    test_discovery: dict = {"method": "scan_root", "roots": []}
+    if not test_files:
+        found: list[Path] = []
+        roots: list[str] = []
+        how: str | None = None
+        if scan_root != project_root:
+            found, roots, how = find_external_tests(scan_root, project_root)
+        if found:
+            test_files = found
+            test_discovery = {"method": how, "roots": roots}
+            warnings.append(
+                f"No test files under the scan root; tests were taken from "
+                f"{', '.join(roots)} ({how}). Source functions are limited to "
+                f"the scan root."
+            )
+        else:
+            test_discovery = {"method": None, "roots": []}
+            warnings.append(
+                "No test files found under the scan root or in the project's "
+                "test directories (pytest testpaths, tests/, test/). Nothing "
+                "was extracted: this is not a clean result."
+            )
+
     # Extract source functions for mapping
     source_functions = extract_source_functions(source_files, project_root)
 
@@ -674,6 +704,11 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
     return {
         "project_root": str(project_root),
         "scan_root": str(scan_root),
+        # "no_tests_found" when no test file was found anywhere: an empty
+        # result then means "not measured", not "no invariants".
+        "status": "ok" if test_files else "no_tests_found",
+        "test_discovery": test_discovery,
+        "warnings": warnings,
         "summary": {
             "source_files": len(source_files),
             "test_files": len(test_files),
