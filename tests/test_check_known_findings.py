@@ -3,7 +3,7 @@
 import ast
 import unittest
 
-from helpers import import_script
+from helpers import TempProject, import_script
 
 mod = import_script("check_known_findings")
 
@@ -98,6 +98,67 @@ class TestErrors(unittest.TestCase):
 
     def test_catalog_is_required(self):
         self.assertIn("error", mod.analyze("."))
+
+
+class TestSuppressedVerdict(unittest.TestCase):
+    """A finding a differential now settles is `suppressed`, not `absent`."""
+
+    SOURCE = (
+        "def first(items=[]):\n"
+        "    return items\n"
+        "\n"
+        "def second(items=[]):\n"
+        "    return items\n"
+    )
+
+    def _run(self, findings, suppressed):
+        def fake_scan(target, max_files=0):
+            return {
+                "files_analyzed": 1,
+                "findings": findings,
+                "suppressed": suppressed,
+            }
+
+        catalog = (
+            "# id\tlocation\tshape\tseverity\tstatus\n"
+            "K-1\tmod.py:2\tmutable-default-argument\tFIX\treproduced\n"
+        )
+        original = mod.scan_python_pitfalls.analyze
+        mod.scan_python_pitfalls.analyze = fake_scan
+        try:
+            with TempProject({"pkg/mod.py": self.SOURCE}) as root:
+                (root / "known.tsv").write_text(catalog, encoding="utf-8")
+                return mod.analyze(str(root / "pkg"), catalog=str(root / "known.tsv"))
+        finally:
+            mod.scan_python_pitfalls.analyze = original
+
+    @staticmethod
+    def _entry(line, **extra):
+        return {
+            "file": "pkg/mod.py",
+            "line": line,
+            "shape": "mutable-default-argument",
+            **extra,
+        }
+
+    def test_moved_to_suppressed_is_suppressed_not_absent(self):
+        result = self._run([], [self._entry(1, reason="returns-error-result")])
+        (record,) = result["results"]
+        self.assertEqual(record["verdict"], "suppressed")
+        self.assertIn("returns-error-result", record["note"])
+        self.assertEqual(result["summary"]["suppressed"], 1)
+        self.assertEqual(result["summary"]["possibly_fixed"], 0)
+        self.assertEqual(result["findings"], [])
+
+    def test_suppressed_in_another_function_is_still_absent(self):
+        result = self._run([], [self._entry(4, reason="returns-error-result")])
+        self.assertEqual(result["results"][0]["verdict"], "absent")
+
+    def test_reported_finding_still_wins(self):
+        result = self._run(
+            [self._entry(1)], [self._entry(1, reason="returns-error-result")]
+        )
+        self.assertEqual(result["results"][0]["verdict"], "present")
 
 
 if __name__ == "__main__":
