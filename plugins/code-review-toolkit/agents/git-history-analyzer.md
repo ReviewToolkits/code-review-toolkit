@@ -271,7 +271,27 @@ For each:
 - **Truncated diffs are not enough**: For fix completeness and similar bug detection, if the diff in the script output is truncated, run `git show HASH` to get the full picture before making a judgment.
 - **Cross-reference generously**: This agent's unique value is combining temporal data with other agents' output. Always cross-reference when data is available.
 - **Cap output**: Max 10 fix-completeness findings, 10 similar-bug findings, 5 feature findings, 15 risk matrix entries, 10 historical annotations, 10 coupling pairs in the summary. When run as part of `explore` with a run directory, annotate **every** confirmed FIX finding from the other agents in your report file (introducing commit, related fixes, unmerged branches touching it): the consolidation step needs them all.
+- **Open pull requests are prior art too** (next section).
 - **Unmerged branches are history too**: `analyze_history.py` lists them in `unmerged_branches` (ahead count, last date, subjects); otherwise list them (`git branch -r --no-merged origin/HEAD`) and check `git log origin/HEAD..<branch>` for fixes to the code other agents flagged. A fix that exists on an unmerged branch changes how a finding is reported.
+
+### Open Pull Requests
+
+A finding may already be fixed, half-fixed or made worse by an open PR, and a PR stuck on red CI is debt worth naming. When the project's forge CLI is available and authenticated (`gh` for GitHub, `glab` for GitLab), list the open PRs. These are read-only calls:
+
+```bash
+gh pr list --state open --limit 50 --json number,title,headRefName,updatedAt,files,statusCheckRollup
+glab mr list --opened --per-page 50   # GitLab
+```
+
+For each PR whose `files` touch code another agent flagged, read `gh pr diff N` and classify it against those findings: fixes / partly fixes / makes worse / unrelated. List the PRs whose checks are failing under Recommendations. To find out *which findings a PR changes*, apply it to an export and re-run the run's reproducers. Never apply it to the checkout:
+
+```bash
+x=$(mktemp -d "$d/pr-N.XXXXXX") && git -C <project> archive HEAD | tar -x -C "$x" &&
+gh pr diff N --repo <owner/repo> | git -C "$x" apply 2>"$x.apply.err"; echo "apply=$?"
+# then run each reproducer from artifacts/ against "$x" (cwd and TMPDIR in your private dir) and diff the outputs with the HEAD export's
+```
+
+A PR that does not apply cleanly to HEAD is reported as such, not skipped. Without the CLI, or without network access, say "open PRs not checked" in the report. Never infer that there are none.
 
 ### Classification Guide
 - **FIX**: Incomplete fix with remaining bug, same bug pattern found elsewhere with high confidence, or new feature with a clear bug
