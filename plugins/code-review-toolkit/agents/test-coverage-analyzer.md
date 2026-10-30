@@ -24,11 +24,17 @@ where `<plugin_root>` is the root of the code-review-toolkit plugin directory.
 Parse the JSON output. This gives you the complete source↔test file mapping, test method counts, untested modules, and public API surface sizes. Use this as your factual foundation — do not re-derive the mapping manually.
 
 Key fields:
-- `untested_sources`: source files with no corresponding tests
-- `source_coverage`: per-file test correspondence with `test_method_count`, `public_surface_size`, `has_tests`
+- `untested_sources`: source files that no test file matches by name **and** no test file imports
+- `source_coverage`: per-file test correspondence with `test_method_count`, `public_surface_size`, `has_tests`, and
+  `match_method`: `"name"` (a `test_<stem>.py` file), `"import"` (a test file imports the module), `"name+import"`, or `null`.
+  `name_matched_test_files` / `import_matched_test_files` list each kind. An import-only match is weaker evidence (the
+  test may only use the module as a fixture), so read the test before calling a module well tested. Modules exercised
+  only indirectly (e.g. HTTP route handlers driven through a test client) match neither way; check them by hand
+  before reporting them untested
 - `summary`: aggregate statistics (source files, test files, coverage percentage, total test methods, skipped tests).
+  `source_files_with_tests_by_name` / `source_files_with_tests_by_import_only` split `source_files_with_tests`.
   `total_test_methods` / `total_skipped_tests` count the whole suite found (pytest-style module-level `test*` functions and plain-class methods included), not only correlated files
-- `test_details`: per-test-file class/method inventory including `skipped_methods` and `skipped_standalone_tests`
+- `test_details`: per-test-file class/method inventory including `skipped_methods`, `skipped_standalone_tests`, `matched_sources` (by name) and `imported_sources` (by import)
 
 ## External Tool Integration
 

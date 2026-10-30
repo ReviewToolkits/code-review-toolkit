@@ -343,5 +343,112 @@ class TestSuiteWideCounts(unittest.TestCase):
         self.assertEqual(out["summary"]["total_skipped_tests"], 1)
 
 
+_IMPORT_PROJECT = {
+    "pkg/__init__.py": "",
+    "pkg/registry.py": "def connect():\n    pass\n",
+    "pkg/service.py": "def serve():\n    pass\n",
+    "pkg/storage/__init__.py": "",
+    "pkg/storage/engine.py": "class Engine:\n    pass\n",
+    "pkg/storage/base.py": "class Base:\n    pass\n",
+    "pkg/untouched.py": "def idle():\n    pass\n",
+}
+
+
+class TestImportCorrelation(unittest.TestCase):
+    """A test file that imports a module correlates with it, whatever its name."""
+
+    def _coverage(self, out: dict) -> dict:
+        return {sc["source_file"]: sc for sc in out["source_coverage"]}
+
+    def test_feature_named_tests_correlate_by_import(self):
+        files = dict(_IMPORT_PROJECT)
+        files["tests/test_engine_shutdown_race.py"] = (
+            "from pkg.storage.engine import Engine\n"
+            "\n"
+            "def test_close():\n    Engine()\n"
+        )
+        files["tests/test_catalog.py"] = (
+            "import pkg.registry\n"
+            "\n"
+            "def test_open():\n    pkg.registry.connect()\n"
+        )
+        files["tests/test_api.py"] = (
+            "def test_serve():\n"
+            "    from pkg import service\n"
+            "    service.serve()\n"
+        )
+        with TempProject(files) as root:
+            out = _run_main(root)
+        cov = self._coverage(out)
+        for src in ("pkg/storage/engine.py", "pkg/registry.py", "pkg/service.py"):
+            self.assertEqual(cov[src]["match_method"], "import", src)
+            self.assertTrue(cov[src]["has_tests"], src)
+            self.assertNotIn(src, out["untested_sources"])
+        # True negatives: nothing imports these.
+        self.assertIn("pkg/untouched.py", out["untested_sources"])
+        self.assertIn("pkg/storage/base.py", out["untested_sources"])
+        self.assertIsNone(cov["pkg/untouched.py"]["match_method"])
+        # `from pkg import service` imports the submodule, not pkg/__init__.
+        self.assertIn("pkg/__init__.py", out["untested_sources"])
+        self.assertEqual(
+            out["summary"]["source_files_with_tests_by_import_only"], 3
+        )
+
+    def test_name_and_import_match_reported_together(self):
+        files = dict(_IMPORT_PROJECT)
+        files["tests/test_registry.py"] = (
+            "from pkg.registry import connect\n\ndef test_c():\n    connect()\n"
+        )
+        files["tests/test_service.py"] = "def test_s():\n    pass\n"
+        with TempProject(files) as root:
+            cov = self._coverage(_run_main(root))
+        self.assertEqual(cov["pkg/registry.py"]["match_method"], "name+import")
+        self.assertEqual(cov["pkg/service.py"]["match_method"], "name")
+        self.assertEqual(cov["pkg/service.py"]["import_matched_test_files"], [])
+
+    def test_conftest_imports_do_not_count(self):
+        files = dict(_IMPORT_PROJECT)
+        files["tests/conftest.py"] = "import pkg.service\n"
+        files["tests/helpers.py"] = "from pkg.registry import connect\n"
+        with TempProject(files) as root:
+            out = _run_main(root)
+        self.assertIn("pkg/service.py", out["untested_sources"])
+        self.assertIn("pkg/registry.py", out["untested_sources"])
+
+    def test_src_layout_and_relative_import(self):
+        with TempProject({
+            "src/lib/__init__.py": "",
+            "src/lib/core.py": "def f():\n    pass\n",
+            "src/lib/extra.py": "def g():\n    pass\n",
+            "src/lib/tests/__init__.py": "",
+            "src/lib/tests/test_things.py": (
+                "from lib.core import f\n"
+                "from ..extra import g\n"
+                "\n"
+                "def test_f():\n    f()\n"
+            ),
+        }) as root:
+            out = _run_main(root)
+        self.assertNotIn("src/lib/core.py", out["untested_sources"])
+        self.assertNotIn("src/lib/extra.py", out["untested_sources"])
+
+
+class TestModuleNames(unittest.TestCase):
+    def test_package_rooted_names(self):
+        with TempProject({
+            "src/pkg/__init__.py": "",
+            "src/pkg/sub/__init__.py": "",
+            "src/pkg/sub/mod.py": "",
+            "script.py": "",
+        }) as root:
+            self.assertEqual(
+                mod.module_name(root / "src/pkg/sub/mod.py", root), "pkg.sub.mod"
+            )
+            self.assertEqual(
+                mod.module_name(root / "src/pkg/sub/__init__.py", root), "pkg.sub"
+            )
+            self.assertEqual(mod.module_name(root / "script.py", root), "script")
+
+
 if __name__ == "__main__":
     unittest.main()

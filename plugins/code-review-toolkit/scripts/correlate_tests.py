@@ -237,6 +237,95 @@ def _read_test_imports(filepath: Path, project_root: Path) -> list[str]:
     return modules
 
 
+def module_name(path: Path, project_root: Path) -> str:
+    """Dotted import name of *path*, rooted at its topmost package.
+
+    Leading directories that are not packages (`src/`, CPython's `Lib/`) are
+    not part of the import name: `src/pkg/a.py` is `pkg.a`, and
+    `pkg/sub/__init__.py` is `pkg.sub`.
+    """
+    rel = path.relative_to(project_root).with_suffix("")
+    parts = list(rel.parts)
+    depth = 0
+    parent = path.parent
+    while parent != project_root and (parent / "__init__.py").is_file():
+        depth += 1
+        parent = parent.parent
+    parts = parts[-(depth + 1):]
+    if parts[-1] == "__init__" and len(parts) > 1:
+        parts = parts[:-1]
+    return ".".join(parts)
+
+
+def build_module_index(
+    source_files: list[Path], project_root: Path
+) -> dict[str, list[str]]:
+    """Map dotted module names to the source files that define them.
+
+    Each file is indexed under its package-rooted name and, when different,
+    under its plain path from the project root (minus a leading `src`), so a
+    namespace package without `__init__.py` still resolves.
+    """
+    index: dict[str, list[str]] = {}
+    for sf in source_files:
+        rel = str(sf.relative_to(project_root))
+        names = {module_name(sf, project_root)}
+        parts = list(sf.relative_to(project_root).with_suffix("").parts)
+        if parts[-1] == "__init__" and len(parts) > 1:
+            parts = parts[:-1]
+        if parts[0] == "src" and len(parts) > 1:
+            parts = parts[1:]
+        names.add(".".join(parts))
+        for name in names:
+            index.setdefault(name, []).append(rel)
+    return index
+
+
+def resolve_imported_sources(
+    tree: ast.AST, index: dict[str, list[str]], package: str = ""
+) -> dict[str, str]:
+    """Source files a module imports, as `{source_rel_path: import_name}`.
+
+    Handles `import a.b`, `import a.b as x`, `from a.b import c` (where `c` may
+    be a submodule or a name defined in `a.b`), and relative imports resolved
+    against *package* (the importing module's package). Imports inside
+    functions count too: pytest tests often import there.
+    """
+    found: dict[str, str] = {}
+
+    def add(name: str) -> bool:
+        for src in index.get(name, ()):
+            found.setdefault(src, name)
+        return name in index
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                parts = alias.name.split(".")
+                # `import a.b.c` where only `a.b` is a source file.
+                while parts and not add(".".join(parts)):
+                    parts.pop()
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                base = package.split(".") if package else []
+                if node.level > 1:
+                    base = base[: len(base) - (node.level - 1)]
+                module = ".".join(base + ([node.module] if node.module else []))
+            else:
+                module = node.module or ""
+            if not module:
+                continue
+            submodule_hit = False
+            for alias in node.names:
+                if alias.name != "*" and add(f"{module}.{alias.name}"):
+                    submodule_hit = True
+            if not submodule_hit or any(
+                f"{module}.{a.name}" not in index for a in node.names
+            ):
+                add(module)
+    return found
+
+
 def main() -> None:
     from scan_common import exit_on_help
 
@@ -308,6 +397,7 @@ def main() -> None:
         source_info[rel] = info
 
     # Analyze test files and build correlations.
+    module_index = build_module_index(source_files, project_root)
     test_info: dict[str, dict] = {}
     for tf in test_files:
         rel = str(tf.relative_to(project_root))
@@ -316,14 +406,43 @@ def main() -> None:
         imported_modules = _read_test_imports(tf, project_root)
         tinfo["matched_sources"] = matched_sources
         tinfo["imported_modules"] = imported_modules
+        # Import-based correspondence. Feature-named suites (`test_*_race.py`
+        # for `storage/engine.py`) never match by file name, but they import
+        # the module under test. Only files that define tests count: a
+        # conftest.py or helper module importing the app tests nothing.
+        has_tests = bool(
+            tinfo["standalone_tests"]
+            or tinfo["skipped_standalone_tests"]
+            or any(c["total_test_methods"] for c in tinfo["classes"])
+        )
+        tree = None
+        if has_tests and not tinfo["parse_error"]:
+            try:
+                tree = ast.parse(tf.read_text(encoding="utf-8", errors="replace"))
+            except (SyntaxError, ValueError):
+                tree = None
+        tinfo["imported_sources"] = sorted(
+            resolve_imported_sources(
+                tree, module_index, module_name(tf, project_root).rpartition(".")[0]
+            )
+            if tree is not None
+            else []
+        )
         test_info[rel] = tinfo
 
-    # Build the correlation map: source → tests.
+    # Build the correlation map: source → tests, remembering how each matched.
     source_to_tests: dict[str, list[str]] = {s: [] for s in source_info}
+    by_name: dict[str, list[str]] = {s: [] for s in source_info}
+    by_import: dict[str, list[str]] = {s: [] for s in source_info}
     for test_path, tinfo in test_info.items():
         for src in tinfo["matched_sources"]:
-            if src in source_to_tests:
-                source_to_tests[src].append(test_path)
+            if src in by_name:
+                by_name[src].append(test_path)
+        for src in tinfo["imported_sources"]:
+            if src in by_import:
+                by_import[src].append(test_path)
+    for src in source_info:
+        source_to_tests[src] = sorted(set(by_name[src]) | set(by_import[src]))
 
     # Identify untested source files.
     untested = [s for s, tests in source_to_tests.items() if not tests]
@@ -347,9 +466,23 @@ def main() -> None:
             + sum(len(c["public_methods"]) for c in src_info["classes"])
         )
 
+        if by_name[src] and by_import[src]:
+            match_method = "name+import"
+        elif by_name[src]:
+            match_method = "name"
+        elif by_import[src]:
+            match_method = "import"
+        else:
+            match_method = None
         source_coverage.append({
             "source_file": src,
             "test_files": tests,
+            # How the correspondence was found: the test file's name matches
+            # the source's ("name"), a test file imports it ("import"), or
+            # both. A name match is the stronger signal.
+            "match_method": match_method,
+            "name_matched_test_files": by_name[src],
+            "import_matched_test_files": by_import[src],
             "test_method_count": total_test_methods,
             "skipped_test_count": total_skipped,
             "public_classes": len(src_info["classes"]),
@@ -385,6 +518,10 @@ def main() -> None:
             "test_files": len(test_info),
             "source_files_with_tests": tested,
             "source_files_without_tests": len(untested),
+            "source_files_with_tests_by_name": sum(1 for v in by_name.values() if v),
+            "source_files_with_tests_by_import_only": sum(
+                1 for s in source_info if by_import[s] and not by_name[s]
+            ),
             "coverage_percentage": (
                 round(100 * tested / total_source, 1) if total_source else 0
             ),
