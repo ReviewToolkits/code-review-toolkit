@@ -673,7 +673,7 @@ class Project:
             return mod.functions[name]
         if name in mod.classes:
             return self.classes[mod.classes[name]].methods.get("__init__")
-        # A re-export: `from .local import LocalStore` in a package __init__.
+        # A re-export: `from .impl import Store` in a package __init__.
         target = mod.imports.get(name)
         if target and target != dotted:
             return self.func_by_dotted(target, _depth + 1)
