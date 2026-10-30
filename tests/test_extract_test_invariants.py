@@ -419,6 +419,37 @@ class TestDiscoverTestsOutsideScope(unittest.TestCase):
         self.assertEqual(result["warnings"], [])
 
 
+class TestSourceModuleNamedLikeATest(unittest.TestCase):
+    """A package's own `test_*.py` module with no tests does not stop discovery."""
+
+    _FILES = {
+        "app/__init__.py": "",
+        "app/test_outcome.py": "class Outcome:\n    __test__ = False\n    OK = 1\n",
+        "app/core.py": "def parse(text):\n    return text\n",
+        "tests/test_core.py": (
+            "from app.core import parse\n"
+            "\n"
+            "def test_parse_empty():\n"
+            "    assert parse('') == ''\n"
+        ),
+    }
+
+    def test_falls_back_to_project_tests(self):
+        with TempProject(self._FILES) as root:
+            result = mod.analyze(str(root / "app"))
+        self.assertEqual(result["test_discovery"]["method"], "conventional_dir")
+        self.assertEqual(result["summary"]["total_test_functions"], 1)
+        self.assertEqual(result["summary"]["test_files"], 1)
+        self.assertTrue(any("test_outcome.py" in w for w in result["warnings"]))
+
+    def test_envelope_fields_present(self):
+        with TempProject(self._FILES) as root:
+            result = mod.analyze(str(root / "app"), max_files=2)
+        self.assertTrue(result["files_capped"])
+        self.assertEqual(result["files_analyzed"], 2)
+        self.assertEqual(result["files_total"], 3)
+
+
 def _tested(result: dict, test_name: str) -> dict | None:
     for inv in result["invariants"]:
         if inv["function"] == test_name:

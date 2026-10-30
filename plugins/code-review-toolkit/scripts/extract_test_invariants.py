@@ -19,41 +19,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scan_common import (  # noqa: E402
-    discover_python_files,
-    find_project_root,
-)
 from correlate_tests import (  # noqa: E402
     build_module_index,
+    classify_files,
+    defines_tests,
     find_external_tests,
     module_name,
 )
-
-
-# ---------------------------------------------------------------------------
-# Project discovery (adapted from correlate_tests.py)
-# ---------------------------------------------------------------------------
-
-def classify_files(
-    files: list[Path], project_root: Path
-) -> tuple[list[Path], list[Path]]:
-    """Split files into (source, test) lists."""
-    source: list[Path] = []
-    test: list[Path] = []
-    for f in files:
-        rel = f.relative_to(project_root)
-        parts = rel.parts
-        is_test = (
-            f.name.startswith("test_")
-            or f.name.endswith("_test.py")
-            or "test" in parts[:-1]
-            or "tests" in parts[:-1]
-        )
-        if is_test:
-            test.append(f)
-        elif f.name not in ("setup.py", "conftest.py"):
-            source.append(f)
-    return source, test
+from scan_common import (  # noqa: E402
+    build_envelope,
+    collect_python_files,
+    find_project_root,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1318,11 +1295,12 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
     project_root = find_project_root(target_path)
     scan_root = target_path if target_path.is_dir() else target_path.parent
 
-    all_files = list(discover_python_files(scan_root))
-    if max_files > 0:
-        all_files = all_files[:max_files]
+    all_files, files_total = collect_python_files(scan_root, max_files)
 
-    source_files, test_files = classify_files(all_files, project_root)
+    test_named_sources: list[Path] = []
+    source_files, test_files = classify_files(
+        all_files, project_root, test_named_sources
+    )
 
     # A package is usually reviewed on its own (`pkg/`) while its tests live
     # beside it (`tests/`). Finding none under the scan root must not read as
@@ -1330,8 +1308,15 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
     # tests, and say where they came from. Source functions stay limited to
     # the scan root.
     warnings: list[str] = []
+    if test_named_sources:
+        warnings.append(
+            "Named like test modules but define no tests, so treated as source: "
+            + ", ".join(str(f.relative_to(project_root)) for f in test_named_sources)
+        )
     test_discovery: dict = {"method": "scan_root", "roots": []}
-    if not test_files:
+    # Test files that define no test (a lone `tests/__init__.py`, helpers)
+    # are not tests to extract from: look further, as if there were none.
+    if not any(defines_tests(f) for f in test_files):
         found: list[Path] = []
         roots: list[str] = []
         how: str | None = None
@@ -1346,6 +1331,7 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
                 f"the scan root."
             )
         else:
+            test_files = []
             test_discovery = {"method": None, "roots": []}
             warnings.append(
                 "No test files found under the scan root or in the project's "
@@ -1434,8 +1420,7 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
     untested_similar = deduped[:20]
 
     return {
-        "project_root": str(project_root),
-        "scan_root": str(scan_root),
+        **build_envelope(project_root, scan_root, files_total, len(all_files)),
         # "no_tests_found" when no test file was found anywhere: an empty
         # result then means "not measured", not "no invariants".
         "status": "ok" if test_files else "no_tests_found",

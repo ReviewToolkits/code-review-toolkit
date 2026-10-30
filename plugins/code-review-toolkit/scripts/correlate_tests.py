@@ -17,30 +17,71 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scan_common import (  # noqa: E402
     discover_python_files,
     find_project_root,
+    parse_source,
 )
 
 
+_TEST_DIR_NAMES = frozenset({"test", "tests"})
+
+
+def _test_named(f: Path) -> bool:
+    """True for `test_*.py` / `*_test.py` file names."""
+    return f.name.startswith("test_") or f.name.endswith("_test.py")
+
+
+def _in_test_dir(f: Path, project_root: Path) -> bool:
+    return bool(_TEST_DIR_NAMES & set(f.relative_to(project_root).parts[:-1]))
+
+
+def defines_tests(filepath: Path) -> bool:
+    """True when *filepath* defines a test pytest or unittest would collect.
+
+    A module-level `test*` function, or a class with a `test*` method. An
+    unparseable file counts as a test file: its name is the only evidence.
+    """
+    tree = parse_source(filepath)
+    if tree is None:
+        return True
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name.startswith("test"):
+                return True
+        elif isinstance(node, ast.ClassDef) and any(
+            isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and child.name.startswith("test")
+            for child in node.body
+        ):
+            return True
+    return False
+
+
 def classify_files(
-    files: list[Path], project_root: Path
+    files: list[Path],
+    project_root: Path,
+    test_named_sources: list[Path] | None = None,
 ) -> tuple[list[Path], list[Path]]:
-    """Split files into source and test files."""
+    """Split files into source and test files.
+
+    Everything under a `test`/`tests` directory is test code. Elsewhere a
+    `test_*.py` / `*_test.py` name is not enough: a package may own a source
+    module so named (an enum of test outcomes, imported by production code).
+    Such a file is a test only when it defines tests; otherwise it is source,
+    and it is appended to *test_named_sources* when that list is given.
+    """
     source: list[Path] = []
     test: list[Path] = []
     for f in files:
-        rel = f.relative_to(project_root)
-        parts = rel.parts
-        is_test = (
-            f.name.startswith("test_")
-            or f.name.endswith("_test.py")
-            or "test" in parts[:-1]
-            or "tests" in parts[:-1]
-        )
-        if is_test:
+        if _in_test_dir(f, project_root):
             test.append(f)
-        else:
-            # Skip setup.py, conftest.py, and __init__.py in test dirs.
-            if f.name in ("setup.py", "conftest.py"):
-                continue
+        elif _test_named(f):
+            if defines_tests(f):
+                test.append(f)
+            else:
+                source.append(f)
+                if test_named_sources is not None:
+                    test_named_sources.append(f)
+        # Skip setup.py and conftest.py outside test directories.
+        elif f.name not in ("setup.py", "conftest.py"):
             source.append(f)
     return source, test
 
@@ -168,54 +209,46 @@ def _extract_source_info(filepath: Path) -> dict:
     }
 
 
+# Directories that name a test layer rather than the code under test.
+_LAYER_DIR_NAMES = frozenset({
+    "test", "tests", "testing", "unit", "units", "integration", "functional",
+    "e2e", "system", "acceptance", "regression", "src",
+})
+
+
 def _match_test_to_source(
     test_file: Path, source_files: list[Path], project_root: Path
 ) -> list[str]:
     """Find source files that a test file likely corresponds to.
 
     Heuristics:
-    - test_runner.py → runner.py
-    - tests/test_runner.py → src/runner.py or package/runner.py
-    - tests/subpkg/test_foo.py → package/subpkg/foo.py
+    - test_runner.py → runner.py (any directory; several same-stem sources
+      all match)
+    - tests/<stem>/test_*.py → <stem>.py: a directory per source module,
+      holding one test file per method or behaviour
+
+    Only test-named files (`test_*.py`, `*_test.py`) name-match: a test
+    package's `__init__.py` or a `helpers.py` corresponds to no module, and
+    a package `__init__.py` is never matched by name.
     """
-    matches: list[str] = []
-    test_rel = test_file.relative_to(project_root)
+    if not _test_named(test_file):
+        return []
     test_name = test_file.stem  # e.g. "test_runner"
+    source_stem = test_name[5:] if test_name.startswith("test_") else test_name[:-5]
+    parent = test_file.parent.name
+    by_directory = (
+        _in_test_dir(test_file, project_root)
+        and parent not in _LAYER_DIR_NAMES
+        and parent != "__init__"
+    )
 
-    # Strip test_ prefix or _test suffix.
-    if test_name.startswith("test_"):
-        source_stem = test_name[5:]
-    elif test_name.endswith("_test"):
-        source_stem = test_name[:-5]
-    else:
-        source_stem = test_name
-
+    matches: list[str] = []
     for sf in source_files:
-        sf_rel = sf.relative_to(project_root)
-        # Direct stem match.
-        if sf.stem == source_stem:
-            matches.append(str(sf_rel))
+        if sf.stem == "__init__":
             continue
-        # Also try matching subpackage structure.
-        # e.g. tests/benchmarks/test_runner.py → package/benchmarks/runner.py
-        test_parts = list(test_rel.parts[:-1])  # directory parts of test
-        source_parts = list(sf_rel.parts[:-1])
-        # Check if the non-test/tests parts match.
-        test_clean = [p for p in test_parts if p not in ("test", "tests")]
-        source_clean = [p for p in source_parts if p not in ("src",)]
-        if (sf.stem == source_stem
-                and test_clean and source_clean
-                and test_clean[-len(source_clean):] == source_clean[-len(test_clean):]):
-            matches.append(str(sf_rel))
-
-    # Deduplicate preserving order.
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for m in matches:
-        if m not in seen:
-            seen.add(m)
-            deduped.append(m)
-    return deduped
+        if sf.stem == source_stem or (by_directory and sf.stem == parent):
+            matches.append(str(sf.relative_to(project_root)))
+    return list(dict.fromkeys(matches))
 
 
 def _read_test_imports(filepath: Path, project_root: Path) -> list[str]:
@@ -388,22 +421,75 @@ def build_module_index(
     return index
 
 
+def build_reexport_index(
+    source_files: list[Path], project_root: Path
+) -> dict[str, dict[str, str]]:
+    """Names each package `__init__.py` re-exports from its submodules.
+
+    `{"pkg.sub": {"Thing": "pkg.sub.thing.Thing"}}` for a `pkg/sub/__init__.py`
+    holding `from .thing import Thing` (or the absolute spelling), so a test's
+    `from pkg.sub import Thing` correlates with `pkg/sub/thing.py`.
+    """
+    index: dict[str, dict[str, str]] = {}
+    for sf in source_files:
+        if sf.name != "__init__.py":
+            continue
+        tree = parse_source(sf)
+        if tree is None:
+            continue
+        package = module_name(sf, project_root)
+        names: dict[str, str] = {}
+        for node in tree.body:
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            if node.level:
+                base = package.split(".")
+                if node.level > 1:
+                    base = base[: len(base) - (node.level - 1)]
+                module = ".".join(base + ([node.module] if node.module else []))
+            else:
+                module = node.module or ""
+            for alias in node.names:
+                if module and alias.name != "*":
+                    names[alias.asname or alias.name] = f"{module}.{alias.name}"
+        if names:
+            index[package] = names
+    return index
+
+
 def resolve_imported_sources(
-    tree: ast.AST, index: dict[str, list[str]], package: str = ""
+    tree: ast.AST,
+    index: dict[str, list[str]],
+    package: str = "",
+    reexports: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, str]:
     """Source files a module imports, as `{source_rel_path: import_name}`.
 
     Handles `import a.b`, `import a.b as x`, `from a.b import c` (where `c` may
     be a submodule or a name defined in `a.b`), and relative imports resolved
     against *package* (the importing module's package). Imports inside
-    functions count too: pytest tests often import there.
+    functions count too: pytest tests often import there. With *reexports*
+    (see `build_reexport_index`), `from pkg import Thing` also reaches the
+    submodule `pkg/__init__.py` took `Thing` from.
     """
     found: dict[str, str] = {}
+    reexports = reexports or {}
 
     def add(name: str) -> bool:
         for src in index.get(name, ()):
             found.setdefault(src, name)
         return name in index
+
+    def add_reexport(module: str, name: str) -> None:
+        for _ in range(3):  # a re-export of a re-export, at most
+            target = reexports.get(module, {}).get(name)
+            if target is None:
+                return
+            module, _, name = target.rpartition(".")
+            if add(target):  # `from .sub import submodule`
+                return
+            if add(module) and name not in reexports.get(module, {}):
+                return
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -426,6 +512,8 @@ def resolve_imported_sources(
             for alias in node.names:
                 if alias.name != "*" and add(f"{module}.{alias.name}"):
                     submodule_hit = True
+                elif alias.name != "*":
+                    add_reexport(module, alias.name)
             if not submodule_hit or any(
                 f"{module}.{a.name}" not in index for a in node.names
             ):
@@ -444,18 +532,39 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
         all_files = all_files[:max_files]
     files = all_files
 
-    source_files, test_files = classify_files(files, project_root)
+    test_named_sources: list[Path] = []
+    source_files, test_files = classify_files(
+        files, project_root, test_named_sources
+    )
+    warnings: list[str] = []
+    if test_named_sources:
+        warnings.append(
+            "Named like test modules but define no tests, so counted as source: "
+            + ", ".join(str(f.relative_to(project_root)) for f in test_named_sources)
+        )
 
     # A package is very often reviewed on its own (`coverage/`, `Lib/_pyrepl`)
     # while its tests live in a SIBLING tree. Scanning only the target then finds
     # zero test files and reports 0% coverage for a well-tested project -- which
     # reads as a finding about the project when it is an artefact of the scope.
+    # Test files that define no test (a lone `tests/__init__.py`) do not count.
     external_test_roots: list[str] = []
-    if not test_files and scan_root != project_root:
-        discovered, external_test_roots, _ = find_external_tests(
+    if not any(defines_tests(f) for f in test_files) and scan_root != project_root:
+        discovered, external_test_roots, how = find_external_tests(
             scan_root, project_root
         )
-        test_files.extend(discovered)
+        if discovered:
+            test_files = discovered
+            warnings.append(
+                f"No tests under the scan root; tests were taken from "
+                f"{', '.join(external_test_roots)} ({how})."
+            )
+    if not test_files:
+        warnings.append(
+            "No test files found under the scan root or in the project's test "
+            "directories (pytest testpaths, tests/, test/). Coverage was not "
+            "measured: this is not a clean result."
+        )
 
     # Analyze source files.
     source_info: dict[str, dict] = {}
@@ -466,6 +575,7 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
 
     # Analyze test files and build correlations.
     module_index = build_module_index(source_files, project_root)
+    reexports = build_reexport_index(source_files, project_root)
     test_info: dict[str, dict] = {}
     for tf in test_files:
         rel = str(tf.relative_to(project_root))
@@ -491,7 +601,10 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
                 tree = None
         tinfo["imported_sources"] = sorted(
             resolve_imported_sources(
-                tree, module_index, module_name(tf, project_root).rpartition(".")[0]
+                tree,
+                module_index,
+                module_name(tf, project_root).rpartition(".")[0],
+                reexports,
             )
             if tree is not None
             else []
@@ -581,6 +694,10 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
         "files_total": files_total,
         "files_analyzed": len(all_files),
         "files_capped": max_files > 0 and files_total > max_files,
+        # "no_tests_found": no test file anywhere, so every coverage number
+        # below is unmeasured, not zero.
+        "status": "ok" if test_files else "no_tests_found",
+        "warnings": warnings,
         "summary": {
             "source_files": total_source,
             "test_files": len(test_info),
@@ -591,7 +708,9 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
                 1 for s in source_info if by_import[s] and not by_name[s]
             ),
             "coverage_percentage": (
-                round(100 * tested / total_source, 1) if total_source else 0
+                round(100 * tested / total_source, 1)
+                if total_source and test_files
+                else None
             ),
             # Every test function and method in every test file found
             # (pytest-style module-level functions and plain-class methods
@@ -602,6 +721,10 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
             # reader can tell "this package has no tests" from "the tests live
             # somewhere else and the scope missed them".
             "external_test_roots": external_test_roots,
+            # Source modules named `test_*.py` that define no tests.
+            "test_named_source_files": sorted(
+                str(f.relative_to(project_root)) for f in test_named_sources
+            ),
         },
         "untested_sources": sorted(untested),
         "source_coverage": source_coverage,

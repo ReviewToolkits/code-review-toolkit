@@ -26,7 +26,9 @@ class TestClassifyFiles(unittest.TestCase):
     def test_test_suffix(self):
         with TempProject({
             "pkg/core.py": "",
-            "pkg/core_test.py": "",
+            # Outside a test directory the name alone is not enough: it must
+            # define a test (see TestSourceModuleNamedLikeATest).
+            "pkg/core_test.py": "def test_core():\n    pass\n",
         }) as root:
             files = mod.discover_python_files(root)
             source, test = mod.classify_files(files, root)
@@ -464,6 +466,141 @@ class TestExternalTestDiscovery(unittest.TestCase):
         }) as root:
             out = _run_main(root / "pkg")
         self.assertEqual(out["summary"]["external_test_roots"], ["tests"])
+
+
+# A package whose own source module is named like a test file: an enum of
+# result states, imported by production code, with no test in it.
+_LOOKALIKE_PROJECT = {
+    "app/__init__.py": "",
+    "app/test_outcome.py": (
+        "class Outcome:\n"
+        "    __test__ = False\n"
+        "    PASSED = 'passed'\n"
+        "    FAILED = 'failed'\n"
+    ),
+    "app/runner.py": (
+        "from app.test_outcome import Outcome\n"
+        "\n"
+        "def run():\n"
+        "    return Outcome.PASSED\n"
+    ),
+    "tests/test_runner.py": (
+        "from app.runner import run\n"
+        "\n"
+        "def test_run():\n"
+        "    assert run() == 'passed'\n"
+    ),
+}
+
+
+class TestSourceModuleNamedLikeATest(unittest.TestCase):
+    """A `test_*.py` source module that defines no tests is source, not a test."""
+
+    def test_package_scope_falls_back_to_the_project_tests(self):
+        with TempProject(_LOOKALIKE_PROJECT) as root:
+            out = mod.analyze(str(root / "app"))
+        self.assertEqual(out["summary"]["external_test_roots"], ["tests"])
+        self.assertEqual(out["summary"]["test_files"], 1)
+        self.assertNotIn("app/test_outcome.py", out["test_details"])
+        self.assertIn("app/test_outcome.py", out["summary"]["test_named_source_files"])
+        cov = {sc["source_file"]: sc for sc in out["source_coverage"]}
+        self.assertIn("app/test_outcome.py", cov)
+        self.assertTrue(cov["app/runner.py"]["has_tests"])
+        self.assertTrue(any("test_outcome.py" in w for w in out["warnings"]))
+
+    def test_project_root_scope_lists_it_as_source(self):
+        with TempProject(_LOOKALIKE_PROJECT) as root:
+            out = mod.analyze(str(root))
+        self.assertNotIn("app/test_outcome.py", out["test_details"])
+        self.assertIn("app/test_outcome.py", out["untested_sources"])
+
+    def test_a_real_test_module_inside_the_package_still_counts(self):
+        # True negative: a co-located test module that defines tests.
+        files = dict(_LOOKALIKE_PROJECT)
+        files["app/test_inline.py"] = "def test_x():\n    assert True\n"
+        with TempProject(files) as root:
+            out = mod.analyze(str(root / "app"))
+        self.assertIn("app/test_inline.py", out["test_details"])
+        self.assertEqual(out["summary"]["external_test_roots"], [])
+
+    def test_no_tests_anywhere_is_not_a_measured_zero(self):
+        with TempProject({
+            "app/__init__.py": "",
+            "app/core.py": "def f():\n    pass\n",
+        }) as root:
+            out = mod.analyze(str(root / "app"))
+        self.assertEqual(out["status"], "no_tests_found")
+        self.assertIsNone(out["summary"]["coverage_percentage"])
+        self.assertTrue(out["warnings"])
+
+
+class TestNameMatchingLayouts(unittest.TestCase):
+    """Name matches that are noise, and test layouts the stem match missed."""
+
+    def test_package_inits_are_not_name_matched_to_test_package_inits(self):
+        with TempProject({
+            "app/__init__.py": "",
+            "app/sub/__init__.py": "",
+            "app/sub/core.py": "def f():\n    pass\n",
+            "tests/__init__.py": "",
+            "tests/sub/__init__.py": "",
+            "tests/sub/test_core.py": "def test_f():\n    pass\n",
+        }) as root:
+            out = mod.analyze(str(root))
+        cov = {sc["source_file"]: sc for sc in out["source_coverage"]}
+        self.assertEqual(cov["app/__init__.py"]["name_matched_test_files"], [])
+        self.assertEqual(cov["app/sub/__init__.py"]["name_matched_test_files"], [])
+        # True positive kept.
+        self.assertEqual(
+            cov["app/sub/core.py"]["name_matched_test_files"],
+            ["tests/sub/test_core.py"],
+        )
+
+    def test_directory_per_class_layout_matches_by_directory(self):
+        with TempProject({
+            "app/__init__.py": "",
+            "app/nodes/__init__.py": "",
+            "app/nodes/leaf_node.py": "class LeafNode:\n    pass\n",
+            "app/nodes/branch_node.py": "class BranchNode:\n    pass\n",
+            "tests/unit/nodes/leaf_node/__init__.py": "",
+            "tests/unit/nodes/leaf_node/test_init.py": "def test_a():\n    pass\n",
+            "tests/unit/nodes/leaf_node/test_repr.py": "def test_b():\n    pass\n",
+        }) as root:
+            out = mod.analyze(str(root))
+        cov = {sc["source_file"]: sc for sc in out["source_coverage"]}
+        self.assertEqual(
+            cov["app/nodes/leaf_node.py"]["name_matched_test_files"],
+            [
+                "tests/unit/nodes/leaf_node/test_init.py",
+                "tests/unit/nodes/leaf_node/test_repr.py",
+            ],
+        )
+        # True negative: no directory or file names branch_node.
+        self.assertIn("app/nodes/branch_node.py", out["untested_sources"])
+
+    def test_import_through_a_package_reexport_reaches_the_submodule(self):
+        with TempProject({
+            "app/__init__.py": "",
+            "app/nodes/__init__.py": (
+                "from app.nodes.leaf_node import LeafNode\n"
+                "from .branch_node import BranchNode\n"
+                "__all__ = ['LeafNode', 'BranchNode']\n"
+            ),
+            "app/nodes/leaf_node.py": "class LeafNode:\n    pass\n",
+            "app/nodes/branch_node.py": "class BranchNode:\n    pass\n",
+            "app/nodes/stem_node.py": "class StemNode:\n    pass\n",
+            "tests/test_tree.py": (
+                "from app.nodes import LeafNode, BranchNode\n"
+                "\n"
+                "def test_build():\n    LeafNode(); BranchNode()\n"
+            ),
+        }) as root:
+            out = mod.analyze(str(root))
+        cov = {sc["source_file"]: sc for sc in out["source_coverage"]}
+        self.assertEqual(cov["app/nodes/leaf_node.py"]["match_method"], "import")
+        self.assertEqual(cov["app/nodes/branch_node.py"]["match_method"], "import")
+        # True negative: re-exported by nobody, imported by nobody.
+        self.assertIn("app/nodes/stem_node.py", out["untested_sources"])
 
 
 class TestModuleNames(unittest.TestCase):
