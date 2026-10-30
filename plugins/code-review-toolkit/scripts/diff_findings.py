@@ -44,6 +44,10 @@ _FINDING_LISTS: dict[str, dict[str, tuple[str, ...]]] = {
     # regression and a fix at the same file, line and shape.
     "scan_python_pitfalls": {
         "findings": ("file", "shape", "type"),
+        # Candidates a differential settled: still in the code, not reported.
+        # A finding that moves here from `findings` is `newly_suppressed`,
+        # not gone -- see _RECLASSIFIED.
+        "suppressed": ("file", "shape", "reason"),
     },
     "run_lint_rules": {
         "findings": ("file", "code"),
@@ -51,6 +55,8 @@ _FINDING_LISTS: dict[str, dict[str, tuple[str, ...]]] = {
     "check_typing": {
         "findings": ("file", "code"),
         "phantom_import_findings": ("file", "code"),
+        "unreachable_findings": ("file", "code"),
+        "stale_ignore_findings": ("file", "code"),
     },
     "check_known_findings": {
         "findings": ("id", "shape"),
@@ -58,6 +64,7 @@ _FINDING_LISTS: dict[str, dict[str, tuple[str, ...]]] = {
     "find_dead_symbols": {
         "unused_imports": ("file", "name", "module"),
         "unreferenced_symbols": ("file", "name", "type"),
+        "referenced_only_from_tests": ("file", "name", "type"),
         "orphan_files": ("file",),
         "commented_code_blocks": ("file", "preview"),
     },
@@ -70,8 +77,10 @@ _FINDING_LISTS: dict[str, dict[str, tuple[str, ...]]] = {
     },
     "count_types": {
         "any_usages": ("location", "function"),
-        # No `file` field: the key is weak across a package. Noted at runtime.
-        "unannotated_public_functions": ("name",),
+        # Keyed by (file, name): one `build` per plugin module is not one
+        # function. Falls back to `name` for reports from before `file`
+        # existed -- see _FALLBACK_KEYS.
+        "unannotated_public_functions": ("file", "name"),
     },
     "extract_test_invariants": {
         "invariants": ("file", "function"),
@@ -96,11 +105,24 @@ _CARRY = (
     "message",
     "score",
     "category",
+    "reason",
 )
 
-# Lists whose key cannot include a file path, so two identically-named symbols in
-# different modules collide. Reported rather than silently trusted.
-_WEAK_KEYS = {("count_types", "unannotated_public_functions")}
+# A weaker key for a list whose items gained a field later: used (and noted)
+# when either run has an item without it, so an old report still compares.
+_FALLBACK_KEYS: dict[tuple[str, str], tuple[str, ...]] = {
+    ("count_types", "unannotated_public_functions"): ("name",),
+}
+
+# Lists capped by the producing script: `<list>_capped` true in either run
+# means items past the cap churn in and out without changing.
+_CAPPED = {("count_types", "unannotated_public_functions")}
+
+# (script, reported list, suppressed list, shared key): a finding that leaves
+# the reported list and appears in the suppressed one was reclassified by a
+# differential -- the code is unchanged -- so it is neither `gone` nor a new
+# suppressed entry, but `newly_suppressed`.
+_RECLASSIFIED = (("scan_python_pitfalls", "findings", "suppressed", ("file", "shape")),)
 
 
 def _load_report(path: Path) -> tuple[dict[str, Any] | None, str | None]:
@@ -170,6 +192,55 @@ def _diff_list(old: list, new: list, fields: tuple[str, ...] | None) -> dict:
     }
 
 
+def _lacks_fields(items: list, fields: tuple[str, ...]) -> bool:
+    return any(isinstance(i, dict) and any(f not in i for f in fields) for i in items)
+
+
+def _reclassify(
+    by_source: dict, script: str, reported: str, hidden: str, key: tuple[str, ...]
+) -> None:
+    """Pair findings that moved between a reported list and its suppressed list.
+
+    Reported before, suppressed now: the code did not change, a differential
+    did, so it is `newly_suppressed` on the reported list instead of `gone`
+    (and not an `added` suppression). Suppressed before, reported now: it stays
+    `added` -- it is visible again and needs triage like any new finding --
+    marked `was_suppressed`, and is no longer `gone` from the suppressed list.
+    """
+    shown = by_source.get(f"{script}.{reported}")
+    muted = by_source.get(f"{script}.{hidden}")
+    if not shown or not muted:
+        return
+
+    def pair(gone: list[dict], added: list[dict]) -> list[tuple[dict, dict]]:
+        waiting: dict[tuple, list[dict]] = {}
+        for entry in added:
+            waiting.setdefault(_key_of(entry, key), []).append(entry)
+        pairs = []
+        for entry in gone:
+            match = waiting.get(_key_of(entry, key))
+            if match:
+                pairs.append((entry, match.pop(0)))
+        return pairs
+
+    hidden_now = pair(shown["gone"], muted["added"])
+    if hidden_now:
+        left = {id(old) for old, _ in hidden_now}
+        arrived = {id(new) for _, new in hidden_now}
+        shown["gone"] = [e for e in shown["gone"] if id(e) not in left]
+        muted["added"] = [e for e in muted["added"] if id(e) not in arrived]
+        shown["newly_suppressed"] = [
+            {**old, "reason": new.get("reason")} for old, new in hidden_now
+        ]
+    shown_again = pair(muted["gone"], shown["added"])
+    if shown_again:
+        left = {id(old) for old, _ in shown_again}
+        muted["gone"] = [e for e in muted["gone"] if id(e) not in left]
+        for old, new in shown_again:
+            new["was_suppressed"] = old.get("reason")
+        shown["unsuppressed"] = [new for _, new in shown_again]
+
+
 def _severity_of(entry: dict) -> str:
     return str(entry.get("severity", "")).upper()
 
@@ -192,7 +263,16 @@ def analyze(argv: list[str]) -> dict:
 
     notes: list[str] = []
     by_source: dict[str, dict] = {}
-    totals = {"added": 0, "gone": 0, "moved": 0, "unchanged": 0}
+    totals = {
+        "added": 0,
+        "gone": 0,
+        "moved": 0,
+        "unchanged": 0,
+        # Moved from a reported list to its suppressed list (not `gone`), and
+        # back (still counted in `added`).
+        "newly_suppressed": 0,
+        "unsuppressed": 0,
+    }
 
     scripts = sorted(
         {p.stem for p in old_dir.glob("*.json")}
@@ -237,22 +317,41 @@ def analyze(argv: list[str]) -> dict:
                 continue
             if not old_items and not new_items:
                 continue
+            fallback = _FALLBACK_KEYS.get((script, list_name))
+            if fallback and fields and _lacks_fields(old_items + new_items, fields):
+                fields = fallback
+                notes.append(
+                    f"{script}.{list_name}: an item has no "
+                    f"{'/'.join(f for f in registered[list_name] if f not in fallback)}"
+                    f" field (an older report), so it is keyed by "
+                    f"{'/'.join(fallback)} and identically named symbols collide"
+                )
+            if (script, list_name) in _CAPPED and (
+                old_data.get(f"{list_name}_capped")
+                or new_data.get(f"{list_name}_capped")
+            ):
+                notes.append(
+                    f"{script}.{list_name}: capped in at least one run, so items "
+                    "past the cap appear as added/gone without changing"
+                )
             result = _diff_list(old_items, new_items, fields)
             if severity:
                 for bucket in ("added", "gone", "moved"):
                     result[bucket] = [
                         e for e in result[bucket] if _severity_of(e) == severity
                     ]
-            if (script, list_name) in _WEAK_KEYS:
-                notes.append(
-                    f"{script}.{list_name}: key has no file field, so identically "
-                    "named symbols in different modules collide"
-                )
             by_source[f"{script}.{list_name}"] = result
-            for bucket in totals:
-                totals[bucket] += (
-                    result[bucket] if bucket == "unchanged" else len(result[bucket])
-                )
+
+        for name, reported, hidden, key in _RECLASSIFIED:
+            if name == script:
+                _reclassify(by_source, script, reported, hidden, key)
+
+    for result in by_source.values():
+        for bucket in totals:
+            if bucket == "unchanged":
+                totals[bucket] += result[bucket]
+            else:
+                totals[bucket] += len(result.get(bucket, ()))
 
     # Deliberately NOT a pass/fail boolean. An added finding is either a new true
     # positive (the point of a shape wave) or a false-positive regression, and
@@ -260,6 +359,11 @@ def analyze(argv: list[str]) -> dict:
     # was measured and leaves the judgement to a human.
     if totals["added"] == 0 and totals["gone"] == 0:
         verdict = "stable — no findings appeared or disappeared"
+        if totals["newly_suppressed"] or totals["unsuppressed"]:
+            verdict += (
+                f" ({totals['newly_suppressed']} newly suppressed, "
+                f"{totals['unsuppressed']} no longer suppressed)"
+            )
     elif totals["added"] == 0:
         verdict = f"{totals['gone']} finding(s) disappeared; none appeared"
     else:
