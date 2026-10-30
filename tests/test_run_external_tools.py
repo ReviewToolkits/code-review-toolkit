@@ -1133,7 +1133,24 @@ class TestBuildSkippedReport(unittest.TestCase):
         reasons = {s["tool"]: s["reason"] for s in skipped}
         self.assertEqual(reasons["mypy"], "not installed")
         self.assertEqual(reasons["vulture"], "excluded by user")
-        self.assertEqual(reasons["coverage"], "not installed")
+        # Coverage is read from artifacts: a missing artifact is not a missing
+        # package.
+        self.assertEqual(reasons["coverage"], "no coverage artifacts")
+
+    def test_coverage_installed_without_artifacts(self):
+        availability = {
+            "ruff": {"available": True},
+            "mypy": {"available": True},
+            "vulture": {"available": True},
+            "coverage": {
+                "available": False, "artifacts": [], "coverage_importable": True,
+            },
+        }
+        skipped = mod.build_skipped_report(availability, ["ruff", "mypy", "vulture"])
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["reason"], "no coverage artifacts")
+        self.assertTrue(skipped[0]["coverage_importable"])
+        self.assertIn("coverage run", skipped[0]["hint"])
 
 
 FAKE_RUFF = """\

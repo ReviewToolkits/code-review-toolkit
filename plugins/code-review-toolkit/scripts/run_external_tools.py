@@ -1112,7 +1112,22 @@ def build_skipped_report(
         if name in tools_run:
             continue
         info = availability.get(name, {})
-        if not info.get("available"):
+        if name == "coverage" and not info.get("available"):
+            # Coverage is read from artifacts, not run: "available" means an
+            # artifact exists. Whether coverage.py is installed is a separate
+            # fact, and calling a missing artifact "not installed" sent
+            # reviews looking for a missing package.
+            skipped.append({
+                "tool": name,
+                "reason": "no coverage artifacts",
+                "coverage_importable": info.get("coverage_importable"),
+                "hint": (
+                    "Run the test suite under coverage (e.g. `coverage run -m "
+                    "pytest && coverage json`) to produce .coverage, "
+                    "coverage.xml or coverage.json."
+                ),
+            })
+        elif not info.get("available"):
             skipped.append({"tool": name, "reason": "not installed"})
         else:
             skipped.append({"tool": name, "reason": "excluded by user"})
