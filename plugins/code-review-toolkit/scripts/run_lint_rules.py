@@ -274,7 +274,18 @@ DISMISSAL_REASONS = {
         "a traceback, so an explicit cause would never be shown. Chaining adds "
         "nothing; this is a CLI's normal exit path."
     ),
+    "yaml-loader-subclasses-safeloader": (
+        "S506 on a Loader class defined in the same file whose bases are all "
+        "yaml's SafeLoader/CSafeLoader/BaseLoader/CBaseLoader: ruff matches the "
+        "loader by name and cannot see the subclass is safe. Constructors the "
+        "subclass registers (`add_constructor`) are not checked: review them "
+        "on their own."
+    ),
 }
+
+_SAFE_YAML_LOADERS = frozenset(
+    {"SafeLoader", "CSafeLoader", "BaseLoader", "CBaseLoader"}
+)
 
 
 class _FileContext:
@@ -346,6 +357,79 @@ def _raises_systemexit(ctx: _FileContext, line: int, col: int) -> bool:
     return False
 
 
+def _yaml_bindings(tree: ast.Module) -> tuple[set[str], set[str]]:
+    """(names bound to the yaml module, names bound to a safe yaml loader)."""
+    modules: set[str] = set()
+    loaders: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "yaml" or alias.name.startswith("yaml."):
+                    modules.add(alias.asname or "yaml")
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and node.level == 0
+            and node.module
+            and (node.module == "yaml" or node.module.startswith("yaml."))
+        ):
+            for alias in node.names:
+                if alias.name in _SAFE_YAML_LOADERS:
+                    loaders.add(alias.asname or alias.name)
+                elif alias.name in ("loader", "cyaml"):
+                    modules.add(alias.asname or alias.name)
+    return modules, loaders
+
+
+def _safe_yaml_loader_class(
+    tree: ast.Module, name: str, modules: set, loaders: set, seen: set
+) -> bool:
+    if name in seen:
+        return False
+    seen.add(name)
+    classes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name]
+    # Exactly one top-level class, and nothing else binding that name.
+    if len(classes) != 1 or name in loaders:
+        return False
+    others = sum(
+        1
+        for n in ast.walk(tree)
+        if (
+            isinstance(n, ast.Name) and n.id == name and not isinstance(n.ctx, ast.Load)
+        )
+        or (
+            isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and n.name == name
+        )
+    )
+    if others != 1 or not classes[0].bases:
+        return False
+    for base in classes[0].bases:
+        if isinstance(base, ast.Attribute) and base.attr in _SAFE_YAML_LOADERS:
+            root = base.value
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if isinstance(root, ast.Name) and root.id in modules:
+                continue
+            return False
+        if isinstance(base, ast.Name):
+            if base.id in loaders:
+                continue
+            if _safe_yaml_loader_class(tree, base.id, modules, loaders, seen):
+                continue
+        return False
+    return True
+
+
+def _yaml_safe_subclass(ctx: _FileContext, line: int, col: int) -> bool:
+    names = ctx.at(line, col, ast.Name)
+    if not names:
+        return False
+    modules, loaders = _yaml_bindings(ctx.tree)
+    if not modules and not loaders:
+        return False
+    return _safe_yaml_loader_class(ctx.tree, names[0].id, modules, loaders, set())
+
+
 def _fastapi_marker(ctx: _FileContext, line: int, col: int, end) -> str | None:
     if not ctx.fastapi_markers and not ctx.fastapi_modules:
         return None
@@ -363,11 +447,18 @@ def _systemexit(ctx: _FileContext, line: int, col: int, end) -> str | None:
     return None
 
 
+def _yaml_loader(ctx: _FileContext, line: int, col: int, end) -> str | None:
+    if _yaml_safe_subclass(ctx, line, col):
+        return "yaml-loader-subclasses-safeloader"
+    return None
+
+
 # One mechanical dismissal per rule. Each resolves the flagged node in the
 # same file and dismisses only what it can prove.
 _DISMISSERS = {
     "B008": _fastapi_marker,
     "B904": _systemexit,
+    "S506": _yaml_loader,
 }
 
 
@@ -379,7 +470,8 @@ def dismissal_reason(
     B008 is dismissed only when the flagged call resolves to a fastapi import
     in that same file: a local ``Depends`` class, or a ``Query()`` from
     another library, is still reported. B904 only for the builtin
-    ``SystemExit``. *finding* may carry ruff's
+    ``SystemExit``; S506 only for a Loader class whose bases are all safe yaml
+    loaders. *finding* may carry ruff's
     ``end`` location, which pins the flagged node exactly.
     """
     check = _DISMISSERS.get(finding["code"])

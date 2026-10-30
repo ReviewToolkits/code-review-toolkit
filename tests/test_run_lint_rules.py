@@ -450,3 +450,52 @@ class TestSystemExitDismissal(unittest.TestCase):
                 root, [_fake_hit(root, "cli.py", 8, "raise", code="B904")], tier=2
             )
         self.assertEqual(result["dismissed"], [])
+
+
+class TestYamlSafeLoaderSubclassDismissal(unittest.TestCase):
+    """S506 on a Loader that subclasses a safe yaml loader."""
+
+    SOURCE = (
+        "import yaml\n"
+        "from yaml import SafeLoader as SL\n"
+        "\n"
+        "class Safe(yaml.SafeLoader):\n"
+        "    pass\n"
+        "\n"
+        "class Safer(Safe):\n"
+        "    pass\n"
+        "\n"
+        "class Aliased(SL):\n"
+        "    pass\n"
+        "\n"
+        "class Unsafe(yaml.Loader):\n"
+        "    pass\n"
+        "\n"
+        "class Mixed(yaml.SafeLoader, Helper):\n"
+        "    pass\n"
+        "\n"
+        "def load(f, chosen):\n"
+        "    a = yaml.load(f, Safe)\n"
+        "    b = yaml.load(f, Loader=Safer)\n"
+        "    c = yaml.load(f, Aliased)\n"
+        "    d = yaml.load(f, Unsafe)\n"
+        "    e = yaml.load(f, Mixed)\n"
+        "    g = yaml.load(f, chosen)\n"
+    )
+
+    def test_only_all_safe_bases_are_dismissed(self):
+        from helpers import TempProject
+
+        with TempProject({"cfg.py": self.SOURCE}) as root:
+            hits = [
+                _fake_hit(root, "cfg.py", 20, "Safe)", code="S506"),
+                _fake_hit(root, "cfg.py", 21, "Safer", code="S506"),
+                _fake_hit(root, "cfg.py", 22, "Aliased", code="S506"),
+                _fake_hit(root, "cfg.py", 23, "Unsafe", code="S506"),
+                _fake_hit(root, "cfg.py", 24, "Mixed", code="S506"),
+                _fake_hit(root, "cfg.py", 25, "chosen", code="S506"),
+            ]
+            result = _analyze_with_fake_ruff(root, hits)
+        reason = "yaml-loader-subclasses-safeloader"
+        self.assertEqual(_dismissed_lines(result), {20: reason, 21: reason, 22: reason})
+        self.assertEqual(_kept_lines(result), {23, 24, 25})
