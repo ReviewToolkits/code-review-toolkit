@@ -472,3 +472,19 @@ B018 scored **0 of 5** on idlelib.
 
 **Discriminator:** an expression statement with no side effect **and** no surrounding handler —
 typically a dropped `assert` or a `==` that should have been `=`.
+
+### 48. `finally: release()` around an awaited thread offload *(a threaded/async FastAPI service)*
+
+**Why it is not a bug:** a slot, semaphore or lock released in `finally` around
+`await run_in_threadpool(fn)` (Starlette) or `await anyio.to_thread.run_sync(fn)` looks like it frees
+the slot while the worker thread still runs, if the request is cancelled. It doesn't: anyio's default
+`abandon_on_cancel=False` defers the cancellation until the worker returns, so the `finally` runs
+after the work is done. A review flagged exactly this, and a control test refuted it.
+
+**Discriminator:** what the offload does on cancel.
+- `loop.run_in_executor(...)`, `asyncio.wrap_future(executor.submit(...))`, `asyncio.to_thread`,
+  `asyncio.wait_for` without `shield`, or anyio with `abandon_on_cancel=True` **abandon** the worker.
+  There, a `finally` release is the bug: the slot is free while the thread still holds the resource.
+- With a deferring offload the hazard is the reverse. The deferred `CancelledError` (a
+  `BaseException`) skips `except Exception` arms, so a release placed only in those arms leaks the
+  slot.

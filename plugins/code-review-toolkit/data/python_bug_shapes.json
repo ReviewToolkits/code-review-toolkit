@@ -296,7 +296,7 @@
         "Instances there: typing.py x4, argparse.py, subprocess.py, http/cookiejar.py, xml.sax, xml.dom.domreg",
         "ruff BLE001 blind-except"
       ],
-      "differential": "A broad catch at a genuine trust boundary is legitimate: a plugin/entry-point loader, a top-level CLI handler, or a call into user-supplied code -- ESPECIALLY when it logs at warning+ or re-raises, or carries a comment explaining the containment. The discriminator is the size and nature of the try body: one narrow operation = too broad; a whole subsystem call at a boundary = fine.",
+      "differential": "Graded by what the HANDLER does with the failure, not by the size of the try body. Not this shape: a handler that re-raises (bare, or wrapped with `from`), logs at warning or above with the exception, or returns a sentinel the caller demonstrably checks (the scanner lists these under `suppressed`); and a broad catch at a genuine trust boundary -- a plugin/entry-point loader, a top-level CLI handler, a call into user-supplied code -- that reports what it contained. The defect is a handler that substitutes a normal-looking value (`pass`, a default, an empty result) so the caller proceeds as if the operation had succeeded or found nothing.",
       "detected_by": "scan_python_pitfalls.py",
       "detectability": "implemented"
     },
@@ -399,7 +399,7 @@
       "references": [
         "idlelib contains five correct twins of this idiom: debugger.py:153 (self.interacting), colorizer.py:265 (self.colorizing), run.py:588 (interruptible), pyshell.py:1174 (self.reading), sidebar.py:57 (temp_enable_text_widget)."
       ],
-      "differential": "Only state that OUTLIVES the call matters -- an attribute or a qualified global. Re-binding a bare LOCAL is ordinary computation, not a missed reset. Also fine if a `finally` elsewhere in the function restores it, or if the early exit happens BEFORE the flag is set.",
+      "differential": "Only state that OUTLIVES the call matters -- an attribute or a qualified global. Re-binding a bare LOCAL is ordinary computation, not a missed reset. Also fine if a `finally` elsewhere in the function restores it, or if the early exit happens BEFORE the flag is set. A COMPLETION marker is not a guard: `self.done = True` / `self.closed = True` set once and never meant to be reset is the opposite idiom. The shape needs a set-at-entry/reset-at-exit pair in the same function.",
       "detected_by": "scan_python_pitfalls.py",
       "detectability": "implemented"
     },
@@ -502,7 +502,7 @@
       "references": [
         "Across CPython's Lib/ (1847 files) this shape produces 1 finding, which is real."
       ],
-      "differential": "A repeated guard is CORRECT when its own operand was rebound in between -- the `path = ...; if path.is_file(): return ...` loop idiom, or `token, value = get_fws(value)` before re-checking `value`. The check must consider bindings at any nesting depth and via tuple targets; missing either produces false positives on very common code.",
+      "differential": "A repeated guard is CORRECT when its own operand was rebound in between -- the `path = ...; if path.is_file(): return ...` loop idiom, or `token, value = get_fws(value)` before re-checking `value`. The check must consider bindings at any nesting depth and via tuple targets; missing either produces false positives on very common code. A repeated test of a POLL call (`if proc.poll() is None`, `if queue.empty()`, `if sock.recv(...)`) re-reads external state each time and is not a copied guard, even when the text is identical.",
       "detected_by": "scan_python_pitfalls.py",
       "detectability": "implemented"
     },
@@ -1996,7 +1996,7 @@
       "references": [
         "ruff DTZ005 / DTZ006 flag the call site; the destination is what decides whether it matters"
       ],
-      "differential": "A naive timestamp used only for an in-process duration, a log line, or a filename is fine -- do not report it. The destination is the entire test: it must be read by something outside this process.",
+      "differential": "A naive timestamp used only for a log line or a filename is fine -- do not report it. The destination is the entire test: it must be read by something outside this process. An in-process DURATION computed from two naive readings is NOT covered by this exclusion: that is `duration-measured-with-wall-clock`.",
       "detected_by": null,
       "detectability": "implementable"
     },
@@ -2347,6 +2347,66 @@
       "differential": "An `except ... as NAME` whose NAME is really unused anywhere (no closure) is a genuine F841; the fix is safe there.",
       "detected_by": null,
       "detectability": "implementable"
+    },
+    {
+      "id": "duration-measured-with-wall-clock",
+      "title": "An elapsed time computed by subtracting two wall-clock readings -- negative or an hour off across DST, wrong after a clock step",
+      "agent": "python-pitfall-scanner",
+      "severity": "CONSIDER",
+      "pattern": "`start = datetime.now()` ... `datetime.now() - start` (or `time.time() - t0`) used as a DURATION: a 'took Ns' summary, a progress line, a timeout, a rate. Naive local `now()` jumps by -1 h at the DST fall-back and +1 h at spring-forward; `time.time()` jumps with NTP or manual clock changes. The two readings are often split across `__init__` and a method (`self.started_at`).",
+      "guarded_twin": "`time.monotonic()` or `time.perf_counter()` for the duration, keeping `datetime.now(timezone.utc)` only for a displayed start timestamp.",
+      "hunt": "Every subtraction whose operands both derive from `datetime.now()`/`datetime.today()`/`time.time()`, including through an attribute set elsewhere. Escalate when the result gates control flow (timeout, retry budget, rate limit) rather than display. ruff DTZ005 flags the call sites; the subtraction is what makes it this shape.",
+      "expected": "a reported or enforced duration equals real elapsed time, whatever the zone rules or clock adjustments.",
+      "caught_as": "SILENT and rare: a negative or hour-shifted duration twice a year, or a timeout that fires at once or never after a clock step. Tests that freeze time can never see it.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "Python docs, time.monotonic: 'The clock is not affected by system clock updates.'",
+        "Reproduced on a CLI reviewed privately: a 20-minute run across a US fall-back reported -2400 s."
+      ],
+      "differential": "A UTC-aware `datetime.now(timezone.utc)` difference is correct across DST but still moves with clock steps; report it only where the result gates control flow. A wall-clock difference that is only logged as an approximate figure is low severity.",
+      "detected_by": null,
+      "detectability": "implementable"
+    },
+    {
+      "id": "deferred-annotation-names-unimported-symbol",
+      "title": "A string or deferred annotation names a symbol that is never imported",
+      "agent": "typing-integrity-auditor",
+      "severity": "CONSIDER",
+      "pattern": "`def fail(msg) -> \"NoReturn\":` (or any annotation under `from __future__ import annotations` / PEP 649) naming a type the module never imports. Nothing fails at import because the annotation is never evaluated on the normal path; mypy reports `name-defined` and degrades the annotation to `Any`, losing the narrowing (`NoReturn`) or the checking (a parameter type).",
+      "guarded_twin": "The same name imported from `typing` or the defining module, or under `if TYPE_CHECKING:` when only checkers need it.",
+      "hunt": "F821 hits whose column falls inside an annotation or a string literal used as one. Escalate when the annotated object is introspected at runtime: pydantic models, FastAPI route signatures, dataclasses resolved with `typing.get_type_hints`, typer/click, attrs, cattrs. There the unresolved name is a NameError at startup or at the first request.",
+      "expected": "every annotation resolves to the type the author named.",
+      "caught_as": "SILENT at runtime unless introspected; LOUD only in a type-checker run someone reads. If mypy is not gating, the annotation has stopped checking anything.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "ruff F821 (undefined name) in annotation position",
+        "PEP 563, PEP 649"
+      ],
+      "differential": "A name defined later in the same module (a forward reference) or imported under `TYPE_CHECKING` resolves for the checker and is fine.",
+      "detected_by": null,
+      "detectability": "implementable"
+    },
+    {
+      "id": "lenient-template-undefined-hides-renamed-attribute",
+      "title": "A template engine's lenient `Undefined` turns a renamed or misspelled attribute into an empty string",
+      "agent": "silent-failure-hunter",
+      "severity": "CONSIDER",
+      "pattern": "A Jinja2 `Environment` (or `Template`) built with the default `Undefined`, rendering project objects whose attributes the template reads by name: `{{ request.path_url }}`, `{% if response.body %}`. When a dependency upgrade or refactor renames the attribute, the expression renders as `\"\"` or tests false; the report or page silently loses a section.",
+      "guarded_twin": "`Environment(undefined=StrictUndefined)` for templates the project owns, at least in tests, plus one render test over the real object types (not dicts or mocks). User-supplied templates may keep a lenient mode, with a logged warning (`DebugUndefined`, a logging `Undefined` subclass).",
+      "hunt": "Grep `Environment(`, `Template(`, `jinja2.` for an `undefined=` argument. For each template the project ships, list the attribute chains it reads and check each against the current type of the object passed in; do it by rendering once with `StrictUndefined` in an export.",
+      "expected": "a template reference to a missing attribute fails loudly in tests.",
+      "caught_as": "SILENT -- a blank field or a missing section in generated output, often for years after a library migration, because no test renders with the real types.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "Jinja2 docs, Undefined Types: the default Undefined renders as an empty string; StrictUndefined raises on any use",
+        "Reproduced on a CLI reviewed privately: two report sections blank since an HTTP-client migration."
+      ],
+      "differential": "A template that reads optional keys by design (`{{ item.note or '' }}` with `note` absent on purpose) is fine; the test is whether the attribute EXISTS on the real type.",
+      "detected_by": null,
+      "detectability": "agent-only"
     }
   ]
 }
