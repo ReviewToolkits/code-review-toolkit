@@ -265,5 +265,53 @@ class TestMaxFiles(unittest.TestCase):
             self.assertGreater(output["files_total"], 3)
 
 
+def _run_main(root) -> dict:
+    """Run count_types.main() on *root* and return its parsed JSON."""
+    import io
+    import sys
+
+    old_stdout, old_argv = sys.stdout, sys.argv
+    sys.stdout = io.StringIO()
+    sys.argv = ["count_types.py", str(root)]
+    try:
+        mod.main()
+        return json.loads(sys.stdout.getvalue())
+    finally:
+        sys.stdout, sys.argv = old_stdout, old_argv
+
+
+class TestUnannotatedPublicFunctions(unittest.TestCase):
+    """`unannotated_public_functions[]` entries must say which file they are in."""
+
+    def test_same_name_in_two_files_is_distinguishable(self):
+        with TempProject({
+            "pkg/a.py": "def build(x):\n    return x\n",
+            "pkg/b.py": "def build(x):\n    return x\n",
+        }) as root:
+            out = _run_main(root / "pkg")
+        entries = out["unannotated_public_functions"]
+        self.assertEqual(
+            sorted((e["file"], e["name"]) for e in entries),
+            [("pkg/a.py", "build"), ("pkg/b.py", "build")],
+        )
+
+    def test_method_entry_carries_its_file(self):
+        with TempProject({
+            "pkg/a.py": "class C:\n    def run(self, x):\n        return x\n",
+        }) as root:
+            out = _run_main(root / "pkg")
+        self.assertEqual(
+            out["unannotated_public_functions"],
+            [{"file": "pkg/a.py", "name": "C.run", "line": 2}],
+        )
+
+    def test_annotated_function_not_listed(self):
+        with TempProject({
+            "pkg/a.py": "def build(x: int) -> int:\n    return x\n",
+        }) as root:
+            out = _run_main(root / "pkg")
+        self.assertEqual(out["unannotated_public_functions"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -275,6 +275,14 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
     return result
 
 
+def _all_file_functions(file_analysis: dict) -> list[dict]:
+    """Module-level functions followed by class methods, in summary order."""
+    funcs = list(file_analysis["functions"])
+    for cls in file_analysis["classes"]:
+        funcs.extend(cls["methods"])
+    return funcs
+
+
 def main() -> None:
     from scan_common import exit_on_help
 
@@ -330,11 +338,13 @@ def main() -> None:
         if ct:
             container_types.setdefault(ct, []).append(cls["name"])
 
-    # Unannotated public functions.
+    # Unannotated public functions. `file` is needed to tell apart same-named
+    # functions in different modules (one `build` per plugin module).
     unannotated_public = [
-        {"name": f["name"], "line": f["line"]}
-        for f in public_funcs
-        if not f["fully_annotated"]
+        {"file": fa["file"], "name": f["name"], "line": f["line"]}
+        for fa in file_analyses
+        for f in _all_file_functions(fa)
+        if f["is_public"] and not f["fully_annotated"]
     ]
 
     output = {
