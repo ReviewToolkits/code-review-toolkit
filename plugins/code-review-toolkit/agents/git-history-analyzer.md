@@ -22,8 +22,14 @@ If these aren't available, note reduced analysis depth and focus on capabilities
 
 If git-history-context output is already available (e.g., from Phase 1
 of explore), use that data directly — do NOT re-run
-`analyze_history.py`. The script output is identical. Only run the
-script yourself if git-history-context output was not provided.
+`analyze_history.py`. The script output is identical. In an `explore`
+run its raw JSON is at
+`<run_dir>/artifacts/git-history-context/analyze_history.json`: read
+`recent_fixes`, `recent_features`, `behavioural_non_code_commits`,
+`co_change_clusters` and `unmerged_branches` from there rather than
+from the prose report. Only run the script yourself if neither the file
+nor the context output was provided, and then save its output to the
+same path.
 
 ## Scope
 

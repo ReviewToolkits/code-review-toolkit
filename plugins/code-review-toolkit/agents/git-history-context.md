@@ -27,6 +27,8 @@ where `<plugin_root>` is the root of the code-review-toolkit plugin directory.
 
 Parse the JSON output. This gives you file/function churn, commit classification, recent fixes/features/refactors, and co-change clusters. Use this as your factual foundation.
 
+**Keep the raw JSON.** When you run with a run directory (an `explore` run), copy the script's output to `<run_dir>/artifacts/git-history-context/analyze_history.json` (with `cp`, from the private directory where you wrote it) and give that path in your report. git-history-analyzer runs last and reuses this file instead of re-running the script. Without it, it has to rebuild the fix lists, diffs, co-change pairs and branch data by hand. If you re-ran the script with different flags (`--key-type`, a wider `--since`), keep the run your report is based on, and name its flags in the report.
+
 Key fields:
 - `summary`: total commits, commits by type (fix/feature/refactor/docs/test/chore/unknown), `classified_by` (which signal decided each type, strongest first: `conventional` type, leading bracketed `tag`, tracker `key`, `key-majority` (an unknown commit took the majority type of its key's other commits), a `strong` word such as `docstrings` or `flake8`, the subject's leading `verb`, a `keyword`, or `none`). A `keyword` classification is the weakest; quote a fix:feature ratio that rests mostly on keywords as approximate, files changed, functions changed, author count
 - `time_range`: the window actually analyzed (`start`, `end`, `days`). `empty: true` with `last_commit_in_scope` means no commit touched the scope in the window: re-run with `--since` before that date (or `--last N`) rather than reporting a quiet project from an empty window
