@@ -1028,6 +1028,61 @@ _FIX_COMMIT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A conventional-commit type (`fix:`, `chore(deps)!:`, even a malformed
+# `feat(scope:`) and bracket tags (`[fix][cli]`, `[test]`).
+_COMMIT_TYPE_RE = re.compile(r"^\s*([A-Za-z]+)(?:\([^):]*\)?)?!?:")
+_COMMIT_TAG_RE = re.compile(r"\[([A-Za-z]+)\]")
+_FIX_TYPES = frozenset({"fix", "fixes", "fixed", "bugfix", "hotfix", "bug"})
+# Commit types that are not product fixes, whatever their subject says
+# (`chore: fix a typo`, `ci: fix the build`, `[test] Raise a timeout`).
+_NON_FIX_TYPES = frozenset({
+    "chore", "ci", "docs", "doc", "style", "test", "tests", "build",
+    "refactor", "perf", "bench", "benchmark", "benchmarks", "release",
+    "deps", "revert", "wip", "lint", "typo", "feat", "feature",
+})
+
+
+def is_fix_commit(subject: str) -> bool:
+    """True when a commit subject describes a bug fix.
+
+    A conventional-commit type or a bracket tag decides when it names a
+    known type: `fix`/`hotfix` (or a `[fix]` tag) is a fix, `chore`, `ci`,
+    `test`, `docs`, `[bench]` and the like are not, even when the subject
+    says "fix". Only an untyped subject falls back to the fix vocabulary
+    (`_FIX_COMMIT_RE`).
+    """
+    types: list[str] = []
+    match = _COMMIT_TYPE_RE.match(subject)
+    if match:
+        types.append(match.group(1).lower())
+    types += [t.lower() for t in _COMMIT_TAG_RE.findall(subject)]
+    if any(t in _FIX_TYPES for t in types):
+        return True
+    if any(t in _NON_FIX_TYPES for t in types):
+        return False
+    return bool(_FIX_COMMIT_RE.search(subject))
+
+
+# Directories whose files are never product code: a fix commit touching only
+# these (and tests) adjusts the test harness, not the product.
+_NON_PRODUCT_DIRS = frozenset({
+    "test", "tests", "testing", "bench", "benchmark", "benchmarks", "docs",
+    "doc", "examples", "scripts", "tools", ".github",
+})
+
+
+def _is_product_file(path: str) -> bool:
+    parts = Path(path).parts
+    name = parts[-1] if parts else ""
+    return (
+        name.endswith(".py")
+        and not name.startswith("test_")
+        and not name.endswith("_test.py")
+        and name not in ("conftest.py", "setup.py", "noxfile.py")
+        and not (set(parts[:-1]) & _NON_PRODUCT_DIRS)
+    )
+
+
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", re.MULTILINE)
 _BUG_FIX_LIST_CAP = 15
 
@@ -1067,8 +1122,9 @@ def _get_bug_fix_tests(
 ) -> tuple[list[dict], int]:
     """Identify the tests that bug-fix commits added or changed, using git.
 
-    A commit counts as a fix when its subject uses fix vocabulary (see
-    `_FIX_COMMIT_RE`). For each test file it touched, the diff's added lines
+    A commit counts as a fix per `is_fix_commit`: its conventional type or
+    tag, else its subject's fix vocabulary. `touches_source` is False when
+    the commit changed no product file (only tests, benchmarks, tooling). For each test file it touched, the diff's added lines
     name the test functions it changed (`test_functions`, with
     `attribution: "function"`); when no test function was touched (a fixture
     or helper changed) the entry keeps `test_functions: []` and
@@ -1084,7 +1140,7 @@ def _get_bug_fix_tests(
     fix_commits: list[tuple[str, str]] = []
     for line in log.strip().split("\n"):
         sha, _, msg = line.partition(" ")
-        if sha and msg and _FIX_COMMIT_RE.search(msg):
+        if sha and msg and is_fix_commit(msg):
             fix_commits.append((sha, msg))
 
     test_rel_paths = set()
@@ -1099,7 +1155,11 @@ def _get_bug_fix_tests(
         changed = _git(
             ["diff-tree", "--no-commit-id", "-r", "--name-only", sha], project_root
         )
-        for changed_file in (changed or "").strip().split("\n"):
+        changed_files = (changed or "").strip().split("\n")
+        # A fix that changed only tests, benchmarks or tooling encodes
+        # harness slack (a longer timeout), not a product failure mode.
+        touches_source = any(_is_product_file(f) for f in changed_files)
+        for changed_file in changed_files:
             if changed_file not in test_rel_paths:
                 continue
             diff = _git(["show", "-U0", "--format=", sha, "--", changed_file],
@@ -1117,6 +1177,7 @@ def _get_bug_fix_tests(
                 "fix_message": msg[:120],
                 "test_functions": functions,
                 "attribution": "function" if functions else "file",
+                "touches_source": touches_source,
             })
 
     return bug_fix_tests, len(bug_fix_tests)
@@ -1197,11 +1258,34 @@ def select_tests(
     tier2 = _round_robin(
         strong, lambda f: not _is_strong_signal_test("", f)
     ) + _round_robin(weak)
-    # Bug-fix files in commit order, newest fix first.
+    # Bug-fix files in commit order, newest fix first; tests a product fix
+    # changed before those of fixes that touched only tests or benchmarks.
     newest_fix: dict[str, int] = {}
     for i, bt in enumerate(bug_fix_tests):
         newest_fix.setdefault(bt["test_file"], i)
-    tier1 = _round_robin(tier1, lambda f: newest_fix.get(f, len(newest_fix)))
+    product_functions = {
+        (bt["test_file"], fn)
+        for bt in bug_fix_tests
+        if bt.get("touches_source", True)
+        for fn in bt.get("test_functions") or ()
+    }
+    product_files = {
+        bt["test_file"]
+        for bt in bug_fix_tests
+        if bt.get("touches_source", True) and not bt.get("test_functions")
+    }
+
+    def from_product_fix(t: dict) -> bool:
+        return (t["file"], t["function"]) in product_functions or (
+            t["file"] in product_files
+        )
+
+    def by_recency(f: str) -> int:
+        return newest_fix.get(f, len(newest_fix))
+
+    tier1 = _round_robin(
+        [t for t in tier1 if from_product_fix(t)], by_recency
+    ) + _round_robin([t for t in tier1 if not from_product_fix(t)], by_recency)
     tier3 = _round_robin(tier3)
 
     # Distribute quota: 10/10/10 by default, redistribute if any tier is short

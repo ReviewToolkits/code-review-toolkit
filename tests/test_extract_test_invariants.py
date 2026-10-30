@@ -745,5 +745,99 @@ class TestBugFixAttribution(unittest.TestCase):
         self.assertEqual(entries[0]["attribution"], "function")
 
 
+class TestFixCommitClassification(unittest.TestCase):
+    """A commit type or tag outranks fix vocabulary in the subject."""
+
+    def test_typed_non_fix_commits_are_not_fixes(self):
+        for subject in (
+            "chore: fix a typo (#12)",
+            "ci: fix the docs build (#34)",
+            "test: cover the parser error paths (#56)",
+            "docs: fix a typo",
+            "style(lint): fix line lengths",
+            "refactor!: fix naming",
+            "[test] Raise the timeout of the slow worker tests",
+            "[bench] Use a larger sample",
+            "[docs][api] Fix the error table",
+        ):
+            with self.subTest(subject=subject):
+                self.assertFalse(mod.is_fix_commit(subject))
+
+    def test_fix_commits(self):
+        for subject in (
+            "fix: keep the trailing newline",
+            "fix(io): flush before close",
+            "Fix: strip whitespace around values",
+            "[fix][cli] Reject an empty --output path",
+            "[core][fix] Close the handle on error",
+            "hotfix: restore the default",
+            # No type at all: fall back to the vocabulary.
+            "Close the race between flush and read",
+            "[core] Avoid a deadlock on close",
+            # A malformed scope still names the type.
+            "fix(io: escape the path",
+        ):
+            with self.subTest(subject=subject):
+                self.assertTrue(mod.is_fix_commit(subject))
+
+    def test_untyped_subject_without_vocabulary(self):
+        self.assertFalse(mod.is_fix_commit("feat(cli: add a quiet flag"))
+        self.assertFalse(mod.is_fix_commit("Add a prefix option"))
+
+
+class TestTestOnlyFixesRankLast(unittest.TestCase):
+    """A fix commit that changes only tests or benchmarks ranks below the rest."""
+
+    def test_product_fix_selected_before_test_only_fix(self):
+        tests = [
+            _t("test_slack", "tests/test_timing.py"),
+            _t("test_regression", "tests/test_store.py"),
+        ]
+        fixes = [
+            {   # Newest: a test-only commit.
+                "test_file": "tests/test_timing.py", "fix_commit": "a",
+                "fix_message": "fix: give the timing test room",
+                "test_functions": ["test_slack"], "attribution": "function",
+                "touches_source": False,
+            },
+            {
+                "test_file": "tests/test_store.py", "fix_commit": "b",
+                "fix_message": "fix: reject a truncated header",
+                "test_functions": ["test_regression"], "attribution": "function",
+                "touches_source": True,
+            },
+        ]
+        selected = mod.select_tests(tests, fixes, max_tests=1)
+        self.assertEqual(selected[0]["function"], "test_regression")
+
+    def test_git_entry_records_touches_source(self):
+        with TempProject({
+            "pkg/core.py": "X = 1\n",
+            "tests/test_core.py": "def test_a():\n    assert True\n",
+            "benchmarks/run.py": "N = 1\n",
+        }) as root:
+            _git(root, "init", "-q", "-b", "main")
+            _git(root, "add", "-A")
+            _git(root, "commit", "-q", "-m", "Add core")
+            (root / "tests/test_core.py").write_text(
+                "def test_a():\n    assert 1\n", encoding="utf-8"
+            )
+            (root / "benchmarks/run.py").write_text("N = 2\n", encoding="utf-8")
+            _git(root, "commit", "-q", "-am", "Fix the slow timeout in the bench")
+            (root / "tests/test_core.py").write_text(
+                "def test_a():\n    assert 2\n", encoding="utf-8"
+            )
+            (root / "pkg/core.py").write_text("X = 2\n", encoding="utf-8")
+            _git(root, "commit", "-q", "-am", "Fix the core crash")
+            _git(root, "commit", "-q", "--allow-empty", "-m", "chore: fix a typo")
+            entries, total = mod._get_bug_fix_tests([root / "tests/test_core.py"], root)
+        self.assertEqual(total, 2)
+        by_msg = {e["fix_message"]: e["touches_source"] for e in entries}
+        self.assertEqual(
+            by_msg,
+            {"Fix the core crash": True, "Fix the slow timeout in the bench": False},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
