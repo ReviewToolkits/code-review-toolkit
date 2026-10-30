@@ -4,6 +4,7 @@ import json
 import unittest
 
 from helpers import TempProject, import_script
+from test_analyze_history import GitTempProject
 
 mod = import_script("measure_complexity")
 
@@ -482,6 +483,133 @@ class TestNestedFunctionsMeasured(unittest.TestCase):
             "def test_x():\n    def helper():\n        return 1\n    assert helper()\n"
         )
         self.assertTrue(_functions(source)["test_x.helper"]["is_test"])
+
+
+def _hotspot(rel: str, name: str, start: int, end: int, score: float = 6.0) -> dict:
+    return {
+        "name": name,
+        "qualified_name": f"{rel}::{name}",
+        "line_start": start,
+        "line_end": end,
+        "score": score,
+    }
+
+
+class TestHistoryCrossingAttribution(unittest.TestCase):
+    """Fixes are attributed at their own commit, by full path, and
+    only real fix commits count."""
+
+    def test_fix_to_a_function_that_has_since_moved_is_counted(self):
+        v1 = "def a():\n    return 1\n\ndef target():\n    return 1\n"
+        v2 = "def a():\n    return 1\n\ndef target():\n    return 2\n"
+        v3 = "def a():\n    return 1\n\ndef target():\n    return 3\n"
+        # Five padding functions on top: pad1 now sits at lines 4-5, where
+        # both fixes' hunks (post-image line 5) landed at the time.
+        grow = "".join(f"def pad{i}():\n    return {i}\n\n" for i in range(5))
+        with GitTempProject(
+            [
+                {"files": {"m.py": v1}, "message": "Add functions"},
+                {"files": {"m.py": v2}, "message": "[fix] Repair target (K29)"},
+                {"files": {"m.py": v3}, "message": "fix: Bound target (K41)"},
+                {"files": {"m.py": grow + v3}, "message": "Add padding"},
+            ]
+        ) as root:
+            start = (grow + v3).splitlines().index("def target():") + 1
+            hotspots = [
+                _hotspot("m.py", "target", start, start + 1),
+                _hotspot("m.py", "pad1", 4, 5),
+            ]
+            meta = mod.cross_with_history(hotspots, root, since="2000-01-01")
+        self.assertTrue(meta["history_available"])
+        by_name = {h["name"]: h for h in hotspots}
+        self.assertEqual(by_name["target"]["fix_commits_2y"], 2)
+        self.assertEqual(by_name["target"]["verdict"], "active-risk")
+        # The HEAD-line mapping credited both fixes to whatever sits there now.
+        self.assertEqual(by_name["pad1"]["fix_commits_2y"], 0)
+
+    def test_files_are_keyed_by_full_path_not_basename(self):
+        base_v1 = "def run():\n    return 1\n"
+        base_v2 = "def run():\n    return 2\n"
+        base_v3 = "def run():\n    return 3\n"
+        with GitTempProject(
+            [
+                {
+                    "files": {"stores/base.py": base_v1, "backends/base.py": base_v1},
+                    "message": "Add bases",
+                },
+                {"files": {"stores/base.py": base_v2}, "message": "Fix stores run"},
+                {
+                    "files": {"stores/base.py": base_v3},
+                    "message": "Fix stores run again",
+                },
+            ]
+        ) as root:
+            hotspots = [
+                _hotspot("stores/base.py", "run", 1, 2),
+                _hotspot("backends/base.py", "run", 1, 2),
+            ]
+            mod.cross_with_history(hotspots, root, since="2000-01-01")
+        self.assertEqual(hotspots[0]["fix_commits_2y"], 2)
+        self.assertEqual(hotspots[1]["fix_commits_2y"], 0)
+
+    def test_fix_inside_a_word_is_not_a_fix_commit(self):
+        v1 = "def f():\n    return 1\n"
+        with GitTempProject(
+            [
+                {"files": {"m.py": v1}, "message": "Add f"},
+                {
+                    "files": {"m.py": v1.replace("1", "2")},
+                    "message": "Support URL prefixes",
+                },
+                {
+                    "files": {"m.py": v1.replace("1", "3")},
+                    "message": "Route by policies",
+                },
+            ]
+        ) as root:
+            hotspots = [_hotspot("m.py", "f", 1, 2)]
+            mod.cross_with_history(hotspots, root, since="2000-01-01")
+        self.assertEqual(hotspots[0]["fix_commits_2y"], 0)
+
+    def test_unattributed_fixes_make_the_verdict_unknown(self):
+        # An unmeasured value must not look like a clean one: with the parse
+        # budget at zero, two fixes are seen but cannot be placed, so `quiet`
+        # would be a guess.
+        v1 = "def f():\n    return 1\n"
+        with GitTempProject(
+            [
+                {"files": {"m.py": v1}, "message": "Add f"},
+                {"files": {"m.py": v1.replace("1", "2")}, "message": "Fix f"},
+                {"files": {"m.py": v1.replace("1", "3")}, "message": "Fix f again"},
+            ]
+        ) as root:
+            hotspots = [_hotspot("m.py", "f", 1, 2, score=5.0)]
+            old_cap = mod.MAX_HISTORY_PARSES
+            mod.MAX_HISTORY_PARSES = 0
+            try:
+                meta = mod.cross_with_history(hotspots, root, since="2000-01-01")
+            finally:
+                mod.MAX_HISTORY_PARSES = old_cap
+        self.assertEqual(meta["fix_commits_unattributed"], 2)
+        self.assertTrue(meta["parse_cap_reached"])
+        self.assertEqual(hotspots[0]["verdict"], "unknown")
+        self.assertEqual(hotspots[0]["fix_commits_unattributed"], 2)
+
+    def test_project_in_a_repo_subdirectory(self):
+        v1 = "def f():\n    return 1\n"
+        with GitTempProject(
+            [
+                {
+                    "files": {"sub/pyproject.toml": "", "sub/m.py": v1},
+                    "message": "Add f",
+                },
+                {"files": {"sub/m.py": v1.replace("1", "2")}, "message": "Fix f"},
+            ]
+        ) as root:
+            hotspots = [_hotspot("m.py", "f", 1, 2)]
+            meta = mod.cross_with_history(hotspots, root / "sub", since="2000-01-01")
+        self.assertTrue(meta["history_available"])
+        self.assertEqual(hotspots[0]["fix_commits_2y"], 1)
 
 
 if __name__ == "__main__":
