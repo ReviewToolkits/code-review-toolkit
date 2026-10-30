@@ -266,11 +266,14 @@ For each finding, consider:
 [2-3 sentence overview: How healthy is the error handling in this codebase? What's the biggest systemic issue?]
 
 ### Statistics
-- Total error handling sites found: N
-- Critical (silenced errors): N
-- High (poorly handled): N
-- Medium (improvable): N
-- Low (minor): N
+Sites are places in the code; findings are what you report. Keep the two apart.
+
+- Explicit sites surveyed: N (`summary.explicit_sites`: H handlers + S `suppress` blocks + E
+  suppressing `__exit__`), plus F `finally` blocks checked in Step 3b
+- Implicit sites listed: N, by kind (`summary.implicit_by_kind`), or "not surveyed"
+- Sites found by reading, outside the survey (missing handling, Step 3c): N
+- Findings by severity (a finding can cover several sites; ACCEPTABLE sites are not findings):
+  Critical N, High N, Medium N, Low N
 
 ## Critical Issues (must fix)
 
