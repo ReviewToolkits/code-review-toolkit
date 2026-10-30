@@ -24,7 +24,8 @@ where `<plugin_root>` is the root of the code-review-toolkit plugin directory.
 Parse the JSON output. This gives you precise per-function metrics and pre-computed complexity scores. Use this as your factual foundation — do not re-derive these metrics manually.
 
 Key fields:
-- `hotspots`: pre-ranked list of functions scoring ≥ 5 (up to 30)
+- `hotspots`: pre-ranked list of functions scoring ≥ 5 (up to 30). Each entry has `file`, `line_start` and `line_end`; `qualified_name` is `file::Class.method`
+- `is_test`: true for code in a test path (`tests/`, `test/`, `test_*.py`, `*_test.py`, `conftest.py`) or in a `unittest.TestCase` subclass that does not set `__test__ = False`. Test code is excluded from the averages and the hotspots. Names alone don't count: a source class called `TestRunConfig` or a `tests` property is source code
 - `summary`: aggregate statistics (total functions, hotspot counts, average scores)
 - Per-function `metrics`: `line_count`, `nesting_depth`, `parameter_count`, `branch_count`, `loop_count`, `return_count`, `local_variable_count`, `cognitive_complexity`
 - Per-function `score`: pre-computed 1-10 complexity rating

@@ -387,8 +387,69 @@ def _compute_score(metrics: dict) -> float:
     return min(score, 10.0)
 
 
+_TEST_DIRS = frozenset({"tests", "test"})
+
+
+def is_test_path(rel: str) -> bool:
+    """True for a file test runners collect: under tests/ or test/, or named
+    test_*.py, *_test.py, tests.py or conftest.py."""
+    parts = Path(rel).parts
+    name = parts[-1] if parts else ""
+    return (
+        any(part in _TEST_DIRS for part in parts[:-1])
+        or name.startswith("test_")
+        or name.endswith("_test.py")
+        or name in ("tests.py", "conftest.py")
+    )
+
+
+def _sets_test_false(cls: ast.ClassDef) -> bool:
+    """`__test__ = False` in the class body: test runners must not collect it."""
+    for stmt in cls.body:
+        if isinstance(stmt, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "__test__" for t in stmt.targets
+        ):
+            return isinstance(stmt.value, ast.Constant) and stmt.value.value is False
+    return False
+
+
+def _is_test_case_class(cls: ast.ClassDef) -> bool:
+    """A unittest-style class (a base named *TestCase) that is not opted out."""
+    for base in cls.bases:
+        name = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", "")
+        if name.endswith("TestCase"):
+            return not _sets_test_false(cls)
+    return False
+
+
+def _test_classes(tree: ast.AST) -> set[str]:
+    """Qualified names (as iter_qualified_defs builds them) of TestCase classes."""
+    found: set[str] = set()
+    stack: list[tuple[ast.AST, str]] = [(tree, "")]
+    while stack:
+        node, prefix = stack.pop()
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                qual = prefix + child.name
+                if _is_test_case_class(child):
+                    found.add(qual)
+                stack.append((child, qual + "."))
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                stack.append((child, prefix + child.name + "."))
+            else:
+                stack.append((child, prefix))
+    return found
+
+
 def analyze_file(filepath: Path, project_root: Path) -> dict:
-    """Analyze all functions/methods in a file."""
+    """Analyze all functions/methods in a file.
+
+    `is_test` is decided by the file's path (tests/, test_*.py, *_test.py,
+    conftest.py), or by an enclosing unittest-style TestCase class that does
+    not set `__test__ = False`. Deciding by name made every method of a
+    source class whose name starts with `Test`, and every `tests` property,
+    test code, so they vanished from the averages and the hotspots.
+    """
     rel = str(filepath.relative_to(project_root))
     result: dict = {
         "file": rel,
@@ -404,6 +465,8 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
         return result
 
     source_lines = source.splitlines()
+    test_file = is_test_path(rel)
+    test_classes = set() if test_file else _test_classes(tree)
 
     def _process_func(
         node: ast.FunctionDef | ast.AsyncFunctionDef,
@@ -448,14 +511,13 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
         }
 
         segments = qualname.split(".")[:-1]
-        enclosing = list(zip(segments, kinds))
-        in_test_class = any(k == "class" and n.startswith("Test") for n, k in enclosing)
-        in_test_func = any(
-            k == "function" and n.startswith("test") for n, k in enclosing
+        in_test_class = any(
+            ".".join(segments[: i + 1]) in test_classes for i in range(len(segments))
         )
         return {
             "name": qualname,
             "qualified_name": f"{rel}::{qualname}",
+            "file": rel,
             "line_start": start,
             "line_end": end,
             "is_method": bool(kinds) and kinds[-1] == "class",
@@ -469,7 +531,7 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
             ),
             "is_async": isinstance(node, ast.AsyncFunctionDef),
-            "is_test": node.name.startswith("test") or in_test_class or in_test_func,
+            "is_test": test_file or in_test_class,
             "has_decorators": len(node.decorator_list) > 0,
             "decorator_count": len(node.decorator_list),
             "metrics": metrics,

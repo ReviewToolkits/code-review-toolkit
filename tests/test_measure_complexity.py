@@ -224,6 +224,66 @@ class TestTestFunctionDetection(unittest.TestCase):
             self.assertTrue(funcs["TestFoo.helper"])
 
 
+class TestTestDetectionByPath(unittest.TestCase):
+    """Test code is decided by path and TestCase bases, not by name."""
+
+    _DOMAIN = (
+        "class TestRunConfig:\n"
+        "    __test__ = False\n"
+        "    def run(self):\n"
+        "        return 1\n"
+        "\n"
+        "class Checklist:\n"
+        "    @property\n"
+        "    def tests(self):\n"
+        "        return []\n"
+        "\n"
+        "def test_connection(url):\n"
+        "    return url\n"
+    )
+
+    def test_source_names_that_look_like_tests_are_source(self):
+        funcs = _functions(self._DOMAIN, "pkg/tree/nodes.py")
+        self.assertEqual(
+            {name: f["is_test"] for name, f in funcs.items()},
+            {
+                "TestRunConfig.run": False,
+                "Checklist.tests": False,
+                "test_connection": False,
+            },
+        )
+
+    def test_everything_in_a_test_path_is_test_code(self):
+        for path in (
+            "tests/helpers.py",
+            "pkg/tests/test_nodes.py",
+            "test_nodes.py",
+            "nodes_test.py",
+            "conftest.py",
+        ):
+            funcs = _functions(self._DOMAIN, path)
+            self.assertTrue(all(f["is_test"] for f in funcs.values()), path)
+
+    def test_testcase_subclass_outside_a_test_path_is_test(self):
+        source = (
+            "import unittest\n"
+            "class ChecksTestCase(unittest.TestCase):\n"
+            "    def test_a(self):\n"
+            "        pass\n"
+            "class Opted(unittest.TestCase):\n"
+            "    __test__ = False\n"
+            "    def test_b(self):\n"
+            "        pass\n"
+        )
+        funcs = _functions(source, "pkg/selfcheck.py")
+        self.assertTrue(funcs["ChecksTestCase.test_a"]["is_test"])
+        self.assertFalse(funcs["Opted.test_b"]["is_test"])
+
+    def test_every_entry_names_its_file(self):
+        funcs = _functions("def f():\n    return 1\n", "pkg/m.py")
+        self.assertEqual(funcs["f"]["file"], "pkg/m.py")
+
+
 class TestNestedFunctionIsolation(unittest.TestCase):
     """Test that nested function defs don't affect outer metrics."""
 
@@ -379,9 +439,9 @@ class TestHistoryCrossing(unittest.TestCase):
         self.assertEqual(mod.verdict_for(fix_commits=2, score=1.0), "active-risk")
 
 
-def _functions(source: str) -> dict:
-    with TempProject({"mod.py": source}) as root:
-        result = mod.analyze_file(root / "mod.py", root)
+def _functions(source: str, path: str = "mod.py") -> dict:
+    with TempProject({path: source}) as root:
+        result = mod.analyze_file(root / path, root)
     return {f["name"]: f for f in result["functions"]}
 
 
@@ -482,7 +542,9 @@ class TestNestedFunctionsMeasured(unittest.TestCase):
         source = (
             "def test_x():\n    def helper():\n        return 1\n    assert helper()\n"
         )
-        self.assertTrue(_functions(source)["test_x.helper"]["is_test"])
+        self.assertTrue(
+            _functions(source, "tests/test_m.py")["test_x.helper"]["is_test"]
+        )
 
 
 def _hotspot(rel: str, name: str, start: int, end: int, score: float = 6.0) -> dict:
