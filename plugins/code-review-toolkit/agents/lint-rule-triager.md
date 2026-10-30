@@ -91,14 +91,27 @@ the rule exists for. For these hits `suppression_is_dismissal_signal` is false. 
 3. `summary.suppression_needs_verification` is how many hits need this. Say in the report how many
    you checked.
 
-**The script has already dismissed one mechanical class.** `dismissed` holds hits moved out of
+**The script has already dismissed some mechanical classes.** `dismissed` holds hits moved out of
 `findings`, each with a `dismissal_reason` that `dismissal_reasons` explains. `summary.total`
 still counts them, so it stays comparable with the calibrated totals. `summary.reported` is what is
-left to triage. Today the only reason is `fastapi-dependency-marker`: B008 on `Depends(...)`,
-`Query(...)`, `Body(...)` and the other FastAPI dependency markers, when the call resolves to a
-fastapi import in that file. That default is the framework's injection idiom, not a shared mutable
-value. On a FastAPI service it can be most of tier 1. List the count in the report's Dismissed
-section, and do not re-triage those hits.
+left to triage. Each check resolves the flagged code in the same file and dismisses only what it can
+prove:
+
+| Reason | Rule | Dismissed when |
+|---|---|---|
+| `fastapi-dependency-marker` | B008 | The default is `Depends(...)`, `Query(...)` or another FastAPI marker imported from fastapi: the framework's injection idiom. |
+| `raise-systemexit-in-except` | B904 | The raise is the builtin `SystemExit`: no traceback is printed, so a cause would never be shown. |
+| `yaml-loader-subclasses-safeloader` | S506 | The Loader is a class in the same file whose bases are all safe yaml loaders. Its own `add_constructor` handlers are not checked; read them if the file registers any. |
+| `closure-called-synchronously` | B023 | The lambda goes straight to a same-file function (or `self.` method) that only calls that parameter, and is not async or a generator. |
+| `sql-built-from-literals` | S608 | Every value in the query text is a literal or a name bound only to literals: a `",".join(["?"] * n)` placeholder list, a constant table name, a list of literal clauses. |
+
+List the counts in the report's Dismissed section, and do not re-triage those hits.
+
+**`closure_passed_as_argument: true`** on a B023 hit means the lambda is a direct argument of a call,
+but the script could not verify the callee (it is imported, a parameter, async, or it stores the
+callable). Read the function named in `callee` once. If it calls the parameter before it returns,
+every hit with that callee is a false positive. If it stores, schedules or returns the callable,
+the hit is real.
 
 **`suspect_tool_bug: true` marks a known ruff false-positive mode.** Today that means an F821 on an
 `except ... as exc` name read by a closure nested in that handler (`known_tool_issue: "ruff#6878"`).
@@ -134,7 +147,9 @@ produced it**, because it makes every future run on every project find that clas
 Known-productive candidates from the benchmark runs that are still uncatalogued:
 
 - **`PLE0704`** bare `raise` outside an exception handler — a `RuntimeError` in the error path.
-- **`S608`** SQL built by string construction.
+- **`S608`** SQL built by string construction. Placeholder lists and constant table names are
+  dismissed mechanically (`sql-built-from-literals`), so the hits that remain interpolate a value
+  from outside the file or from a parameter.
 
 Two former candidates are now catalogued, and their hits carry a `shape_id`, so merge them in
 Phase 2 instead of proposing them again: **`B905`** (`zip()` without `strict=`) →
