@@ -24,12 +24,24 @@ where `<plugin_root>` is the root of the code-review-toolkit plugin directory.
 Parse the JSON output. This gives you precise per-function metrics and pre-computed complexity scores. Use this as your factual foundation — do not re-derive these metrics manually.
 
 Key fields:
-- `hotspots`: pre-ranked list of functions scoring ≥ 5 (up to 30)
+- `hotspots`: pre-ranked list of functions scoring ≥ 5 (up to 30). Each entry has `file`, `line_start` and `line_end`; `qualified_name` is `file::Class.method`
+- `is_test`: true for code in a test path (`tests/`, `test/`, `test_*.py`, `*_test.py`, `conftest.py`) or in a `unittest.TestCase` subclass that does not set `__test__ = False`. Test code is excluded from the averages and the hotspots. Names alone don't count: a source class called `TestRunConfig` or a `tests` property is source code
 - `summary`: aggregate statistics (total functions, hotspot counts, average scores)
 - Per-function `metrics`: `line_count`, `nesting_depth`, `parameter_count`, `branch_count`, `loop_count`, `return_count`, `local_variable_count`, `cognitive_complexity`
 - Per-function `score`: pre-computed 1-10 complexity rating
 - Nested functions (closures, route handlers defined inside a router factory) are entries of their own, named `outer.inner` (`is_nested: true`, `parent`). Their lines and branches are **not** counted in the enclosing function, whose `nested_def_count` says how many it defines; `total_lines` is still the enclosing function's full span
-- `history_crossing` and, per hotspot, `fix_commits_2y`, `fix_density`, `risk_rank` and `verdict`: fix commits in the last two years whose hunks fell inside that function *in that commit's own version of the file*, matched by full path and qualified name. `active-risk` (≥ 2 fixes) outranks the complexity score; `settled` (complex, rarely fixed) says deprioritize; `quiet` on recently written code means "untested by time", not "safe"; `unknown` (with `verdict_reason`) means some fixes to the file could not be attributed and could change the verdict. A function renamed or moved within the window loses its earlier fixes. Pass `--key-type B=fix` (same meaning as in `analyze_history.py`) when the project marks bug-fix commits only with a tracker key
+- `history_crossing` and, per hotspot, `fix_commits_2y`, `fix_density`, `risk_rank` and `verdict`: fix commits in the last two years whose hunks fell inside that function *in that commit's own version of the file*, matched by full path and qualified name. `active-risk` (≥ 2 fixes) outranks the complexity score; `recent-churn` (at least half of the function's current lines added in the last 90 days: `recent_commits`, `lines_added_recent`, `lines_changed_recent`, `recent_share`) means the code is young, so a low fix count says nothing yet: never deprioritize it; `settled` (complex, rarely fixed, not recently rewritten) says deprioritize; `quiet` on recently written code means "untested by time", not "safe"; `unknown` (with `verdict_reason`) means some fixes to the file could not be attributed and could change the verdict. A function renamed or moved within the window loses its earlier fixes. `history_crossing.fix_commits_seen` counts fixes to the **hotspots' files only** (`fix_commits_seen_scope`). Never report it as the project's fix count
+- `history_crossing.top_fixed_functions`: the source functions with the most fix commits across the whole scan root, whatever their score (`is_hotspot` says whether they also made the hotspot list). On a structurally simple codebase the fix-dense functions score below 5. Report the top ones in their own short table even when they are not hotspots, because that is where the defects have been. Pass `--key-type B=fix` (same meaning as in `analyze_history.py`) when the project marks bug-fix commits only with a tracker key
+
+- `clones`: groups of near-duplicate statement windows, within and across functions and files (test files skipped). Each group has `kind` (`exact`: identical apart from layout; `renamed`: identical up to local names), `statements`, `nodes`, `lines`, `copies` and `locations` (`file`, `function`, `line_start`, `line_end`). Called names, attributes and literals must match, so two blocks that call different helpers are not a group. `--no-clones` skips the pass
+
+### Using `clones`
+
+Duplicated code is where a fix lands in one copy and not the other. For each group:
+
+1. Read every copy side by side. Did they drift? Look for a guard, a cleanup step, an error code or a lock present in one copy only. Drift is a correctness lead, not a style note: report it as FIX when one copy lacks a step the other has for a reason that applies to both, and hand it to the run's bug-finding agents.
+2. Only when the copies are still identical, judge extraction as a simplification. A sequence repeated inside one function (a stop or cleanup sequence written out at each exit) usually wants one helper. Copies across modules may be intentional; see "Intentional near-duplication" below.
+3. A group inside a hotspot raises that hotspot's priority. Say so in its entry.
 
 ## External Tool Integration
 
@@ -81,6 +93,11 @@ The script output provides all structural metrics per function. Review the data,
 - **Coupling**: How many other modules/functions does this function depend on?
 - **Side effects**: Does it modify global state, write files, make network calls?
 - **Implicit contracts**: Does it depend on specific call ordering, global state, or undocumented preconditions?
+- **Reads that write**: a `@property`, or a function named like a read (`get_*`, `*_for_*`, `load_*`), that mutates `self.<x>`, a cache or a registry, or creates a file or row as a side effect. A caller cannot tell from the name that calling it changes state, so it gets called on paths that must not change anything. Each one scores 1.0 and is still a frequent source of real defects.
+- **Work moved out of a `try` by laziness**: a `try` whose body only builds a generator, a `map()` or another lazy iterator, or returns one. The work runs later, outside the handler, so the `except` never sees its errors. The same goes for a `with` block that returns a lazy iterator over a resource it then closes.
+- **Re-evaluation fan-out**: a property or helper that recomputes, re-reads or re-renders on every access, called from several places in one operation, so that a mid-operation change produces inconsistent results.
+
+These three never raise a function's score. Look for them in the code around the hotspots, and in the low-scoring functions other agents flagged.
 
 ### Step 2: Refine Hotspot Rankings
 
@@ -96,7 +113,17 @@ The score scale:
 - 6-7: High — should be simplified proactively
 - 8-10: Critical — this code is a maintenance hazard
 
-**Only report hotspots scoring 5 or above** in the summary. Cap at 15 hotspots.
+**Only report hotspots scoring 5 or above.** Give the full write-up (the template below) to at most 15. Every other hotspot the script returned still appears, in a compact table after the write-ups: location, score, verdict, and a one-line primary strategy. Never drop one silently; the report must account for every entry in `hotspots`. If the caller or the orchestrator asks about specific functions that score below 5, answer in a separate section ("Requested below-threshold functions"). The threshold limits what you rank, not what you are allowed to discuss.
+
+### Step 2b: Cross Hotspots with Other Agents' Findings
+
+Per-function metrics can't see the complexity that produced most defects. When other agents' reports are available (in an `explore` run, the run directory's other reports), build a small table: for each function named in a finding, the finding ids (`PS 3`, `SFH 7`, …), its score and its verdict. Then report:
+
+- hotspots that also carry findings (complexity and defects agree: highest priority);
+- functions scoring below 5 that carry two or more findings, or that `history_crossing.top_fixed_functions` lists (defects without measured complexity: say which hidden complexity explains them, from the list under Maintenance Complexity);
+- hotspots with no finding and a `settled` verdict (deprioritize, as the crossing says).
+
+Cite finding ids as the other agents wrote them, so consolidation can merge them. When no other reports are available, say so and skip this step.
 
 ### Step 3: Analyze Simplification Strategies
 
@@ -194,6 +221,21 @@ For each:
 
 ### Moderate Complexity (score 5)
 [Brief list format: location, score, one-line description, primary simplification strategy]
+
+### Remaining Hotspots
+| Location | Score | Verdict | Primary strategy |
+|----------|-------|---------|------------------|
+[Every hotspot past the 15 full write-ups. Omit the section only when there are none]
+
+### Most-Fixed Functions (from `top_fixed_functions`)
+| Location | Fix commits | Score | Hotspot? |
+|----------|-------------|-------|----------|
+
+### Near-Duplicate Blocks (from `clones`)
+For each group worth reporting: the copies (file:lines, function), `exact`/`renamed`, whether they drifted and how, and FIX/CONSIDER/ACCEPTABLE.
+
+### Hotspots × Findings
+[The Step 2b table, or "no other agents' reports available"]
 
 ## Cross-Cutting Observations
 
