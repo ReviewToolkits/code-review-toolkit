@@ -27,8 +27,18 @@ Key fields:
 - `internal_graph`: dependency edges between project modules
 - `metrics.fan_in` / `metrics.fan_out`: coupling data per file
 - `cycles`: detected circular dependencies (you assess severity)
+- `import_time_cycles`: the subset of `cycles` whose every edge runs at import time (no
+  `TYPE_CHECKING`-only or lazy edge). These can fail a plain `import`; start severity assessment here
 - `re_exports`: `__init__.py` and `__all__` data
-- `files[].imports[]`: per-file imports with `category`, `is_relative`, `type_checking_only`, and `conditional` classification
+- `files[].imports[]`: per-file imports with `category`, `is_relative`, `type_checking_only`, and `conditional` classification, plus:
+  - `scope` (`module` / `class` / `function`) and `lazy`: a function-level import is lazy unless the
+    module calls that function at import time (`_X = _init()`), in which case it runs on import
+  - `form` (`import` / `from` / `dynamic`) and `dynamic`: literal `importlib.import_module("m")` and
+    `__import__("m")` calls are listed as imports too
+  - `names` is always a list; for `import a.b` it holds the module itself
+- `dynamic_import_sites`: `import_module`/`__import__` calls with a computed name (`file`, `line`,
+  `expression`, `prefix`). They are not graph edges, so a module reached only this way shows fan-in 0
+  — check them before calling such a module orphaned
 - `external_dependencies`: third-party packages and which files use them
 
 ## Analysis Strategy

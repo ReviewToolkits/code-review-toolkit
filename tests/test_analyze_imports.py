@@ -510,5 +510,125 @@ class TestSubmoduleVsBoundName(unittest.TestCase):
         self.assertEqual(mod.detect_cycles(graph, all_files=all_files), [])
 
 
+def _imports(files: dict[str, str], target: str) -> dict:
+    with TempProject(files) as root:
+        return mod.analyze_file(root / target, root, {"pkg"})
+
+
+class TestImportScopeAndLaziness(unittest.TestCase):
+    """A function-level import does not run at import time -- unless the module
+    calls that function at import time."""
+
+    def test_module_class_and_function_scopes(self):
+        src = (
+            "import os\n"
+            "class C:\n    import json\n"
+            "def f():\n    import pkg.b\n    return pkg.b\n"
+        )
+        result = _imports({"pkg/__init__.py": "", "pkg/a.py": src}, "pkg/a.py")
+        by_module = {i["module"]: i for i in result["imports"]}
+        self.assertEqual(
+            (by_module["os"]["scope"], by_module["os"]["lazy"]), ("module", False)
+        )
+        self.assertEqual(
+            (by_module["json"]["scope"], by_module["json"]["lazy"]), ("class", False)
+        )
+        self.assertEqual(
+            (by_module["pkg.b"]["scope"], by_module["pkg.b"]["lazy"]),
+            ("function", True),
+        )
+
+    def test_function_called_at_import_time_is_not_lazy(self):
+        src = (
+            "def _init():\n    from pkg.config import settings\n    return settings\n"
+            "_SINGLETON = _init()\n"
+        )
+        result = _imports({"pkg/__init__.py": "", "pkg/log.py": src}, "pkg/log.py")
+        (imp,) = result["imports"]
+        self.assertEqual((imp["scope"], imp["lazy"]), ("function", False))
+
+    def test_import_time_cycles_exclude_lazy_edges(self):
+        files = {
+            "pkg/__init__.py": "",
+            "pkg/a.py": "from pkg import b\n",
+            "pkg/b.py": "def f():\n    from pkg import a\n    return a\n",
+        }
+        with TempProject(files) as root:
+            paths = sorted(mod.discover_python_files(root))
+            analyses = [mod.analyze_file(p, root, {"pkg"}) for p in paths]
+            names = [a["file"] for a in analyses]
+            graph = mod.build_internal_graph(analyses)
+        self.assertEqual(len(mod.detect_cycles(graph, all_files=names)), 1)
+        self.assertEqual(
+            mod.detect_cycles(graph, all_files=names, include_lazy=False), []
+        )
+
+
+class TestDynamicImports(unittest.TestCase):
+    def test_literal_import_module_and_dunder_import_are_edges(self):
+        src = (
+            "import importlib\n"
+            "def load():\n"
+            "    a = importlib.import_module('pkg.plugins.alpha')\n"
+            "    b = __import__('pkg.plugins.beta')\n"
+            "    return a, b\n"
+        )
+        result = _imports({"pkg/__init__.py": "", "pkg/f.py": src}, "pkg/f.py")
+        dynamic = {i["module"]: i for i in result["imports"] if i["dynamic"]}
+        self.assertEqual(set(dynamic), {"pkg.plugins.alpha", "pkg.plugins.beta"})
+        alpha = dynamic["pkg.plugins.alpha"]
+        self.assertEqual(alpha["category"], "internal")
+        self.assertTrue(alpha["lazy"])
+        self.assertEqual(result["dynamic_import_sites"], [])
+
+    def test_from_importlib_import_module_is_recognized(self):
+        src = "from importlib import import_module\nm = import_module('json')\n"
+        result = _imports({"pkg/__init__.py": "", "pkg/f.py": src}, "pkg/f.py")
+        self.assertIn("json", [i["module"] for i in result["imports"] if i["dynamic"]])
+
+    def test_computed_name_is_reported_as_a_site(self):
+        src = (
+            "import importlib\n"
+            "def load(kind):\n"
+            "    return importlib.import_module(f'pkg.plugins.{kind}')\n"
+        )
+        result = _imports({"pkg/__init__.py": "", "pkg/f.py": src}, "pkg/f.py")
+        (site,) = result["dynamic_import_sites"]
+        self.assertEqual(site["prefix"], "pkg.plugins.")
+        self.assertEqual(site["call"], "importlib.import_module")
+        self.assertEqual(site["line"], 3)
+        self.assertFalse(any(i["dynamic"] for i in result["imports"]))
+
+    def test_non_literal_argument_is_a_site_never_an_edge(self):
+        src = "def f(loader, spec):\n    return loader.import_module(spec)\n"
+        result = _imports({"pkg/__init__.py": "", "pkg/f.py": src}, "pkg/f.py")
+        self.assertEqual(result["imports"], [])
+        self.assertEqual(len(result["dynamic_import_sites"]), 1)
+
+
+class TestPlainImportNames(unittest.TestCase):
+    def test_plain_import_names_is_a_list(self):
+        # `names` used to be null for `import a.b`, which crashed consumers
+        # that iterate it.
+        src = "import pkg.sub\nimport pkg.sub as s\n"
+        result = _imports(
+            {"pkg/__init__.py": "", "pkg/sub.py": "", "pkg/a.py": src}, "pkg/a.py"
+        )
+        self.assertEqual(
+            [i["names"] for i in result["imports"]],
+            [
+                [{"name": "pkg.sub", "alias": None}],
+                [{"name": "pkg.sub", "alias": "s"}],
+            ],
+        )
+
+    def test_plain_import_names_do_not_resolve_as_submodules(self):
+        # `import pkg` stays an edge to pkg/__init__.py even when a submodule
+        # pkg/pkg.py exists.
+        index = {"pkg": "pkg/__init__.py", "pkg.pkg": "pkg/pkg.py"}
+        edge = {"target": "pkg", "names": [{"name": "pkg"}], "form": "import"}
+        self.assertEqual(mod.resolve_edge_targets(edge, index), {"pkg/__init__.py"})
+
+
 if __name__ == "__main__":
     unittest.main()

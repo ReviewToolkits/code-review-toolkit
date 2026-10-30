@@ -390,16 +390,96 @@ def analyze_file(
                     if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
                 ]
 
+    scopes = _scope_map(tree)
+    import_time_calls = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and scopes.get(id(node), ("module", None))[0] != "function"
+    }
+
+    def _timing(node: ast.AST) -> dict:
+        """`scope` of an import and whether it is `lazy` (deferred to a call).
+
+        An import inside a function runs when the function is called, not when
+        the module is imported -- unless the module itself calls that function
+        at import time (`_STATE = _init()`, where `_init` holds a "lazy"
+        `from pkg.config import settings`). Such an edge can close an import
+        cycle that fails a plain `import` while looking function-level.
+        """
+        scope, top_fn = scopes.get(id(node), ("module", None))
+        lazy = scope == "function" and top_fn not in import_time_calls
+        return {"scope": scope, "lazy": lazy}
+
     # Extract imports.
+    dynamic_sites: list[dict] = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
+        if isinstance(node, ast.Call):
+            dynamic = _dynamic_import(node)
+            if dynamic is None:
+                continue
+            call_name, arg = dynamic
+            literal = (
+                arg.value
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+                else None
+            )
+            if not literal:
+                dynamic_sites.append(
+                    {
+                        "line": node.lineno,
+                        "call": call_name,
+                        "expression": ast.unparse(arg) if arg is not None else None,
+                        "prefix": _constant_prefix(arg),
+                        **_timing(node),
+                    }
+                )
+                continue
+            level = len(literal) - len(literal.lstrip("."))
+            module_str = literal.lstrip(".")
+            resolved = (
+                _resolve_relative_import(
+                    filepath, project_root, level, module_str or None
+                )
+                if level
+                else None
+            )
+            top = (
+                (resolved or module_str).split(".")[0]
+                if (resolved or module_str)
+                else None
+            )
+            result["imports"].append(
+                {
+                    "module": module_str,
+                    "names": [{"name": literal, "alias": None}],
+                    "alias": None,
+                    "top_level": top,
+                    "category": "internal"
+                    if level
+                    else _classify(top, project_packages),
+                    "line": node.lineno,
+                    "is_relative": bool(level),
+                    "relative_level": level,
+                    "resolved_module": resolved,
+                    "type_checking_only": _in_type_checking(node.lineno),
+                    "conditional": _is_conditional(node.lineno),
+                    "dynamic": True,
+                    "form": "dynamic",
+                    **_timing(node),
+                }
+            )
+        elif isinstance(node, ast.Import):
             for alias in node.names:
                 top = alias.name.split(".")[0]
                 category = _classify(top, project_packages)
                 result["imports"].append(
                     {
                         "module": alias.name,
-                        "names": None,
+                        # `import a.b` binds the module itself: listing it keeps
+                        # `names` a list for every entry (it used to be null).
+                        "names": [{"name": alias.name, "alias": alias.asname}],
                         "alias": alias.asname,
                         "top_level": top,
                         "category": category,
@@ -408,6 +488,9 @@ def analyze_file(
                         "relative_level": 0,
                         "type_checking_only": _in_type_checking(node.lineno),
                         "conditional": _is_conditional(node.lineno),
+                        "dynamic": False,
+                        "form": "import",
+                        **_timing(node),
                     }
                 )
         elif isinstance(node, ast.ImportFrom):
@@ -445,10 +528,76 @@ def analyze_file(
                     ),
                     "type_checking_only": _in_type_checking(node.lineno),
                     "conditional": _is_conditional(node.lineno),
+                    "dynamic": False,
+                    "form": "from",
+                    **_timing(node),
                 }
             )
 
+    result["dynamic_import_sites"] = dynamic_sites
     return result
+
+
+def _scope_map(tree: ast.AST) -> dict[int, tuple[str, str | None]]:
+    """Map ``id(node)`` to ``(scope, enclosing module-level function)``.
+
+    *scope* is ``module``, ``class`` (a class body runs at import time) or
+    ``function``. The function name is the OUTERMOST module-level ``def``
+    enclosing the node, so a module-level call to it can be recognized.
+    """
+    out: dict[int, tuple[str, str | None]] = {}
+
+    def visit(node: ast.AST, scope: str, top_fn: str | None) -> None:
+        for child in ast.iter_child_nodes(node):
+            out[id(child)] = (scope, top_fn)
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                name = getattr(child, "name", None) if scope == "module" else top_fn
+                visit(child, "function", name)
+            elif isinstance(child, ast.ClassDef):
+                visit(child, "function" if scope == "function" else "class", top_fn)
+            else:
+                visit(child, scope, top_fn)
+
+    visit(tree, "module", None)
+    return out
+
+
+def _dynamic_import(node: ast.Call) -> tuple[str, ast.expr | None] | None:
+    """``(call name, module argument)`` for ``importlib.import_module(...)`` or
+    ``__import__(...)``, else None."""
+    func = node.func
+    if isinstance(func, ast.Name) and func.id in ("__import__", "import_module"):
+        name = func.id
+    elif isinstance(func, ast.Attribute) and func.attr == "import_module":
+        name = (
+            f"{func.value.id}.import_module"
+            if isinstance(func.value, ast.Name)
+            else "import_module"
+        )
+    else:
+        return None
+    arg = node.args[0] if node.args else None
+    if arg is None:
+        for kw in node.keywords:
+            if kw.arg == "name":
+                arg = kw.value
+    return name, arg
+
+
+def _constant_prefix(arg: ast.expr | None) -> str | None:
+    """The literal leading part of a computed module name (`f"pkg.{x}"` -> `pkg.`)."""
+    if isinstance(arg, ast.JoinedStr) and arg.values:
+        first = arg.values[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            return first.value
+    if (
+        isinstance(arg, ast.BinOp)
+        and isinstance(arg.op, ast.Add)
+        and isinstance(arg.left, ast.Constant)
+        and isinstance(arg.left.value, str)
+    ):
+        return arg.left.value
+    return None
 
 
 def identify_project_packages(root: Path, scan_root: Path | None = None) -> set[str]:
@@ -501,6 +650,10 @@ def build_internal_graph(
                     "line": imp["line"],
                     "type_checking_only": imp["type_checking_only"],
                     "conditional": imp["conditional"],
+                    "scope": imp.get("scope", "module"),
+                    "lazy": imp.get("lazy", False),
+                    "dynamic": imp.get("dynamic", False),
+                    "form": imp.get("form", "from"),
                 }
             )
         if edges:
@@ -521,7 +674,13 @@ def resolve_edge_targets(edge: dict, index: dict[str, str]) -> set[str]:
     so the dependency is on the package and is order-sensitive.
     """
     target = edge.get("target") or ""
-    names = [n.get("name") for n in (edge.get("names") or []) if n.get("name")]
+    # Only `from X import name` can bind a submodule; for `import a.b` and a
+    # dynamic import, `names` just repeats the module itself.
+    names = (
+        [n.get("name") for n in (edge.get("names") or []) if n.get("name")]
+        if edge.get("form", "from") == "from"
+        else []
+    )
     submodules = {
         index[f"{target}.{name}"] for name in names if f"{target}.{name}" in index
     }
@@ -580,6 +739,7 @@ def detect_cycles(
     graph: dict[str, list[dict]],
     include_type_checking: bool = False,
     all_files: list[str] | None = None,
+    include_lazy: bool = True,
 ) -> list[list[str]]:
     """Detect circular dependencies using DFS.
 
@@ -590,12 +750,18 @@ def detect_cycles(
     through such edges is not an import cycle -- avoiding it is precisely why
     the guard is there. Those edges are excluded by default; the flag keeps the
     type-time graph available for callers that want it.
+
+    ``include_lazy=False`` also drops function-level imports that do not run at
+    import time, leaving the cycles that can fail a plain ``import``.
     """
     # Build a simplified adjacency list: file -> set of live edges.
     adj: dict[str, list[dict]] = {}
     for source, edges in graph.items():
         adj[source] = [
-            e for e in edges if include_type_checking or not e.get("type_checking_only")
+            e
+            for e in edges
+            if (include_type_checking or not e.get("type_checking_only"))
+            and (include_lazy or not e.get("lazy"))
         ]
 
     # Collect all known file-stem identifiers so we can map dotted targets
@@ -689,6 +855,14 @@ def main() -> None:
     internal_graph = build_internal_graph(file_analyses)
     metrics = compute_metrics(internal_graph, all_file_paths)
     cycles = detect_cycles(internal_graph, all_files=all_file_paths)
+    import_time_cycles = detect_cycles(
+        internal_graph, all_files=all_file_paths, include_lazy=False
+    )
+    dynamic_import_sites = [
+        {"file": fa["file"], **site}
+        for fa in file_analyses
+        for site in fa.get("dynamic_import_sites", [])
+    ]
 
     # Collect external dependencies.
     external: dict[str, list[str]] = {}
@@ -784,6 +958,15 @@ def main() -> None:
         },
         "metrics": metrics,
         "cycles": cycles,
+        # The subset of `cycles` whose every edge runs at import time (no
+        # TYPE_CHECKING-only or lazy function-level edge): these can fail a
+        # plain `import`; the rest only bite when the lazy import executes.
+        "import_time_cycles": import_time_cycles,
+        # importlib.import_module / __import__ calls whose module name is
+        # computed. Literal ones are ordinary `imports` entries with
+        # `dynamic: true`; these are not edges, so modules reached only this
+        # way show fan-in 0.
+        "dynamic_import_sites": dynamic_import_sites,
         "re_exports": re_exports,
     }
 
