@@ -718,6 +718,78 @@ class TestDeriveConfig(unittest.TestCase):
         self.assertIsNone(mod.ignore_missing_imports_scope(None))
 
 
+class TestDependencyDrift(unittest.TestCase):
+    """A call an installed dependency rejects is tagged with that dependency,
+    so it does not sit in the same bucket as stub noise."""
+
+    _OUT = (
+        'pkg/m.py:3: error: Unexpected keyword argument "retries" for "Client"  '
+        "[call-arg]\n"
+        'pkg/m.py:3: note: "Client" defined in "extlib.client"\n'
+        'pkg/m.py:5: error: Signature of "f" incompatible with supertype '
+        '"bounded.base.Base"  [override]\n'
+        'pkg/m.py:7: error: Module "winreg" has no attribute "QueryThing"  '
+        "[attr-defined]\n"
+        'pkg/m.py:9: error: Signature of "g" incompatible with supertype '
+        '"pkg.base.Base"  [override]\n'
+        "pkg/m.py:11: error: Incompatible return value  [return-value]\n"
+        'pkg/m.py:11: note: "h" defined in "extlib.other"\n'
+        'pkg/m.py:13: error: Module "loose" has no attribute "gone"  '
+        "[attr-defined]\n"
+        "Found 6 errors in 1 file (checked 2 source files)\n"
+    )
+
+    def test_third_party_callees_are_tagged_with_their_declaration(self):
+        files = {
+            **_PKG,
+            "pkg/base.py": "class Base: ...\n",
+            "setup.py": (
+                "from setuptools import setup\n"
+                "setup(install_requires=['extlib[extra]>=1.0', "
+                "'bounded>=2,<3'])\n"
+            ),
+        }
+        result, _ = _run(files, {"": self._OUT})
+        tagged = {
+            f["line"]: f["dependency"] for f in result["dependency_drift_findings"]
+        }
+        # stdlib (7), the project's own package (9) and a code outside the
+        # drift set (11) are not tagged.
+        self.assertEqual(sorted(tagged), [3, 5, 13])
+        self.assertEqual(tagged[3]["module"], "extlib.client")
+        self.assertEqual(tagged[3]["declared"], "extlib[extra]>=1.0")
+        self.assertIs(tagged[3]["upper_bounded"], False)
+        self.assertIs(tagged[5]["upper_bounded"], True)
+        self.assertIsNone(tagged[13]["declared"])
+        self.assertIsNone(tagged[13]["upper_bounded"])
+        summary = result["summary"]
+        self.assertEqual(summary["dependency_drift_candidates"], 3)
+        self.assertEqual(summary["dependency_drift_unbounded"], 1)
+        # Tagging adds a field; the finding stays in `findings`.
+        self.assertIn("dependency", result["findings"][0])
+
+    def test_declared_dependencies_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "requirements-dev.txt").write_text(
+                "# comment\n-r base.txt\nSome_Lib==1.2 ; python_version>'3'\n"
+            )
+            (root / "setup.cfg").write_text(
+                "[options]\ninstall_requires =\n    other.pkg~=3.1\n"
+            )
+            declared = mod.declared_dependencies(root)
+        self.assertEqual(
+            declared,
+            {
+                "some-lib": "Some_Lib==1.2 ; python_version>'3'",
+                "other-pkg": "other.pkg~=3.1",
+            },
+        )
+        self.assertTrue(mod._upper_bounded(declared["some-lib"]))
+        self.assertTrue(mod._upper_bounded(declared["other-pkg"]))
+        self.assertFalse(mod._upper_bounded("lib>=1,!=1.5"))
+
+
 class TestConfigDiscovery(unittest.TestCase):
     def test_pyproject_without_a_mypy_section_is_not_a_config(self):
         import tempfile

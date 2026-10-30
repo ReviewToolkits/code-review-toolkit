@@ -589,6 +589,212 @@ def mypy_python_info(mypy_bin: str, config: str | None) -> dict:
     return {**info, "source": source, "reason": None}
 
 
+# Codes where a third-party callee or base class rejecting the call can mean
+# the installed version of a dependency changed under the project.
+_DRIFT_CODES = frozenset(
+    {
+        "call-arg",
+        "call-overload",
+        "arg-type",
+        "attr-defined",
+        "override",
+        "misc",
+        "valid-type",
+        "type-var",
+    }
+)
+_DEFINED_IN = re.compile(r'defined in "([\w.]+)"')
+_MODULE_ATTR = re.compile(r'^Module "([\w.]+)" has no attribute')
+_SUPERTYPE = re.compile(r'supertype "([\w.]+)\.\w+"')
+_SITE_DIR = re.compile(
+    r"[/\\](?:site|dist)-packages[/\\](.+?)(?:[/\\]__init__)?\.pyi?$"
+)
+_REQUIREMENT = re.compile(
+    r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*([^;#]*)"
+)
+
+_DIST_PROBE = (
+    "import json, sys\n"
+    "import importlib.metadata as m\n"
+    "pd = m.packages_distributions()\n"
+    "out = {}\n"
+    "for mod in sys.argv[1:]:\n"
+    "    dists = []\n"
+    "    for d in pd.get(mod, []):\n"
+    "        try:\n"
+    "            dists.append([d, m.version(d)])\n"
+    "        except Exception:\n"
+    "            dists.append([d, None])\n"
+    "    out[mod] = dists\n"
+    "print(json.dumps(out))\n"
+)
+
+
+def _normalize_dist(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def declared_dependencies(project_root: Path) -> dict[str, str]:
+    """Normalized distribution name -> the requirement string that declares it.
+
+    Read from `[project]` (dependencies and optional-dependencies), setup.cfg
+    `install_requires`, a literal `install_requires`/`extras_require` in
+    setup.py, and requirements*.txt at the root. Best effort: what is not
+    found is reported as undeclared, never guessed.
+    """
+    specs: list[str] = []
+    pyproject = project_root / "pyproject.toml"
+    data = _load_toml(pyproject) if pyproject.is_file() else None
+    if data:
+        project = data.get("project", {})
+        specs += [x for x in project.get("dependencies", []) if isinstance(x, str)]
+        for group in project.get("optional-dependencies", {}).values():
+            specs += [x for x in group if isinstance(x, str)]
+    setup_cfg = project_root / "setup.cfg"
+    if setup_cfg.is_file():
+        parser = configparser.RawConfigParser()
+        try:
+            parser.read(setup_cfg, encoding="utf-8")
+            specs += parser.get("options", "install_requires", fallback="").splitlines()
+        except (OSError, configparser.Error):
+            pass
+    tree = parse_source(project_root / "setup.py")
+    if tree is not None:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.keyword) or node.arg not in (
+                "install_requires",
+                "extras_require",
+            ):
+                continue
+            for const in ast.walk(node.value):
+                if isinstance(const, ast.Constant) and isinstance(const.value, str):
+                    specs.append(const.value)
+    for req in sorted(project_root.glob("requirements*.txt")):
+        try:
+            specs += req.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+    declared: dict[str, str] = {}
+    for spec in specs:
+        m = _REQUIREMENT.match(spec)
+        if m and not spec.lstrip().startswith(("#", "-")):
+            declared.setdefault(_normalize_dist(m.group(1)), spec.strip())
+    return declared
+
+
+def _upper_bounded(spec: str) -> bool:
+    m = _REQUIREMENT.match(spec)
+    rest = m.group(2) if m else spec
+    return bool(re.search(r"<|==|~=", rest))
+
+
+def _third_party_module(finding: dict, own: set[str]) -> str | None:
+    """The non-project, non-stdlib module a finding's callee or base lives in."""
+    candidates: list[str] = []
+    for note in finding["notes"]:
+        m = _DEFINED_IN.search(note["message"])
+        if m:
+            candidates.append(m.group(1))
+        m = _SITE_DIR.search(note["file"])
+        if m:
+            candidates.append(re.sub(r"[/\\]", ".", m.group(1)))
+    for pattern in (_MODULE_ATTR, _SUPERTYPE):
+        m = pattern.search(finding["message"])
+        if m:
+            candidates.append(m.group(1))
+    stdlib = set(getattr(sys, "stdlib_module_names", ())) | {
+        "builtins",
+        "_typeshed",
+    }
+    for module in candidates:
+        top = module.split(".")[0]
+        if top and top not in own and top not in stdlib:
+            return module
+    return None
+
+
+def _distributions(python: str | None, modules: list[str]) -> dict[str, list]:
+    if not python or not modules:
+        return {}
+    try:
+        out = subprocess.run(
+            [python, "-I", "-B", "-c", _DIST_PROBE, *modules],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        return json.loads(out.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {}
+
+
+def tag_dependency_drift(
+    findings: list[dict],
+    project_root: Path,
+    own_packages: set[str],
+    python: str | None,
+) -> list[dict]:
+    """Tag findings where a third-party callee or base rejects the project's code.
+
+    A `call-arg` against a class defined in an installed dependency is either
+    a project bug or the dependency changing under the project; when the
+    dependency is declared without an upper bound, the second is likely and
+    is the more valuable finding. Each tagged finding gets `dependency`:
+    module, distribution, installed version, the declared requirement (null
+    if undeclared), and whether it is upper-bounded. Returns the tagged ones.
+    """
+    hits = [
+        (f, mod)
+        for f in findings
+        if f["code"] in _DRIFT_CODES
+        and (mod := _third_party_module(f, own_packages)) is not None
+    ]
+    if not hits:
+        return []
+    tops = sorted({mod.split(".")[0] for _, mod in hits})
+    dists = _distributions(python, tops)
+    declared = declared_dependencies(project_root)
+    tagged = []
+    for f, module in hits:
+        top = module.split(".")[0]
+        installed = dists.get(top) or []
+        names = [d[0] for d in installed] or [top]
+        spec = next(
+            (
+                declared[_normalize_dist(n)]
+                for n in names
+                if _normalize_dist(n) in declared
+            ),
+            None,
+        )
+        f["dependency"] = {
+            "module": module,
+            "distribution": installed[0][0] if installed else None,
+            "installed_version": installed[0][1] if installed else None,
+            "declared": spec,
+            "upper_bounded": None if spec is None else _upper_bounded(spec),
+        }
+        tagged.append(f)
+    return tagged
+
+
+def _own_packages(project_root: Path, scan_root: Path) -> set[str]:
+    """Top-level import names that belong to the project itself."""
+    own = {scan_root.name}
+    for base in (project_root, project_root / "src"):
+        try:
+            entries = list(base.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.is_dir() and (entry / "__init__.py").is_file():
+                own.add(entry.name)
+            elif entry.suffix == ".py":
+                own.add(entry.stem)
+    return own
+
+
 def _count_untyped_defs(files: list[Path]) -> int:
     """Functions with no parameter or return annotation (mypy's "untyped")."""
     count = 0
@@ -945,6 +1151,13 @@ def _analyze_with_cache(
         status = "FAILED"
         failure_reason = parse_mismatch
 
+    drift = tag_dependency_drift(
+        findings,
+        Path(envelope["project_root"]),
+        _own_packages(Path(envelope["project_root"]), Path(envelope["scan_root"])),
+        (mypy_python or {}).get("executable"),
+    )
+
     by_code: dict[str, int] = {}
     for f in findings:
         by_code[f["code"] or "(none)"] = by_code.get(f["code"] or "(none)", 0) + 1
@@ -982,6 +1195,14 @@ def _analyze_with_cache(
             ),
             "other": sum(1 for f in findings if f["kind"] == "other"),
             # Root causes are closer to lines than to findings: see line_groups.
+            # Findings where an installed dependency's callee or base class
+            # rejects the project's code -- see dependency_drift_findings.
+            "dependency_drift_candidates": len(drift),
+            # ... of which the dependency is declared without an upper bound,
+            # so the installed version can have moved past what the code used.
+            "dependency_drift_unbounded": sum(
+                1 for f in drift if f["dependency"]["upper_bounded"] is False
+            ),
             "distinct_lines": len({(f["file"], f["line"]) for f in findings}),
             "defect_lines": len(
                 {(f["file"], f["line"]) for f in findings if f["kind"] == "defect"}
@@ -1043,6 +1264,7 @@ def _analyze_with_cache(
         },
         "findings": findings,
         "line_groups": _line_groups(findings),
+        "dependency_drift_findings": drift,
         "phantom_import_findings": phantom_imports or [],
         "unreachable_findings": unreachable or [],
         "stale_ignore_findings": stale_ignores or [],
