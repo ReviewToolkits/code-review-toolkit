@@ -1026,6 +1026,68 @@ class TestBlockingUnderLock(unittest.TestCase):
         self.assertEqual(len(found), 1)
 
 
+class TestBlockingLowSignal(unittest.TestCase):
+    shape = "blocking-call-under-lock"
+
+    _FILE_IO = """
+    import threading
+    lock = threading.Lock()
+
+    def save(path, text):
+        with lock:
+            with open(path, "w") as fh:
+                fh.write(text)
+    """
+
+    def test_file_io_under_lock_is_summarized_not_reported(self):
+        result = scan_project({"pkg/mod.py": self._FILE_IO})
+        self.assertEqual(of(result["findings"], self.shape), [])
+        low = result["summary"]["blocking_low_signal"]
+        self.assertEqual(low["reported_as"], "summary")
+        self.assertEqual(low["sites"], 1)
+        self.assertEqual(low["by_lock"][0]["lock"], "lock")
+        self.assertEqual(low["by_lock"][0]["by_category"], {"file-io": 1})
+
+    def test_all_blocking_reports_each_one(self):
+        result = scan_project({"pkg/mod.py": self._FILE_IO}, all_blocking=True)
+        self.assertEqual(len(of(result["findings"], self.shape)), 1)
+        low = result["summary"]["blocking_low_signal"]
+        self.assertEqual((low["reported_as"], low["sites"]), ("findings", None))
+
+    def test_worst_category_wins_through_a_call(self):
+        src = """
+        import threading, json, requests
+        lock = threading.Lock()
+
+        def sync(path):
+            with open(path) as fh:
+                cfg = json.load(fh)
+            return requests.get(cfg["url"])
+
+        def refresh(path):
+            with lock:
+                return sync(path)
+        """
+        found = of(scan(src), self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertIn("network", found[0]["message"])
+
+    def test_designated_call_that_also_blocks_is_one_finding(self):
+        src = """
+        import threading, time
+        lock = threading.Lock()
+
+        def embed_many(items):
+            time.sleep(1)
+
+        def job(items):
+            with lock:
+                embed_many(items)
+        """
+        found = of(scan(src, blocking=["embed_many"]), self.shape)
+        self.assertEqual(len(found), 1)
+
+
 class TestAwaitUnderLock(unittest.TestCase):
     shape = "await-while-holding-thread-lock"
 

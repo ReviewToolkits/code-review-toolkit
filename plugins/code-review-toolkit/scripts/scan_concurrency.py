@@ -45,7 +45,11 @@ Confidence levels:
 
 Usage:
     python scan_concurrency.py [path] [--max-files N] [--check ID[,ID...]]
-        [--exclude PAT[,PAT...]] [--blocking NAME[,NAME...]]
+        [--exclude PAT[,PAT...]] [--blocking NAME[,NAME...]] [--all-blocking]
+
+``--all-blocking`` reports every file-I/O and pipe wait under a lock as a
+finding; by default they are summarized per lock in
+``summary.blocking_low_signal``, because they are mostly by design.
 """
 
 from __future__ import annotations
@@ -2612,10 +2616,49 @@ def _check_conditions(p: Project, s: Summaries) -> list[dict]:
     return out
 
 
-def _check_blocking_under_lock(p: Project, s: Summaries) -> list[dict]:
+# Worst first: a call that reaches both a sleep and a file read is reported as the sleep.
+_BLOCKING_ORDER = (
+    "sleep",
+    "network",
+    "subprocess",
+    "thread-wait",
+    "custom",
+    "ipc",
+    "file-io",
+)
+# Categories whose hits under a lock are mostly by design (one writer per file, one
+# request per pipe): summarized per lock unless --all-blocking asks for each one.
+_LOW_SIGNAL_BLOCKING = frozenset({"file-io", "ipc"})
+
+
+def _check_blocking_under_lock(
+    p: Project,
+    s: Summaries,
+    low_signal: list[dict] | None = None,
+) -> list[dict]:
+    """blocking-call-under-lock.
+
+    With *low_signal* given, file-I/O and pipe hits go there (for the per-lock
+    summary) instead of becoming findings.
+    """
     out: list[dict] = []
+
+    def emit(finding: dict, category: str, lock_key: str, leaf: str) -> None:
+        if low_signal is not None and category in _LOW_SIGNAL_BLOCKING:
+            low_signal.append(
+                {
+                    "lock": lock_key.split(":", 1)[-1],
+                    "category": category,
+                    "site": f"{finding['file']}:{finding['line']}",
+                    "leaf": leaf,
+                }
+            )
+        else:
+            out.append(finding)
+
     for func in p.funcs.values():
         entry = s.entry_held.get(func.key, frozenset())
+        direct_nodes = {id(node) for _c, _n, node, _h in func.direct_blocking}
         for category, name, node, held in func.direct_blocking:
             thread_held = [h for h in held if not h.is_async]
             if not thread_held and not entry:
@@ -2626,7 +2669,8 @@ def _check_blocking_under_lock(p: Project, s: Summaries) -> list[dict]:
                 if thread_held
                 else f"{min(entry).split(':', 1)[-1]} (held by every caller)"
             )
-            out.append(
+            lock_key = thread_held[0].key if thread_held else min(entry)
+            emit(
                 _finding(
                     "blocking-call-under-lock",
                     severity,
@@ -2637,40 +2681,72 @@ def _check_blocking_under_lock(p: Project, s: Summaries) -> list[dict]:
                     f"the lock waits for it",
                     "move the slow work out of the critical section (compute, then lock and "
                     "publish), or document why the lock must cover it",
-                )
+                ),
+                category,
+                lock_key,
+                f"{func.qualname}: {name}(...)",
             )
         for call in func.calls:
             thread_held = [h for h in call.held if not h.is_async]
-            if not thread_held:
-                continue
+            if not thread_held or id(call.node) in direct_nodes:
+                continue  # a call that is itself designated slow is reported once
             for callee, strong in call.callees:
                 if callee not in s.blocks or p.funcs[callee].is_async:
                     continue
-                for category, (chain, cstrong) in sorted(s.blocks[callee].items()):
-                    if category not in _BLOCKING_CATEGORIES:
-                        continue
-                    severity, confidence, label = _CATEGORY[category]
-                    confidence = _lower(
-                        confidence
-                    )  # through a call: one more hop to verify
-                    if not (strong and cstrong):
-                        confidence = _lower(confidence)
-                    step = _call_step(func, call, strong)
-                    out.append(
-                        _finding(
-                            "blocking-call-under-lock",
-                            severity,
-                            confidence,
-                            func,
-                            call.node,
-                            f"{_text(call.node.func)}(...) {label} (via {len(chain)} call"
-                            f"{'s' if len(chain) > 1 else ''}) while holding {thread_held[0].text}",
-                            "move the slow work out of the critical section, or document why the "
-                            "lock must cover it",
-                            [step, *chain],
-                        )
-                    )
-                    break  # one finding per call site: the worst category first
+                blocks = s.blocks[callee]
+                category = next((c for c in _BLOCKING_ORDER if c in blocks), None)
+                if category is None:
+                    continue
+                chain, cstrong = blocks[category]
+                severity, confidence, label = _CATEGORY[category]
+                confidence = _lower(
+                    confidence
+                )  # through a call: one more hop to verify
+                if not (strong and cstrong):
+                    confidence = _lower(confidence)
+                step = _call_step(func, call, strong)
+                emit(
+                    _finding(
+                        "blocking-call-under-lock",
+                        severity,
+                        confidence,
+                        func,
+                        call.node,
+                        f"{_text(call.node.func)}(...) {label} (via {len(chain)} call"
+                        f"{'s' if len(chain) > 1 else ''}) while holding {thread_held[0].text}",
+                        "move the slow work out of the critical section, or document why the "
+                        "lock must cover it",
+                        [step, *chain],
+                    ),
+                    category,
+                    thread_held[0].key,
+                    f"{chain[-1].func}: {chain[-1].text}",
+                )
+    return out
+
+
+def _summarize_low_signal(low_signal: list[dict]) -> list[dict]:
+    """Group summarized blocking hits by lock, then by the leaf they end in."""
+    by_lock: dict[str, list[dict]] = {}
+    for hit in low_signal:
+        by_lock.setdefault(hit["lock"], []).append(hit)
+    out: list[dict] = []
+    for lock, hits in by_lock.items():
+        categories: dict[str, int] = {}
+        leaves: dict[str, int] = {}
+        for hit in hits:
+            categories[hit["category"]] = categories.get(hit["category"], 0) + 1
+            leaves[hit["leaf"]] = leaves.get(hit["leaf"], 0) + 1
+        out.append(
+            {
+                "lock": lock,
+                "sites": len(hits),
+                "by_category": dict(sorted(categories.items())),
+                "leaves": dict(sorted(leaves.items(), key=lambda kv: (-kv[1], kv[0]))),
+                "examples": sorted({h["site"] for h in hits})[:5],
+            }
+        )
+    out.sort(key=lambda g: (-g["sites"], g["lock"]))
     return out
 
 
@@ -2886,8 +2962,13 @@ def analyze(
     checks: list[str] | None = None,
     exclude: list[str] | None = None,
     blocking: list[str] | None = None,
+    all_blocking: bool = False,
 ) -> dict:
-    """Scan *target* (a directory or a file) for concurrency defects."""
+    """Scan *target* (a directory or a file) for concurrency defects.
+
+    File-I/O and pipe waits under a lock are summarized per lock in
+    ``summary["blocking_low_signal"]`` unless *all_blocking* reports each one.
+    """
     resolved = Path(target).resolve()
     project_root = find_project_root(resolved)
     scan_root = resolved
@@ -2906,6 +2987,7 @@ def analyze(
     selected = set(checks or _CHECKS)
 
     findings: list[dict] = []
+    low_signal: list[dict] = []
     guard_findings, guards = _check_guards(project, summaries)
     if "unguarded-access-to-lock-guarded-state" in selected:
         findings.extend(guard_findings)
@@ -2921,7 +3003,7 @@ def analyze(
             project, summaries
         ),
         "blocking-call-under-lock": lambda: _check_blocking_under_lock(
-            project, summaries
+            project, summaries, None if all_blocking else low_signal
         ),
         "await-while-holding-thread-lock": lambda: _check_await_under_lock(project),
         "transitive-blocking-call-in-async": lambda: (
@@ -3003,6 +3085,13 @@ def analyze(
         ),
         "guards_inferred": len(guards),
         "slow_locks": sorted(k.split(":", 1)[-1] for k in summaries.slow_locks),
+        # File I/O and pipe waits under a lock: mostly by design, so summarized
+        # per lock instead of one finding each (--all-blocking lists them).
+        "blocking_low_signal": {
+            "reported_as": "findings" if all_blocking else "summary",
+            "sites": None if all_blocking else len(low_signal),
+            "by_lock": [] if all_blocking else _summarize_low_signal(low_signal),
+        },
     }
     result["guards"] = guards
     result["findings"] = findings
@@ -3041,7 +3130,10 @@ def _extract_options(argv: list[str]) -> tuple[list[str], dict[str, list[str] | 
 
 
 def main() -> None:
-    argv, opts = _extract_options(sys.argv[1:])
+    argv = sys.argv[1:]
+    all_blocking = "--all-blocking" in argv
+    argv = [a for a in argv if a != "--all-blocking"]
+    argv, opts = _extract_options(argv)
     target, max_files = parse_common_args(argv)
     checks = opts["check"]
     if checks:
@@ -3061,6 +3153,7 @@ def main() -> None:
             checks=checks,
             exclude=opts["exclude"],
             blocking=opts["blocking"],
+            all_blocking=all_blocking,
         )
     )
 
