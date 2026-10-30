@@ -751,3 +751,68 @@ class TestSqlFromLiteralsDismissal(unittest.TestCase):
         # A parameter, a list fed a parameter, a list handed to another
         # function, a .format() of a parameter, a number times a parameter.
         self.assertEqual(_kept_lines(result), {15, 18, 21, 22, 23})
+
+
+class TestProjectRuffPin(unittest.TestCase):
+    """The ruff the project itself runs, read from its lock/pin files."""
+
+    def _pin(self, files):
+        from helpers import TempProject
+
+        with TempProject(files) as root:
+            return mod.detect_project_ruff_pin(root)
+
+    def test_lock_file(self):
+        lock = (
+            '[[package]]\nname = "requests"\nversion = "2.0"\n\n'
+            '[[package]]\nname = "ruff"\nversion = "0.14.10"\n'
+        )
+        self.assertEqual(
+            self._pin({"uv.lock": lock}), {"version": "0.14.10", "source": "uv.lock"}
+        )
+
+    def test_pre_commit_hook(self):
+        config = (
+            "repos:\n"
+            "  - repo: https://github.com/astral-sh/ruff-pre-commit\n"
+            "    rev: v0.15.2\n"
+            "    hooks:\n      - id: ruff\n"
+        )
+        pin = self._pin({".pre-commit-config.yaml": config})
+        self.assertEqual(pin["version"], "0.15.2")
+
+    def test_requirements_file(self):
+        pin = self._pin({"dev-requirements.txt": "pytest\nruff==0.13.1\n"})
+        self.assertEqual(pin, {"version": "0.13.1", "source": "dev-requirements.txt"})
+
+    def test_a_range_in_pyproject_is_not_a_pin(self):
+        from helpers import TempProject
+
+        with TempProject({}) as root:
+            (root / "pyproject.toml").write_text(
+                '[project]\nname = "x"\n'
+                '[project.optional-dependencies]\ndev = ["ruff>=0.8.0,<1.0.0"]\n',
+                encoding="utf-8",
+            )
+            pin = mod.detect_project_ruff_pin(root)
+        self.assertIsNone(pin["version"])
+        self.assertEqual(pin["specifier"], ">=0.8.0,<1.0.0")
+        self.assertIsNone(mod.version_matches_project_pin("0.16.0", pin))
+
+    def test_no_pin(self):
+        self.assertIsNone(self._pin({"m.py": "x = 1\n"}))
+        self.assertIsNone(mod.version_matches_project_pin("0.16.0", None))
+
+    def test_match(self):
+        pin = {"version": "0.14.10", "source": "uv.lock"}
+        self.assertTrue(mod.version_matches_project_pin("0.14.10", pin))
+        self.assertFalse(mod.version_matches_project_pin("0.16.0", pin))
+
+    def test_envelope_reports_the_project_pin(self):
+        from helpers import TempProject
+
+        lock = '[[package]]\nname = "ruff"\nversion = "0.14.10"\n'
+        with TempProject({"uv.lock": lock, "m.py": "x = 1\n"}) as root:
+            result = _analyze_with_fake_ruff(root, [])
+        self.assertEqual(result["project_ruff_pin"]["version"], "0.14.10")
+        self.assertFalse(result["version_matches_project_pin"])

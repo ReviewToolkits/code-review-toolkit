@@ -31,11 +31,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from run_lint_rules import (  # noqa: E402
     closure_argument_hint,
+    detect_project_ruff_pin,
     detect_target_version,
     dismissal_reason,
     except_closure_annotation,
     unlinted_error,
     unlinted_paths,
+    version_matches_project_pin,
 )
 from scan_common import (  # noqa: E402
     find_project_root,
@@ -388,6 +390,98 @@ def _flag_known_tool_bugs(
         finding["category"] = "suspected-tool-false-positive"
         finding["significance"] = "reduced"
     return finding
+
+
+# ruff 0.16.0 changed its default rule set (59 -> 413 rules, not a superset).
+_RUFF_DEFAULT_SET_CHANGE = (0, 16, 0)
+
+
+def _version_tuple(version: str | None) -> tuple[int, ...] | None:
+    parts = re.findall(r"\d+", version or "")[:3]
+    return tuple(int(p) for p in parts) if parts else None
+
+
+def ruff_config_selection(project_root: Path) -> dict | None:
+    """Does the project's ruff config set `select`, or only extend the default?
+
+    None when there is no ruff config, or it cannot be parsed. A config
+    without `select` runs on ruff's DEFAULT set, so its results move with the
+    ruff version.
+    """
+    import_ok = True
+    data: dict | None = None
+    for name in ("ruff.toml", ".ruff.toml"):
+        path = project_root / name
+        if path.exists():
+            try:
+                import tomllib
+
+                data = tomllib.loads(path.read_text(encoding="utf-8"))
+            except (ImportError, ValueError, OSError):
+                import_ok = False
+            break
+    else:
+        pyproject = _read_pyproject(project_root)
+        if pyproject is not None:
+            data = pyproject.get("tool", {}).get("ruff")
+    if data is None or not import_ok:
+        return None
+    lint = data.get("lint", {}) if isinstance(data.get("lint"), dict) else {}
+    return {
+        "select": "select" in data or "select" in lint,
+        "extend_select": "extend-select" in data or "extend-select" in lint,
+    }
+
+
+def ruff_version_report(
+    project_root: Path, version: str | None, config_source: str
+) -> dict:
+    """The ruff *version* that ran against the project's pin, with warnings."""
+    pin = detect_project_ruff_pin(project_root)
+    matches = version_matches_project_pin(version, pin)
+    if config_source == "project":
+        selection = ruff_config_selection(project_root)
+        default_set = None if selection is None else not selection["select"]
+    else:
+        selection = None
+        default_set = config_source == "ruff-default"
+    warnings: list[str] = []
+    pinned = (pin or {}).get("version")
+    if matches is False:
+        warnings.append(
+            f"ruff {version} is not the project's pinned ruff {pinned} "
+            f"({pin['source']}): the project pass may not match what the "
+            "project's own `ruff check` reports."
+        )
+    if default_set:
+        how = (
+            "extends ruff's default rule set (`extend-select` without `select`)"
+            if selection and selection["extend_select"]
+            else "uses ruff's default rule set (no `select`)"
+        )
+        ours, theirs = _version_tuple(version), _version_tuple(pinned)
+        cut = _RUFF_DEFAULT_SET_CHANGE
+        if ours and theirs and (ours >= cut) != (theirs >= cut):
+            warnings.append(
+                f"The project config {how}, and ruff 0.16.0 changed that default "
+                f"from 59 to 413 rules. This run (ruff {version}) and the "
+                f"project's pin ({pinned}) are on opposite sides of that change: "
+                "the extra findings are pending debt for a ruff upgrade, not "
+                "what the project's lint reports today."
+            )
+        elif ours and not theirs:
+            warnings.append(
+                f"The project config {how}, and no exact ruff pin was found: "
+                "the project pass depends on the ruff version (0.16.0 changed "
+                "the default from 59 to 413 rules)."
+            )
+    return {
+        "ruff_version": version,
+        "project_ruff_pin": pin,
+        "version_matches_project_pin": matches,
+        "uses_default_rule_set": default_set,
+        "warnings": warnings,
+    }
 
 
 def _extract_rules_applied(findings: list[dict]) -> list[str]:
@@ -1283,6 +1377,16 @@ def analyze(argv: list[str] | None = None) -> dict:
     results: dict[str, dict] = {}
     for tool in tools_to_run:
         results[tool] = run_tool_safely(tool, args, project_root, scan_root)
+    if "config_source" in results.get("ruff", {}):
+        # The ruff that ran, against the project's own pin: a "project" pass
+        # from a different ruff is not the project's lint (see `warnings`).
+        results["ruff"].update(
+            ruff_version_report(
+                project_root,
+                availability["ruff"].get("version"),
+                results["ruff"]["config_source"],
+            )
+        )
 
     return build_output(
         project_root, scan_root, availability,

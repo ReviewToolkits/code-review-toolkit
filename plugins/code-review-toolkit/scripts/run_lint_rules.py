@@ -1206,6 +1206,65 @@ def normalize(
     }
 
 
+_LOCK_PIN = re.compile(r'(?m)^name\s*=\s*"ruff"\s*\n\s*version\s*=\s*"([^"]+)"')
+_PRECOMMIT_PIN = re.compile(r"ruff-pre-commit\S*\s*\n\s*rev:\s*[\"']?v?([\w.]+)")
+_REQUIREMENT_PIN = re.compile(r"(?im)^\s*ruff\s*==\s*([\w.]+)")
+_PYPROJECT_PIN = re.compile(r"[\"']ruff\s*==\s*([\w.]+)[\"']")
+_PYPROJECT_SPEC = re.compile(r"[\"']ruff\s*([<>=!~][^\"']*)[\"']")
+
+
+def _read(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def detect_project_ruff_pin(project_root: Path) -> dict | None:
+    """The ruff version the project itself pins, and where, or None.
+
+    Lock files first (what `uv run ruff` / `poetry run ruff` executes), then
+    a pre-commit hook rev, then requirements files, then an exact pin in
+    pyproject.toml. A pyproject range alone gives ``version: None`` with the
+    ``specifier``. A review that runs a different ruff than the project's
+    reports findings the project's own `ruff check` does not produce.
+    """
+    for name in ("uv.lock", "poetry.lock", "pdm.lock"):
+        match = _LOCK_PIN.search(_read(project_root / name))
+        if match:
+            return {"version": match.group(1), "source": name}
+    for name in (".pre-commit-config.yaml", ".pre-commit-config.yml"):
+        match = _PRECOMMIT_PIN.search(_read(project_root / name))
+        if match:
+            return {"version": match.group(1), "source": name}
+    requirement_files = sorted(project_root.glob("*requirements*.txt"))
+    requirement_files += sorted(project_root.glob("requirements/*.txt"))
+    requirement_files += sorted(project_root.glob("constraints*.txt"))
+    for path in requirement_files:
+        match = _REQUIREMENT_PIN.search(_read(path))
+        if match:
+            return {"version": match.group(1), "source": path.name}
+    text = _read(project_root / "pyproject.toml")
+    match = _PYPROJECT_PIN.search(text)
+    if match:
+        return {"version": match.group(1), "source": "pyproject.toml"}
+    match = _PYPROJECT_SPEC.search(text)
+    if match:
+        return {
+            "version": None,
+            "specifier": match.group(1).strip(),
+            "source": "pyproject.toml",
+        }
+    return None
+
+
+def version_matches_project_pin(version: str | None, pin: dict | None) -> bool | None:
+    """True/False against an exact project pin; None when there is none."""
+    if version is None or not pin or not pin.get("version"):
+        return None
+    return version == pin["version"]
+
+
 def detect_target_version(project_root: Path) -> str:
     """The Python version to tell ruff to assume.
 
@@ -1379,6 +1438,7 @@ def analyze(
             "findings": [],
         }
 
+    project_pin = detect_project_ruff_pin(project_root)
     codes = _tier_codes(tier)
     validation = validate_rules(ruff_bin, codes)
     # Never send ruff a code it will reject; an unknown code aborts the whole run.
@@ -1455,6 +1515,13 @@ def analyze(
         # A mismatch does not fail the run, but it makes every count in this
         # envelope non-comparable with a calibrated one. Say so.
         "version_matches_pin": version == PINNED_RUFF_VERSION,
+        # The ruff the PROJECT pins (lock file, pre-commit, requirements).
+        # When it differs from both this run and PINNED_RUFF_VERSION, run once
+        # per version and report the difference.
+        "project_ruff_pin": project_pin,
+        "version_matches_project_pin": version_matches_project_pin(
+            version, project_pin
+        ),
         "tier": tier,
         "target_version": target_version,
         "rules_selected": len(runnable),

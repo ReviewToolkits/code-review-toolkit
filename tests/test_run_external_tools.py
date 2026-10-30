@@ -1118,9 +1118,11 @@ class TestToolkitRuffPass(unittest.TestCase):
             ] if toolkit else []
             return MagicMock(stdout=json.dumps(hits), stderr="")
 
-        with TempProject({"app.py": source}) as root:
-            with patch.object(mod.subprocess, "run", side_effect=fake_run):
-                out = mod.run_ruff(mod.parse_args([str(root)]), root, root)
+        with (
+            TempProject({"app.py": source}) as root,
+            patch.object(mod.subprocess, "run", side_effect=fake_run),
+        ):
+            out = mod.run_ruff(mod.parse_args([str(root)]), root, root)
         self.assertEqual(
             out["toolkit_pass"]["dismissed"], {"raise-systemexit-in-except": 1}
         )
@@ -1205,6 +1207,67 @@ class TestIntegrationConfiguredMissing(unittest.TestCase):
                 configured = result["configured_but_not_installed"]
                 self.assertEqual(len(configured), 1)
                 self.assertEqual(configured[0]["tool"], "ruff")
+
+
+class TestRuffVersionReport(unittest.TestCase):
+    """A project pass from a ruff other than the project's own is flagged."""
+
+    LOCK = '[[package]]\nname = "ruff"\nversion = "0.14.10"\n'
+
+    def _report(self, ruff_section, version, lock=LOCK, source="project"):
+        with TempProject({"uv.lock": lock} if lock else {}) as root:
+            (root / "pyproject.toml").write_text(
+                '[project]\nname = "x"\n\n' + ruff_section, encoding="utf-8"
+            )
+            return mod.ruff_version_report(root, version, source)
+
+    def test_extend_select_across_the_default_set_change(self):
+        out = self._report('[tool.ruff.lint]\nextend-select = ["I"]\n', "0.17.1")
+        self.assertEqual(out["project_ruff_pin"]["version"], "0.14.10")
+        self.assertFalse(out["version_matches_project_pin"])
+        self.assertTrue(out["uses_default_rule_set"])
+        self.assertEqual(len(out["warnings"]), 2)
+        self.assertIn("not the project's pinned ruff 0.14.10", out["warnings"][0])
+        self.assertIn("opposite sides", out["warnings"][1])
+        self.assertIn("extend-select", out["warnings"][1])
+
+    def test_an_explicit_select_is_not_version_dependent(self):
+        out = self._report('[tool.ruff.lint]\nselect = ["E", "F"]\n', "0.17.1")
+        self.assertFalse(out["uses_default_rule_set"])
+        self.assertEqual(len(out["warnings"]), 1)  # the version mismatch only
+
+    def test_the_pinned_version_is_clean(self):
+        out = self._report('[tool.ruff.lint]\nextend-select = ["I"]\n', "0.14.10")
+        self.assertTrue(out["version_matches_project_pin"])
+        self.assertEqual(out["warnings"], [])
+
+    def test_no_pin_with_the_default_set_is_flagged(self):
+        out = self._report("[tool.ruff]\nline-length = 80\n", "0.17.1", lock=None)
+        self.assertIsNone(out["project_ruff_pin"])
+        self.assertIsNone(out["version_matches_project_pin"])
+        self.assertEqual(len(out["warnings"]), 1)
+        self.assertIn("no exact ruff pin", out["warnings"][0])
+
+    def test_analyze_attaches_the_report_to_the_ruff_section(self):
+        def fake_run(cmd, **kwargs):
+            if "--version" in cmd:
+                return MagicMock(stdout="ruff 0.17.1\n", stderr="")
+            return MagicMock(stdout="[]", stderr="")
+
+        with TempProject({"uv.lock": self.LOCK, "m.py": "x = 1\n"}) as root:
+            (root / "pyproject.toml").write_text(
+                '[project]\nname = "x"\n\n[tool.ruff.lint]\nextend-select = ["I"]\n',
+                encoding="utf-8",
+            )
+            with (
+                patch.object(mod.shutil, "which", return_value="/bin/ruff"),
+                patch.object(mod.subprocess, "run", side_effect=fake_run),
+            ):
+                result = mod.analyze([str(root), "--tools", "ruff"])
+        ruff = result["ruff"]
+        self.assertEqual(ruff["ruff_version"], "0.17.1")
+        self.assertFalse(ruff["version_matches_project_pin"])
+        self.assertEqual(len(ruff["warnings"]), 2)
 
 
 class TestBuildSkippedReport(unittest.TestCase):

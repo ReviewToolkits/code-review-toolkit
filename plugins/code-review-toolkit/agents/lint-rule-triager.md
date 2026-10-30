@@ -27,12 +27,31 @@ likely-defects and strong smells; run it only when tier 1 is exhausted or the us
 | Field | What it means for your report |
 |---|---|
 | `version_matches_pin` false | Every count below is **non-comparable** with a calibrated run. Say so in the report; do not silently compare against a previous run's numbers. |
+| `project_ruff_pin` set, and `version_matches_project_pin` false | The project runs a different ruff than this run did (its lock file, pre-commit rev or requirements say which). See "Two pins" below. |
 | `rule_validation.unknown` non-empty | Codes ruff does not recognise — a stale selection. Report it. |
 | `rule_validation.removed` non-empty | Rules deleted from ruff. **A membership test would have passed for these**; they are found by reading `status`. Report and stop selecting them. |
 | `rule_validation.preview_gated` non-empty | Those rules **silently did nothing**. Their absence from the findings is not evidence of absence in the code. |
 | `stderr` non-empty | Remapped codes and no-effect selections warn here and nowhere else. Read it. |
 | `error` non-null | The run is incomplete. An incomplete lint pass reported as clean is worse than no pass. |
 | `unlinted` non-empty | ruff could not read those paths ("Failed to lint" on stderr), and it still exits 0 with no findings. A sandboxed ruff, such as the snap package, cannot read `/tmp`. `error` is set. Re-run with `--ruff-bin` pointing at a different ruff; never report those paths as clean. |
+
+**Two pins.** When the project pins a ruff (`project_ruff_pin.version`) that is not the toolkit's
+`pinned_version`, one run cannot be both comparable with the calibration and true to the project.
+Run the script twice, once per version, and report the difference:
+
+```bash
+python3 <plugin_root>/scripts/run_lint_rules.py [scope] --tier 1 --ruff-bin <the project's ruff>
+printf '#!/bin/sh\nexec uvx ruff@<pinned_version> "$@"\n' > "$d/ruff-pinned" && chmod +x "$d/ruff-pinned"
+python3 <plugin_root>/scripts/run_lint_rules.py [scope] --tier 1 --ruff-bin "$d/ruff-pinned"
+```
+
+`--ruff-bin` takes one executable path, hence the wrapper in your private directory `$d`. Hits that
+appear in only one run come from the version change, not from the code: say which version reports
+them. A finding that only the newer ruff reports is debt that comes due when
+the project upgrades ruff. It is not a defect the project's lint reports today.
+
+Each finding's `tier` is the tier of **its rule**, not the run's `--tier`. A `--tier 2` run also
+returns every tier-1 hit, tagged `1`.
 
 ## Phase 2 — Merge, do not double-report
 
