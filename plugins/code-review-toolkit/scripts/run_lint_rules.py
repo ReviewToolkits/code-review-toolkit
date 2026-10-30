@@ -295,6 +295,9 @@ def _run_ruff(
         # --isolated so results are comparable across projects: a project's own
         # ruff config would otherwise silently change the selection.
         "--isolated",
+        # --no-cache: ruff otherwise writes `.ruff_cache/` into the project it
+        # lints. A review must leave the reviewed checkout exactly as it found it.
+        "--no-cache",
         "--select",
         ",".join(codes),
     ]

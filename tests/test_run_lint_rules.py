@@ -100,6 +100,29 @@ class TestNormalize(unittest.TestCase):
         self.assertIsNone(out["shape_id"])
 
 
+class TestRuffInvocation(unittest.TestCase):
+    """The ruff command line: what the reviewed project is exposed to."""
+
+    def _cmd(self):
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+
+        with patch.object(mod.subprocess, "run") as run:
+            run.return_value = MagicMock(stdout="[]", stderr="")
+            mod._run_ruff("ruff", ["F821"], Path("/p"), preview=False)
+        return run.call_args.args[0]
+
+    def test_ruff_never_writes_a_cache_into_the_project(self):
+        # Without --no-cache ruff leaves `.ruff_cache/` in the reviewed checkout.
+        self.assertIn("--no-cache", self._cmd())
+
+    def test_selection_is_still_isolated_and_explicit(self):
+        cmd = self._cmd()
+        self.assertIn("--isolated", cmd)
+        self.assertIn("--select", cmd)
+        self.assertNotIn("--extend-select", cmd)
+
+
 class TestMissingRuff(unittest.TestCase):
     def test_absent_binary_is_an_error_not_an_empty_result(self):
         result = mod.analyze(".", ruff_bin="definitely-not-a-real-ruff-binary")
