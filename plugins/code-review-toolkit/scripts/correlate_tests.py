@@ -9,7 +9,6 @@ Usage:
 """
 
 import ast
-import json
 import sys
 from pathlib import Path
 
@@ -434,28 +433,11 @@ def resolve_imported_sources(
     return found
 
 
-def main() -> None:
-    from scan_common import exit_on_help
-
-    exit_on_help(sys.argv[1:], __doc__)
-    max_files = 0  # 0 = no limit
-    positional: list[str] = []
-    argv = sys.argv[1:]
-    i = 0
-    while i < len(argv):
-        if argv[i] == "--max-files" and i + 1 < len(argv):
-            max_files = int(argv[i + 1])
-            i += 2
-        elif argv[i].startswith("--"):
-            i += 1
-        else:
-            positional.append(argv[i])
-            i += 1
-    target = Path(positional[0]) if positional else Path(".")
-    target = target.resolve()
-
-    project_root = find_project_root(target)
-    scan_root = target if target.is_dir() else project_root
+def analyze(target: str, *, max_files: int = 0) -> dict:
+    """Correlate the source and test files under *target*; return the report."""
+    target_path = Path(target).resolve()
+    project_root = find_project_root(target_path)
+    scan_root = target_path if target_path.is_dir() else project_root
     all_files = sorted(discover_python_files(scan_root))
     files_total = len(all_files)
     if max_files > 0 and files_total > max_files:
@@ -593,7 +575,7 @@ def main() -> None:
             suite_test_methods += len(cls["test_methods"])
             suite_skipped += len(cls["skipped_methods"])
 
-    output = {
+    return {
         "project_root": str(project_root),
         "scan_root": str(scan_root),
         "files_total": files_total,
@@ -626,8 +608,12 @@ def main() -> None:
         "test_details": test_info,
     }
 
-    json.dump(output, sys.stdout, indent=2)
-    sys.stdout.write("\n")
+
+def main() -> None:
+    from scan_common import emit, parse_common_args
+
+    target, max_files = parse_common_args(sys.argv[1:], __doc__)
+    emit(analyze(target, max_files=max_files))
 
 
 if __name__ == "__main__":
