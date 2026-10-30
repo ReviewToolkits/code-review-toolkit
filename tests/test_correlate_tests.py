@@ -26,10 +26,12 @@ class TestClassifyFiles(unittest.TestCase):
     def test_test_suffix(self):
         with TempProject({
             "pkg/core.py": "",
-            "pkg/core_test.py": "",
+            # Outside a test directory the name alone is not enough: it must
+            # define a test (see TestSourceModuleNamedLikeATest).
+            "pkg/core_test.py": "def test_core():\n    pass\n",
         }) as root:
             files = mod.discover_python_files(root)
-            source, test = mod.classify_files(files, root)
+            _source, test = mod.classify_files(files, root)
             test_names = {f.name for f in test}
             self.assertIn("core_test.py", test_names)
 
@@ -39,7 +41,7 @@ class TestClassifyFiles(unittest.TestCase):
             "test/helpers.py": "",
         }) as root:
             files = mod.discover_python_files(root)
-            source, test = mod.classify_files(files, root)
+            _source, test = mod.classify_files(files, root)
             test_names = {f.name for f in test}
             self.assertIn("helpers.py", test_names)
 
@@ -49,7 +51,7 @@ class TestClassifyFiles(unittest.TestCase):
             "pkg/__init__.py": "",
         }) as root:
             files = mod.discover_python_files(root)
-            source, test = mod.classify_files(files, root)
+            source, _test = mod.classify_files(files, root)
             source_names = {f.name for f in source}
             self.assertNotIn("setup.py", source_names)
 
@@ -464,6 +466,340 @@ class TestExternalTestDiscovery(unittest.TestCase):
         }) as root:
             out = _run_main(root / "pkg")
         self.assertEqual(out["summary"]["external_test_roots"], ["tests"])
+
+
+# A package whose own source module is named like a test file: an enum of
+# result states, imported by production code, with no test in it.
+_LOOKALIKE_PROJECT = {
+    "app/__init__.py": "",
+    "app/test_outcome.py": (
+        "class Outcome:\n"
+        "    __test__ = False\n"
+        "    PASSED = 'passed'\n"
+        "    FAILED = 'failed'\n"
+    ),
+    "app/runner.py": (
+        "from app.test_outcome import Outcome\n"
+        "\n"
+        "def run():\n"
+        "    return Outcome.PASSED\n"
+    ),
+    "tests/test_runner.py": (
+        "from app.runner import run\n"
+        "\n"
+        "def test_run():\n"
+        "    assert run() == 'passed'\n"
+    ),
+}
+
+
+class TestSourceModuleNamedLikeATest(unittest.TestCase):
+    """A `test_*.py` source module that defines no tests is source, not a test."""
+
+    def test_package_scope_falls_back_to_the_project_tests(self):
+        with TempProject(_LOOKALIKE_PROJECT) as root:
+            out = mod.analyze(str(root / "app"))
+        self.assertEqual(out["summary"]["external_test_roots"], ["tests"])
+        self.assertEqual(out["summary"]["test_files"], 1)
+        self.assertNotIn("app/test_outcome.py", out["test_details"])
+        self.assertIn("app/test_outcome.py", out["summary"]["test_named_source_files"])
+        cov = {sc["source_file"]: sc for sc in out["source_coverage"]}
+        self.assertIn("app/test_outcome.py", cov)
+        self.assertTrue(cov["app/runner.py"]["has_tests"])
+        self.assertTrue(any("test_outcome.py" in w for w in out["warnings"]))
+
+    def test_project_root_scope_lists_it_as_source(self):
+        with TempProject(_LOOKALIKE_PROJECT) as root:
+            out = mod.analyze(str(root))
+        self.assertNotIn("app/test_outcome.py", out["test_details"])
+        self.assertIn("app/test_outcome.py", out["untested_sources"])
+
+    def test_a_real_test_module_inside_the_package_still_counts(self):
+        # True negative: a co-located test module that defines tests.
+        files = dict(_LOOKALIKE_PROJECT)
+        files["app/test_inline.py"] = "def test_x():\n    assert True\n"
+        with TempProject(files) as root:
+            out = mod.analyze(str(root / "app"))
+        self.assertIn("app/test_inline.py", out["test_details"])
+        self.assertEqual(out["summary"]["external_test_roots"], [])
+
+    def test_no_tests_anywhere_is_not_a_measured_zero(self):
+        with TempProject({
+            "app/__init__.py": "",
+            "app/core.py": "def f():\n    pass\n",
+        }) as root:
+            out = mod.analyze(str(root / "app"))
+        self.assertEqual(out["status"], "no_tests_found")
+        self.assertIsNone(out["summary"]["coverage_percentage"])
+        self.assertTrue(out["warnings"])
+
+
+class TestNameMatchingLayouts(unittest.TestCase):
+    """Name matches that are noise, and test layouts the stem match missed."""
+
+    def test_package_inits_are_not_name_matched_to_test_package_inits(self):
+        with TempProject({
+            "app/__init__.py": "",
+            "app/sub/__init__.py": "",
+            "app/sub/core.py": "def f():\n    pass\n",
+            "tests/__init__.py": "",
+            "tests/sub/__init__.py": "",
+            "tests/sub/test_core.py": "def test_f():\n    pass\n",
+        }) as root:
+            out = mod.analyze(str(root))
+        cov = {sc["source_file"]: sc for sc in out["source_coverage"]}
+        self.assertEqual(cov["app/__init__.py"]["name_matched_test_files"], [])
+        self.assertEqual(cov["app/sub/__init__.py"]["name_matched_test_files"], [])
+        # True positive kept.
+        self.assertEqual(
+            cov["app/sub/core.py"]["name_matched_test_files"],
+            ["tests/sub/test_core.py"],
+        )
+
+    def test_directory_per_class_layout_matches_by_directory(self):
+        with TempProject({
+            "app/__init__.py": "",
+            "app/nodes/__init__.py": "",
+            "app/nodes/leaf_node.py": "class LeafNode:\n    pass\n",
+            "app/nodes/branch_node.py": "class BranchNode:\n    pass\n",
+            "tests/unit/nodes/leaf_node/__init__.py": "",
+            "tests/unit/nodes/leaf_node/test_init.py": "def test_a():\n    pass\n",
+            "tests/unit/nodes/leaf_node/test_repr.py": "def test_b():\n    pass\n",
+        }) as root:
+            out = mod.analyze(str(root))
+        cov = {sc["source_file"]: sc for sc in out["source_coverage"]}
+        self.assertEqual(
+            cov["app/nodes/leaf_node.py"]["name_matched_test_files"],
+            [
+                "tests/unit/nodes/leaf_node/test_init.py",
+                "tests/unit/nodes/leaf_node/test_repr.py",
+            ],
+        )
+        # True negative: no directory or file names branch_node.
+        self.assertIn("app/nodes/branch_node.py", out["untested_sources"])
+
+    def test_import_through_a_package_reexport_reaches_the_submodule(self):
+        with TempProject({
+            "app/__init__.py": "",
+            "app/nodes/__init__.py": (
+                "from app.nodes.leaf_node import LeafNode\n"
+                "from .branch_node import BranchNode\n"
+                "__all__ = ['LeafNode', 'BranchNode']\n"
+            ),
+            "app/nodes/leaf_node.py": "class LeafNode:\n    pass\n",
+            "app/nodes/branch_node.py": "class BranchNode:\n    pass\n",
+            "app/nodes/stem_node.py": "class StemNode:\n    pass\n",
+            "tests/test_tree.py": (
+                "from app.nodes import LeafNode, BranchNode\n"
+                "\n"
+                "def test_build():\n    LeafNode(); BranchNode()\n"
+            ),
+        }) as root:
+            out = mod.analyze(str(root))
+        cov = {sc["source_file"]: sc for sc in out["source_coverage"]}
+        self.assertEqual(cov["app/nodes/leaf_node.py"]["match_method"], "import")
+        self.assertEqual(cov["app/nodes/branch_node.py"]["match_method"], "import")
+        # True negative: re-exported by nobody, imported by nobody.
+        self.assertIn("app/nodes/stem_node.py", out["untested_sources"])
+
+
+class TestSupportFilesAndMarkers(unittest.TestCase):
+    """conftest.py and helpers are not test files; markers are counted."""
+
+    def _project(self) -> dict:
+        files = dict(_IMPORT_PROJECT)
+        files["tests/__init__.py"] = ""
+        files["tests/conftest.py"] = (
+            "import pytest\n"
+            "import pkg.service\n"
+            "\n"
+            "@pytest.fixture\n"
+            "def svc():\n    return pkg.service\n"
+        )
+        files["tests/helpers.py"] = "from pkg.registry import connect\n"
+        files["tests/test_engine.py"] = (
+            "import pytest\n"
+            "from pkg.storage.engine import Engine\n"
+            "\n"
+            "pytestmark = pytest.mark.slow\n"
+            "\n"
+            "def test_a():\n    Engine()\n"
+            "\n"
+            "def test_b():\n    Engine()\n"
+        )
+        files["tests/test_base.py"] = (
+            "import pytest\n"
+            "from pkg.storage.base import Base\n"
+            "\n"
+            "@pytest.mark.slow\n"
+            "@pytest.mark.parametrize('x', [1, 2])\n"
+            "def test_c(x):\n    Base()\n"
+            "\n"
+            "@pytest.mark.network\n"
+            "class TestRemote:\n"
+            "    def test_d(self):\n        Base()\n"
+            "\n"
+            "def test_e():\n"
+            "    if True:\n"
+            "        pytest.skip('needs a GPU')\n"
+        )
+        files["tests/test_optional.py"] = (
+            "import pytest\n"
+            "\n"
+            "np = pytest.importorskip('numpy')\n"
+            "\n"
+            "def test_f():\n    assert np\n"
+        )
+        return files
+
+    def test_support_files_are_not_test_files(self):
+        with TempProject(self._project()) as root:
+            out = mod.analyze(str(root))
+        self.assertEqual(out["summary"]["test_files"], 3)
+        self.assertEqual(out["summary"]["support_files"], 3)
+        self.assertNotIn("tests/conftest.py", out["test_details"])
+        self.assertEqual(out["support_files"]["tests/conftest.py"]["kind"], "conftest")
+        self.assertEqual(out["support_files"]["tests/helpers.py"]["kind"], "helper")
+        self.assertEqual(
+            out["support_files"]["tests/__init__.py"]["kind"], "package_init"
+        )
+
+    def test_conftest_imports_are_reported_but_not_counted(self):
+        with TempProject(self._project()) as root:
+            out = mod.analyze(str(root))
+        self.assertEqual(
+            out["support_files"]["tests/conftest.py"]["imported_sources"],
+            ["pkg/service.py"],
+        )
+        cov = {sc["source_file"]: sc for sc in out["source_coverage"]}
+        self.assertEqual(
+            cov["pkg/service.py"]["support_imported_by"], ["tests/conftest.py"]
+        )
+        # Reported, but a conftest import is not a test.
+        self.assertIn("pkg/service.py", out["untested_sources"])
+
+    def test_markers_and_runtime_skips_counted(self):
+        with TempProject(self._project()) as root:
+            out = mod.analyze(str(root))
+        summary = out["summary"]
+        # test_a, test_b (module pytestmark) and test_c (decorator).
+        self.assertEqual(summary["marked_tests"], {"network": 1, "slow": 3})
+        self.assertEqual(summary["tests_with_runtime_skip"], 1)
+        self.assertEqual(
+            summary["files_with_module_level_skip"], ["tests/test_optional.py"]
+        )
+        details = out["test_details"]["tests/test_base.py"]
+        self.assertEqual(details["runtime_skip_tests"], ["test_e"])
+
+    def test_class_and_module_skip_marks_count_as_skipped(self):
+        with TempProject({
+            "tests/test_x.py": (
+                "import pytest\n"
+                "pytestmark = pytest.mark.skipif(True, reason='x')\n"
+                "def test_a():\n    pass\n"
+            ),
+            "tests/test_y.py": (
+                "import unittest\n"
+                "@unittest.skip('x')\n"
+                "class TestY(unittest.TestCase):\n"
+                "    def test_b(self):\n        pass\n"
+                "\n"
+                "class TestZ(unittest.TestCase):\n"
+                "    def test_c(self):\n        pass\n"
+            ),
+        }) as root:
+            out = mod.analyze(str(root))
+        self.assertEqual(out["summary"]["total_skipped_tests"], 2)
+        self.assertEqual(out["summary"]["total_test_methods"], 1)
+
+
+_ROUTE_PROJECT = {
+    "web/__init__.py": "",
+    "web/app.py": (
+        "from web.routes import admin, items\n"
+        "app = object()\n"
+    ),
+    "web/routes/__init__.py": "",
+    "web/routes/admin.py": (
+        "from framework import Router\n"
+        "\n"
+        "def build(router):\n"
+        "    @router.get('/admin/stats')\n"
+        "    def stats():\n        return {}\n"
+        "\n"
+        "    @router.post('/admin/groups/{group}/{name}/rebuild')\n"
+        "    def rebuild(group, name):\n        return {}\n"
+        "    return router\n"
+    ),
+    "web/routes/items.py": (
+        "from framework import Router\n"
+        "router = Router(prefix='/items')\n"
+        "\n"
+        "@router.get('/{item_id}')\n"
+        "def read(item_id):\n    return {}\n"
+    ),
+    "web/routes/reports.py": (
+        "def build(router):\n"
+        "    @router.get('/reports/{rid}')\n"
+        "    def report(rid):\n        return {}\n"
+    ),
+    "tests/conftest.py": (
+        "import pytest\n"
+        "from web.app import app\n"
+        "\n"
+        "@pytest.fixture\n"
+        "def client():\n    return app\n"
+    ),
+}
+
+
+class TestRouteCorrelation(unittest.TestCase):
+    """Tests that drive a module over HTTP correlate with it by route."""
+
+    def test_url_literals_match_route_decorators(self):
+        files = dict(_ROUTE_PROJECT)
+        files["tests/test_ops.py"] = (
+            "import pytest\n"
+            "\n"
+            "def test_stats(client):\n"
+            "    assert client.get('/v1/admin/stats').status_code == 200\n"
+            "\n"
+            "@pytest.mark.parametrize('path', [\n"
+            "    '/v1/admin/groups/acme/books/rebuild',\n"
+            "])\n"
+            "def test_rebuild(client, path):\n"
+            "    assert client.post(path).status_code == 202\n"
+            "\n"
+            "def test_item(client):\n"
+            "    item = 7\n"
+            "    assert client.get(f'/v1/items/{item}').status_code == 200\n"
+        )
+        with TempProject(files) as root:
+            out = mod.analyze(str(root))
+        cov = {sc["source_file"]: sc for sc in out["source_coverage"]}
+        self.assertEqual(cov["web/routes/admin.py"]["match_method"], "route")
+        self.assertEqual(
+            cov["web/routes/admin.py"]["route_matched_test_files"],
+            ["tests/test_ops.py"],
+        )
+        # The router's own prefix is part of the template.
+        self.assertEqual(cov["web/routes/items.py"]["match_method"], "route")
+        self.assertNotIn("web/routes/admin.py", out["untested_sources"])
+        # True negative: no test URL names /reports/.
+        self.assertIn("web/routes/reports.py", out["untested_sources"])
+        self.assertEqual(out["summary"]["source_files_with_tests_by_route_only"], 2)
+
+    def test_filesystem_paths_do_not_match_routes(self):
+        files = dict(_ROUTE_PROJECT)
+        files["tests/test_paths.py"] = (
+            "def test_tmp():\n"
+            "    assert '/var/admin/notes.txt' != '/tmp/items'\n"
+        )
+        with TempProject(files) as root:
+            out = mod.analyze(str(root))
+        self.assertIn("web/routes/admin.py", out["untested_sources"])
+        # A bare prefix with a wildcard and no literal after it is not enough.
+        self.assertIn("web/routes/items.py", out["untested_sources"])
 
 
 class TestModuleNames(unittest.TestCase):

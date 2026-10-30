@@ -24,17 +24,30 @@ where `<plugin_root>` is the root of the code-review-toolkit plugin directory.
 Parse the JSON output. This gives you the complete source↔test file mapping, test method counts, untested modules, and public API surface sizes. Use this as your factual foundation — do not re-derive the mapping manually.
 
 Key fields:
-- `untested_sources`: source files that no test file matches by name **and** no test file imports
+- `status`, `warnings`: read them first. `status: "no_tests_found"` means no test file was found anywhere; every
+  coverage number is then unmeasured (`coverage_percentage` is `null`), not zero. A warning says when the tests came
+  from outside the scope (`summary.external_test_roots`), and names source modules that are only *named* like tests
+  (`summary.test_named_source_files`: a `test_*.py` module under the package that defines no tests)
+- `untested_sources`: source files that no test file matches by name, imports, or reaches by URL
 - `source_coverage`: per-file test correspondence with `test_method_count`, `public_surface_size`, `has_tests`, and
-  `match_method`: `"name"` (a `test_<stem>.py` file), `"import"` (a test file imports the module), `"name+import"`, or `null`.
-  `name_matched_test_files` / `import_matched_test_files` list each kind. An import-only match is weaker evidence (the
-  test may only use the module as a fixture), so read the test before calling a module well tested. Modules exercised
-  only indirectly (e.g. HTTP route handlers driven through a test client) match neither way; check them by hand
-  before reporting them untested
-- `summary`: aggregate statistics (source files, test files, coverage percentage, total test methods, skipped tests).
-  `source_files_with_tests_by_name` / `source_files_with_tests_by_import_only` split `source_files_with_tests`.
-  `total_test_methods` / `total_skipped_tests` count the whole suite found (pytest-style module-level `test*` functions and plain-class methods included), not only correlated files
-- `test_details`: per-test-file class/method inventory including `skipped_methods`, `skipped_standalone_tests`, `matched_sources` (by name) and `imported_sources` (by import)
+  `match_method`: `"name"` (a `test_<stem>.py` file, or a `tests/**/<stem>/test_*.py` directory per module),
+  `"import"` (a test file imports the module, also through a package `__init__` re-export), `"route"` (a URL literal
+  in a test file reaches one of the module's route decorators: a handler driven through a test client), a
+  `+`-joined combination, or `null`. `name_matched_test_files` / `import_matched_test_files` /
+  `route_matched_test_files` list each kind. An import-only or route-only match is weaker evidence (the test may only
+  use the module as a fixture, or hit one of its routes), so read the test before calling a module well tested.
+  `support_imported_by` lists conftest/helper files importing the module; they do not count as tests
+- `summary`: aggregate statistics. `test_files` counts files that define tests; `support_files` counts conftest.py,
+  helpers and test-package `__init__.py` files (listed with their imports under `support_files`).
+  `source_files_with_tests_by_name` / `_by_import_only` / `_by_route_only` split `source_files_with_tests`.
+  `total_test_methods` / `total_skipped_tests` count the whole suite found (pytest-style module-level `test*`
+  functions and plain-class methods included; a class or module skip mark skips every test under it), not only
+  correlated files. `marked_tests` counts the tests carrying each pytest mark: a `slow: 12` there means the usual
+  `-m "not slow"` run never executes those tests, so say which marks the coverage you measured excluded.
+  `tests_with_runtime_skip` and `files_with_module_level_skip` are skips decided at run time (`pytest.skip()`,
+  `importorskip`) that no static count includes
+- `test_details`: per-test-file class/method inventory including `skipped_methods`, `skipped_standalone_tests`,
+  `markers`, `matched_sources` (by name), `imported_sources` (by import) and `route_matched_sources` (by URL)
 
 ## External Tool Integration
 
@@ -157,6 +170,62 @@ Assess the overall test suite structure:
 - Are test files reasonable in size, or are some monolithic?
 - Do tests follow the project's testing conventions (unittest, naming patterns, etc.)?
 
+### Step 5: Is the defective path tested?
+
+When other agents' FIX findings are available and the suite runs (in an exported copy, never the checkout), measure
+each finding's lines instead of guessing.
+
+1. **Collect coverage with branches**, in the export, with `TMPDIR` set to your private directory:
+
+   ```bash
+   coverage run --branch -m pytest -q -p no:cacheprovider && coverage json -o "$d/coverage.json"
+   ```
+
+   `coverage run` misses `multiprocessing` and `spawn` children unless the project's coverage config sets
+   `concurrency = multiprocessing` and `parallel = true`: check that before calling a child-process function unrun.
+2. **Map the findings to it.** Pass the other agents' reports (any text with `path.py:N` or `path.py:N-M` references,
+   or a findings JSON) and the coverage report:
+
+   ```bash
+   python3 <plugin_root>/scripts/map_findings_coverage.py <project> --coverage "$d/coverage.json" \
+       --findings <report.md> [--findings <findings.json>] [--ref pkg/mod.py:120-134] > "$d/fixcov.json"
+   ```
+
+   Each reference gets `verdict`: `never_run`, `partly_run` (with `missing_lines`), `ran_branches_missing` (with
+   `missing_branches`: an `except` arm or an `if` exit that never fired), `ran`, or `null` with a `reason` (file not in
+   the report, ambiguous name, no statement there): unmeasured, never "covered". `function` gives the enclosing
+   function's coverage.
+3. **Classify each finding** with one of these verdicts. Line coverage alone overstates protection: most defects sit on
+   lines that ran.
+   - **NEVER RUN**: the defective statements never executed.
+   - **RAN, WRONG TRIGGER**: the lines ran, but no test sets up the failing condition: the exception edge, the
+     interleaving, the input shape. Check `missing_branches`, then grep the tests that reach the function for the
+     trigger (`side_effect=`, `raise`, `cancel`, the bad input). A finding on a 100%-covered line is usually this.
+   - **RAN, WRONG ASSERTION**: the trigger is set up, but the test asserts something other than what the defect breaks.
+   - **RAN, PINNED**: a test asserts the defective behaviour; fixing the bug will "break" it. Name the test.
+   - **RAN, CHECKED**: a test sets up the trigger and would fail on the defect. Then the finding itself is suspect.
+4. **Prove the doubtful ones with a mutation probe.** Write `(file, old, new)` triples: `"kind": "break"` neutralizes
+   load-bearing behaviour (delete the cleanup, invert the guard), `"kind": "fix"` applies the fix a finding proposes.
+
+   ```bash
+   python3 <plugin_root>/scripts/map_findings_coverage.py <project> --mutations "$d/mutations.json" \
+       --export <export_dir> --test-cmd "python -m pytest -q -x -p no:cacheprovider" > "$d/mutations.out.json"
+   ```
+
+   ```json
+   [{"id": "M1", "finding": "F3", "file": "pkg/store.py", "kind": "break",
+     "old": "        self._release(slot)\n", "new": ""}]
+   ```
+
+   `old` must occur exactly once. A `break` mutation that survives (`meaning: covered_but_unchecked`) is code the suite
+   runs and never checks: false coverage. A `fix` mutation that is killed (`meaning: pinned`) names the tests that
+   defend the bug. `status: baseline_failed` means the suite fails unmutated and no verdict means anything. Use the
+   project's own Python (its venv) in `--test-cmd`, and keep the run short (`-x`, a test subset): every mutation is a
+   full run.
+
+Add a table to the report: finding, defective site, verdict, evidence (the missing lines, branches, test or
+mutation that decided it).
+
 ## Output Format
 
 ```
@@ -212,11 +281,11 @@ Note: Simple functions with obvious correctness are ACCEPTABLE even without test
 
 ## Important Guidelines
 
-- **Structural analysis only**: You're analyzing code, not running tests. Focus on what you can determine by reading source and test files.
+- **Structural analysis first**: most of the report comes from reading source and test files. Run the suite only for Step 5, and only in an exported copy.
 - **Behavioral over line coverage**: A function can have 100% line coverage and still be poorly tested if only the happy path is exercised. Assess whether tests verify meaningful behavior.
 - **Don't demand 100%**: Some code is inherently hard to test (I/O, CLI parsing, display formatting). Acknowledge this and focus on code where tests provide the most value.
 - **Match the project's test framework**: check whether it uses `unittest` (TestCase subclasses, `self.assert*`, setUp/tearDown) or pytest (plain `test_*` functions, fixtures, `pytest.raises`, parametrize), and assess against that framework's idioms.
-- **Measured coverage beats structural correlation** when you can get it. If the project's test suite runs in the environment (in an exported copy, never the checkout), `coverage run -m pytest` (or `-m unittest`) plus `coverage json` gives executed lines; then check, for each FIX finding other agents reported, whether its lines ever ran. "The defective path is never executed by the suite" is the most actionable coverage statement you can make.
+- **Measured coverage beats structural correlation** when you can get it. See *Is the defective path tested?* below: "the defective path is never executed by the suite" is the most actionable coverage statement you can make.
 - **Cap output**: Report at most 10 critical gaps and 10 important gaps in the summary. Offer to drill deeper on specific modules.
 - **Consider architecture**: If architecture-mapper output is available, prioritize coverage gaps in high fan-in modules (foundational code used by many others) over leaf modules.
 
@@ -241,6 +310,9 @@ These rules apply to every script call this agent makes.
   d=$(mktemp -d "${TMPDIR:-/tmp}/crt-test-coverage-analyzer.XXXXXX") && echo "$d" &&
   python3 <plugin_root>/scripts/correlate_tests.py [scope] [options] > "$d/out.json" 2> "$d/out.err"; echo "exit=$?"
   ```
+
+  Run `map_findings_coverage.py` the same way, writing into the same directory. In mutation mode raise the
+  timeout to cover the baseline plus one run per mutation, or use `run_in_background`.
 
   Each Bash call is a fresh shell: a `$$` suffix or a shell variable does not survive into the next
   call. Reuse the literal path `echo` printed.

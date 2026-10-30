@@ -15,46 +15,29 @@ import re
 import subprocess
 import sys
 from collections import defaultdict
+from http import HTTPStatus
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scan_common import (  # noqa: E402
-    discover_python_files,
-    find_project_root,
-)
 from correlate_tests import (  # noqa: E402
+    HTTP_VERBS,
+    best_routes,
     build_module_index,
+    classify_files,
+    defines_tests,
     find_external_tests,
     module_name,
+    path_segments,
+    route_templates,
+    router_prefixes,
+    template_segments,
 )
-
-
-# ---------------------------------------------------------------------------
-# Project discovery (adapted from correlate_tests.py)
-# ---------------------------------------------------------------------------
-
-def classify_files(
-    files: list[Path], project_root: Path
-) -> tuple[list[Path], list[Path]]:
-    """Split files into (source, test) lists."""
-    source: list[Path] = []
-    test: list[Path] = []
-    for f in files:
-        rel = f.relative_to(project_root)
-        parts = rel.parts
-        is_test = (
-            f.name.startswith("test_")
-            or f.name.endswith("_test.py")
-            or "test" in parts[:-1]
-            or "tests" in parts[:-1]
-        )
-        if is_test:
-            test.append(f)
-        elif f.name not in ("setup.py", "conftest.py"):
-            source.append(f)
-    return source, test
-
+from scan_common import (  # noqa: E402
+    build_envelope,
+    collect_python_files,
+    find_project_root,
+)
 
 # ---------------------------------------------------------------------------
 # Assertion extraction
@@ -123,6 +106,98 @@ def _get_call_name(node: ast.expr) -> str | None:
     return None
 
 
+_STATUS_ATTRS = frozenset({"status_code", "status"})
+_HTTP_CONSTANT_RE = re.compile(r"^HTTP_(\d{3})(?:_|$)")
+
+
+def _status_value(node: ast.expr) -> int | None:
+    """The integer an HTTP status expression stands for, if it is static.
+
+    `409`, `HTTPStatus.CONFLICT`, `status.HTTP_409_CONFLICT`.
+    """
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return node.value
+    name = node.attr if isinstance(node, ast.Attribute) else (
+        node.id if isinstance(node, ast.Name) else None
+    )
+    if name is None:
+        return None
+    match = _HTTP_CONSTANT_RE.match(name)
+    if match:
+        return int(match.group(1))
+    if isinstance(node, ast.Attribute):
+        chain = _dotted_chain(node)
+        if chain and len(chain) >= 2 and chain[-2] == "HTTPStatus":
+            try:
+                return HTTPStatus[name].value
+            except KeyError:
+                return None
+    return None
+
+
+def _is_status(node: ast.expr) -> bool:
+    return (isinstance(node, ast.Attribute) and node.attr in _STATUS_ATTRS) or (
+        isinstance(node, ast.Name) and node.id == "status_code"
+    )
+
+
+def _error_statuses(op: ast.cmpop, value: ast.expr) -> list[int]:
+    """The 4xx/5xx statuses `<status> <op> <value>` asserts; [] when none."""
+    if isinstance(op, ast.Eq):
+        code = _status_value(value)
+        return [code] if code is not None and 400 <= code <= 599 else []
+    if isinstance(op, ast.In) and isinstance(value, (ast.Tuple, ast.List, ast.Set)):
+        codes = [_status_value(e) for e in value.elts]
+        if codes and all(c is not None and 400 <= c <= 599 for c in codes):
+            return sorted(codes)
+        return []
+    if isinstance(op, (ast.GtE, ast.Gt)):
+        code = _status_value(value)
+        if code is not None and code + isinstance(op, ast.Gt) >= 400:
+            return [code]
+    return []
+
+
+_FLIPPED = {ast.Lt: ast.Gt, ast.LtE: ast.GtE, ast.Eq: ast.Eq}
+_STATUS_ASSERT_OPS = {
+    "assertEqual": ast.Eq, "assertIn": ast.In,
+    "assertGreaterEqual": ast.GtE, "assertGreater": ast.Gt,
+}
+
+
+def http_error_status(node: ast.AST) -> str | None:
+    """`"HTTP 409"` when *node* asserts an HTTP error status; None otherwise.
+
+    A web API's error-condition test asserts the response status, not an
+    exception: `assert r.status_code == 400`, `in (401, 403)`, `>= 400`,
+    `self.assertEqual(r.status_code, HTTPStatus.CONFLICT)`.
+    """
+    pairs: list[tuple[ast.cmpop, ast.expr]] = []
+    if isinstance(node, ast.Assert) and isinstance(node.test, ast.Compare):
+        cmp = node.test
+        if len(cmp.ops) == 1:
+            left, op, right = cmp.left, cmp.ops[0], cmp.comparators[0]
+            if _is_status(left):
+                pairs.append((op, right))
+            elif _is_status(right) and type(op) in _FLIPPED:
+                pairs.append((_FLIPPED[type(op)](), left))
+    elif isinstance(node, ast.Call) and len(node.args) >= 2:
+        name = _get_call_name(node.func)
+        op_type = _STATUS_ASSERT_OPS.get(name or "")
+        if op_type is not None:
+            first, second = node.args[0], node.args[1]
+            if _is_status(first):
+                pairs.append((op_type(), second))
+            elif _is_status(second) and op_type is ast.Eq:
+                pairs.append((op_type(), first))
+    for op, value in pairs:
+        codes = _error_statuses(op, value)
+        if codes:
+            prefix = ">=" if isinstance(op, (ast.GtE, ast.Gt)) else ""
+            return "HTTP " + prefix + "/".join(str(c) for c in codes)
+    return None
+
+
 def extract_assertions(func_node: ast.FunctionDef) -> list[dict]:
     """Extract assertion calls and classify them from a test function AST."""
     assertions: list[dict] = []
@@ -140,6 +215,9 @@ def extract_assertions(func_node: ast.FunctionDef) -> list[dict]:
             inv_type = _ASSERT_INVARIANT_MAP[call_name]
             # For assertRaises, extract the exception type
             detail = ""
+            status = http_error_status(node)
+            if status:
+                inv_type, detail = "error_condition", status
             if call_name in ("assertRaises", "assertRaisesRegex") and node.args:
                 exc_arg = node.args[0]
                 if isinstance(exc_arg, ast.Name):
@@ -189,11 +267,12 @@ def extract_assertions(func_node: ast.FunctionDef) -> list[dict]:
     # Also capture bare assert statements
     for node in ast.walk(func_node):
         if isinstance(node, ast.Assert):
+            status = http_error_status(node)
             assertions.append({
                 "method": "assert",
-                "invariant_type": "general",
+                "invariant_type": "error_condition" if status else "general",
                 "line": node.lineno,
-                "detail": "",
+                "detail": status or "",
                 "is_implementation_detail": False,
             })
 
@@ -212,8 +291,7 @@ def extract_assertions(func_node: ast.FunctionDef) -> list[dict]:
 # local variables, conftest fixtures and HTTP route decorators, and only
 # then falls back to name matching.
 
-_HTTP_VERBS = frozenset({"get", "post", "put", "patch", "delete", "head", "options"})
-_ROUTE_DECORATORS = _HTTP_VERBS | {"route", "api_route", "websocket"}
+_HTTP_VERBS = HTTP_VERBS
 # One-word names too generic to identify a function from a test name alone.
 _GENERIC_TOKENS = frozenset({
     "get", "set", "run", "add", "new", "make", "main", "call", "init", "load",
@@ -275,37 +353,6 @@ def _tokens(name: str) -> list[str]:
     return [t for t in name.lower().strip("_").split("_") if t]
 
 
-def _path_segments(node: ast.expr) -> list[str | None] | None:
-    """URL path segments of a str / f-string literal; None marks a wildcard."""
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        text = node.value
-    elif isinstance(node, ast.JoinedStr):
-        pieces = []
-        for value in node.values:
-            if isinstance(value, ast.Constant) and isinstance(value.value, str):
-                pieces.append(value.value)
-            else:
-                pieces.append("\0")
-        text = "".join(pieces)
-    else:
-        return None
-    if not text.startswith("/"):
-        return None
-    text = text.split("?", 1)[0]
-    return [
-        None if "\0" in seg else seg for seg in text.strip("/").split("/") if seg
-    ]
-
-
-def _template_segments(path: str) -> list[str | None]:
-    """Segments of a route template; `{param}` / `<param>` become wildcards."""
-    return [
-        None if ("{" in seg or "<" in seg) else seg
-        for seg in path.strip("/").split("/")
-        if seg
-    ]
-
-
 class SourceIndex:
     """What a test may reach in the source tree, indexed for call resolution."""
 
@@ -332,6 +379,7 @@ class SourceIndex:
 
     def _index_tree(self, tree: ast.Module, rel: str) -> None:
         method_nodes: set[int] = set()
+        prefixes = router_prefixes(tree)
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef):
                 methods: dict[str, int] = {}
@@ -354,40 +402,22 @@ class SourceIndex:
                     self.short_names[name].append((rel, f"{node.name}.{name}"))
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                self._index_route(node, rel)
+                self._index_route(node, rel, prefixes)
                 if id(node) not in method_nodes and (rel, node.name) not in self.functions:
                     self.functions[(rel, node.name)] = node.lineno
                     self.short_names[node.name].append((rel, node.name))
 
-    def _index_route(self, node: ast.FunctionDef | ast.AsyncFunctionDef, rel: str):
-        for dec in node.decorator_list:
-            if not (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)):
-                continue
-            verb = dec.func.attr
-            if verb not in _ROUTE_DECORATORS or not dec.args:
-                continue
-            path = dec.args[0]
-            if not (isinstance(path, ast.Constant) and isinstance(path.value, str)):
-                continue
-            if not path.value.startswith("/"):
-                continue
-            if verb in _HTTP_VERBS:
-                methods = {verb}
-            else:
-                methods = {"get"}
-                for kw in dec.keywords:
-                    if kw.arg == "methods" and isinstance(kw.value, (ast.List, ast.Tuple)):
-                        methods = {
-                            e.value.lower()
-                            for e in kw.value.elts
-                            if isinstance(e, ast.Constant) and isinstance(e.value, str)
-                        }
+    def _index_route(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef, rel: str,
+        prefixes: dict[str, str],
+    ) -> None:
+        for methods, path in route_templates(node, prefixes):
             self.routes.append({
                 "file": rel,
                 "line": node.lineno,
                 "function": node.name,
                 "methods": methods,
-                "segments": _template_segments(path.value),
+                "segments": template_segments(path),
             })
 
     # -- resolution ---------------------------------------------------------
@@ -437,27 +467,8 @@ class SourceIndex:
 
     def match_route(self, verb: str, segments: list[str | None]) -> dict | None:
         """The most specific route whose template is a suffix of the path."""
-        best = None
-        best_key = (0, 0)
-        for route in self.routes:
-            if verb not in route["methods"]:
-                continue
-            tmpl = route["segments"]
-            if len(tmpl) > len(segments) or not tmpl:
-                continue
-            tail = segments[len(segments) - len(tmpl):]
-            literal = 0
-            for want, got in zip(tmpl, tail):
-                if want is None or got is None:
-                    continue
-                if want != got:
-                    break
-                literal += 1
-            else:
-                key = (literal, len(tmpl))
-                if literal and key > best_key:
-                    best, best_key = route, key
-        return best
+        best = best_routes(segments, self.routes, verb)
+        return best[0] if best else None
 
 
 class _TestFileContext:
@@ -668,7 +679,7 @@ def _call_candidates(
             continue
         # client.post("/api/...") → the route handler.
         if isinstance(func, ast.Attribute) and func.attr in _HTTP_VERBS and call.args:
-            segments = _path_segments(call.args[0])
+            segments = path_segments(call.args[0])
             if segments is not None:
                 route = index.match_route(func.attr, segments)
                 if route:
@@ -837,10 +848,56 @@ def resolve_tested_function(
 # Source function extraction and similarity
 # ---------------------------------------------------------------------------
 
+_ABSTRACT_BASES = frozenset({"ABC", "Protocol", "ABCMeta"})
+
+
+def _is_abstract(
+    node: ast.FunctionDef | ast.AsyncFunctionDef, owner: ast.ClassDef | None
+) -> bool:
+    """True for a declaration with no behaviour to hold an invariant.
+
+    `@abstractmethod` / `@overload`, or a body (after any docstring) that is
+    only `...` or `raise NotImplementedError`. A bare `pass` counts only in an
+    ABC or Protocol class: elsewhere it is a real no-op implementation, and
+    a no-op `close()` can violate an invariant its siblings keep.
+    """
+    for dec in node.decorator_list:
+        chain = _dotted_chain(dec.func if isinstance(dec, ast.Call) else dec)
+        if chain and chain[-1] in ("abstractmethod", "overload"):
+            return True
+    body = node.body
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    if len(body) != 1:
+        return not body  # docstring only
+    stmt = body[0]
+    if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
+        return stmt.value.value is Ellipsis
+    if isinstance(stmt, ast.Raise) and stmt.exc is not None:
+        exc = stmt.exc.func if isinstance(stmt.exc, ast.Call) else stmt.exc
+        chain = _dotted_chain(exc)
+        return bool(chain) and chain[-1] == "NotImplementedError"
+    if isinstance(stmt, ast.Pass) and owner is not None:
+        bases = {chain[-1] for chain in map(_dotted_chain, owner.bases) if chain}
+        bases |= {
+            chain[-1]
+            for kw in owner.keywords
+            if kw.arg == "metaclass" and (chain := _dotted_chain(kw.value))
+        }
+        return bool(bases & _ABSTRACT_BASES)
+    return False
+
+
 def extract_source_functions(source_files: list[Path], project_root: Path) -> dict[str, list[dict]]:
     """Extract all function/method definitions from source files.
 
-    Returns {qualified_name: [{file, line, params, is_method}]}.
+    Returns {qualified_name: [{file, line, params, is_method, is_abstract,
+    ...}]}.
     """
     functions: dict[str, list[dict]] = defaultdict(list)
 
@@ -852,25 +909,22 @@ def extract_source_functions(source_files: list[Path], project_root: Path) -> di
             continue
 
         rel = str(filepath.relative_to(project_root))
+        # The class each method is defined directly in.
+        owners: dict[int, ast.ClassDef] = {
+            id(child): cls
+            for cls in ast.walk(tree)
+            if isinstance(cls, ast.ClassDef)
+            for child in cls.body
+        }
 
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                # Build qualified name
                 params = [a.arg for a in node.args.args if a.arg != "self"]
                 is_method = any(
                     a.arg == "self" for a in node.args.args
                 )
-
-                # Get parent class name if method
-                # (simplified — checks direct parent)
-                parent_name = ""
-                for parent in ast.walk(tree):
-                    if isinstance(parent, ast.ClassDef):
-                        if node in ast.iter_child_nodes(parent):
-                            parent_name = parent.name
-                            break
-
-                qualified = f"{parent_name}.{node.name}" if parent_name else node.name
+                owner = owners.get(id(node))
+                qualified = f"{owner.name}.{node.name}" if owner else node.name
 
                 functions[qualified].append({
                     "file": rel,
@@ -879,6 +933,7 @@ def extract_source_functions(source_files: list[Path], project_root: Path) -> di
                     "param_count": len(params),
                     "is_method": is_method,
                     "is_async": isinstance(node, ast.AsyncFunctionDef),
+                    "is_abstract": _is_abstract(node, owner),
                     "name": node.name,
                 })
 
@@ -921,7 +976,13 @@ def find_similar_functions(
 
     Candidates outside the tested function's top-level directory (benchmarks/
     and scripts/ for a package's function), private helpers of a public
-    function, and dunder methods are not considered.
+    function, dunder methods and abstract declarations (`...`,
+    `raise NotImplementedError`, `@abstractmethod`: no body to hold an
+    invariant) are not considered. Nor is a bare verb that is all of the
+    shared prefix (`_check` for `_check_spec_version`: a dispatcher, not a
+    sibling); and one shared non-generic word is enough only with the same
+    shape (method or not, parameter count within one) or a second shared
+    word further on (`_parse_options` is no sibling of `Loader._parse_header`).
     """
     results: list[dict] = []
     base_name = func_info.get("name", func_name.rsplit(".", 1)[-1])
@@ -943,6 +1004,7 @@ def find_similar_functions(
                 cand for cand in locations
                 if (cand["file"], cand["line"]) != (base_file, base_line)
                 and _top_dir(cand["file"]) == base_top
+                and not cand.get("is_abstract")
             ),
             None,
         )
@@ -950,11 +1012,21 @@ def find_similar_functions(
             continue
 
         same_name = short == base_name
-        shared = _shared_leading_words(base_words, _tokens(short))
+        words = _tokens(short)
+        shared = _shared_leading_words(base_words, words)
         needed = 2 if base_words and base_words[0] in _GENERIC_TOKENS else 1
         prefix_match = (
             not same_name and shared >= needed and len(base_words[0]) > 2
+            # A bare verb that is all of the shared prefix is a dispatcher.
+            and not (shared == len(words) < len(base_words))
         )
+        if prefix_match and shared == 1:
+            same_shape = (
+                loc.get("is_method") == func_info.get("is_method")
+                and abs(loc.get("param_count", 0) - base_params) <= 1
+            )
+            more_shared = bool(set(words[1:]) & set(base_words[1:]))
+            prefix_match = same_shape or more_shared
         if not (same_name or prefix_match):
             continue
 
@@ -988,6 +1060,202 @@ def find_similar_functions(
 
 
 # ---------------------------------------------------------------------------
+# Entry-point siblings: other ways into the same operation
+# ---------------------------------------------------------------------------
+#
+# Name similarity cannot see that `import_record` and `create_record` both
+# install a record, or that a bulk and a single upload both write rows. What
+# they share is the operation: the project helpers they call
+# (the write lock, the path builder, the cleanup). A function that calls
+# several of the tested path's helpers is another entry point into the
+# same operation, and the guard the tested path applies first (`validate_*`,
+# `require_*`, an `if ...: raise`) is the invariant it should keep.
+
+# A helper called by more functions than this is infrastructure, not an
+# operation (`_with_retry` around every query).
+_SINK_MAX_FAN_IN = 20
+# One shared helper is enough only when it is this rare.
+_RARE_SINK_FAN_IN = 4
+_GUARD_VERBS = ("validate", "require", "check", "ensure", "verify", "assert")
+
+
+def _own_nodes(func: ast.AST):
+    """Nodes in *func*'s body, not descending into nested defs or classes."""
+    stack = list(ast.iter_child_nodes(func))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        yield node
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def _distinctive(name: str) -> bool:
+    core = name.strip("_")
+    return (
+        not name.startswith("__")
+        and core.lower() not in _GENERIC_TOKENS
+        and ("_" in core or len(core) >= 8)
+    )
+
+
+class CallIndex:
+    """Which project functions each function calls, and its guards.
+
+    Functions are keyed `(file, qualname)` like `extract_source_functions`.
+    Calls resolve by their last name only (`self._lock(...)` → `_lock`), so
+    only names some source function defines count.
+    """
+
+    def __init__(self, source_files: list[Path], project_root: Path,
+                 source_functions: dict[str, list[dict]]):
+        defined_names = {
+            loc["name"] for locs in source_functions.values() for loc in locs
+        }
+        self.abstract = {
+            (loc["file"], qual)
+            for qual, locs in source_functions.items()
+            for loc in locs
+            if loc.get("is_abstract")
+        }
+        self.calls: dict[tuple[str, str], set[str]] = {}
+        self.guards: dict[tuple[str, str], set[str]] = {}
+        self.lines: dict[tuple[str, str], int] = {}
+        self.callers: dict[str, set[tuple[str, str]]] = defaultdict(set)
+        self.defs: dict[str, set[tuple[str, str]]] = defaultdict(set)
+        for path in source_files:
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+            except (SyntaxError, ValueError):
+                continue
+            rel = str(path.relative_to(project_root))
+            owners = {
+                id(child): cls.name
+                for cls in ast.walk(tree)
+                if isinstance(cls, ast.ClassDef)
+                for child in cls.body
+            }
+            # `from .service import create as svc_create`: a call to the
+            # alias is a call to the original name.
+            aliases = {
+                alias.asname: alias.name
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ImportFrom)
+                for alias in node.names
+                if alias.asname
+            }
+
+            def called(call: ast.Call, aliases: dict[str, str] = aliases) -> str | None:
+                name = _get_call_name(call.func)
+                if isinstance(call.func, ast.Name):
+                    name = aliases.get(name, name)
+                return name
+
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                owner = owners.get(id(node))
+                key = (rel, f"{owner}.{node.name}" if owner else node.name)
+                if key in self.calls:
+                    continue
+                calls: set[str] = set()
+                guards: set[str] = set()
+                for sub in _own_nodes(node):
+                    if isinstance(sub, ast.Call):
+                        name = called(sub)
+                        if name and name in defined_names:
+                            calls.add(name)
+                            if _tokens(name)[:1] and _tokens(name)[0] in _GUARD_VERBS:
+                                guards.add(name)
+                    elif isinstance(sub, (ast.If, ast.Assert)):
+                        # `if not is_allowed(x): raise ...`: a project
+                        # predicate deciding a refusal.
+                        raises = isinstance(sub, ast.Assert) or any(
+                            isinstance(stmt, ast.Raise) for stmt in sub.body
+                        )
+                        if raises:
+                            guards |= {
+                                n for c in ast.walk(sub.test)
+                                if isinstance(c, ast.Call)
+                                and (n := called(c)) in defined_names
+                                and _distinctive(n)
+                            }
+                self.calls[key] = calls
+                self.guards[key] = guards
+                self.lines[key] = node.lineno
+                self.defs[node.name].add(key)
+                for name in calls:
+                    self.callers[name].add(key)
+
+    def chain(self, key: tuple[str, str]) -> list[tuple[str, str]]:
+        """*key* and the same-named functions it reaches through calls.
+
+        A route handler calls the service function of the same name, which
+        calls the store method of the same name: one operation in three
+        layers, and the sinks that matter sit in the deepest one. Only a
+        distinctive name is followed.
+        """
+        name = key[1].rsplit(".", 1)[-1]
+        found = [key]
+        if not _distinctive(name):
+            return found  # `run` calling `child.run()` is not a layer
+        frontier = [key]
+        while frontier:
+            current = frontier.pop()
+            if name not in self.calls.get(current, ()):
+                continue
+            for target in sorted(self.defs.get(name, ())):
+                if target not in found and target not in self.abstract:
+                    found.append(target)
+                    frontier.append(target)
+        return found
+
+    def siblings(self, key: tuple[str, str], max_results: int = 5) -> list[dict]:
+        """Other entry points into the operation *key* performs."""
+        if key not in self.calls:
+            return []
+        chain = self.chain(key)
+        sinks: dict[str, int] = {}
+        for member in chain:
+            for name in self.calls[member]:
+                fan_in = len(self.callers[name])
+                if _distinctive(name) and 2 <= fan_in <= _SINK_MAX_FAN_IN:
+                    sinks[name] = fan_in
+        chain_names = {member[1].rsplit(".", 1)[-1] for member in chain}
+        tested_guards = set().union(*(self.guards[m] for m in chain))
+        shared: dict[tuple[str, str], list[str]] = defaultdict(list)
+        for name in sinks:
+            for caller in self.callers[name]:
+                if caller in chain or caller in self.abstract:
+                    continue
+                short = caller[1].rsplit(".", 1)[-1]
+                if short in chain_names or short in sinks:
+                    continue  # another layer of the same operation, or a sink
+                shared[caller].append(name)
+        results = []
+        for caller, names in shared.items():
+            if len(names) < 2 and sinks[names[0]] > _RARE_SINK_FAN_IN:
+                continue
+            missing = sorted(tested_guards - self.guards[caller] - self.calls[caller])
+            results.append({
+                "function": caller[1],
+                "file": caller[0],
+                "line": self.lines[caller],
+                "shared_calls": sorted(names, key=lambda n: (sinks[n], n)),
+                # Guards the tested path applies that this entry point does
+                # not: the invariant most likely to be missing here.
+                "missing_guards": missing,
+                "score": round(sum(1 / sinks[n] for n in names), 3),
+            })
+        # Public functions first: they are the entry points a caller reaches.
+        results.sort(key=lambda r: (
+            r["function"].rsplit(".", 1)[-1].startswith("_"),
+            -r["score"], r["file"], r["function"],
+        ))
+        return results[:max_results]
+
+
+# ---------------------------------------------------------------------------
 # Test selection (three-tier)
 # ---------------------------------------------------------------------------
 
@@ -1015,6 +1283,61 @@ _FIX_COMMIT_RE = re.compile(
     r"concurren|lock|deadlock|timeout|thread)",
     re.IGNORECASE,
 )
+
+# A conventional-commit type (`fix:`, `chore(deps)!:`, even a malformed
+# `feat(scope:`) and bracket tags (`[fix][cli]`, `[test]`).
+_COMMIT_TYPE_RE = re.compile(r"^\s*([A-Za-z]+)(?:\([^):]*\)?)?!?:")
+_COMMIT_TAG_RE = re.compile(r"\[([A-Za-z]+)\]")
+_FIX_TYPES = frozenset({"fix", "fixes", "fixed", "bugfix", "hotfix", "bug"})
+# Commit types that are not product fixes, whatever their subject says
+# (`chore: fix a typo`, `ci: fix the build`, `[test] Raise a timeout`).
+_NON_FIX_TYPES = frozenset({
+    "chore", "ci", "docs", "doc", "style", "test", "tests", "build",
+    "refactor", "perf", "bench", "benchmark", "benchmarks", "release",
+    "deps", "revert", "wip", "lint", "typo", "feat", "feature",
+})
+
+
+def is_fix_commit(subject: str) -> bool:
+    """True when a commit subject describes a bug fix.
+
+    A conventional-commit type or a bracket tag decides when it names a
+    known type: `fix`/`hotfix` (or a `[fix]` tag) is a fix, `chore`, `ci`,
+    `test`, `docs`, `[bench]` and the like are not, even when the subject
+    says "fix". Only an untyped subject falls back to the fix vocabulary
+    (`_FIX_COMMIT_RE`).
+    """
+    types: list[str] = []
+    match = _COMMIT_TYPE_RE.match(subject)
+    if match:
+        types.append(match.group(1).lower())
+    types += [t.lower() for t in _COMMIT_TAG_RE.findall(subject)]
+    if any(t in _FIX_TYPES for t in types):
+        return True
+    if any(t in _NON_FIX_TYPES for t in types):
+        return False
+    return bool(_FIX_COMMIT_RE.search(subject))
+
+
+# Directories whose files are never product code: a fix commit touching only
+# these (and tests) adjusts the test harness, not the product.
+_NON_PRODUCT_DIRS = frozenset({
+    "test", "tests", "testing", "bench", "benchmark", "benchmarks", "docs",
+    "doc", "examples", "scripts", "tools", ".github",
+})
+
+
+def _is_product_file(path: str) -> bool:
+    parts = Path(path).parts
+    name = parts[-1] if parts else ""
+    return (
+        name.endswith(".py")
+        and not name.startswith("test_")
+        and not name.endswith("_test.py")
+        and name not in ("conftest.py", "setup.py", "noxfile.py")
+        and not (set(parts[:-1]) & _NON_PRODUCT_DIRS)
+    )
+
 
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", re.MULTILINE)
 _BUG_FIX_LIST_CAP = 15
@@ -1055,8 +1378,9 @@ def _get_bug_fix_tests(
 ) -> tuple[list[dict], int]:
     """Identify the tests that bug-fix commits added or changed, using git.
 
-    A commit counts as a fix when its subject uses fix vocabulary (see
-    `_FIX_COMMIT_RE`). For each test file it touched, the diff's added lines
+    A commit counts as a fix per `is_fix_commit`: its conventional type or
+    tag, else its subject's fix vocabulary. `touches_source` is False when
+    the commit changed no product file (only tests, benchmarks, tooling). For each test file it touched, the diff's added lines
     name the test functions it changed (`test_functions`, with
     `attribution: "function"`); when no test function was touched (a fixture
     or helper changed) the entry keeps `test_functions: []` and
@@ -1072,7 +1396,7 @@ def _get_bug_fix_tests(
     fix_commits: list[tuple[str, str]] = []
     for line in log.strip().split("\n"):
         sha, _, msg = line.partition(" ")
-        if sha and msg and _FIX_COMMIT_RE.search(msg):
+        if sha and msg and is_fix_commit(msg):
             fix_commits.append((sha, msg))
 
     test_rel_paths = set()
@@ -1087,7 +1411,11 @@ def _get_bug_fix_tests(
         changed = _git(
             ["diff-tree", "--no-commit-id", "-r", "--name-only", sha], project_root
         )
-        for changed_file in (changed or "").strip().split("\n"):
+        changed_files = (changed or "").strip().split("\n")
+        # A fix that changed only tests, benchmarks or tooling encodes
+        # harness slack (a longer timeout), not a product failure mode.
+        touches_source = any(_is_product_file(f) for f in changed_files)
+        for changed_file in changed_files:
             if changed_file not in test_rel_paths:
                 continue
             diff = _git(["show", "-U0", "--format=", sha, "--", changed_file],
@@ -1105,6 +1433,7 @@ def _get_bug_fix_tests(
                 "fix_message": msg[:120],
                 "test_functions": functions,
                 "attribution": "function" if functions else "file",
+                "touches_source": touches_source,
             })
 
     return bug_fix_tests, len(bug_fix_tests)
@@ -1185,11 +1514,34 @@ def select_tests(
     tier2 = _round_robin(
         strong, lambda f: not _is_strong_signal_test("", f)
     ) + _round_robin(weak)
-    # Bug-fix files in commit order, newest fix first.
+    # Bug-fix files in commit order, newest fix first; tests a product fix
+    # changed before those of fixes that touched only tests or benchmarks.
     newest_fix: dict[str, int] = {}
     for i, bt in enumerate(bug_fix_tests):
         newest_fix.setdefault(bt["test_file"], i)
-    tier1 = _round_robin(tier1, lambda f: newest_fix.get(f, len(newest_fix)))
+    product_functions = {
+        (bt["test_file"], fn)
+        for bt in bug_fix_tests
+        if bt.get("touches_source", True)
+        for fn in bt.get("test_functions") or ()
+    }
+    product_files = {
+        bt["test_file"]
+        for bt in bug_fix_tests
+        if bt.get("touches_source", True) and not bt.get("test_functions")
+    }
+
+    def from_product_fix(t: dict) -> bool:
+        return (t["file"], t["function"]) in product_functions or (
+            t["file"] in product_files
+        )
+
+    def by_recency(f: str) -> int:
+        return newest_fix.get(f, len(newest_fix))
+
+    tier1 = _round_robin(
+        [t for t in tier1 if from_product_fix(t)], by_recency
+    ) + _round_robin([t for t in tier1 if not from_product_fix(t)], by_recency)
     tier3 = _round_robin(tier3)
 
     # Distribute quota: 10/10/10 by default, redistribute if any tier is short
@@ -1318,11 +1670,12 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
     project_root = find_project_root(target_path)
     scan_root = target_path if target_path.is_dir() else target_path.parent
 
-    all_files = list(discover_python_files(scan_root))
-    if max_files > 0:
-        all_files = all_files[:max_files]
+    all_files, files_total = collect_python_files(scan_root, max_files)
 
-    source_files, test_files = classify_files(all_files, project_root)
+    test_named_sources: list[Path] = []
+    source_files, test_files = classify_files(
+        all_files, project_root, test_named_sources
+    )
 
     # A package is usually reviewed on its own (`pkg/`) while its tests live
     # beside it (`tests/`). Finding none under the scan root must not read as
@@ -1330,8 +1683,15 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
     # tests, and say where they came from. Source functions stay limited to
     # the scan root.
     warnings: list[str] = []
+    if test_named_sources:
+        warnings.append(
+            "Named like test modules but define no tests, so treated as source: "
+            + ", ".join(str(f.relative_to(project_root)) for f in test_named_sources)
+        )
     test_discovery: dict = {"method": "scan_root", "roots": []}
-    if not test_files:
+    # Test files that define no test (a lone `tests/__init__.py`, helpers)
+    # are not tests to extract from: look further, as if there were none.
+    if not any(defines_tests(f) for f in test_files):
         found: list[Path] = []
         roots: list[str] = []
         how: str | None = None
@@ -1346,6 +1706,7 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
                 f"the scan root."
             )
         else:
+            test_files = []
             test_discovery = {"method": None, "roots": []}
             warnings.append(
                 "No test files found under the scan root or in the project's "
@@ -1373,6 +1734,8 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
     selected = select_tests(all_test_info, bug_fix_tests, max_tests=30)
     bug_fix_tests = bug_fix_tests[:_BUG_FIX_LIST_CAP]
 
+    call_index = CallIndex(source_files, project_root, source_functions)
+
     # For each selected test with a resolved tested function, find similar functions
     invariants: list[dict] = []
     for test in selected:
@@ -1381,6 +1744,7 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
             invariants.append({
                 **test,
                 "similar_functions": [],
+                "entry_point_siblings": [],
             })
             continue
 
@@ -1395,6 +1759,11 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
         invariants.append({
             **test,
             "similar_functions": similar,
+            # Functions sharing the tested path's helpers: other entry points
+            # into the same operation, whatever their names.
+            "entry_point_siblings": call_index.siblings(
+                (tested["file"], func_name)
+            ),
         })
 
     # Find untested similar functions (functions similar to tested ones but with no tests)
@@ -1433,9 +1802,25 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
     untested_similar_total = len(deduped)
     untested_similar = deduped[:20]
 
+    entry_points: list[dict] = []
+    seen_entry: set[tuple[str, str]] = set()
+    for inv in invariants:
+        for sib in inv["entry_point_siblings"]:
+            key = (sib["file"], sib["function"])
+            if key in seen_entry:
+                continue
+            seen_entry.add(key)
+            entry_points.append({
+                **sib,
+                "sibling_of": inv["tested_function"]["function"],
+                "tested_in": inv["file"],
+                "tested": key in tested_funcs,
+                "invariant_types": inv["invariant_types"],
+            })
+    entry_points_total = len(entry_points)
+
     return {
-        "project_root": str(project_root),
-        "scan_root": str(scan_root),
+        **build_envelope(project_root, scan_root, files_total, len(all_files)),
         # "no_tests_found" when no test file was found anywhere: an empty
         # result then means "not measured", not "no invariants".
         "status": "ok" if test_files else "no_tests_found",
@@ -1459,6 +1844,9 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
             "untested_similar_functions": len(untested_similar),
             "untested_similar_functions_total": untested_similar_total,
             "untested_similar_functions_capped": untested_similar_total > 20,
+            "entry_point_siblings": min(entry_points_total, 20),
+            "entry_point_siblings_total": entry_points_total,
+            "entry_point_siblings_capped": entry_points_total > 20,
             "bug_fix_tests_found": len(bug_fix_tests),
             "bug_fix_tests_total": bug_fix_tests_total,
             "bug_fix_tests_capped": bug_fix_tests_total > _BUG_FIX_LIST_CAP,
@@ -1466,6 +1854,7 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
         "invariants": invariants,
         "bug_fix_tests": bug_fix_tests,
         "untested_similar_functions": untested_similar,
+        "entry_point_siblings": entry_points[:20],
     }
 
 
