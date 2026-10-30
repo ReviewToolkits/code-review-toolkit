@@ -40,7 +40,7 @@ Two fields carry the design:
     not 100%, and an existing suppression naming the rule class is usually why.
 
 Usage:
-    python run_lint_rules.py [path] [--tier 1|2|3] [--ruff-bin PATH]
+    python run_lint_rules.py [path] [--tier 1|2] [--ruff-bin PATH]
                              [--preview-pass] [--max-findings N]
 """
 
@@ -151,6 +151,9 @@ TIER_2 = (
     "C901 PLR0911 PLR0912 PLR0913 PLR0915 "
     "F401 F403 F405 F841"
 ).split()
+
+_TIER_1_SET = frozenset(TIER_1)
+_TIER_2_SET = frozenset(TIER_2)
 
 # Preview-gated codes worth a separate, labelled pass. PLW1514 (unspecified
 # encoding -- a locale-dependent decode, a real defect class) and RUF055 were
@@ -403,6 +406,20 @@ def except_closure_annotation(
     return except_closure_match(code, message, line, bindings_cache[path])
 
 
+def rule_tier(code: str) -> int | None:
+    """The tier *code* is listed in: 1, 2, or None (preview-only or unlisted).
+
+    A finding's tier is its RULE's tier, not the run's ``--tier``: a tier-2
+    run also selects every tier-1 rule, and tagging those hits ``2`` hid them
+    from a reader filtering for tier 1.
+    """
+    if code in _TIER_1_SET:
+        return 1
+    if code in _TIER_2_SET:
+        return 2
+    return None
+
+
 def _tier_codes(tier: int) -> list[str]:
     if tier == 1:
         return [str(c) for c in TIER_1]
@@ -475,7 +492,7 @@ def _source_line(path: Path, lineno: int, cache: dict[Path, list[str]]) -> str:
 
 
 def normalize(
-    raw: dict, project_root: Path, tier: int, cache: dict, preview: bool = False
+    raw: dict, project_root: Path, cache: dict, preview: bool = False
 ) -> dict:
     """Normalize one ruff JSON finding.
 
@@ -495,7 +512,9 @@ def normalize(
         "line": line,
         "column": location.get("column", 0) or 0,
         "message": (raw.get("message") or "").strip(),
-        "tier": tier,
+        # The rule's own tier (None for a preview-only code); the run's
+        # `--tier` is the envelope's `tier`.
+        "tier": rule_tier(code),
         "preview": preview,
         # Non-null => merge with the scanner's finding, do not double-report.
         "shape_id": RULE_TO_SHAPE.get(code),
@@ -608,7 +627,7 @@ def analyze(
     dismissed: list[dict] = []
     closures: dict = {}
     for raw_finding in raw[:max_findings]:
-        finding = normalize(raw_finding, project_root, tier, cache)
+        finding = normalize(raw_finding, project_root, cache)
         filename = raw_finding.get("filename")
         path = Path(filename) if filename else None
         # Flagged, not dismissed: the same F821 is a real NameError when the
@@ -635,7 +654,7 @@ def analyze(
             target_version=target_version,
         )
         preview_findings = [
-            normalize(f, project_root, tier, cache, preview=True)
+            normalize(f, project_root, cache, preview=True)
             for f in praw[:max_findings]
         ]
 

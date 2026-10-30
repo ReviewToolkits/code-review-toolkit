@@ -93,7 +93,6 @@ class TestNormalize(unittest.TestCase):
         out = mod.normalize(
             {"code": "B006", "filename": None, "location": None, "message": "m"},
             Path("/p"),
-            tier=1,
             cache={},
         )
         self.assertEqual(out["file"], "")
@@ -106,10 +105,36 @@ class TestNormalize(unittest.TestCase):
         out = mod.normalize(
             {"code": "S608", "filename": None, "location": None, "message": "m"},
             Path("/p"),
-            tier=1,
             cache={},
         )
         self.assertIsNone(out["shape_id"])
+
+
+class TestPerFindingTier(unittest.TestCase):
+    """A finding's `tier` is its rule's tier, not the run's --tier."""
+
+    def test_tier_one_rule_in_a_tier_two_run_is_tagged_tier_one(self):
+        from helpers import TempProject
+
+        source = "import yaml\n\ndef f(s, x):\n    raise ValueError(x)\n"
+        with TempProject({"m.py": source}) as root:
+            hits = [
+                _fake_hit(root, "m.py", 1, "yaml", code="S506"),
+                _fake_hit(root, "m.py", 4, "raise", code="B904"),
+                _fake_hit(root, "m.py", 4, "raise", code="RUF069"),
+            ]
+            result = _analyze_with_fake_ruff(root, hits, tier=2)
+        self.assertEqual(result["tier"], 2)
+        tiers = {f["code"]: f["tier"] for f in result["findings"]}
+        self.assertEqual(tiers, {"S506": 1, "B904": 2, "RUF069": None})
+
+    def test_rule_tier(self):
+        self.assertEqual(mod.rule_tier("F821"), 1)
+        self.assertEqual(mod.rule_tier("B904"), 2)
+        self.assertIsNone(mod.rule_tier("B909"))
+
+    def test_docstring_names_only_the_tiers_argparse_accepts(self):
+        self.assertNotIn("1|2|3", mod.__doc__)
 
 
 class TestRuffInvocation(unittest.TestCase):
@@ -147,7 +172,7 @@ def _fake_hit(root, relpath, line, needle, code="B008"):
     }
 
 
-def _analyze_with_fake_ruff(root, hits):
+def _analyze_with_fake_ruff(root, hits, **kwargs):
     from unittest.mock import patch
 
     with (
@@ -159,7 +184,7 @@ def _analyze_with_fake_ruff(root, hits):
         ),
         patch.object(mod, "_run_ruff", return_value=(hits, "", None)),
     ):
-        return mod.analyze(str(root))
+        return mod.analyze(str(root), **kwargs)
 
 
 class TestFastapiMarkerDismissal(unittest.TestCase):
