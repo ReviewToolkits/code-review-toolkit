@@ -131,6 +131,8 @@ Combine git-history-context churn data with other agents' output:
 
 Produce a ranked risk table that synthesizes these signals. This answers "where should we invest our quality improvement effort?"
 
+**When complexity carries no information**, drop it. If nearly every file scores ≤ 1.0 in complexity-simplifier's output, or the hotspot list is one or two functions long, the Complexity column ranks nothing. Replace it with **finding density**: the number of confirmed findings from the other agents per file (or per function), counted from their reports by finding id, divided by the file's size in hundreds of lines. Also add `history_crossing.top_fixed_functions` (fix commits per function) when complexity-simplifier ran. Say in the table's heading which columns you used and why. On a structurally simple codebase, the real risk signals are parallel paths that diverged and tests that pass without exercising the code, not long functions.
+
 If other agents' output is not available, produce churn rankings alone with a note that cross-referencing would improve the analysis.
 
 ## Capability 5: Historical Context Annotation
@@ -232,9 +234,9 @@ For each:
 
 ## Risk Matrix
 
-| Rank | File / Function | Churn | Complexity | Coverage | Errors | Risk Score |
-|------|-----------------|-------|------------|----------|--------|------------|
-[Top 15. Columns populated from available agent data. Empty columns marked "—" if that agent didn't run.]
+| Rank | File / Function | Churn | Complexity or Finding density | Coverage | Errors | Risk Score |
+|------|-----------------|-------|-------------------------------|----------|--------|------------|
+[Top 15. Columns populated from available agent data. Empty columns marked "—" if that agent didn't run. Name the fourth column for what it holds.]
 
 ## Historical Context for Other Agents' Findings
 
