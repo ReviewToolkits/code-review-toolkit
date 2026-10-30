@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — unmeasured values no longer reported as clean (#56)
+
+- `check_typing.py` keeps mypy's cache out of the reviewed project and the cwd, honours
+  `--max-files` (with `files_capped`), reports `stale_ignores` as `null` with a reason when
+  `warn_unused_ignores` wasn't in effect, and keeps mypy's `note:` lines with the error they
+  explain.
+- `find_dead_symbols.py` reports the imported name's line for multi-line imports, as ruff does, so
+  findings match by `file:line`.
+
+### Enhanced
+
+- **`check_typing.py` has a labelled `--warn-unreachable` pass**: code that a wrong annotation
+  made unreachable (and so unchecked) shows up there. Labelled passes run in parallel.
+- **`find_dead_symbols.py` checks methods**, with confidence levels and exclusion counts by reason
+  (dunders, overrides, framework hooks), instead of skipping them silently, and reports production
+  code **referenced only from tests** as its own list.
+
 ### Fixed — ruff and external-tool runs (#55)
 
 - `run_lint_rules.py` and `run_external_tools.py` no longer leave `.ruff_cache/` or `.mypy_cache/`

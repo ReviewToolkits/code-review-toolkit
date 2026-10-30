@@ -26,11 +26,13 @@ where `<plugin_root>` is the root of the code-review-toolkit plugin directory.
 Parse the JSON output. This gives you unused imports, unreferenced functions/classes, orphan files, and commented-out code blocks — all with confidence ratings. Use this as your factual foundation, then focus your effort on **verification and false-positive filtering**.
 
 Key fields:
-- `unused_imports`: with `confidence` ratings, accounting for `__all__` and `__init__.py` re-exports
-- `unreferenced_symbols`: with `confidence` ratings, accounting for magic methods, test discovery, and `__main__` guards
+- `unused_imports`: with `confidence` ratings, accounting for `__all__` and `__init__.py` re-exports. `line` is the line of the imported **name** (the line ruff F401 reports), so the two merge by `file:line`; `statement_line` is where the `import` statement starts
+- `unreferenced_symbols`: functions, classes **and methods** (`type: "method"`) with no reference anywhere — not in the scanned tree, its tests, its scripts or its docs — with `confidence` ratings, accounting for magic methods, test discovery, and `__main__` guards. A private method with no reference is `medium`; a public one is `low`, because code outside the project may call it
+- `referenced_only_from_tests`: production functions, classes and methods whose **only** references are in tests (`mentioned_in_docs` says whether the docs name it too). Not dead — removing one means editing tests, and it may be deliberate API — but a refactor often leaves exactly this behind: the production caller is gone and only the tests written for it keep it alive. Report as CONSIDER, never FIX
 - `orphan_files`: with `confidence` ratings
 - `commented_code_blocks`: with line ranges and previews
-- `summary`: aggregate counts for each category plus high/medium confidence totals
+- `summary`: aggregate counts for each category plus high/medium/low confidence totals. `methods_excluded_by_reason` counts the methods a name-reference scan cannot judge and so left out: `dunder`, `sunder_hook` (`_missing_`), `test_file`, `decorated` (a registering decorator such as `@app.get(...)` or `@validator`), `property_accessor`, `framework_base` (the class inherits from a class outside the project, so a method may override a hook the framework calls), `dynamic_dispatch` (a computed `getattr(self, f"cmd_{x}")` can reach it). Say in the report how many methods were checked and how many were left out; never present an empty list as "every method is used"
+- `summary.external_reference_scope_kinds`: which directories outside the scan supplied references, as `test`, `docs` or `production` (`setup.py`, `scripts/`, `tools/`, `benchmarks/`, `examples/`, `bin/`)
 
 ## External Tool Integration
 
@@ -72,7 +74,7 @@ If external tool output is not available, proceed with your standard analysis un
 The script's `unused_imports` identifies imports never referenced in the file body, already accounting for `__all__` re-exports and `__init__.py` patterns. Review the findings — especially medium-confidence items where `TYPE_CHECKING`-guarded imports may need verification against annotations.
 
 ### Unreferenced Functions and Classes
-The script's `unreferenced_symbols` lists functions/classes defined but never referenced anywhere in the codebase. The script already excludes magic methods, test methods, setUp/tearDown, `__all__` entries, and `__main__`-guarded functions. Review medium-confidence items especially for:
+The script's `unreferenced_symbols` lists functions, classes and methods defined but never referenced anywhere in the codebase. The script already excludes magic methods, test methods, setUp/tearDown, `__all__` entries, `__main__`-guarded functions, and the method shapes listed in `methods_excluded_by_reason`. An identifier-like string constant counts as a reference (`getattr(obj, "name")`). Review medium- and low-confidence items especially for:
 - Registered callbacks, decorators, and plugin hooks — these may be called dynamically
 - Classes that may be instantiated by deserializers or frameworks
 

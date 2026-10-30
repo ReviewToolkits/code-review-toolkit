@@ -33,22 +33,40 @@ Two hard rules learned the same way:
 ``pyrefly``'s silent-zero mode makes a clean result indistinguishable from a
 misconfigured one, which is the one failure this script exists to prevent.
 
+Two more labelled passes follow the same rule. ``--warn-unreachable`` finds the
+blocks a wrong annotation has silently removed from checking -- a module-level
+`x = None` with no annotation narrows every `if x is not None:` body away, and
+the phantom-import pass cannot see that. ``--warn-unused-ignores``
+measures stale ignores when the project's config does not; without it a 0 would
+mean "not measured", so an unmeasured count is reported as null with a reason.
+The passes are independent and run concurrently.
+
 Usage:
-    python check_typing.py [path] [--mypy-bin PATH] [--no-strict-pass]
+    python check_typing.py [path] [--mypy-bin PATH] [--max-files N]
+        [--no-strict-pass] [--no-unreachable-pass] [--no-unused-ignores-pass]
 """
 
 from __future__ import annotations
 
 import argparse
+import configparser
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scan_common import emit, find_project_root  # noqa: E402
+from scan_common import (  # noqa: E402
+    build_envelope,
+    discover_python_files,
+    emit,
+    find_project_root,
+)
 
 _MYPY_TIMEOUT = 600
 
@@ -141,9 +159,70 @@ def find_mypy_config(project_root: Path) -> str | None:
     return None
 
 
-def parse_output(stdout: str) -> tuple[list[dict], dict]:
-    """Parse mypy's text output into findings plus its own summary line."""
+def config_enables(config: str | None, option: str) -> bool:
+    """Whether the project's global mypy section turns *option* on.
+
+    ``strict`` implies every warning this script asks about. Per-module
+    sections are deliberately ignored: they enable the option for part of the
+    tree only, so a count taken under them is not a whole-tree measurement.
+    Anything unreadable answers False, which costs at most one extra labelled
+    pass and never reports an unmeasured value as measured.
+    """
+    if not config:
+        return False
+    path = Path(config)
+    if path.suffix == ".toml":
+        try:
+            import tomllib
+        except ImportError:  # Python 3.10
+            return False
+        try:
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        mypy = data.get("tool", {}).get("mypy", {})
+        return any(mypy.get(key) is True for key in (option, "strict"))
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(path, encoding="utf-8")
+    except (OSError, configparser.Error):
+        return False
+    if not parser.has_section("mypy"):
+        return False
+    for key in (option, "strict"):
+        try:
+            if parser.getboolean("mypy", key, fallback=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+# Notes that introduce the error AFTER them rather than explaining the one before.
+_CONTEXT_NOTE = re.compile(
+    r"^(In module imported here|In function |In member |In class |At top level)"
+)
+
+
+def parse_output(
+    stdout: str, standalone_notes: list[dict] | None = None
+) -> tuple[list[dict], dict]:
+    """Parse mypy's text output into findings plus its own summary line.
+
+    A ``note:`` line is part of the error it follows, not a finding of its own:
+    the Superclass/Subclass signatures under an ``override`` error and the
+    candidate list under ``call-overload`` are what make those errors
+    triageable. Each finding carries its notes in ``notes``. A note with an
+    error code of its own (``annotation-unchecked``) stands alone, as does one
+    with no error before it; those are appended to *standalone_notes* when a
+    list is given. Context notes ("In module imported here:") precede the error
+    they introduce and are attached to that one.
+    """
     findings: list[dict] = []
+    # The finding a following code-less note belongs to; None after anything
+    # that breaks the chain (a summary line, an unparseable line, a coded note).
+    current: dict | None = None
+    pending_context: list[dict] = []
     stats: dict[str, int | None] = {
         "errors": None,
         "files_with_errors": None,
@@ -156,6 +235,7 @@ def parse_output(stdout: str) -> tuple[list[dict], dict]:
             stats.update(
                 errors=0, files_with_errors=0, files_checked=int(clean["checked"])
             )
+            current = None
             continue
         summary = _SUMMARY.search(line)
         if summary:
@@ -164,33 +244,55 @@ def parse_output(stdout: str) -> tuple[list[dict], dict]:
                 files_with_errors=int(summary["files"]),
                 files_checked=int(summary["checked"]),
             )
+            current = None
             continue
         m = _LINE.match(line)
-        if not m or m["severity"] == "note":
+        if not m:
+            current = None
             continue
         code = m["code"] or ""
-        findings.append(
-            {
-                "file": m["file"],
-                "line": int(m["line"]),
-                "column": int(m["col"]) if m["col"] else 0,
-                "severity": m["severity"],
-                "code": code,
-                "message": m["message"],
-                "kind": (
-                    "defect"
-                    if code in _DEFECT_CODES
-                    else "missing-annotation"
-                    if code in _ANNOTATION_CODES
-                    else "other"
-                ),
-            }
-        )
+        if m["severity"] == "note":
+            note = {"file": m["file"], "line": int(m["line"]), "message": m["message"]}
+            if code:
+                note["code"] = code
+            if _CONTEXT_NOTE.match(m["message"].strip()) and not code:
+                pending_context.append(note)
+            elif current is not None and not code:
+                current["notes"].append(note)
+            else:
+                if standalone_notes is not None:
+                    standalone_notes.append(note)
+                current = None
+            continue
+        current = {
+            "file": m["file"],
+            "line": int(m["line"]),
+            "column": int(m["col"]) if m["col"] else 0,
+            "severity": m["severity"],
+            "code": code,
+            "message": m["message"],
+            "kind": (
+                "defect"
+                if code in _DEFECT_CODES
+                else "missing-annotation"
+                if code in _ANNOTATION_CODES
+                else "other"
+            ),
+            "notes": pending_context,
+        }
+        findings.append(current)
+        pending_context = []
+    if standalone_notes is not None:
+        standalone_notes.extend(pending_context)
     return findings, stats
 
 
 def _run_mypy(
-    mypy_bin: str, target: Path, config: str | None, extra: list[str]
+    mypy_bin: str,
+    targets: list[str],
+    config: str | None,
+    extra: list[str],
+    cache_dir: str,
 ) -> tuple[str, str, int | None]:
     # --no-color-output is load-bearing, not cosmetic. mypy honours FORCE_COLOR
     # even when stdout is a pipe, and the ANSI codes it injects sit between the
@@ -199,11 +301,23 @@ def _run_mypy(
     # regex only needs the digits. The result is a confident "0 type errors" on
     # any machine with FORCE_COLOR set. Found on coverage.py, where mypy reported
     # 3 errors and this script reported none.
-    cmd = [mypy_bin, "--show-error-codes", "--no-color-output"]
+    #
+    # --cache-dir is load-bearing too. Without it mypy writes `.mypy_cache/` into
+    # whatever directory the caller happens to run from -- the reviewed checkout,
+    # if the agent's shell is there, which a read-only review must never touch,
+    # and a directory concurrent `parallel` agents share. The caller passes a
+    # private temporary directory and removes it afterwards.
+    cmd = [
+        mypy_bin,
+        "--show-error-codes",
+        "--no-color-output",
+        "--cache-dir",
+        cache_dir,
+    ]
     if config:
         cmd.extend(["--config-file", config])
     cmd.extend(extra)
-    cmd.append(str(target))
+    cmd.extend(targets)
     env = {**os.environ, "FORCE_COLOR": "0", "MYPY_FORCE_COLOR": "0", "NO_COLOR": "1"}
     try:
         out = subprocess.run(
@@ -251,29 +365,130 @@ def _diagnose_failure(stderr: str, stdout: str, returncode: int | None) -> str:
     )
 
 
+def _finding_key(f: dict) -> tuple:
+    return (f["file"], f["line"], f["code"], f["message"])
+
+
+def _labelled_pass(
+    mypy_bin: str,
+    targets: list[str],
+    config: str | None,
+    flags: list[str],
+    name: str,
+    cache_dir: str,
+    baseline: set[tuple],
+) -> dict:
+    """Run one LABELLED extra pass and return only what it adds to the baseline.
+
+    A pass that analyzed nothing, or whose parse disagrees with mypy's own
+    count, reports ``ran: False`` with the reason -- never an empty,
+    clean-looking list.
+    """
+    out, err, rc = _run_mypy(mypy_bin, targets, config, flags, cache_dir)
+    found, stats = parse_output(out)
+    if rc is None or not stats["files_checked"]:
+        return {"ran": False, "error": _diagnose_failure(err, out, rc), "findings": []}
+    if stats["errors"] is not None and len(found) != stats["errors"]:
+        return {
+            "ran": False,
+            "error": (
+                f"parsed {len(found)} finding(s) but mypy reported "
+                f"{stats['errors']} error(s)"
+            ),
+            "findings": [],
+        }
+    added = []
+    for f in found:
+        if _finding_key(f) in baseline:
+            continue
+        f["pass"] = name
+        added.append(f)
+    return {"ran": True, "error": None, "findings": added}
+
+
 def analyze(
     target: str,
     *,
     max_files: int = 0,
     mypy_bin: str = "mypy",
     strict_pass: bool = True,
+    unreachable_pass: bool = True,
+    unused_ignores_pass: bool = True,
 ) -> dict:
-    """Run mypy over *target*, plus a labelled --disallow-any-unimported pass."""
+    """Run mypy over *target*, plus labelled extra passes.
+
+    The passes are ``--disallow-any-unimported`` (phantom imports),
+    ``--warn-unreachable`` (code a wrong annotation has silently removed from
+    checking), and ``--warn-unused-ignores`` when the project's own config does
+    not already enable it (stale ignores). Each is diffed against the baseline
+    and reported separately, so the baseline count stays the project's own.
+    """
     scan_root = Path(target).resolve()
     project_root = find_project_root(scan_root)
+    # --max-files is honoured, not just accepted: a capped run hands mypy the
+    # first N discovered files instead of the directory, with imports followed
+    # silently so errors in the files left out are not reported either. The
+    # envelope's files_capped says the result is partial.
+    files = sorted(discover_python_files(scan_root))
+    files_total = len(files)
+    capped = max_files > 0 and files_total > max_files
+    envelope = build_envelope(
+        project_root, scan_root, files_total, max_files if capped else files_total
+    )
+    if capped:
+        targets = [str(p) for p in files[:max_files]]
+        cap_flags = ["--follow-imports=silent"]
+    else:
+        targets = [str(scan_root)]
+        cap_flags = []
     version = mypy_version(mypy_bin)
     if version is None:
         return {
-            "project_root": str(project_root),
-            "scan_root": str(scan_root),
+            **envelope,
             "status": "FAILED",
             "error": f"mypy not runnable as {mypy_bin!r}",
             "findings": [],
         }
 
     config = find_mypy_config(project_root)
-    stdout, stderr, returncode = _run_mypy(mypy_bin, scan_root, config, [])
-    findings, stats = parse_output(stdout)
+    # mypy's cache goes to a private temporary directory, never the reviewed
+    # project or the caller's cwd, and is removed however the run ends.
+    cache_root = tempfile.mkdtemp(prefix="crt-mypy-cache-")
+    try:
+        return _analyze_with_cache(
+            mypy_bin=mypy_bin,
+            envelope=envelope,
+            targets=targets,
+            cap_flags=cap_flags,
+            version=version,
+            config=config,
+            passes={
+                "disallow-any-unimported": strict_pass,
+                "warn-unreachable": unreachable_pass,
+                "warn-unused-ignores": unused_ignores_pass,
+            },
+            cache_root=cache_root,
+        )
+    finally:
+        shutil.rmtree(cache_root, ignore_errors=True)
+
+
+def _analyze_with_cache(
+    *,
+    mypy_bin: str,
+    envelope: dict,
+    targets: list[str],
+    cap_flags: list[str],
+    version: str,
+    config: str | None,
+    passes: dict[str, bool],
+    cache_root: str,
+) -> dict:
+    stdout, stderr, returncode = _run_mypy(
+        mypy_bin, targets, config, cap_flags, os.path.join(cache_root, "baseline")
+    )
+    standalone_notes: list[dict] = []
+    findings, stats = parse_output(stdout, standalone_notes)
 
     # A checker that analyzed nothing is a FAILED run, not a clean one. This is
     # the single most important line in the script: pyrefly reports `0 errors`
@@ -285,21 +500,69 @@ def analyze(
     if status == "FAILED":
         failure_reason = _diagnose_failure(stderr, stdout, returncode)
 
-    # Second, LABELLED pass. Kept separate so the baseline count stays honest:
-    # folding it in would make every project look worse by a flag change.
-    phantom_imports: list[dict] = []
-    strict_stats: dict = {}
-    if strict_pass and status == "OK":
-        s_out, _, _s_rc = _run_mypy(
-            mypy_bin, scan_root, config, ["--disallow-any-unimported"]
-        )
-        strict_findings, strict_stats = parse_output(s_out)
-        baseline = {(f["file"], f["line"], f["code"], f["message"]) for f in findings}
-        for f in strict_findings:
-            if (f["file"], f["line"], f["code"], f["message"]) in baseline:
-                continue
-            f["pass"] = "disallow-any-unimported"
-            phantom_imports.append(f)
+    # Stale ignores come ONLY from mypy's own unused-ignore code. Never grep.
+    # Under the project's config they are measured only if the config turns
+    # warn_unused_ignores on; otherwise a labelled pass measures them. A zero
+    # from a run where the warning was off is "not measured", not "none".
+    ignores_in_config = config_enables(config, "warn_unused_ignores") or any(
+        f["code"] == "unused-ignore" for f in findings
+    )
+
+    # LABELLED passes. Kept separate so the baseline count stays honest:
+    # folding them in would make every project look worse by a flag change.
+    # They are independent, so they run concurrently, each with its own cache.
+    wanted = {
+        name: ["--" + name]
+        for name, enabled in passes.items()
+        if enabled and status == "OK"
+    }
+    if ignores_in_config:
+        wanted.pop("warn-unused-ignores", None)
+    baseline = {_finding_key(f) for f in findings}
+    labelled: dict[str, dict] = {}
+    if wanted:
+        with ThreadPoolExecutor(max_workers=len(wanted)) as pool:
+            futures = {
+                name: pool.submit(
+                    _labelled_pass,
+                    mypy_bin,
+                    targets,
+                    config,
+                    [*cap_flags, *flags],
+                    name,
+                    os.path.join(cache_root, name),
+                    baseline,
+                )
+                for name, flags in wanted.items()
+            }
+            labelled = {name: fut.result() for name, fut in futures.items()}
+
+    def pass_findings(name: str, code: str | None = None) -> list[dict] | None:
+        result = labelled.get(name)
+        if result is None or not result["ran"]:
+            return None
+        return [f for f in result["findings"] if code is None or f["code"] == code]
+
+    phantom_imports = pass_findings("disallow-any-unimported")
+    unreachable = pass_findings("warn-unreachable")
+
+    stale_reason = None
+    stale_ignores: list[dict] | None
+    if ignores_in_config:
+        stale_ignores = [f for f in findings if f["code"] == "unused-ignore"]
+        stale_source = "project-config"
+    else:
+        stale_ignores = pass_findings("warn-unused-ignores", "unused-ignore")
+        stale_source = None
+        if stale_ignores is not None:
+            stale_source = "warn-unused-ignores-pass"
+        else:
+            ran = labelled.get("warn-unused-ignores")
+            how = f"failed ({ran['error']})" if ran else "did not run"
+            stale_reason = (
+                "not measured: the project's config does not enable "
+                f"warn_unused_ignores and the labelled --warn-unused-ignores pass {how}"
+            )
 
     # mypy's summary line states how many errors it found. If our parse produced a
     # different number we dropped findings, and silently reporting the smaller one
@@ -317,16 +580,12 @@ def analyze(
         status = "FAILED"
         failure_reason = parse_mismatch
 
-    # Stale ignores come ONLY from mypy's own unused-ignore code. Never grep.
-    stale_ignores = [f for f in findings if f["code"] == "unused-ignore"]
-
     by_code: dict[str, int] = {}
     for f in findings:
         by_code[f["code"] or "(none)"] = by_code.get(f["code"] or "(none)", 0) + 1
 
     return {
-        "project_root": str(project_root),
-        "scan_root": str(scan_root),
+        **envelope,
         "status": status,
         "failure_reason": failure_reason,
         "mypy_version": version,
@@ -344,16 +603,39 @@ def analyze(
             "other": sum(1 for f in findings if f["kind"] == "other"),
             "by_code": dict(sorted(by_code.items(), key=lambda kv: -kv[1])),
             # Only mypy's own unused-ignore counts. A grep for `# type: ignore`
-            # measures how many ignores EXIST, not how many are stale.
-            "stale_ignores": len(stale_ignores),
+            # measures how many ignores EXIST, not how many are stale. null when
+            # nothing measured it -- see stale_ignores_reason.
+            "stale_ignores": None if stale_ignores is None else len(stale_ignores),
+            "stale_ignores_source": stale_source,
+            "stale_ignores_reason": stale_reason,
             # Pre-correlated deliverable: an import that resolves to Any silently
-            # disables every annotation that uses the name.
-            "phantom_imports": len(phantom_imports),
+            # disables every annotation that uses the name. null if the pass
+            # did not run.
+            "phantom_imports": (
+                None if phantom_imports is None else len(phantom_imports)
+            ),
+            # Code mypy proves unreachable -- often because an annotation is
+            # wrong, so the block is silently never type-checked. null if the
+            # pass did not run.
+            "unreachable": None if unreachable is None else len(unreachable),
             "parse_mismatch": parse_mismatch,
-            "strict_pass_ran": bool(strict_stats),
+            "strict_pass_ran": phantom_imports is not None,
+            "labelled_passes": {
+                name: {
+                    "ran": r["ran"],
+                    "error": r["error"],
+                    "added": len(r["findings"]),
+                }
+                for name, r in labelled.items()
+            },
         },
         "findings": findings,
-        "phantom_import_findings": phantom_imports,
+        "phantom_import_findings": phantom_imports or [],
+        "unreachable_findings": unreachable or [],
+        "stale_ignore_findings": stale_ignores or [],
+        # Notes that belong to no error: `annotation-unchecked` (an annotated
+        # variable inside an untyped function body mypy skips), reveal_type.
+        "standalone_notes": standalone_notes,
     }
 
 
@@ -364,9 +646,25 @@ def main() -> None:
     parser.add_argument(
         "--no-strict-pass",
         action="store_true",
-        help="skip the labelled --disallow-any-unimported second pass",
+        help="skip the labelled --disallow-any-unimported pass",
     )
-    parser.add_argument("--max-files", type=int, default=0)
+    parser.add_argument(
+        "--no-unreachable-pass",
+        action="store_true",
+        help="skip the labelled --warn-unreachable pass",
+    )
+    parser.add_argument(
+        "--no-unused-ignores-pass",
+        action="store_true",
+        help="skip the labelled --warn-unused-ignores pass (stale_ignores is "
+        "then null unless the project's config enables the warning)",
+    )
+    parser.add_argument(
+        "--max-files",
+        type=int,
+        default=0,
+        help="check only the first N discovered files (files_capped says so)",
+    )
     args = parser.parse_args()
     try:
         result = analyze(
@@ -374,6 +672,8 @@ def main() -> None:
             max_files=args.max_files,
             mypy_bin=args.mypy_bin,
             strict_pass=not args.no_strict_pass,
+            unreachable_pass=not args.no_unreachable_pass,
+            unused_ignores_pass=not args.no_unused_ignores_pass,
         )
         emit(result)
         sys.exit(1 if result["status"] == "FAILED" else 0)

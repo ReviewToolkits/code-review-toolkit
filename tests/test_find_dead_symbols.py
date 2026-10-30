@@ -2,6 +2,7 @@
 
 import json
 import unittest
+from typing import ClassVar
 
 from helpers import TempProject, import_script
 
@@ -64,6 +65,27 @@ class TestUnusedImports(unittest.TestCase):
         # But this file isn't __init__.py, so unused_thing should be flagged.
         names = {u["name"] for u in unused}
         self.assertNotIn("helper", names)
+
+    def test_multiline_from_import_reports_the_name_line_like_ruff(self):
+        """#43: ruff F401 reports the line of the name; the statement line made
+        findings unmatchable by file:line."""
+        unused = self._find_unused(
+            "from os.path import (\n"
+            "    join,\n"
+            "    split,\n"
+            ")\n"
+            "\n"
+            "join('a', 'b')\n"
+        )
+        self.assertEqual(len(unused), 1)
+        self.assertEqual(unused[0]["name"], "split")
+        self.assertEqual(unused[0]["line"], 3)
+        self.assertEqual(unused[0]["statement_line"], 1)
+
+    def test_single_line_import_line_is_unchanged(self):
+        unused = self._find_unused("x = 1\nimport os, json\n\nos.getcwd()\n")
+        self.assertEqual([(u["name"], u["line"]) for u in unused], [("json", 2)])
+        self.assertEqual(unused[0]["statement_line"], 2)
 
     def test_aliased_import_used(self):
         unused = self._find_unused(
@@ -363,6 +385,260 @@ class TestDeadCodeFalsePositives(unittest.TestCase):
         with TempProject({"pkg/__main__.py": "print(1)\n"}) as root:
             out = mod.analyze_file(root / "pkg" / "__main__.py", root)
         self.assertEqual(mod.find_orphan_files([out], root), [])
+
+
+def _run_main(root, target) -> dict:
+    import io
+    import sys
+
+    old_stdout, old_argv = sys.stdout, sys.argv
+    sys.stdout = io.StringIO()
+    sys.argv = ["find_dead_symbols.py", str(target)]
+    try:
+        mod.main()
+        return json.loads(sys.stdout.getvalue())
+    finally:
+        sys.stdout, sys.argv = old_stdout, old_argv
+
+
+def _unreferenced(files: dict[str, str], excluded: dict | None = None) -> dict:
+    with TempProject(files) as root:
+        analyses = [mod.analyze_file(f, root) for f in mod.discover_python_files(root)]
+        kwargs = {} if excluded is None else {"excluded": excluded}
+        return {
+            u["name"]: u for u in mod.find_unreferenced_symbols(analyses, **kwargs)
+        }
+
+
+class TestUnreferencedMethods(unittest.TestCase):
+    """#39: every method was skipped while the summary read
+    `unreferenced_symbols: 0`, an absence presented as a clean result."""
+
+    def test_private_method_with_no_reference_is_reported(self):
+        found = _unreferenced({
+            "pkg/db.py": (
+                "class DB:\n"
+                "    def write(self):\n"
+                "        return self._writer()\n"
+                "    def _writer(self):\n"
+                "        return 1\n"
+                "    def _require_conn(self):\n"
+                "        return 2\n"
+            ),
+            "pkg/use.py": "from pkg.db import DB\nDB().write()\n",
+        })
+        self.assertIn("DB._require_conn", found)
+        self.assertEqual(found["DB._require_conn"]["type"], "method")
+        self.assertEqual(found["DB._require_conn"]["confidence"], "medium")
+        self.assertNotIn("DB._writer", found)
+        self.assertNotIn("DB.write", found)
+
+    def test_public_method_is_reported_at_low_confidence(self):
+        # It may be API called from outside the project.
+        found = _unreferenced({"pkg/a.py": "class A:\n    def export(self): pass\n"})
+        self.assertEqual(found["A.export"]["confidence"], "low")
+
+    def test_dunder_and_sunder_hooks_are_excluded(self):
+        excluded: dict = {}
+        found = _unreferenced(
+            {
+                "pkg/a.py": (
+                    "import enum\n"
+                    "class Color(enum.Enum):\n"
+                    "    RED = 1\n"
+                    "    def _missing_(cls, value): pass\n"
+                    "    def __rich_repr__(self): pass\n"
+                ),
+            },
+            excluded,
+        )
+        self.assertFalse([n for n in found if n.startswith("Color.")])
+        self.assertEqual(excluded, {"dunder": 1, "sunder_hook": 1})
+
+    def test_override_of_a_framework_hook_is_excluded(self):
+        # A subclass of a class defined outside the project may override a hook
+        # the framework calls by name: invisible to a reference scan.
+        excluded: dict = {}
+        found = _unreferenced(
+            {
+                "pkg/srv.py": (
+                    "import uvicorn\n"
+                    "class Server(uvicorn.Server):\n"
+                    "    def handle_exit(self, sig, frame): pass\n"
+                    "class Quiet(Server):\n"
+                    "    def install_signal_handlers(self): pass\n"
+                ),
+            },
+            excluded,
+        )
+        self.assertNotIn("Server.handle_exit", found)
+        self.assertNotIn("Quiet.install_signal_handlers", found)
+        self.assertEqual(excluded.get("framework_base"), 2)
+
+    def test_subclass_of_an_inert_base_is_still_checked(self):
+        found = _unreferenced({
+            "pkg/a.py": (
+                "from abc import ABC\n"
+                "class Base(ABC):\n    pass\n"
+                "class Impl(Base):\n    def _stale(self): pass\n"
+                "class Boom(ValueError):\n    def _stale2(self): pass\n"
+            ),
+        })
+        self.assertIn("Impl._stale", found)
+        self.assertIn("Boom._stale2", found)
+
+    def test_registering_decorator_excludes_but_property_does_not(self):
+        excluded: dict = {}
+        found = _unreferenced(
+            {
+                "pkg/a.py": (
+                    "class Model:\n"
+                    "    @validator('name')\n"
+                    "    def _check_name(cls, v): return v\n"
+                    "    @property\n"
+                    "    def _unused_prop(self): return 1\n"
+                    "    @staticmethod\n"
+                    "    def _unused_static(): return 1\n"
+                ),
+            },
+            excluded,
+        )
+        self.assertNotIn("Model._check_name", found)
+        self.assertIn("Model._unused_prop", found)
+        self.assertIn("Model._unused_static", found)
+        self.assertEqual(excluded, {"decorated": 1})
+
+    def test_getattr_with_a_string_constant_keeps_a_method_alive(self):
+        found = _unreferenced({
+            "pkg/a.py": (
+                "class Jobs:\n"
+                "    def pause_job(self): pass\n"
+                "    def _orphan(self): pass\n"
+                "def act(jobs, action):\n"
+                "    return getattr(jobs, action)()\n"
+                "def pause(jobs):\n"
+                "    return act(jobs, 'pause_job')\n"
+            ),
+        })
+        self.assertNotIn("Jobs.pause_job", found)
+        self.assertIn("Jobs._orphan", found)
+
+    def test_computed_getattr_prefix_excludes_matching_methods(self):
+        excluded: dict = {}
+        found = _unreferenced(
+            {
+                "pkg/cli.py": (
+                    "class CLI:\n"
+                    "    def cmd_run(self): pass\n"
+                    "    def _other(self): pass\n"
+                    "    def dispatch(self, name):\n"
+                    "        return getattr(self, f'cmd_{name}')()\n"
+                    "CLI().dispatch('run')\n"
+                ),
+            },
+            excluded,
+        )
+        self.assertNotIn("CLI.cmd_run", found)
+        self.assertIn("CLI._other", found)
+        self.assertEqual(excluded, {"dynamic_dispatch": 1})
+
+    def test_methods_in_test_files_are_excluded(self):
+        excluded: dict = {}
+        found = _unreferenced(
+            {"tests/test_a.py": "class Helper:\n    def _build(self): pass\n"},
+            excluded,
+        )
+        self.assertNotIn("Helper._build", found)
+        self.assertEqual(excluded, {"test_file": 1})
+
+    def test_summary_says_methods_were_checked_and_what_was_left_out(self):
+        files = {
+            "pkg/__init__.py": "",
+            "pkg/a.py": (
+                "class A:\n"
+                "    def __init__(self): pass\n"
+                "    def _dead(self): pass\n"
+            ),
+        }
+        with TempProject(files) as root:
+            out = _run_main(root, root)
+        summary = out["summary"]
+        self.assertTrue(summary["methods_checked"])
+        self.assertEqual(summary["methods_defined"], 2)
+        self.assertEqual(summary["methods_excluded"], 1)
+        self.assertEqual(summary["methods_excluded_by_reason"], {"dunder": 1})
+        self.assertIn(
+            "A._dead", [u["name"] for u in out["unreferenced_symbols"]]
+        )
+
+
+class TestReferencedOnlyFromTests(unittest.TestCase):
+    """#40: a mention in a test counted as a use, so production code kept alive
+    only by its own tests was invisible."""
+
+    _FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/store.py": (
+            "class Store:\n"
+            "    def get(self, k): return k\n"
+            "    def has_key(self, k): return True\n"
+            "def percentiles(xs): return xs\n"
+            "def used(): return 1\n"
+            "def registered(): return 2\n"
+        ),
+        "pkg/app.py": (
+            "from pkg.store import Store, used\n"
+            "Store().get(1)\n"
+            "used()\n"
+        ),
+        "tests/test_store.py": (
+            "from pkg.store import Store, percentiles, used, registered\n"
+            "def test_it():\n"
+            "    assert Store().has_key(1)\n"
+            "    assert percentiles([1])\n"
+            "    assert used()\n"
+            "    assert registered()\n"
+        ),
+        "docs/api.md": "`has_key` checks membership.\n",
+    }
+
+    def test_package_review_with_tests_outside_the_scan(self):
+        files = dict(self._FILES)
+        files["pkg/store.py"] = files["pkg/store.py"].replace(
+            "def registered", "@app.on_event('startup')\ndef registered"
+        )
+        with TempProject(files) as root:
+            out = _run_main(root, root / "pkg")
+        test_only = {u["name"]: u for u in out["referenced_only_from_tests"]}
+        self.assertEqual(set(test_only), {"Store.has_key", "percentiles"})
+        self.assertTrue(test_only["Store.has_key"]["mentioned_in_docs"])
+        self.assertFalse(test_only["percentiles"]["mentioned_in_docs"])
+        self.assertEqual(out["summary"]["referenced_only_from_tests"], 2)
+        self.assertEqual(
+            out["summary"]["external_reference_scope_kinds"].get("tests"), "test"
+        )
+        # Not dead: a test still uses them.
+        names = {u["name"] for u in out["unreferenced_symbols"]}
+        self.assertNotIn("percentiles", names)
+        self.assertNotIn("Store.has_key", names)
+
+    def test_whole_project_review_classifies_test_files_too(self):
+        with TempProject(self._FILES) as root:
+            out = _run_main(root, root)
+        test_only = {u["name"] for u in out["referenced_only_from_tests"]}
+        self.assertIn("percentiles", test_only)
+        self.assertNotIn("used", test_only)
+        self.assertNotIn("Store.get", test_only)
+        # Test-file symbols are never "production code used only by tests".
+        self.assertNotIn("test_it", test_only)
+
+    def test_production_reference_from_scripts_counts(self):
+        files = dict(self._FILES)
+        files["scripts/report.py"] = "from pkg.store import percentiles\npercentiles([])\n"
+        with TempProject(files) as root:
+            out = _run_main(root, root / "pkg")
+        test_only = {u["name"] for u in out["referenced_only_from_tests"]}
+        self.assertNotIn("percentiles", test_only)
 
 
 if __name__ == "__main__":

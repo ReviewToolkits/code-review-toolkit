@@ -94,7 +94,7 @@ candidates, and prints JSON to stdout.
 | `extract_test_invariants.py` | Extracts assertions as invariant specs |
 | `run_external_tools.py` | ruff / mypy / vulture / coverage integration |
 | `run_lint_rules.py` | Pinned, tiered ruff selection: defect-grade rules only, merged with the shape catalog |
-| `check_typing.py` | mypy on the project's own config, plus a `--disallow-any-unimported` phantom-import pass |
+| `check_typing.py` | mypy on the project's own config, plus labelled `--disallow-any-unimported` (phantom imports) and `--warn-unreachable` passes |
 | `check_known_findings.py` | Cross-references a catalog of known findings against a fresh scan (`known-issues`) |
 | `diff_findings.py` | Diffs two report directories — the false-positive regression gate |
 | `build_informed_briefing.py` | Assembles the informed-explore briefing from `data/` |
