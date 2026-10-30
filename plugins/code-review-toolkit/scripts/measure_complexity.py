@@ -24,10 +24,36 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from analyze_history import (  # noqa: E402
+    def_start_line,
+    iter_qualified_defs,
+)
 from scan_common import (  # noqa: E402
     discover_python_files,
     find_project_root,
 )
+
+_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _iter_own_nodes(func_node: ast.AST):
+    """Walk a function's own body, NOT descending into nested defs or classes.
+
+    `ast.walk` plus `continue` does not prune: the nested def's children are
+    still queued. That is how a router factory whose body is nothing but
+    nested route handlers came out with `return_count: 46` and a hotspot score.
+    """
+    todo = list(ast.iter_child_nodes(func_node))
+    while todo:
+        node = todo.pop()
+        yield node
+        if not isinstance(node, _SCOPE_NODES):
+            todo.extend(ast.iter_child_nodes(node))
+
+
+def _nested_scopes(func_node: ast.AST) -> list[ast.AST]:
+    """Defs and classes directly inside this function's own scope."""
+    return [n for n in _iter_own_nodes(func_node) if isinstance(n, _SCOPE_NODES)]
 
 
 def _is_always_false(test: ast.expr) -> bool:
@@ -205,10 +231,7 @@ class _CognitiveVisitor(ast.NodeVisitor):
 def _count_branches(func_node: ast.AST) -> int:
     """Count if/elif/else/match-case/except branches in a function body."""
     count = 0
-    for node in ast.walk(func_node):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if node is not func_node:
-                continue
+    for node in _iter_own_nodes(func_node):
         if isinstance(node, ast.If):
             count += 1  # if
             if node.orelse:
@@ -224,10 +247,7 @@ def _count_branches(func_node: ast.AST) -> int:
 def _count_loops(func_node: ast.AST) -> int:
     """Count for/while loops (including nested)."""
     count = 0
-    for node in ast.walk(func_node):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if node is not func_node:
-                continue
+    for node in _iter_own_nodes(func_node):
         if isinstance(node, (ast.For, ast.While, ast.AsyncFor)):
             count += 1
     return count
@@ -236,10 +256,7 @@ def _count_loops(func_node: ast.AST) -> int:
 def _count_returns(func_node: ast.AST) -> int:
     """Count return statements."""
     count = 0
-    for node in ast.walk(func_node):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if node is not func_node:
-                continue
+    for node in _iter_own_nodes(func_node):
         if isinstance(node, ast.Return):
             count += 1
     return count
@@ -248,10 +265,7 @@ def _count_returns(func_node: ast.AST) -> int:
 def _count_local_variables(func_node: ast.AST) -> int:
     """Count unique variable names assigned in the function body."""
     names: set[str] = set()
-    for node in ast.walk(func_node):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if node is not func_node:
-                continue
+    for node in _iter_own_nodes(func_node):
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name):
@@ -387,11 +401,24 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
 
     def _process_func(
         node: ast.FunctionDef | ast.AsyncFunctionDef,
-        class_name: str | None = None,
+        qualname: str,
+        kinds: tuple[str, ...],
     ) -> dict:
         start = node.lineno
         end = node.end_lineno or node.lineno
-        func_lines = source_lines[start - 1 : end]
+        # A nested def or class is measured as its own entry, so its lines
+        # are not this function's lines.
+        nested = _nested_scopes(node)
+        excluded: set[int] = set()
+        for child in nested:
+            excluded.update(
+                range(def_start_line(child), (child.end_lineno or child.lineno) + 1)
+            )
+        func_lines = [
+            source_lines[i - 1]
+            for i in range(start, end + 1)
+            if i not in excluded and i - 1 < len(source_lines)
+        ]
         effective_lines = _effective_line_count(func_lines)
 
         nesting_v = _NestingVisitor()
@@ -401,8 +428,6 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
         cognitive_v = _CognitiveVisitor()
         for child in ast.iter_child_nodes(node):
             cognitive_v.visit(child)
-
-        name = f"{class_name}.{node.name}" if class_name else node.name
 
         metrics = {
             "line_count": effective_lines,
@@ -416,29 +441,40 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
             "cognitive_complexity": cognitive_v.score,
         }
 
+        segments = qualname.split(".")[:-1]
+        enclosing = list(zip(segments, kinds))
+        in_test_class = any(k == "class" and n.startswith("Test") for n, k in enclosing)
+        in_test_func = any(
+            k == "function" and n.startswith("test") for n, k in enclosing
+        )
         return {
-            "name": name,
-            "qualified_name": f"{rel}::{name}",
+            "name": qualname,
+            "qualified_name": f"{rel}::{qualname}",
             "line_start": start,
             "line_end": end,
-            "is_method": class_name is not None,
+            "is_method": bool(kinds) and kinds[-1] == "class",
+            # Defined inside another function: a closure, or a route handler
+            # inside a router factory.
+            "is_nested": "function" in kinds,
+            "parent": ".".join(segments) or None,
+            "nested_def_count": sum(
+                1
+                for n in nested
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ),
             "is_async": isinstance(node, ast.AsyncFunctionDef),
-            "is_test": node.name.startswith("test")
-            or (class_name is not None and class_name.startswith("Test")),
+            "is_test": node.name.startswith("test") or in_test_class or in_test_func,
             "has_decorators": len(node.decorator_list) > 0,
             "decorator_count": len(node.decorator_list),
             "metrics": metrics,
             "score": round(_compute_score(metrics), 1),
         }
 
-    # Walk top-level and class-level definitions.
-    for node in ast.iter_child_nodes(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            result["functions"].append(_process_func(node))
-        elif isinstance(node, ast.ClassDef):
-            for child in ast.iter_child_nodes(node):
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    result["functions"].append(_process_func(child, node.name))
+    # Every function at any depth: module level, methods, nested classes, and
+    # functions defined inside other functions (each measured on its own).
+    for qualname, node, kinds in iter_qualified_defs(tree):
+        result["functions"].append(_process_func(node, qualname, kinds))
+    result["functions"].sort(key=lambda f: f["line_start"])
 
     return result
 

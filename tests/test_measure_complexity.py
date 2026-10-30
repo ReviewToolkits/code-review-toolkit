@@ -376,3 +376,113 @@ class TestHistoryCrossing(unittest.TestCase):
         # on whichever value sits in the middle and moves with it.
         self.assertEqual(mod.ACTIVE_RISK_FIXES, 2)
         self.assertEqual(mod.verdict_for(fix_commits=2, score=1.0), "active-risk")
+
+
+def _functions(source: str) -> dict:
+    with TempProject({"mod.py": source}) as root:
+        result = mod.analyze_file(root / "mod.py", root)
+    return {f["name"]: f for f in result["functions"]}
+
+
+_FACTORY = (
+    "def build_router(app):\n"
+    "    @app.get('/a')\n"
+    "    def handler_a(x):\n"
+    "        if x:\n"
+    "            for i in x:\n"
+    "                if i:\n"
+    "                    return i\n"
+    "        return None\n"
+    "\n"
+    "    def handler_b(y):\n"
+    "        if y:\n"
+    "            return 1\n"
+    "        return 2\n"
+    "\n"
+    "    return app\n"
+)
+
+
+class TestNestedFunctionsMeasured(unittest.TestCase):
+    """Nested defs are their own entries, and their bodies no longer
+    inflate the enclosing function's metrics."""
+
+    def test_nested_defs_are_entries_with_qualified_names(self):
+        funcs = _functions(_FACTORY)
+        self.assertEqual(
+            sorted(funcs),
+            ["build_router", "build_router.handler_a", "build_router.handler_b"],
+        )
+        handler = funcs["build_router.handler_a"]
+        self.assertTrue(handler["is_nested"])
+        self.assertFalse(handler["is_method"])
+        self.assertEqual(handler["parent"], "build_router")
+        self.assertEqual(handler["qualified_name"], "mod.py::build_router.handler_a")
+        self.assertEqual(handler["metrics"]["nesting_depth"], 3)
+        self.assertEqual(handler["metrics"]["return_count"], 2)
+
+    def test_factory_is_not_credited_with_its_children(self):
+        factory = _functions(_FACTORY)["build_router"]["metrics"]
+        # Before: return_count 4 and branch_count 4 from the handlers.
+        self.assertEqual(factory["return_count"], 1)
+        self.assertEqual(factory["branch_count"], 0)
+        self.assertEqual(factory["loop_count"], 0)
+        self.assertEqual(factory["line_count"], 2)  # def line + return
+        self.assertEqual(factory["total_lines"], 15)
+        self.assertEqual(_functions(_FACTORY)["build_router"]["nested_def_count"], 2)
+
+    def test_router_factory_is_not_a_hotspot(self):
+        # A factory whose body is large nested handlers ranked as a hotspot on
+        # their lines, with cognitive complexity 0; the large handler is the
+        # real hotspot.
+        body = "".join(f"        x{i} = {i}\n" for i in range(220))
+        source = (
+            "def build_big_router(app):\n"
+            "    def big_handler(req):\n" + body + "        return x0\n"
+            "    return app\n"
+        )
+        funcs = _functions(source)
+        self.assertLess(funcs["build_big_router"]["score"], 5.0)
+        self.assertGreaterEqual(funcs["build_big_router.big_handler"]["score"], 4.0)
+
+    def test_flat_function_and_methods_unchanged(self):
+        # True negative: no nested defs, nothing moves.
+        source = (
+            "def f(x):\n    if x:\n        return 1\n    return 2\n\n"
+            "class C:\n    def m(self):\n        return 1\n"
+            "    class Inner:\n        def n(self):\n            return 2\n"
+        )
+        funcs = _functions(source)
+        self.assertEqual(sorted(funcs), ["C.Inner.n", "C.m", "f"])
+        self.assertEqual(funcs["f"]["metrics"]["return_count"], 2)
+        self.assertEqual(funcs["f"]["metrics"]["line_count"], 4)
+        self.assertEqual(funcs["f"]["nested_def_count"], 0)
+        self.assertFalse(funcs["f"]["is_nested"])
+        self.assertTrue(funcs["C.m"]["is_method"])
+        self.assertTrue(funcs["C.Inner.n"]["is_method"])
+        self.assertFalse(funcs["C.Inner.n"]["is_nested"])
+        self.assertEqual(funcs["C.Inner.n"]["parent"], "C.Inner")
+
+    def test_class_inside_function(self):
+        source = (
+            "def make():\n"
+            "    class Handler:\n"
+            "        def get(self):\n"
+            "            return 1\n"
+            "    return Handler\n"
+        )
+        funcs = _functions(source)
+        get = funcs["make.Handler.get"]
+        self.assertTrue(get["is_method"])
+        self.assertTrue(get["is_nested"])
+        self.assertEqual(funcs["make"]["metrics"]["return_count"], 1)
+
+    def test_nested_in_test_function_is_test(self):
+        source = (
+            "def test_x():\n    def helper():\n        return 1\n    assert helper()\n"
+        )
+        self.assertTrue(_functions(source)["test_x.helper"]["is_test"])
+
+
+if __name__ == "__main__":
+    unittest.main()
