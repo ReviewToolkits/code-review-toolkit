@@ -51,7 +51,7 @@ For each recent fix commit (from git-history-context's script data):
 
 When the diff is truncated, use `git show HASH` to get more context if needed.
 
-**Cap**: Review the 15 most recent fixes. If there are more, note the total and offer to review specific commits.
+**Cap**: Review the 15 most recent fixes. If there are more, note the total and offer to review specific commits. An orchestrator-supplied list of commits replaces this default selection; review those, then fill up to the cap from the script's list.
 
 ### Classification Guidance
 - **FIX**: The recent fix is demonstrably incomplete — there's a remaining bug or missed occurrence
@@ -60,7 +60,16 @@ When the diff is truncated, use `git show HASH` to get more context if needed.
 
 ## Capability 2: Similar Bug Detection (Fix Propagation)
 
-This is the highest-value capability. For each recent fix:
+This is the highest-value capability.
+
+**Sources.** A "fix" for this capability is any commit that changed how one place handles a case, not only a commit whose subject says fix. Take, in this order:
+
+1. A list the orchestrator or the caller supplied: commits, PRs or finding ids. Use it as given.
+2. `recent_fixes`.
+3. `feat:`, `refactor:` and `docs:` commits that changed **one of several parallel paths**: one handler of a family, one backend of several, one sync/async twin, one of the per-format encoders. A feature that adds validation to one path is a fix for the paths it skipped. Look in `recent_features`, `recent_refactors` and `behavioural_non_code_commits.flagged` (docs or chore commits that changed code). On one validation project these were the most productive sources, and a keyword grep for `fix|race|leak` finds none of them.
+4. Older fixes, read on the **re-introduction** axis (step 5 below).
+
+For each source:
 
 1. Understand the *pattern* of the bug from the diff — not the specific variable names or values, but the CLASS of error:
    - Missing null/None check before attribute access
@@ -82,6 +91,8 @@ This is the highest-value capability. For each recent fix:
    - **Entire codebase**: Third priority — anywhere the same pattern might appear
 
 4. For each candidate, assess: is the analogous code actually vulnerable to the same bug, or does it have different guards/context that make it safe?
+
+5. **Re-introduction.** For each fix older than the newest feature batch, ask whether code written after the fix re-introduced its shape. Features written without knowledge of an old fix are where most live siblings come from. List the feature commits since the fix (`git log --since=<fix date> --format='%h %s' -- <module>`), read the ones that add code doing what the fixed code does (a new route, a new backend method, a new job type), and check them for the guard the fix added. `annotate_findings.py`'s `introduced_by` dates each candidate. A sibling introduced after the fix is a re-introduction, which is worth saying explicitly in the finding.
 
 ### Classification Guidance
 - **FIX**: High confidence the same bug exists in analogous code
