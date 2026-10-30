@@ -162,7 +162,9 @@ These rules apply to every script call this agent makes.
   exported copy, never in the checkout, and set `TMPDIR` to your private directory so the project's
   own temp files land there instead of a shared `/tmp`.
 - **Forward `--max-files N`** when the caller gave one, and say so in the report whenever the
-  envelope's `files_capped` is true.
+  envelope's `files_capped` is true. In this script the cap applies to function churn only
+  (`files_total` / `files_analyzed` count the in-scope Python files it covered); file churn and
+  the commit lists always cover the whole window.
 - **Check before you read.** A non-zero `exit` or an empty `out.json` means the run did not
   succeed. Read `out.err`, and any `status`, `failure_reason` or `error` field in `out.json` — some
   scripts report their failure there, as JSON, with nothing on stderr.

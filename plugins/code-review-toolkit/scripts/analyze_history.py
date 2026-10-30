@@ -13,6 +13,9 @@ Options:
     --until DATE      End date (ISO format, default: today)
     --last N          Analyze exactly the last N commits (overrides time range)
     --max-commits N   Cap total commits analyzed (default: 2000)
+    --max-files N     Compute function-level churn for at most N in-scope
+                      Python files (default: no limit); `files_capped` in
+                      the output says when the cap applied
     --no-function     Skip function-level churn (file-level only, faster)
     --no-branches     Skip the unmerged remote branch listing
     --key-type SPEC   Map tracker-key prefixes, or single keys, to commit
@@ -1058,8 +1061,12 @@ def compute_function_churn_level2(
     project_root: Path,
     max_files: int = 0,
     attributor: CommitAttributor | None = None,
+    stats: dict | None = None,
 ) -> list[dict]:
     """Level 2: map each commit's hunks onto the functions of THAT commit.
+
+    `stats`, when given, receives `files_total` (in-scope Python files at
+    HEAD) and `files_analyzed` (after the `max_files` cap).
 
     The old implementation mapped every historical hunk onto function
     boundaries parsed from HEAD. On a file that more than doubled in the
@@ -1071,7 +1078,9 @@ def compute_function_churn_level2(
     if attributor is None:
         attributor = CommitAttributor(git_root)
     try:
-        return _function_churn(commits, scan_root, git_root, max_files, attributor)
+        return _function_churn(
+            commits, scan_root, git_root, max_files, attributor, stats
+        )
     finally:
         if owned:
             attributor.close()
@@ -1083,6 +1092,7 @@ def _function_churn(
     git_root: Path,
     max_files: int,
     attributor: CommitAttributor,
+    stats: dict | None = None,
 ) -> list[dict]:
     # The in-scope Python files that exist at HEAD, keyed by repo path.
     if scan_root.is_file():
@@ -1111,8 +1121,12 @@ def _function_churn(
             continue
         allowed.append(pf.relative_to(git_root).as_posix())
 
+    if stats is not None:
+        stats["files_total"] = len(allowed)
     if max_files > 0 and len(allowed) > max_files:
         allowed = allowed[:max_files]
+    if stats is not None:
+        stats["files_analyzed"] = len(allowed)
     allowed_set = set(allowed)
     if not allowed_set:
         return []
@@ -1747,6 +1761,9 @@ def analyze(argv: list[str] | None = None) -> dict:
 
     git_root = git_toplevel(project_root)
     attributor = CommitAttributor(git_root)
+    # --max-files caps the files function churn is computed for; null counts
+    # mean function churn did not run.
+    file_stats: dict = {"files_total": None, "files_analyzed": None}
     try:
         # Function-level churn.
         function_churn: list[dict] = []
@@ -1763,6 +1780,7 @@ def analyze(argv: list[str] | None = None) -> dict:
                 project_root,
                 max_files=args["max_files"],
                 attributor=attributor,
+                stats=file_stats,
             )
             if _check_script_timeout():
                 function_churn_note = (
@@ -1815,9 +1833,19 @@ def analyze(argv: list[str] | None = None) -> dict:
         )
 
     # Build result.
+    files_capped = (
+        file_stats["files_total"] is not None
+        and file_stats["files_analyzed"] < file_stats["files_total"]
+    )
     result: dict = {
         "project_root": str(project_root),
         "scan_root": str(scan_root),
+        # The envelope's file fields describe function churn, the only part
+        # --max-files caps. File churn and commit lists always cover the
+        # whole window.
+        "files_total": file_stats["files_total"],
+        "files_analyzed": file_stats["files_analyzed"],
+        "files_capped": files_capped,
         "time_range": {
             "start": since,
             "end": until,
@@ -1918,6 +1946,14 @@ def analyze(argv: list[str] | None = None) -> dict:
             + ". The analysis below ran with default values for whatever those "
             "flags were meant to set -- re-run with the correct flag before "
             "trusting any temporal claim."
+        )
+
+    if files_capped:
+        result["notes"].append(
+            f"FILES CAPPED: function churn covers {file_stats['files_analyzed']} "
+            f"of {file_stats['files_total']} in-scope Python files "
+            "(--max-files). Functions in the remaining files are missing from "
+            "`function_churn`, not unchanged."
         )
 
     if commit_cap_applied:

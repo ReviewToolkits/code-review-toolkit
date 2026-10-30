@@ -681,6 +681,39 @@ class TestMaxFilesArg(unittest.TestCase):
         args = mod.parse_args(["--max-files", "50"])
         self.assertEqual(args["max_files"], 50)
 
+    def _files_repo(self):
+        return GitTempProject(
+            [
+                {
+                    "files": {f"m{i}.py": f"def f{i}():\n    return {i}\n"},
+                    "message": f"Add m{i}",
+                }
+                for i in range(3)
+            ]
+        )
+
+    def test_cap_is_reported_in_the_envelope(self):
+        with self._files_repo() as root:
+            result = mod.analyze([str(root), *_WINDOW, "--max-files", "1"])
+        self.assertEqual((result["files_total"], result["files_analyzed"]), (3, 1))
+        self.assertTrue(result["files_capped"])
+        self.assertTrue(any(n.startswith("FILES CAPPED") for n in result["notes"]))
+
+    def test_no_cap_is_not_capped(self):
+        with self._files_repo() as root:
+            result = mod.analyze([str(root), *_WINDOW])
+        self.assertEqual((result["files_total"], result["files_analyzed"]), (3, 3))
+        self.assertFalse(result["files_capped"])
+
+    def test_skipped_function_churn_counts_nothing(self):
+        with self._files_repo() as root:
+            result = mod.analyze([str(root), *_WINDOW, "--no-function"])
+        self.assertIsNone(result["files_total"])
+        self.assertFalse(result["files_capped"])
+
+    def test_help_documents_max_files(self):
+        self.assertIn("--max-files", mod.__doc__)
+
 
 def _latin1_repo(testcase) -> Path:
     """A one-commit git repo whose diff payload is not valid UTF-8."""
