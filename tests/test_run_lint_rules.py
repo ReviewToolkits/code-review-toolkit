@@ -499,3 +499,54 @@ class TestYamlSafeLoaderSubclassDismissal(unittest.TestCase):
         reason = "yaml-loader-subclasses-safeloader"
         self.assertEqual(_dismissed_lines(result), {20: reason, 21: reason, 22: reason})
         self.assertEqual(_kept_lines(result), {23, 24, 25})
+
+
+class TestSqlFromLiteralsDismissal(unittest.TestCase):
+    """S608 on a query whose interpolated values are all literals."""
+
+    SOURCE = (
+        "TABLE = 'events'\n"
+        "\n"
+        "def q(conn, ids, kind, table, extra):\n"
+        "    marks = ','.join(['?'] * len(ids))\n"
+        "    gen = ', '.join('?' for _ in ids)\n"
+        "    name = 'a_table' if kind else 'b_table'\n"
+        "    where = 'id=?'\n"
+        "    if kind:\n"
+        "        where += f' AND kind IN ({gen})'\n"
+        "    sets = ['updated=1']\n"
+        "    sets.append('kind=?')\n"
+        "    conn.execute(f'SELECT * FROM {name} WHERE id IN ({marks})', ids)\n"
+        "    conn.execute('UPDATE ' + TABLE + ' SET ' + ', '.join(sets) + ' WHERE ' + where)\n"
+        "    conn.execute('SELECT * FROM t WHERE id IN (%s)' % marks, ids)\n"
+        "    conn.execute(f'SELECT * FROM {table}')\n"
+        "    bad = ['a=1']\n"
+        "    bad.append(extra)\n"
+        "    conn.execute('UPDATE t SET ' + ', '.join(bad))\n"
+        "    shared = ['a=1']\n"
+        "    fill(shared)\n"
+        "    conn.execute('UPDATE t SET ' + ', '.join(shared))\n"
+        "    conn.execute('SELECT {}'.format(extra))\n"
+        '    conn.execute(f"SELECT {3 * extra}")\n'
+    )
+
+    def test_literal_only_queries_are_dismissed_and_others_kept(self):
+        from helpers import TempProject
+
+        with TempProject({"db.py": self.SOURCE}) as root:
+            hits = [
+                _fake_hit(root, "db.py", 12, "f'SELECT", code="S608"),
+                _fake_hit(root, "db.py", 13, "'UPDATE", code="S608"),
+                _fake_hit(root, "db.py", 14, "'SELECT", code="S608"),
+                _fake_hit(root, "db.py", 15, "f'SELECT", code="S608"),
+                _fake_hit(root, "db.py", 18, "'UPDATE", code="S608"),
+                _fake_hit(root, "db.py", 21, "'UPDATE", code="S608"),
+                _fake_hit(root, "db.py", 22, "'SELECT", code="S608"),
+                _fake_hit(root, "db.py", 23, 'f"SELECT', code="S608"),
+            ]
+            result = _analyze_with_fake_ruff(root, hits)
+        reason = "sql-built-from-literals"
+        self.assertEqual(_dismissed_lines(result), {12: reason, 13: reason, 14: reason})
+        # A parameter, a list fed a parameter, a list handed to another
+        # function, a .format() of a parameter, a number times a parameter.
+        self.assertEqual(_kept_lines(result), {15, 18, 21, 22, 23})

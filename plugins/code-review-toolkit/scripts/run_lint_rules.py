@@ -281,11 +281,23 @@ DISMISSAL_REASONS = {
         "subclass registers (`add_constructor`) are not checked: review them "
         "on their own."
     ),
+    "sql-built-from-literals": (
+        "S608 on SQL whose every interpolated value is built only from string "
+        "literals in the same file (a `','.join(['?'] * n)` placeholder list, a "
+        "constant table name, a list of literal clauses): no outside value can "
+        "reach the query text."
+    ),
 }
 
+_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 _SAFE_YAML_LOADERS = frozenset(
     {"SafeLoader", "CSafeLoader", "BaseLoader", "CBaseLoader"}
 )
+# Methods that read a list without changing it, and those that add to it.
+_LIST_READERS = frozenset({"count", "index", "copy"})
+_LIST_ADDERS = frozenset({"append", "extend", "insert"})
+_PURE_CONSUMERS = frozenset({"len", "tuple", "list", "sorted", "bool", "any", "all"})
 
 
 class _FileContext:
@@ -329,6 +341,247 @@ def _byte_col(path: Path, line: int, column: int, cache: dict) -> int:
     """ruff's 1-based character column as ast's 0-based UTF-8 byte offset."""
     text = _source_line(path, line, cache)
     return len(text[: max(column - 1, 0)].encode("utf-8"))
+
+
+def _scope_nodes(scope: ast.AST):
+    """Every node evaluated in *scope*, without entering nested scopes.
+
+    A nested def/class/lambda/comprehension node is yielded itself (its name
+    is a binding here) but its body is not walked.
+    """
+    if isinstance(scope, ast.Lambda):
+        stack = [scope.body]
+    else:
+        stack = list(getattr(scope, "body", []))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (*_SCOPES, *_COMPREHENSIONS)):
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def _param_names(scope: ast.AST) -> set[str]:
+    if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        return set()
+    a = scope.args
+    names = {p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
+    names.update(p.arg for p in (a.vararg, a.kwarg) if p is not None)
+    return names
+
+
+def _bindings(scope: ast.AST, name: str) -> list[ast.AST] | None:
+    """The values *name* is bound to in *scope*, or None if one is opaque.
+
+    An empty list means *scope* does not bind *name*. ``None`` means some
+    binding's value cannot be read (a parameter, a loop target, an import, a
+    ``global`` declaration ...).
+    """
+    if name in _param_names(scope):
+        return None
+    values: list[ast.AST] = []
+    for node in _scope_nodes(scope):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == name:
+                    values.append(node.value)
+                elif any(
+                    isinstance(n, ast.Name) and n.id == name for n in ast.walk(target)
+                ) and not isinstance(target, (ast.Attribute, ast.Subscript)):
+                    return None  # tuple unpacking
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+            target = node.target
+            if isinstance(target, ast.Name) and target.id == name:
+                if node.value is None:
+                    continue  # a bare annotation binds nothing
+                values.append(node.value)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names:
+            return None
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name == name:
+                return None
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            if any((a.asname or a.name.split(".")[0]) == name for a in node.names):
+                return None
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            if any(
+                isinstance(n, ast.Name) and n.id == name for n in ast.walk(node.target)
+            ):
+                return None
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if item.optional_vars is not None and any(
+                    isinstance(n, ast.Name) and n.id == name
+                    for n in ast.walk(item.optional_vars)
+                ):
+                    return None
+        elif (
+            isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar))
+            and node.name == name
+        ) or (isinstance(node, ast.MatchMapping) and node.rest == name):
+            return None
+    return values
+
+
+class _LiteralCheck:
+    """Is an expression built only from literals of the same file?
+
+    Used for S608: a query whose every interpolated value is a literal, a
+    placeholder list of literals, or a name bound only to such values cannot
+    carry an outside value into the SQL text.
+    """
+
+    def __init__(self, ctx: _FileContext) -> None:
+        self.ctx = ctx
+        self.visiting: set[tuple[int, str]] = set()
+
+    def safe(
+        self, node: ast.AST, scope: ast.AST, hidden: frozenset = frozenset()
+    ) -> bool:
+        if isinstance(node, ast.Constant):
+            return True
+        if isinstance(node, ast.JoinedStr):
+            return all(self.safe(v, scope, hidden) for v in node.values)
+        if isinstance(node, ast.FormattedValue):
+            return self.safe(node.value, scope, hidden) and (
+                node.format_spec is None or self.safe(node.format_spec, scope, hidden)
+            )
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            return all(self.safe(e, scope, hidden) for e in node.elts)
+        if isinstance(node, ast.BinOp):
+            if isinstance(node.op, (ast.Add, ast.Mod)):
+                return self.safe(node.left, scope, hidden) and self.safe(
+                    node.right, scope, hidden
+                )
+            if isinstance(node.op, ast.Mult):
+                # `"?" * n`, `["?"] * len(xs)`: copies of a literal sequence. The
+                # literal side must be a sequence, not a number (3 * value).
+                return any(
+                    self._literal_sequence(side) and self.safe(side, scope, hidden)
+                    for side in (node.left, node.right)
+                )
+            return False
+        if isinstance(node, ast.IfExp):
+            return self.safe(node.body, scope, hidden) and self.safe(
+                node.orelse, scope, hidden
+            )
+        if isinstance(node, _COMPREHENSIONS) and not isinstance(node, ast.DictComp):
+            targets = frozenset(
+                n.id
+                for gen in node.generators
+                for n in ast.walk(gen.target)
+                if isinstance(n, ast.Name)
+            )
+            return self.safe(node.elt, scope, hidden | targets)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.keywords and node.func.attr != "format":
+                return False
+            if node.func.attr == "join" and len(node.args) == 1:
+                return self.safe(node.func.value, scope, hidden) and self.safe(
+                    node.args[0], scope, hidden
+                )
+            if node.func.attr == "format":
+                values = [*node.args, *(k.value for k in node.keywords)]
+                return (
+                    not any(isinstance(v, ast.Starred) for v in node.args)
+                    and all(k.arg is not None for k in node.keywords)
+                    and self.safe(node.func.value, scope, hidden)
+                    and all(self.safe(v, scope, hidden) for v in values)
+                )
+            return False
+        if isinstance(node, ast.Name):
+            if node.id in hidden:
+                return False
+            return self._name_safe(node.id, scope)
+        return False
+
+    @staticmethod
+    def _literal_sequence(node: ast.AST) -> bool:
+        if isinstance(node, ast.Constant):
+            return isinstance(node.value, str)
+        return isinstance(node, (ast.JoinedStr, ast.List, ast.Tuple))
+
+    def _name_safe(self, name: str, scope: ast.AST) -> bool:
+        # Resolve through the enclosing function scopes, then the module.
+        while True:
+            values = _bindings(scope, name)
+            if values is None:
+                return False
+            if values:
+                break
+            if isinstance(scope, ast.Module):
+                return False
+            scope = self.ctx.scope_of(scope)
+        key = (id(scope), name)
+        if key in self.visiting:
+            return True  # `where += ...`: the other bindings decide
+        self.visiting.add(key)
+        try:
+            if not all(self.safe(v, scope) for v in values):
+                return False
+            if any(
+                isinstance(v, (ast.List, ast.Set, ast.ListComp, ast.SetComp))
+                for v in values
+            ):
+                # A list can grow after its binding: every use must be a read
+                # or an append of a literal, and it must be local.
+                return not isinstance(scope, ast.Module) and self._list_uses_safe(
+                    name, scope
+                )
+            return True
+        finally:
+            self.visiting.discard(key)
+
+    def _list_uses_safe(self, name: str, scope: ast.AST) -> bool:
+        parents = self.ctx.parents
+        for node in _scope_nodes(scope):
+            if not (isinstance(node, ast.Name) and node.id == name):
+                continue
+            if not isinstance(node.ctx, ast.Load):
+                continue  # bindings were checked by _bindings
+            parent = parents.get(node)
+            grand = parents.get(parent) if parent is not None else None
+            if isinstance(parent, ast.Attribute):
+                if parent.attr in _LIST_READERS:
+                    continue
+                if (
+                    parent.attr in _LIST_ADDERS
+                    and isinstance(grand, ast.Call)
+                    and grand.func is parent
+                    and not grand.keywords
+                ):
+                    args = grand.args[1:] if parent.attr == "insert" else grand.args
+                    if all(self.safe(a, scope) for a in args):
+                        continue
+                return False
+            if isinstance(parent, ast.Call) and node in parent.args:
+                func = parent.func
+                if isinstance(func, ast.Name) and func.id in _PURE_CONSUMERS:
+                    continue
+                if isinstance(func, ast.Attribute) and func.attr == "join":
+                    continue
+                return False
+            if isinstance(parent, (ast.If, ast.While, ast.IfExp, ast.Assert)) and (
+                parent.test is node
+            ):
+                continue
+            if isinstance(parent, (ast.BoolOp, ast.UnaryOp, ast.Compare)):
+                continue
+            return False
+        return True
+
+
+def _sql_from_literals(
+    ctx: _FileContext, line: int, col: int, end: tuple | None
+) -> bool:
+    candidates = ctx.at(line, col, ast.expr)
+    if end is not None:
+        exact = [n for n in candidates if (n.end_lineno, n.end_col_offset) == end]
+        candidates = exact or candidates
+    if not candidates:
+        return False
+    node = candidates[0]
+    return _LiteralCheck(ctx).safe(node, ctx.scope_of(node))
 
 
 def _shadows(tree: ast.Module, name: str) -> bool:
@@ -453,12 +706,19 @@ def _yaml_loader(ctx: _FileContext, line: int, col: int, end) -> str | None:
     return None
 
 
+def _literal_sql(ctx: _FileContext, line: int, col: int, end) -> str | None:
+    if _sql_from_literals(ctx, line, col, end):
+        return "sql-built-from-literals"
+    return None
+
+
 # One mechanical dismissal per rule. Each resolves the flagged node in the
 # same file and dismisses only what it can prove.
 _DISMISSERS = {
     "B008": _fastapi_marker,
     "B904": _systemexit,
     "S506": _yaml_loader,
+    "S608": _literal_sql,
 }
 
 
@@ -471,7 +731,8 @@ def dismissal_reason(
     in that same file: a local ``Depends`` class, or a ``Query()`` from
     another library, is still reported. B904 only for the builtin
     ``SystemExit``; S506 only for a Loader class whose bases are all safe yaml
-    loaders. *finding* may carry ruff's
+    loaders; S608 only when every
+    interpolated value is a literal. *finding* may carry ruff's
     ``end`` location, which pins the flagged node exactly.
     """
     check = _DISMISSERS.get(finding["code"])
