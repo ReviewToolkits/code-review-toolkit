@@ -14,6 +14,7 @@ Options:
     --last N          Analyze exactly the last N commits (overrides time range)
     --max-commits N   Cap total commits analyzed (default: 2000)
     --no-function     Skip function-level churn (file-level only, faster)
+    --no-branches     Skip the unmerged remote branch listing
     --key-type SPEC   Map tracker-key prefixes to commit types, e.g.
                       B=fix,F=feature (repeatable)
 """
@@ -205,6 +206,9 @@ _FUNCTION_COUNT_THRESHOLD = 500
 # the parses per run; past it, the remaining commits are left unattributed and
 # the output says so.
 _MAX_BLOB_PARSES = 4000
+_MAX_UNMERGED_BRANCHES = 30
+_MAX_UNMERGED_COMMITS = 20
+_MAX_UNMERGED_FILES = 30
 
 
 def tracker_key_prefix(key: str) -> str:
@@ -1172,6 +1176,171 @@ def summarize_tracker_keys(commits: list[dict], max_repeated: int = 30) -> dict:
     }
 
 
+def _default_branch(git_root: Path) -> str | None:
+    """The ref unmerged work is measured against.
+
+    `origin/HEAD` when set, else the first of origin/main, origin/master,
+    main, master that exists. None if none does.
+    """
+    try:
+        result = _run_git(
+            ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+            git_root,
+            timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+        for candidate in ("origin/main", "origin/master", "main", "master"):
+            result = _run_git(
+                ["rev-parse", "--verify", "--quiet", candidate + "^{commit}"],
+                git_root,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                return candidate
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return None
+
+
+def find_unmerged_branches(
+    git_root: Path,
+    rel_scope: str = ".",
+    key_types: dict[str, str] | None = None,
+    max_branches: int = _MAX_UNMERGED_BRANCHES,
+    max_commits: int = _MAX_UNMERGED_COMMITS,
+) -> dict:
+    """Remote branches with commits the default branch does not have.
+
+    Unmerged work is prior art: on one validation project the most
+    consequential fact for the review -- a branch already fixing several
+    findings -- lived only on an unmerged remote branch. Read-only: this never
+    fetches, so it reflects the remote-tracking refs as of the last fetch.
+    """
+    base = _default_branch(git_root)
+    if base is None:
+        return {
+            "available": False,
+            "reason": "no default branch found "
+            "(no origin/HEAD, origin/main, origin/master, main or master)",
+            "branches": [],
+        }
+    try:
+        refs = _run_git(
+            [
+                "for-each-ref",
+                "--sort=-committerdate",
+                "--format=%(refname:short)%00%(symref)%00%(committerdate:iso-strict)",
+                "refs/remotes",
+            ],
+            git_root,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "available": False,
+            "reason": "git for-each-ref timed out",
+            "base": base,
+            "branches": [],
+        }
+    if refs.returncode != 0:
+        return {
+            "available": False,
+            "reason": "git for-each-ref failed",
+            "base": base,
+            "branches": [],
+        }
+
+    candidates: list[tuple[str, str]] = []
+    for line in refs.stdout.splitlines():
+        name, symref, date = (line.split("\x00") + ["", ""])[:3]
+        if symref or name == base or not name:
+            continue  # origin/HEAD, or the base itself
+        candidates.append((name, date))
+
+    scope_args = ["--", rel_scope] if rel_scope != "." else []
+    branches: list[dict] = []
+    examined = 0
+    for name, date in candidates:
+        if len(branches) >= max_branches or _check_script_timeout():
+            break
+        examined += 1
+        try:
+            counts = _run_git(
+                ["rev-list", "--left-right", "--count", f"{base}...{name}"],
+                git_root,
+            )
+            if counts.returncode != 0:
+                continue
+            behind, ahead = (int(x) for x in counts.stdout.split()[:2])
+            if ahead == 0:
+                continue
+            log = _run_git(
+                [
+                    "log",
+                    f"-{max_commits}",
+                    "--format=%H%x00%cI%x00%s",
+                    f"{base}..{name}",
+                ],
+                git_root,
+            )
+            files = _run_git(
+                [
+                    "diff",
+                    "--name-only",
+                    "--no-color",
+                    "--no-ext-diff",
+                    f"{base}...{name}",
+                    *scope_args,
+                ],
+                git_root,
+            )
+        except (subprocess.TimeoutExpired, ValueError):
+            continue
+        commits = []
+        for entry in log.stdout.splitlines():
+            sha, cdate, subject = (entry.split("\x00") + ["", ""])[:3]
+            detail = classify_commit_detail(subject, key_types)
+            commits.append(
+                {
+                    "commit_short": sha[:7],
+                    "date": cdate,
+                    "message": subject,
+                    "type": detail["type"],
+                    "keys": detail["keys"],
+                }
+            )
+        changed = (
+            [f for f in files.stdout.splitlines() if f] if files.returncode == 0 else []
+        )
+        branches.append(
+            {
+                "branch": name,
+                "ahead": ahead,
+                "behind": behind,
+                "last_commit_date": date,
+                "fix_commits_shown": sum(1 for c in commits if c["type"] == "fix"),
+                "commits": commits,
+                "commits_truncated": ahead > len(commits),
+                "files_in_scope_changed": len(changed),
+                "files_in_scope": changed[:_MAX_UNMERGED_FILES],
+            }
+        )
+    return {
+        "available": True,
+        "base": base,
+        "remote_branches_total": len(candidates),
+        "remote_branches_examined": examined,
+        "unmerged_count": len(branches),
+        "truncated": examined < len(candidates),
+        "note": (
+            "Commits on remote branches that are not in the base branch, as "
+            "of the last fetch (this script never fetches). Treat them as "
+            "prior art: a finding may already be fixed, or attempted, there."
+        ),
+        "branches": branches,
+    }
+
+
 def parse_args(argv: list[str]) -> dict:
     """Parse command-line arguments."""
     args: dict = {
@@ -1183,6 +1352,7 @@ def parse_args(argv: list[str]) -> dict:
         "max_commits": 2000,
         "max_files": 0,
         "no_function": False,
+        "no_branches": False,
         "key_types": {},
         "unknown_args": [],
     }
@@ -1238,6 +1408,9 @@ def parse_args(argv: list[str]) -> dict:
             i += 2
         elif arg == "--no-function":
             args["no_function"] = True
+            i += 1
+        elif arg == "--no-branches":
+            args["no_branches"] = True
             i += 1
         elif arg == "--key-type" and i + 1 < len(argv):
             try:
@@ -1396,6 +1569,19 @@ def analyze(argv: list[str] | None = None) -> dict:
     # Co-change clusters.
     co_change_clusters = compute_co_change_clusters(commits)
 
+    if args["no_branches"]:
+        unmerged = {
+            "available": False,
+            "reason": "skipped (--no-branches)",
+            "branches": [],
+        }
+    else:
+        unmerged = find_unmerged_branches(
+            git_root,
+            _relative_scope(scan_root, git_root),
+            key_types,
+        )
+
     # Build result.
     result: dict = {
         "project_root": str(project_root),
@@ -1429,6 +1615,7 @@ def analyze(argv: list[str] | None = None) -> dict:
         "recent_features": recent_features,
         "recent_refactors": recent_refactors,
         "co_change_clusters": co_change_clusters,
+        "unmerged_branches": unmerged,
         "notes": [],
     }
 

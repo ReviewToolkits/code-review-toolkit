@@ -701,6 +701,16 @@ class TestUnknownArgumentsAndCommitCap(unittest.TestCase):
         )
 
 
+def _git(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
 _WINDOW = ["--since", "2024-12-01", "--until", "2025-02-01"]
 
 
@@ -1015,6 +1025,76 @@ class TestFunctionAttributionAtCommit(unittest.TestCase):
                 b["qualname"] for b in mod.get_function_boundaries(root / "mod.py")
             ]
         self.assertEqual(sorted(quals), ["C.m", "C.m.inner", "guarded"])
+
+
+class TestUnmergedBranches(unittest.TestCase):
+    """Commits on remote branches that the default branch lacks."""
+
+    def _repo(self) -> Path:
+        project = GitTempProject(
+            [
+                {"files": {"src/a.py": "x = 1\n"}, "message": "Add a"},
+                {"files": {"src/a.py": "x = 2\n"}, "message": "Change a"},
+            ]
+        )
+        root = project.__enter__()
+        self.addCleanup(project.__exit__, None, None, None)
+        main_sha = _git(root, "rev-parse", "HEAD")
+        _git(root, "checkout", "-q", "-b", "work")
+        (root / "src" / "a.py").write_text("x = 3\n", encoding="utf-8")
+        _git(root, "commit", "-qam", "[fix] Guard a (K7)")
+        (root / "docs.md").write_text("notes\n", encoding="utf-8")
+        _git(root, "add", "docs.md")
+        _git(root, "commit", "-qm", "[doc] Notes")
+        work_sha = _git(root, "rev-parse", "HEAD")
+        _git(root, "checkout", "-q", "main")
+        merged_sha = _git(root, "rev-parse", "HEAD~1")
+        _git(root, "update-ref", "refs/remotes/origin/main", main_sha)
+        _git(root, "update-ref", "refs/remotes/origin/work", work_sha)
+        _git(root, "update-ref", "refs/remotes/origin/merged", merged_sha)
+        _git(
+            root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"
+        )
+        return root
+
+    def test_unmerged_branch_is_listed_with_its_commits(self):
+        root = self._repo()
+        result = mod.analyze([str(root), *_WINDOW, "--no-function"])
+        unmerged = result["unmerged_branches"]
+        self.assertTrue(unmerged["available"])
+        self.assertEqual(unmerged["base"], "origin/main")
+        self.assertEqual([b["branch"] for b in unmerged["branches"]], ["origin/work"])
+        work = unmerged["branches"][0]
+        self.assertEqual((work["ahead"], work["behind"]), (2, 0))
+        self.assertEqual(
+            [(c["message"], c["type"]) for c in work["commits"]],
+            [("[doc] Notes", "docs"), ("[fix] Guard a (K7)", "fix")],
+        )
+        self.assertEqual(work["commits"][1]["keys"], ["K7"])
+        self.assertEqual(work["fix_commits_shown"], 1)
+        self.assertEqual(work["files_in_scope"], ["docs.md", "src/a.py"])
+
+    def test_scope_limits_the_files_listed(self):
+        root = self._repo()
+        result = mod.analyze([str(root / "src"), *_WINDOW, "--no-function"])
+        work = result["unmerged_branches"]["branches"][0]
+        self.assertEqual(work["files_in_scope"], ["src/a.py"])
+        # The ahead count is about the branch, not the scope.
+        self.assertEqual(work["ahead"], 2)
+
+    def test_merged_branch_and_symref_are_not_listed(self):
+        root = self._repo()
+        result = mod.analyze([str(root), *_WINDOW, "--no-function"])
+        unmerged = result["unmerged_branches"]
+        names = {b["branch"] for b in unmerged["branches"]}
+        self.assertEqual(names, {"origin/work"})
+        self.assertEqual(unmerged["remote_branches_total"], 2)  # work, merged
+
+    def test_no_branches_flag_skips(self):
+        root = self._repo()
+        result = mod.analyze([str(root), *_WINDOW, "--no-function", "--no-branches"])
+        self.assertFalse(result["unmerged_branches"]["available"])
+        self.assertIn("--no-branches", result["unmerged_branches"]["reason"])
 
 
 if __name__ == "__main__":
