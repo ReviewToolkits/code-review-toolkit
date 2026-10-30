@@ -166,10 +166,15 @@ def find_mypy_config(project_root: Path) -> str | None:
     return None
 
 
+# What `strict = true` turns on, among the options this script asks about.
+# `warn_unreachable` is deliberately absent: --strict does not enable it.
+_STRICT_IMPLIES = frozenset({"warn_unused_ignores", "check_untyped_defs"})
+
+
 def config_enables(config: str | None, option: str) -> bool:
     """Whether the project's global mypy section turns *option* on.
 
-    ``strict`` implies every warning this script asks about. Per-module
+    ``strict`` implies it when it is one of ``_STRICT_IMPLIES``. Per-module
     sections are deliberately ignored: they enable the option for part of the
     tree only, so a count taken under them is not a whole-tree measurement.
     Anything unreadable answers False, which costs at most one extra labelled
@@ -188,7 +193,7 @@ def config_enables(config: str | None, option: str) -> bool:
         except (OSError, ValueError):
             return False
         mypy = data.get("tool", {}).get("mypy", {})
-        return any(mypy.get(key) is True for key in (option, "strict"))
+        return any(mypy.get(key) is True for key in _keys_enabling(option))
     parser = configparser.ConfigParser()
     try:
         parser.read(path, encoding="utf-8")
@@ -196,13 +201,17 @@ def config_enables(config: str | None, option: str) -> bool:
         return False
     if not parser.has_section("mypy"):
         return False
-    for key in (option, "strict"):
+    for key in _keys_enabling(option):
         try:
             if parser.getboolean("mypy", key, fallback=False):
                 return True
         except ValueError:
             continue
     return False
+
+
+def _keys_enabling(option: str) -> tuple[str, ...]:
+    return (option, "strict") if option in _STRICT_IMPLIES else (option,)
 
 
 # Notes that introduce the error AFTER them rather than explaining the one before.
@@ -525,6 +534,12 @@ def _analyze_with_cache(
     }
     if ignores_in_config:
         wanted.pop("warn-unused-ignores", None)
+    # Same for unreachable code: when the project's config already enables
+    # warn_unreachable the baseline reports it, and a labelled pass would add
+    # nothing -- an `added: 0` that reads like a measurement but is a no-op.
+    unreachable_in_config = config_enables(config, "warn_unreachable")
+    if unreachable_in_config:
+        wanted.pop("warn-unreachable", None)
     baseline = {_finding_key(f) for f in findings}
     labelled: dict[str, dict] = {}
     if wanted:
@@ -551,7 +566,13 @@ def _analyze_with_cache(
         return [f for f in result["findings"] if code is None or f["code"] == code]
 
     phantom_imports = pass_findings("disallow-any-unimported")
-    unreachable = pass_findings("warn-unreachable")
+    unreachable: list[dict] | None
+    if unreachable_in_config and status == "OK":
+        unreachable = [f for f in findings if f["code"] == "unreachable"]
+        unreachable_source = "project-config"
+    else:
+        unreachable = pass_findings("warn-unreachable")
+        unreachable_source = None if unreachable is None else "warn-unreachable-pass"
 
     stale_reason = None
     stale_ignores: list[dict] | None
@@ -625,6 +646,9 @@ def _analyze_with_cache(
             # wrong, so the block is silently never type-checked. null if the
             # pass did not run.
             "unreachable": None if unreachable is None else len(unreachable),
+            # `project-config` (the baseline reports it; no extra pass ran) or
+            # `warn-unreachable-pass`; null when nothing measured it.
+            "unreachable_source": unreachable_source,
             "parse_mismatch": parse_mismatch,
             "strict_pass_ran": phantom_imports is not None,
             "labelled_passes": {

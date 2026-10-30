@@ -469,6 +469,35 @@ class TestUnreachablePass(unittest.TestCase):
         self.assertTrue(result["summary"]["labelled_passes"]["warn-unreachable"]["ran"])
 
 
+class TestUnreachableSource(unittest.TestCase):
+    """With warn_unreachable on in the project's config, the labelled pass is
+    a no-op: its `added: 0` read as a measurement. The baseline is the source."""
+
+    def test_project_config_is_the_source_and_no_pass_runs(self):
+        files = {**_PKG, "mypy.ini": "[mypy]\nwarn_unreachable = True\n"}
+        result, flags_seen = _run(files, {"": _UNREACHABLE + _BASE_ERR + _TWO_ERRORS})
+        summary = result["summary"]
+        self.assertEqual(summary["unreachable_source"], "project-config")
+        self.assertEqual(summary["unreachable"], 1)
+        self.assertEqual(result["unreachable_findings"][0]["line"], 7)
+        self.assertNotIn("warn-unreachable", summary["labelled_passes"])
+        self.assertFalse(any("--warn-unreachable" in f for f in flags_seen))
+
+    def test_strict_does_not_imply_warn_unreachable(self):
+        files = {**_PKG, "mypy.ini": "[mypy]\nstrict = True\n"}
+        result, flags_seen = _run(files, {"": _BASE_ERR + _ONE_ERROR})
+        self.assertEqual(result["summary"]["unreachable_source"], "warn-unreachable-pass")
+        self.assertTrue(any("--warn-unreachable" in f for f in flags_seen))
+
+    def test_without_it_the_labelled_pass_is_the_source(self):
+        result, _ = _run(_PKG, {"": _BASE_ERR + _ONE_ERROR})
+        self.assertEqual(result["summary"]["unreachable_source"], "warn-unreachable-pass")
+
+    def test_skipped_pass_has_no_source(self):
+        result, _ = _run(_PKG, {"": _BASE_ERR + _ONE_ERROR}, unreachable_pass=False)
+        self.assertIsNone(result["summary"]["unreachable_source"])
+
+
 class TestConfigDiscovery(unittest.TestCase):
     def test_pyproject_without_a_mypy_section_is_not_a_config(self):
         import tempfile
