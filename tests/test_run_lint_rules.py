@@ -143,7 +143,7 @@ def _fake_hit(root, relpath, line, needle, code="B008"):
         "code": code,
         "filename": str(path),
         "location": {"row": line, "column": text.index(needle) + 1},
-        "message": f"hit on {needle}",
+        "message": f"hit on `{needle}`",
     }
 
 
@@ -251,6 +251,49 @@ class TestFastapiMarkerDismissal(unittest.TestCase):
                 root, [_fake_hit(root, "routes.py", 4, "Depends(", code="B006")]
             )
         self.assertEqual(len(result["findings"]), 1)
+
+
+class TestExceptClosureFlag(unittest.TestCase):
+    """F821 on an except binding read by a closure in its handler (ruff#6878)."""
+
+    SOURCE = (
+        "def f(job, retry):\n"
+        "    try:\n"
+        "        job()\n"
+        "    except Exception as exc:\n"
+        "        retry(lambda c: str(exc))\n"
+        "    return missing\n"
+    )
+
+    def test_closure_read_is_flagged_but_kept_for_triage(self):
+        from helpers import TempProject
+
+        with TempProject({"m.py": self.SOURCE}) as root:
+            result = _analyze_with_fake_ruff(
+                root,
+                [
+                    _fake_hit(root, "m.py", 5, "exc", code="F821"),
+                    _fake_hit(root, "m.py", 6, "missing", code="F821"),
+                ],
+            )
+        by_line = {f["line"]: f for f in result["findings"]}
+        # Flagged, not dismissed: an escaping closure makes the same F821 real.
+        self.assertEqual(len(result["findings"]), 2)
+        self.assertTrue(by_line[5]["suspect_tool_bug"])
+        self.assertEqual(by_line[5]["known_tool_issue"], "ruff#6878")
+        self.assertNotIn("suspect_tool_bug", by_line[6])
+        self.assertEqual(result["summary"]["suspect_tool_bug"], 1)
+        # The genuine F821 keeps F821 a novel-shape candidate ...
+        self.assertEqual(result["summary"]["novel_shape_candidates"], ["F821"])
+
+    def test_a_known_tool_bug_alone_is_not_a_novel_shape(self):
+        from helpers import TempProject
+
+        with TempProject({"m.py": self.SOURCE}) as root:
+            result = _analyze_with_fake_ruff(
+                root, [_fake_hit(root, "m.py", 5, "exc", code="F821")]
+            )
+        self.assertEqual(result["summary"]["novel_shape_candidates"], [])
 
 
 class TestMissingRuff(unittest.TestCase):

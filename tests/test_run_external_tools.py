@@ -852,6 +852,112 @@ class TestNoCacheInReviewedProject(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Known ruff false positive: except-binding read from a closure (#22)
+# ---------------------------------------------------------------------------
+
+EXCEPT_CLOSURE_SOURCE = """\
+def retry(fn):
+    return fn(None)
+
+def f(job):
+    try:
+        job()
+    except Exception as exc:
+        retry(lambda c: str(exc))
+
+def g(job):
+    try:
+        job()
+    except Exception as exc:
+        def report():
+            return f"failed: {exc}"
+        report()
+
+def h():
+    return undefined_name
+
+def k(job):
+    try:
+        job()
+    except Exception as exc:
+        pass
+
+def m(job):
+    try:
+        job()
+    except Exception as exc:
+        pass
+    return lambda: exc
+"""
+
+
+def _ruff_hit(root, code, line, name):
+    message = {
+        "F821": f"Undefined name `{name}`",
+        "F841": f"Local variable `{name}` is assigned to but never used",
+    }[code]
+    return {
+        "code": code,
+        "filename": str(root / "m.py"),
+        "location": {"row": line, "column": 1},
+        "message": message,
+        "fix": {"applicability": "unsafe"} if code == "F841" else None,
+    }
+
+
+class TestExceptClosureFalsePositive(unittest.TestCase):
+    """ruff 0.16.0 flags `exc` read by a closure inside its own handler."""
+
+    def _run(self, hits):
+        with TempProject({"m.py": EXCEPT_CLOSURE_SOURCE}) as root:
+            hits = [_ruff_hit(root, *h) for h in hits]
+            with patch.object(mod.subprocess, "run") as run:
+                run.return_value = MagicMock(stdout=json.dumps(hits), stderr="")
+                out = mod.run_ruff(
+                    mod.parse_args([str(root), "--ruff-rules", "F"]), root, root
+                )
+        return {(f["rule"], f["line"]): f for f in out["findings"]}, out
+
+    def test_closure_reads_are_labelled_not_bug_risk(self):
+        by_site, out = self._run([("F821", 8, "exc"), ("F821", 15, "exc")])
+        for site in (("F821", 8), ("F821", 15)):
+            with self.subTest(site=site):
+                hit = by_site[site]
+                self.assertEqual(hit["category"], "suspected-tool-false-positive")
+                self.assertTrue(hit["suspect_tool_bug"])
+                self.assertEqual(hit["known_tool_issue"], "ruff#6878")
+                self.assertIn("escapes", hit["tool_bug_note"])
+        self.assertEqual(out["suspected_tool_false_positives"], 2)
+
+    def test_matching_f841_autofix_is_flagged_unsafe(self):
+        by_site, _ = self._run([("F841", 7, "exc"), ("F841", 13, "exc")])
+        for site in (("F841", 7), ("F841", 13)):
+            with self.subTest(site=site):
+                hit = by_site[site]
+                self.assertTrue(hit["autofix_unsafe"])
+                self.assertEqual(hit["category"], "suspected-tool-false-positive")
+                self.assertIn("NameError", hit["tool_bug_note"])
+
+    def test_genuine_undefined_name_stays_bug_risk(self):
+        by_site, out = self._run([("F821", 19, "undefined_name")])
+        self.assertEqual(by_site[("F821", 19)]["category"], "bug-risk")
+        self.assertNotIn("suspect_tool_bug", by_site[("F821", 19)])
+        self.assertEqual(out["suspected_tool_false_positives"], 0)
+
+    def test_closure_escaping_the_handler_stays_bug_risk(self):
+        # `return lambda: exc` AFTER the handler: exc is deleted by then, so
+        # this F821 is a real NameError.
+        by_site, _ = self._run([("F821", 32, "exc")])
+        self.assertEqual(by_site[("F821", 32)]["category"], "bug-risk")
+
+    def test_genuinely_unused_binding_keeps_its_autofix(self):
+        by_site, _ = self._run([("F841", 24, "exc")])
+        hit = by_site[("F841", 24)]
+        self.assertEqual(hit["category"], "dead-code")
+        self.assertNotIn("autofix_unsafe", hit)
+
+
+# ---------------------------------------------------------------------------
 # Integration: full pipeline with mocked tools
 # ---------------------------------------------------------------------------
 

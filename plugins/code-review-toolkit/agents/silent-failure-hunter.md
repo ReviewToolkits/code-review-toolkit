@@ -22,6 +22,7 @@ If external tool output is available (from `run_external_tools.py`), incorporate
 Filter the ruff output for `category: "bug-risk"` and `category: "security"` findings:
 
 - **`F821`** (undefined name): A variable or function used but never defined — potential runtime NameError. These are high-confidence bug risks. Classify as FIX.
+  - Exception: hits with `category: "suspected-tool-false-positive"` (`known_tool_issue: "ruff#6878"`) are an `except ... as exc` name read by a closure inside that handler. That is valid Python, and the hit is a false positive, unless the closure escapes the handler (stored, returned, scheduled) and runs after it ends. Check that one question; do not report it as FIX by default.
 - **`F811`** (redefined unused): A name is defined twice and the first definition is never used — possible logic error where the wrong variable is being checked. Classify as CONSIDER.
 - **`B006`** (mutable default argument): `def f(x=[])` — a classic Python bug where the default list is shared across calls. Classify as FIX.
 - **`B007`** (unused loop variable): Loop variable never used in the body — may indicate a logic error. Classify as CONSIDER.

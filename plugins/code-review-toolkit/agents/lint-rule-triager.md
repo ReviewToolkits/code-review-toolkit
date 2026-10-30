@@ -65,6 +65,13 @@ fastapi import in that file. That default is the framework's injection idiom, no
 value. On a FastAPI service it can be most of tier 1. List the count in the report's Dismissed
 section, and do not re-triage those hits.
 
+**`suspect_tool_bug: true` marks a known ruff false-positive mode.** Today that means an F821 on an
+`except ... as exc` name read by a closure nested in that handler (`known_tool_issue: "ruff#6878"`).
+The binding is alive until the handler exits, so the hit is false if the closure runs inside the
+handler. It is a real NameError if the closure escapes (stored, returned, scheduled) and runs later.
+Decide that one question per hit. These hits are kept out of `novel_shape_candidates`. Never
+recommend removing the `as exc`.
+
 For everything else, the ordinary rules apply: read the code, construct a concrete failure scenario,
 and drop anything you cannot make concrete. Rules that are policy rather than defect in a given
 project — `S101` (assert) in a test suite, `S603`/`S607` in a build script — are ACCEPTABLE, and

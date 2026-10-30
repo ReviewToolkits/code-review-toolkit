@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scan_common import (  # noqa: E402
     find_project_root,
 )
+from run_lint_rules import except_closure_annotation  # noqa: E402
 
 _KNOWN_TOOLS = ("ruff", "mypy", "vulture", "coverage")
 
@@ -335,6 +336,33 @@ def normalize_ruff_finding(finding: dict, project_root: Path) -> dict:
     }
 
 
+def _flag_known_tool_bugs(
+    finding: dict, filename: str | None, closures: dict,
+) -> dict:
+    """Re-label a hit that matches a known ruff false-positive mode.
+
+    The case handled is an ``except ... as exc`` binding read from a closure
+    nested in that handler: ruff 0.16.0 reports the read as F821 and the
+    binding as F841. Unlabelled, the F821 hits were shown as ``bug-risk``,
+    and the F841 hits offered a "safe" autofix (dropping ``as exc``) that
+    breaks the closure with a NameError. They get their own category so they
+    leave the bug-risk and dead-code feeds, and F841 is marked
+    ``autofix_unsafe`` so no agent recommends the fix.
+    """
+    annotation = except_closure_annotation(
+        finding["rule"],
+        finding["message"],
+        finding["line"],
+        Path(filename) if filename else None,
+        closures,
+    )
+    if annotation:
+        finding.update(annotation)
+        finding["category"] = "suspected-tool-false-positive"
+        finding["significance"] = "reduced"
+    return finding
+
+
 def _extract_rules_applied(findings: list[dict]) -> list[str]:
     """Extract the set of unique rule codes from ruff findings."""
     return sorted({f.get("code", "") for f in findings if f.get("code")})
@@ -377,8 +405,11 @@ def run_ruff(
 
     findings = json.loads(result.stdout) if result.stdout else []
 
+    closures: dict = {}
     normalized = [
-        normalize_ruff_finding(f, project_root)
+        _flag_known_tool_bugs(
+            normalize_ruff_finding(f, project_root), f.get("filename"), closures
+        )
         for f in findings[:args.max_findings]
     ]
 
@@ -387,6 +418,11 @@ def run_ruff(
         "rules_applied": _extract_rules_applied(findings),
         "total_findings": len(findings),
         "findings_capped": len(findings) > args.max_findings,
+        # Hits re-labelled `suspected-tool-false-positive`; see each one's
+        # `tool_bug_note`.
+        "suspected_tool_false_positives": sum(
+            1 for f in normalized if f.get("suspect_tool_bug")
+        ),
         "findings": normalized,
     }
 

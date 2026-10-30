@@ -268,6 +268,110 @@ def dismissal_reason(
     return None
 
 
+# ---------------------------------------------------------------------------
+# A known ruff false positive: the `except ... as NAME` binding read from a
+# closure nested inside that same handler. Shared with run_external_tools.py.
+# ---------------------------------------------------------------------------
+
+EXCEPT_CLOSURE_ISSUE = "ruff#6878"
+
+_NAME_IN_MESSAGE = re.compile(r"`([^`]+)`")
+
+
+def except_closure_bindings(tree: ast.Module) -> list[tuple[str, int, int, set[int]]]:
+    """Every ``except ... as NAME`` whose NAME is read inside a nested closure.
+
+    Returns ``(name, first_line, last_header_line, closure_read_lines)`` per
+    handler. The header span covers a multi-line ``except (A,\\n B) as NAME:``,
+    where ruff places F841 on the line of NAME rather than of ``except``.
+
+    Python keeps the binding alive until the handler exits, so a lambda or
+    nested def that runs *inside* the handler sees it. ruff 0.16.0 reports
+    those reads as F821 (undefined name) and the binding as F841 (unused) --
+    and F841's autofix removes ``as NAME``, which turns working code into a
+    NameError.
+    """
+    found: list[tuple[str, int, int, set[int]]] = []
+    for handler in ast.walk(tree):
+        if not isinstance(handler, ast.ExceptHandler) or not handler.name:
+            continue
+        name = handler.name
+        reads: set[int] = set()
+        for stmt in handler.body:
+            for node in ast.walk(stmt):
+                if not isinstance(
+                    node, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef)
+                ):
+                    continue
+                body = [node.body] if isinstance(node, ast.Lambda) else node.body
+                for part in body:
+                    for inner in ast.walk(part):
+                        if (
+                            isinstance(inner, ast.Name)
+                            and inner.id == name
+                            and isinstance(inner.ctx, ast.Load)
+                        ):
+                            reads.add(inner.lineno)
+        if reads:
+            header_end = handler.body[0].lineno if handler.body else handler.lineno
+            found.append((name, handler.lineno, header_end, reads))
+    return found
+
+
+def except_closure_match(code: str, message: str, line: int, bindings: list) -> dict:
+    """Annotation for an F821/F841 hit that is the except-closure false positive.
+
+    Empty when the hit is anything else -- an F821 on a genuinely undefined
+    name, or an F841 on a binding nothing reads, is left alone.
+    """
+    if code not in ("F821", "F841"):
+        return {}
+    named = _NAME_IN_MESSAGE.search(message or "")
+    if not named:
+        return {}
+    name = named.group(1)
+    for bound, first, header_end, reads in bindings:
+        if bound != name:
+            continue
+        if code == "F821" and line in reads:
+            return {
+                "suspect_tool_bug": True,
+                "known_tool_issue": EXCEPT_CLOSURE_ISSUE,
+                "tool_bug_note": (
+                    f"`{name}` is the `except ... as {name}` binding, read from a "
+                    "closure nested in that handler. Python keeps it bound until "
+                    "the handler exits, so this is a false positive when the "
+                    "closure runs inside the handler. It is a real NameError only "
+                    "if the closure escapes (stored, returned, scheduled) and runs "
+                    "after the handler ends."
+                ),
+            }
+        if code == "F841" and first <= line <= header_end:
+            return {
+                "suspect_tool_bug": True,
+                "known_tool_issue": EXCEPT_CLOSURE_ISSUE,
+                "autofix_unsafe": True,
+                "tool_bug_note": (
+                    f"`{name}` IS used, by a closure at line {min(reads)}. ruff's "
+                    f"fix removes `as {name}` and makes that closure raise "
+                    "NameError: do not apply or recommend it."
+                ),
+            }
+    return {}
+
+
+def except_closure_annotation(
+    code: str, message: str, line: int, path: Path | None, bindings_cache: dict
+) -> dict:
+    """``except_closure_match`` for a hit in *path*, parsing each file once."""
+    if code not in ("F821", "F841") or path is None:
+        return {}
+    if path not in bindings_cache:
+        tree = parse_source(path)
+        bindings_cache[path] = except_closure_bindings(tree) if tree else []
+    return except_closure_match(code, message, line, bindings_cache[path])
+
+
 def _tier_codes(tier: int) -> list[str]:
     if tier == 1:
         return [str(c) for c in TIER_1]
@@ -471,12 +575,19 @@ def analyze(
     findings: list[dict] = []
     # Hits with a known, mechanical dismissal: kept and counted, never dropped.
     dismissed: list[dict] = []
+    closures: dict = {}
     for raw_finding in raw[:max_findings]:
         finding = normalize(raw_finding, project_root, tier, cache)
         filename = raw_finding.get("filename")
-        reason = dismissal_reason(
-            finding, Path(filename) if filename else None, trees, cache
+        path = Path(filename) if filename else None
+        # Flagged, not dismissed: the same F821 is a real NameError when the
+        # closure escapes the handler, and only the agent can tell.
+        finding.update(
+            except_closure_annotation(
+                finding["code"], finding["message"], finding["line"], path, closures
+            )
         )
+        reason = dismissal_reason(finding, path, trees, cache)
         if reason:
             dismissed.append({**finding, "dismissal_reason": reason})
         else:
@@ -540,10 +651,18 @@ def analyze(
             # ~30 selected rules have no shape at all. A confirmed true positive
             # from one of those is a NEW CATALOG ENTRY -- the highest-value
             # output of this script, more than the findings themselves.
+            # A known tool false positive is not evidence of a new shape.
             "novel_shape_candidates": sorted(
-                {f["code"] for f in findings if not f["shape_id"]}
+                {
+                    f["code"]
+                    for f in findings
+                    if not f["shape_id"] and not f.get("suspect_tool_bug")
+                }
             ),
             "has_suppression_comment": len(suppressed),
+            # Hits matching a known ruff false-positive mode (see each hit's
+            # `known_tool_issue` and `tool_bug_note`). Flagged, not dismissed.
+            "suspect_tool_bug": sum(1 for f in findings if f.get("suspect_tool_bug")),
         },
         "findings_capped": len(raw) > max_findings,
         "findings": findings + preview_findings,
