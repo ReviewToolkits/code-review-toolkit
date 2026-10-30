@@ -38,9 +38,11 @@ Two fields carry the design:
 ``has_suppression_comment``
     Measured to be the strongest dismissal signal. Tier-1 precision is 50-70%,
     not 100%, and an existing suppression naming the rule class is usually why.
+    Not for security rules or ``nosec``: ``suppression_is_dismissal_signal``
+    is False there, and the comment's claim is checked instead.
 
 Usage:
-    python run_lint_rules.py [path] [--tier 1|2|3] [--ruff-bin PATH]
+    python run_lint_rules.py [path] [--tier 1|2] [--ruff-bin PATH]
                              [--preview-pass] [--max-findings N]
 """
 
@@ -152,6 +154,9 @@ TIER_2 = (
     "F401 F403 F405 F841"
 ).split()
 
+_TIER_1_SET = frozenset(TIER_1)
+_TIER_2_SET = frozenset(TIER_2)
+
 # Preview-gated codes worth a separate, labelled pass. PLW1514 (unspecified
 # encoding -- a locale-dependent decode, a real defect class) and RUF055 were
 # found here by `rule_validation` on its first run: both had been tiered as
@@ -196,6 +201,56 @@ _SUPPRESSION = re.compile(
     re.IGNORECASE,
 )
 
+# A suppression comment from `#` to the end of the line, and the codes it
+# names. ruff's `S<nnn>` rules are flake8-bandit's `B<nnn>`, so `# nosec B307`
+# names S307.
+_SUPPRESSION_TAIL = re.compile(
+    r"#\s*(?:noqa|type:\s*ignore|pylint:\s*disable|ruff:\s*noqa|nosec|pragma).*$",
+    re.IGNORECASE,
+)
+_SUPPRESSION_CODES = re.compile(r"\b([A-Z]{1,4}\d{2,4})\b")
+_SECURITY_RULE = re.compile(r"^S\d{3}$")
+
+
+def suppression_details(code: str, text: str) -> dict:
+    """What a suppression comment on a finding's line says about that finding.
+
+    ``has_suppression_comment`` was the agent's strongest dismissal signal,
+    calibrated on `redefined-builtin` idioms. It does not transfer to security
+    rules: a `# nosec` asserts a guard, and when the guard does not hold the
+    comment hides the very finding. So the comment is reported, with whether it names
+    this rule, and ``suppression_is_dismissal_signal`` is False for security
+    rules and for every ``nosec``: those claims are checked, not trusted.
+    """
+    match = _SUPPRESSION_TAIL.search(text or "")
+    if not match:
+        return {
+            "suppression_comment": None,
+            "suppression_names_rule": None,
+            "suppression_is_dismissal_signal": False,
+        }
+    comment = match.group(0).strip()
+    head = comment.lower()
+    named = set(_SUPPRESSION_CODES.findall(comment))
+    aliases = {code}
+    if _SECURITY_RULE.match(code):
+        aliases.add("B" + code[1:])
+    if "type:" in head or "pragma" in head or "pylint" in head:
+        names_rule = None  # cannot name a ruff code
+    elif not named:
+        names_rule = None  # a blanket suppression
+    else:
+        names_rule = bool(named & aliases)
+    exempt = bool(_SECURITY_RULE.match(code)) or "nosec" in head
+    return {
+        "suppression_comment": comment,
+        # True: it names this rule; False: it names only other rules (stale or
+        # misdirected); None: blanket, or a kind that cannot name a ruff code.
+        "suppression_names_rule": names_rule,
+        "suppression_is_dismissal_signal": not exempt and names_rule is not False,
+    }
+
+
 # FastAPI's dependency-injection markers. `def route(db=Depends(get_db))` is the
 # framework's documented idiom: the call builds an immutable marker object that
 # FastAPI reads at startup, so B008's "evaluated once at definition time" is the
@@ -205,16 +260,6 @@ _SUPPRESSION = re.compile(
 FASTAPI_DEPENDENCY_MARKERS = frozenset(
     {"Depends", "Query", "Body", "File", "Form", "Header", "Path", "Security", "Cookie"}
 )
-
-# Why a hit was moved from `findings` to `dismissed`. Every dismissal is
-# counted and kept, never silently dropped.
-DISMISSAL_REASONS = {
-    "fastapi-dependency-marker": (
-        "B008 on a FastAPI dependency marker (Depends/Query/Body/...) imported from "
-        "fastapi: the default is the framework's injection idiom, not a shared "
-        "mutable value."
-    ),
-}
 
 
 def _fastapi_bindings(tree: ast.Module) -> tuple[dict[str, str], set[str]]:
@@ -268,6 +313,625 @@ def _default_calls(tree: ast.Module) -> dict[tuple[int, int], ast.Call]:
     return calls
 
 
+# Why a hit was moved from `findings` to `dismissed`. Every dismissal is
+# counted and kept, never silently dropped.
+DISMISSAL_REASONS = {
+    "fastapi-dependency-marker": (
+        "B008 on a FastAPI dependency marker (Depends/Query/Body/...) imported from "
+        "fastapi: the default is the framework's injection idiom, not a shared "
+        "mutable value."
+    ),
+    "raise-systemexit-in-except": (
+        "B904 on `raise SystemExit(...)`: the interpreter exits without printing "
+        "a traceback, so an explicit cause would never be shown. Chaining adds "
+        "nothing; this is a CLI's normal exit path."
+    ),
+    "yaml-loader-subclasses-safeloader": (
+        "S506 on a Loader class defined in the same file whose bases are all "
+        "yaml's SafeLoader/CSafeLoader/BaseLoader/CBaseLoader: ruff matches the "
+        "loader by name and cannot see the subclass is safe. Constructors the "
+        "subclass registers (`add_constructor`) are not checked: review them "
+        "on their own."
+    ),
+    "closure-called-synchronously": (
+        "B023 on a lambda passed straight to a function in the same file that "
+        "only calls that parameter (never stores, returns or defers it) and is "
+        "neither async nor a generator: the lambda runs inside the iteration "
+        "that created it, so it sees the current loop value."
+    ),
+    "sql-built-from-literals": (
+        "S608 on SQL whose every interpolated value is built only from string "
+        "literals in the same file (a `','.join(['?'] * n)` placeholder list, a "
+        "constant table name, a list of literal clauses): no outside value can "
+        "reach the query text."
+    ),
+}
+
+_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+_SAFE_YAML_LOADERS = frozenset(
+    {"SafeLoader", "CSafeLoader", "BaseLoader", "CBaseLoader"}
+)
+# Methods that read a list without changing it, and those that add to it.
+_LIST_READERS = frozenset({"count", "index", "copy"})
+_LIST_ADDERS = frozenset({"append", "extend", "insert"})
+_PURE_CONSUMERS = frozenset({"len", "tuple", "list", "sorted", "bool", "any", "all"})
+
+
+class _FileContext:
+    """One parsed file, with the lookups the mechanical dismissals share."""
+
+    def __init__(self, tree: ast.Module) -> None:
+        self.tree = tree
+        self.parents: dict[ast.AST, ast.AST] = {}
+        # (line, byte column) -> nodes starting there, outermost first.
+        self.starts: dict[tuple[int, int], list[ast.AST]] = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                self.parents[child] = node
+            if isinstance(node, (ast.expr, ast.stmt)):
+                key = (node.lineno, node.col_offset)
+                self.starts.setdefault(key, []).append(node)
+        self.default_calls = _default_calls(tree)
+        self.fastapi_markers, self.fastapi_modules = _fastapi_bindings(tree)
+
+    def at(self, line: int, byte_col: int, kind: type | tuple) -> list:
+        return [n for n in self.starts.get((line, byte_col), []) if isinstance(n, kind)]
+
+    def scope_of(self, node: ast.AST) -> ast.AST:
+        """The innermost function, lambda or module enclosing *node*."""
+        cur = self.parents.get(node)
+        while cur is not None and not isinstance(
+            cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.Module)
+        ):
+            cur = self.parents.get(cur)
+        return cur if cur is not None else self.tree
+
+
+def _file_context(path: Path, trees: dict) -> _FileContext | None:
+    if path not in trees:
+        tree = parse_source(path)
+        trees[path] = _FileContext(tree) if tree else None
+    return trees[path]
+
+
+def _byte_col(path: Path, line: int, column: int, cache: dict) -> int:
+    """ruff's 1-based character column as ast's 0-based UTF-8 byte offset."""
+    text = _source_line(path, line, cache)
+    return len(text[: max(column - 1, 0)].encode("utf-8"))
+
+
+def _scope_nodes(scope: ast.AST):
+    """Every node evaluated in *scope*, without entering nested scopes.
+
+    A nested def/class/lambda/comprehension node is yielded itself (its name
+    is a binding here) but its body is not walked.
+    """
+    if isinstance(scope, ast.Lambda):
+        stack = [scope.body]
+    else:
+        stack = list(getattr(scope, "body", []))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (*_SCOPES, *_COMPREHENSIONS)):
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def _param_names(scope: ast.AST) -> set[str]:
+    if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        return set()
+    a = scope.args
+    names = {p.arg for p in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
+    names.update(p.arg for p in (a.vararg, a.kwarg) if p is not None)
+    return names
+
+
+def _bindings(scope: ast.AST, name: str) -> list[ast.AST] | None:
+    """The values *name* is bound to in *scope*, or None if one is opaque.
+
+    An empty list means *scope* does not bind *name*. ``None`` means some
+    binding's value cannot be read (a parameter, a loop target, an import, a
+    ``global`` declaration ...).
+    """
+    if name in _param_names(scope):
+        return None
+    values: list[ast.AST] = []
+    for node in _scope_nodes(scope):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == name:
+                    values.append(node.value)
+                elif any(
+                    isinstance(n, ast.Name) and n.id == name for n in ast.walk(target)
+                ) and not isinstance(target, (ast.Attribute, ast.Subscript)):
+                    return None  # tuple unpacking
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+            target = node.target
+            if isinstance(target, ast.Name) and target.id == name:
+                if node.value is None:
+                    continue  # a bare annotation binds nothing
+                values.append(node.value)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names:
+            return None
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name == name:
+                return None
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            if any((a.asname or a.name.split(".")[0]) == name for a in node.names):
+                return None
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            if any(
+                isinstance(n, ast.Name) and n.id == name for n in ast.walk(node.target)
+            ):
+                return None
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if item.optional_vars is not None and any(
+                    isinstance(n, ast.Name) and n.id == name
+                    for n in ast.walk(item.optional_vars)
+                ):
+                    return None
+        elif (
+            isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar))
+            and node.name == name
+        ) or (isinstance(node, ast.MatchMapping) and node.rest == name):
+            return None
+    return values
+
+
+class _LiteralCheck:
+    """Is an expression built only from literals of the same file?
+
+    Used for S608: a query whose every interpolated value is a literal, a
+    placeholder list of literals, or a name bound only to such values cannot
+    carry an outside value into the SQL text.
+    """
+
+    def __init__(self, ctx: _FileContext) -> None:
+        self.ctx = ctx
+        self.visiting: set[tuple[int, str]] = set()
+
+    def safe(
+        self, node: ast.AST, scope: ast.AST, hidden: frozenset = frozenset()
+    ) -> bool:
+        if isinstance(node, ast.Constant):
+            return True
+        if isinstance(node, ast.JoinedStr):
+            return all(self.safe(v, scope, hidden) for v in node.values)
+        if isinstance(node, ast.FormattedValue):
+            return self.safe(node.value, scope, hidden) and (
+                node.format_spec is None or self.safe(node.format_spec, scope, hidden)
+            )
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            return all(self.safe(e, scope, hidden) for e in node.elts)
+        if isinstance(node, ast.BinOp):
+            if isinstance(node.op, (ast.Add, ast.Mod)):
+                return self.safe(node.left, scope, hidden) and self.safe(
+                    node.right, scope, hidden
+                )
+            if isinstance(node.op, ast.Mult):
+                # `"?" * n`, `["?"] * len(xs)`: copies of a literal sequence. The
+                # literal side must be a sequence, not a number (3 * value).
+                return any(
+                    self._literal_sequence(side) and self.safe(side, scope, hidden)
+                    for side in (node.left, node.right)
+                )
+            return False
+        if isinstance(node, ast.IfExp):
+            return self.safe(node.body, scope, hidden) and self.safe(
+                node.orelse, scope, hidden
+            )
+        if isinstance(node, _COMPREHENSIONS) and not isinstance(node, ast.DictComp):
+            targets = frozenset(
+                n.id
+                for gen in node.generators
+                for n in ast.walk(gen.target)
+                if isinstance(n, ast.Name)
+            )
+            return self.safe(node.elt, scope, hidden | targets)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.keywords and node.func.attr != "format":
+                return False
+            if node.func.attr == "join" and len(node.args) == 1:
+                return self.safe(node.func.value, scope, hidden) and self.safe(
+                    node.args[0], scope, hidden
+                )
+            if node.func.attr == "format":
+                values = [*node.args, *(k.value for k in node.keywords)]
+                return (
+                    not any(isinstance(v, ast.Starred) for v in node.args)
+                    and all(k.arg is not None for k in node.keywords)
+                    and self.safe(node.func.value, scope, hidden)
+                    and all(self.safe(v, scope, hidden) for v in values)
+                )
+            return False
+        if isinstance(node, ast.Name):
+            if node.id in hidden:
+                return False
+            return self._name_safe(node.id, scope)
+        return False
+
+    @staticmethod
+    def _literal_sequence(node: ast.AST) -> bool:
+        if isinstance(node, ast.Constant):
+            return isinstance(node.value, str)
+        return isinstance(node, (ast.JoinedStr, ast.List, ast.Tuple))
+
+    def _name_safe(self, name: str, scope: ast.AST) -> bool:
+        # Resolve through the enclosing function scopes, then the module.
+        while True:
+            values = _bindings(scope, name)
+            if values is None:
+                return False
+            if values:
+                break
+            if isinstance(scope, ast.Module):
+                return False
+            scope = self.ctx.scope_of(scope)
+        key = (id(scope), name)
+        if key in self.visiting:
+            return True  # `where += ...`: the other bindings decide
+        self.visiting.add(key)
+        try:
+            if not all(self.safe(v, scope) for v in values):
+                return False
+            if any(
+                isinstance(v, (ast.List, ast.Set, ast.ListComp, ast.SetComp))
+                for v in values
+            ):
+                # A list can grow after its binding: every use must be a read
+                # or an append of a literal, and it must be local.
+                return not isinstance(scope, ast.Module) and self._list_uses_safe(
+                    name, scope
+                )
+            return True
+        finally:
+            self.visiting.discard(key)
+
+    def _list_uses_safe(self, name: str, scope: ast.AST) -> bool:
+        parents = self.ctx.parents
+        for node in _scope_nodes(scope):
+            if not (isinstance(node, ast.Name) and node.id == name):
+                continue
+            if not isinstance(node.ctx, ast.Load):
+                continue  # bindings were checked by _bindings
+            parent = parents.get(node)
+            grand = parents.get(parent) if parent is not None else None
+            if isinstance(parent, ast.Attribute):
+                if parent.attr in _LIST_READERS:
+                    continue
+                if (
+                    parent.attr in _LIST_ADDERS
+                    and isinstance(grand, ast.Call)
+                    and grand.func is parent
+                    and not grand.keywords
+                ):
+                    args = grand.args[1:] if parent.attr == "insert" else grand.args
+                    if all(self.safe(a, scope) for a in args):
+                        continue
+                return False
+            if isinstance(parent, ast.Call) and node in parent.args:
+                func = parent.func
+                if isinstance(func, ast.Name) and func.id in _PURE_CONSUMERS:
+                    continue
+                if isinstance(func, ast.Attribute) and func.attr == "join":
+                    continue
+                return False
+            if isinstance(parent, (ast.If, ast.While, ast.IfExp, ast.Assert)) and (
+                parent.test is node
+            ):
+                continue
+            if isinstance(parent, (ast.BoolOp, ast.UnaryOp, ast.Compare)):
+                continue
+            return False
+        return True
+
+
+def _sql_from_literals(
+    ctx: _FileContext, line: int, col: int, end: tuple | None
+) -> bool:
+    candidates = ctx.at(line, col, ast.expr)
+    if end is not None:
+        exact = [n for n in candidates if (n.end_lineno, n.end_col_offset) == end]
+        candidates = exact or candidates
+    if not candidates:
+        return False
+    node = candidates[0]
+    return _LiteralCheck(ctx).safe(node, ctx.scope_of(node))
+
+
+def _shadows(tree: ast.Module, name: str) -> bool:
+    """Does the module bind *name* anywhere (def, class, import, assignment)?"""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name == name:
+                return True
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            if any((a.asname or a.name.split(".")[0]) == name for a in node.names):
+                return True
+        elif (
+            isinstance(node, ast.Name)
+            and node.id == name
+            and not isinstance(node.ctx, ast.Load)
+        ):
+            return True
+    return False
+
+
+def _raises_systemexit(ctx: _FileContext, line: int, col: int) -> bool:
+    for node in ctx.at(line, col, ast.Raise):
+        exc = node.exc.func if isinstance(node.exc, ast.Call) else node.exc
+        if isinstance(exc, ast.Name) and exc.id == "SystemExit":
+            return not _shadows(ctx.tree, "SystemExit")
+    return False
+
+
+def _yaml_bindings(tree: ast.Module) -> tuple[set[str], set[str]]:
+    """(names bound to the yaml module, names bound to a safe yaml loader)."""
+    modules: set[str] = set()
+    loaders: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "yaml" or alias.name.startswith("yaml."):
+                    modules.add(alias.asname or "yaml")
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and node.level == 0
+            and node.module
+            and (node.module == "yaml" or node.module.startswith("yaml."))
+        ):
+            for alias in node.names:
+                if alias.name in _SAFE_YAML_LOADERS:
+                    loaders.add(alias.asname or alias.name)
+                elif alias.name in ("loader", "cyaml"):
+                    modules.add(alias.asname or alias.name)
+    return modules, loaders
+
+
+def _safe_yaml_loader_class(
+    tree: ast.Module, name: str, modules: set, loaders: set, seen: set
+) -> bool:
+    if name in seen:
+        return False
+    seen.add(name)
+    classes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name]
+    # Exactly one top-level class, and nothing else binding that name.
+    if len(classes) != 1 or name in loaders:
+        return False
+    others = sum(
+        1
+        for n in ast.walk(tree)
+        if (
+            isinstance(n, ast.Name) and n.id == name and not isinstance(n.ctx, ast.Load)
+        )
+        or (
+            isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and n.name == name
+        )
+    )
+    if others != 1 or not classes[0].bases:
+        return False
+    for base in classes[0].bases:
+        if isinstance(base, ast.Attribute) and base.attr in _SAFE_YAML_LOADERS:
+            root = base.value
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if isinstance(root, ast.Name) and root.id in modules:
+                continue
+            return False
+        if isinstance(base, ast.Name):
+            if base.id in loaders:
+                continue
+            if _safe_yaml_loader_class(tree, base.id, modules, loaders, seen):
+                continue
+        return False
+    return True
+
+
+def _yaml_safe_subclass(ctx: _FileContext, line: int, col: int) -> bool:
+    names = ctx.at(line, col, ast.Name)
+    if not names:
+        return False
+    modules, loaders = _yaml_bindings(ctx.tree)
+    if not modules and not loaders:
+        return False
+    return _safe_yaml_loader_class(ctx.tree, names[0].id, modules, loaders, set())
+
+
+def _enclosing_lambda_call(ctx: _FileContext, line: int, col: int):
+    """For a B023 hit: (lambda, the Call it is a direct argument of), or None."""
+    names = ctx.at(line, col, ast.Name)
+    if not names:
+        return None
+    cur = ctx.parents.get(names[0])
+    while cur is not None and not isinstance(cur, (*_SCOPES, ast.Module)):
+        cur = ctx.parents.get(cur)
+    if not isinstance(cur, ast.Lambda):
+        return None
+    call = ctx.parents.get(cur)
+    if isinstance(call, ast.keyword):
+        call = ctx.parents.get(call)
+    if not isinstance(call, ast.Call) or call.func is cur:
+        return None
+    return cur, call
+
+
+def _callee_def(ctx: _FileContext, call: ast.Call):
+    """(the FunctionDef *call* resolves to in this file, implicit first args)."""
+    func = call.func
+    scope = ctx.scope_of(call)
+    if isinstance(func, ast.Name):
+        while True:
+            defs = [
+                n
+                for n in _scope_nodes(scope)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and n.name == func.id
+            ]
+            values = _bindings(scope, func.id) if not defs else []
+            if defs or values is None or values:
+                return (defs[0], 0) if len(defs) == 1 else None
+            if isinstance(scope, ast.Module):
+                return None
+            scope = ctx.scope_of(scope)
+    if (
+        isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Name)
+        and isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and isinstance(ctx.parents.get(scope), ast.ClassDef)
+        and scope.args.args
+        and func.value.id == scope.args.args[0].arg
+    ):
+        cls = ctx.parents[scope]
+        members = [
+            n
+            for n in cls.body
+            if (
+                isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and n.name == func.attr
+            )
+            or (
+                isinstance(n, (ast.Assign, ast.AnnAssign))
+                and any(
+                    isinstance(t, ast.Name) and t.id == func.attr
+                    for t in (n.targets if isinstance(n, ast.Assign) else [n.target])
+                )
+            )
+        ]
+        if len(members) != 1 or not isinstance(members[0], ast.FunctionDef):
+            return None
+        decorators = {
+            d.id for d in members[0].decorator_list if isinstance(d, ast.Name)
+        }
+        return members[0], 0 if "staticmethod" in decorators else 1
+    return None
+
+
+def _calls_param_only(fn: ast.FunctionDef, param: str) -> bool:
+    """Is *param* only ever called, directly, in *fn*'s own body?"""
+    for node in _scope_nodes(fn):
+        if isinstance(node, (ast.Yield, ast.YieldFrom)):
+            return False  # a generator does not run its body when called
+        if isinstance(node, (*_SCOPES, *_COMPREHENSIONS)) and any(
+            isinstance(n, ast.Name) and n.id == param for n in ast.walk(node)
+        ):
+            return False  # captured: may run later
+    parents: dict = {}
+    for node in ast.walk(fn):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Name) and node.id == param:
+            parent = parents.get(node)
+            if not (
+                isinstance(node.ctx, ast.Load)
+                and isinstance(parent, ast.Call)
+                and parent.func is node
+            ):
+                return False
+    return True
+
+
+def closure_argument_check(ctx: _FileContext, line: int, col: int) -> dict:
+    """For a B023 hit on a lambda passed as a call argument.
+
+    Returns ``{"dismiss": True}`` when the callee is verified to call the
+    lambda synchronously, ``{"closure_passed_as_argument": True, "callee":
+    ...}`` when the lambda is an argument but the callee could not be
+    verified, and ``{}`` otherwise.
+    """
+    found = _enclosing_lambda_call(ctx, line, col)
+    if found is None:
+        return {}
+    lam, call = found
+    hint = {"closure_passed_as_argument": True, "callee": ast.unparse(call.func)}
+    # The call must run in the loop's own frame, not inside another closure.
+    cur = ctx.parents.get(call)
+    while cur is not None and not isinstance(
+        cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)
+    ):
+        if isinstance(cur, (ast.Lambda, *_COMPREHENSIONS)):
+            return hint
+        cur = ctx.parents.get(cur)
+    resolved = _callee_def(ctx, call)
+    if resolved is None:
+        return hint
+    callee, implicit = resolved
+    if not isinstance(callee, ast.FunctionDef):
+        return hint
+    allowed = {"staticmethod", "classmethod"}
+    if any(
+        not (isinstance(d, ast.Name) and d.id in allowed) for d in callee.decorator_list
+    ):
+        return hint
+    a = callee.args
+    positional = [*a.posonlyargs, *a.args][implicit:]
+    param = None
+    if lam in call.args:
+        index = call.args.index(lam)
+        if any(isinstance(x, ast.Starred) for x in call.args[: index + 1]):
+            return hint
+        if index < len(positional):
+            param = positional[index].arg
+    else:
+        kw = next(k for k in call.keywords if k.value is lam)
+        names = {p.arg for p in (*a.args[implicit:], *a.kwonlyargs)}
+        if kw.arg in names:
+            param = kw.arg
+    if param is None or not _calls_param_only(callee, param):
+        return hint
+    return {"dismiss": True}
+
+
+def _fastapi_marker(ctx: _FileContext, line: int, col: int, end) -> str | None:
+    if not ctx.fastapi_markers and not ctx.fastapi_modules:
+        return None
+    call = ctx.default_calls.get((line, col))
+    if call is not None and _is_fastapi_marker_call(
+        call, ctx.fastapi_markers, ctx.fastapi_modules
+    ):
+        return "fastapi-dependency-marker"
+    return None
+
+
+def _systemexit(ctx: _FileContext, line: int, col: int, end) -> str | None:
+    if _raises_systemexit(ctx, line, col):
+        return "raise-systemexit-in-except"
+    return None
+
+
+def _yaml_loader(ctx: _FileContext, line: int, col: int, end) -> str | None:
+    if _yaml_safe_subclass(ctx, line, col):
+        return "yaml-loader-subclasses-safeloader"
+    return None
+
+
+def _sync_closure(ctx: _FileContext, line: int, col: int, end) -> str | None:
+    if closure_argument_check(ctx, line, col).get("dismiss"):
+        return "closure-called-synchronously"
+    return None
+
+
+def _literal_sql(ctx: _FileContext, line: int, col: int, end) -> str | None:
+    if _sql_from_literals(ctx, line, col, end):
+        return "sql-built-from-literals"
+    return None
+
+
+# One mechanical dismissal per rule. Each resolves the flagged node in the
+# same file and dismisses only what it can prove.
+_DISMISSERS = {
+    "B008": _fastapi_marker,
+    "B904": _systemexit,
+    "S506": _yaml_loader,
+    "B023": _sync_closure,
+    "S608": _literal_sql,
+}
+
+
 def dismissal_reason(
     finding: dict, path: Path | None, trees: dict, cache: dict
 ) -> str | None:
@@ -275,28 +939,40 @@ def dismissal_reason(
 
     B008 is dismissed only when the flagged call resolves to a fastapi import
     in that same file: a local ``Depends`` class, or a ``Query()`` from
-    another library, is still reported.
+    another library, is still reported. B904 only for the builtin
+    ``SystemExit``; S506 only for a Loader class whose bases are all safe yaml
+    loaders; B023 only when the callee is verified; S608 only when every
+    interpolated value is a literal. *finding* may carry ruff's
+    ``end`` location, which pins the flagged node exactly.
     """
-    if finding["code"] != "B008" or path is None:
+    check = _DISMISSERS.get(finding["code"])
+    if check is None or path is None:
         return None
-    if path not in trees:
-        tree = parse_source(path)
-        trees[path] = (
-            (tree, _default_calls(tree), *_fastapi_bindings(tree)) if tree else None
-        )
-    entry = trees[path]
-    if entry is None:
+    ctx = _file_context(path, trees)
+    if ctx is None:
         return None
-    _, calls, markers, modules = entry
-    if not markers and not modules:
-        return None
-    # ruff's column is 1-based characters; ast's col_offset is 0-based UTF-8 bytes.
-    text = _source_line(path, finding["line"], cache)
-    byte_col = len(text[: max(finding["column"] - 1, 0)].encode("utf-8"))
-    call = calls.get((finding["line"], byte_col))
-    if call is not None and _is_fastapi_marker_call(call, markers, modules):
-        return "fastapi-dependency-marker"
-    return None
+    line = finding["line"]
+    col = _byte_col(path, line, finding["column"], cache)
+    end = finding.get("end")
+    end_key = None
+    if end and end.get("row"):
+        end_key = (end["row"], _byte_col(path, end["row"], end.get("column", 0), cache))
+    return check(ctx, line, col, end_key)
+
+
+def closure_argument_hint(
+    finding: dict, path: Path | None, trees: dict, cache: dict
+) -> dict:
+    """Annotation for a B023 hit whose lambda is passed to an unverified callee."""
+    if finding["code"] != "B023" or path is None:
+        return {}
+    ctx = _file_context(path, trees)
+    if ctx is None:
+        return {}
+    col = _byte_col(path, finding["line"], finding["column"], cache)
+    hint = closure_argument_check(ctx, finding["line"], col)
+    hint.pop("dismiss", None)
+    return hint
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +981,9 @@ def dismissal_reason(
 # ---------------------------------------------------------------------------
 
 EXCEPT_CLOSURE_ISSUE = "ruff#6878"
+# The catalogued shape for the real defect behind these hits: the project's
+# own `ruff check --fix` deleting `as NAME` that a closure still reads.
+EXCEPT_CLOSURE_SHAPE = "linter-autofix-breaks-closure-capture"
 
 _NAME_IN_MESSAGE = re.compile(r"`([^`]+)`")
 
@@ -368,6 +1047,9 @@ def except_closure_match(code: str, message: str, line: int, bindings: list) -> 
             return {
                 "suspect_tool_bug": True,
                 "known_tool_issue": EXCEPT_CLOSURE_ISSUE,
+                "shape_id": EXCEPT_CLOSURE_SHAPE,
+                # The `except ... as NAME` header, where ruff puts the F841.
+                "except_lines": [first, header_end],
                 "tool_bug_note": (
                     f"`{name}` is the `except ... as {name}` binding, read from a "
                     "closure nested in that handler. Python keeps it bound until "
@@ -381,6 +1063,9 @@ def except_closure_match(code: str, message: str, line: int, bindings: list) -> 
             return {
                 "suspect_tool_bug": True,
                 "known_tool_issue": EXCEPT_CLOSURE_ISSUE,
+                "shape_id": EXCEPT_CLOSURE_SHAPE,
+                # The `except ... as NAME` header, where ruff puts the F841.
+                "except_lines": [first, header_end],
                 "autofix_unsafe": True,
                 "tool_bug_note": (
                     f"`{name}` IS used, by a closure at line {min(reads)}. ruff's "
@@ -401,6 +1086,20 @@ def except_closure_annotation(
         tree = parse_source(path)
         bindings_cache[path] = except_closure_bindings(tree) if tree else []
     return except_closure_match(code, message, line, bindings_cache[path])
+
+
+def rule_tier(code: str) -> int | None:
+    """The tier *code* is listed in: 1, 2, or None (preview-only or unlisted).
+
+    A finding's tier is its RULE's tier, not the run's ``--tier``: a tier-2
+    run also selects every tier-1 rule, and tagging those hits ``2`` hid them
+    from a reader filtering for tier 1.
+    """
+    if code in _TIER_1_SET:
+        return 1
+    if code in _TIER_2_SET:
+        return 2
+    return None
 
 
 def _tier_codes(tier: int) -> list[str]:
@@ -475,7 +1174,7 @@ def _source_line(path: Path, lineno: int, cache: dict[Path, list[str]]) -> str:
 
 
 def normalize(
-    raw: dict, project_root: Path, tier: int, cache: dict, preview: bool = False
+    raw: dict, project_root: Path, cache: dict, preview: bool = False
 ) -> dict:
     """Normalize one ruff JSON finding.
 
@@ -495,13 +1194,75 @@ def normalize(
         "line": line,
         "column": location.get("column", 0) or 0,
         "message": (raw.get("message") or "").strip(),
-        "tier": tier,
+        # The rule's own tier (None for a preview-only code); the run's
+        # `--tier` is the envelope's `tier`.
+        "tier": rule_tier(code),
         "preview": preview,
         # Non-null => merge with the scanner's finding, do not double-report.
         "shape_id": RULE_TO_SHAPE.get(code),
         # The strongest measured dismissal signal.
         "has_suppression_comment": bool(_SUPPRESSION.search(text)),
+        **suppression_details(code, text),
     }
+
+
+_LOCK_PIN = re.compile(r'(?m)^name\s*=\s*"ruff"\s*\n\s*version\s*=\s*"([^"]+)"')
+_PRECOMMIT_PIN = re.compile(r"ruff-pre-commit\S*\s*\n\s*rev:\s*[\"']?v?([\w.]+)")
+_REQUIREMENT_PIN = re.compile(r"(?im)^\s*ruff\s*==\s*([\w.]+)")
+_PYPROJECT_PIN = re.compile(r"[\"']ruff\s*==\s*([\w.]+)[\"']")
+_PYPROJECT_SPEC = re.compile(r"[\"']ruff\s*([<>=!~][^\"']*)[\"']")
+
+
+def _read(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def detect_project_ruff_pin(project_root: Path) -> dict | None:
+    """The ruff version the project itself pins, and where, or None.
+
+    Lock files first (what `uv run ruff` / `poetry run ruff` executes), then
+    a pre-commit hook rev, then requirements files, then an exact pin in
+    pyproject.toml. A pyproject range alone gives ``version: None`` with the
+    ``specifier``. A review that runs a different ruff than the project's
+    reports findings the project's own `ruff check` does not produce.
+    """
+    for name in ("uv.lock", "poetry.lock", "pdm.lock"):
+        match = _LOCK_PIN.search(_read(project_root / name))
+        if match:
+            return {"version": match.group(1), "source": name}
+    for name in (".pre-commit-config.yaml", ".pre-commit-config.yml"):
+        match = _PRECOMMIT_PIN.search(_read(project_root / name))
+        if match:
+            return {"version": match.group(1), "source": name}
+    requirement_files = sorted(project_root.glob("*requirements*.txt"))
+    requirement_files += sorted(project_root.glob("requirements/*.txt"))
+    requirement_files += sorted(project_root.glob("constraints*.txt"))
+    for path in requirement_files:
+        match = _REQUIREMENT_PIN.search(_read(path))
+        if match:
+            return {"version": match.group(1), "source": path.name}
+    text = _read(project_root / "pyproject.toml")
+    match = _PYPROJECT_PIN.search(text)
+    if match:
+        return {"version": match.group(1), "source": "pyproject.toml"}
+    match = _PYPROJECT_SPEC.search(text)
+    if match:
+        return {
+            "version": None,
+            "specifier": match.group(1).strip(),
+            "source": "pyproject.toml",
+        }
+    return None
+
+
+def version_matches_project_pin(version: str | None, pin: dict | None) -> bool | None:
+    """True/False against an exact project pin; None when there is none."""
+    if version is None or not pin or not pin.get("version"):
+        return None
+    return version == pin["version"]
 
 
 def detect_target_version(project_root: Path) -> str:
@@ -569,6 +1330,91 @@ def _run_ruff(
     return findings, out.stderr, None
 
 
+def _run_project_ruff(
+    ruff_bin: str, files: list[Path], project_root: Path
+) -> tuple[list[dict], str | None]:
+    """ruff over *files* under the PROJECT's own config; (findings, error).
+
+    No --isolated and no --select: the question is what the project's own
+    `ruff check --fix` would do. --force-exclude honours the project's
+    excludes for explicitly named files, as a whole-project run would.
+    """
+    cmd = [ruff_bin, "check", "--output-format", "json", "--no-cache"]
+    cmd += ["--force-exclude", *(str(f) for f in files)]
+    try:
+        out = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=_RUFF_TIMEOUT,
+            cwd=str(project_root),
+            check=False,  # exit 1 means "findings"; the code is read below
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [], f"could not run ruff with the project config: {exc}"
+    try:
+        return (json.loads(out.stdout) if out.stdout.strip() else []), (
+            None if out.returncode in (0, 1) else (out.stderr.strip() or "ruff failed")
+        )
+    except json.JSONDecodeError as exc:
+        return [], f"ruff emitted unparseable JSON: {exc}"
+
+
+def project_autofix_check(
+    ruff_bin: str, findings: list[dict], project_root: Path
+) -> dict:
+    """Would the project's own ruff config autofix away an except-closure binding?
+
+    The ruff#6878 hits are false positives, but their F841 carries a "safe"
+    fix that deletes ``as NAME`` while a closure still reads it. Whether that
+    is a live defect depends on the PROJECT's config (is F841 selected and
+    fixable?), which the --isolated run cannot see. Each hit gets
+    ``project_config_autofixes`` (True / False, None if not measured).
+    """
+    hits = [f for f in findings if f.get("known_tool_issue") == EXCEPT_CLOSURE_ISSUE]
+    if not hits:
+        return {"ran": False, "skipped": "no except-closure (ruff#6878) hits"}
+    files = sorted({project_root / f["file"] for f in hits if f.get("file")})
+    raw, error = _run_project_ruff(ruff_bin, files, project_root)
+    if error:
+        for f in hits:
+            f["project_config_autofixes"] = None
+        return {"ran": False, "error": error, "hits_checked": 0}
+    fixes: dict[tuple[str, int], str | None] = {}
+    for item in raw:
+        if item.get("code") != "F841" or not item.get("filename"):
+            continue
+        rel = relative_to_root(Path(item["filename"]), project_root)
+        row = (item.get("location") or {}).get("row", 0)
+        fix = item.get("fix") or {}
+        fixes[(rel, row)] = fix.get("applicability") if fix else None
+    autofixed = 0
+    for f in hits:
+        first, last = f.get("except_lines") or (0, -1)
+        found = [
+            fixes[(f["file"], row)]
+            for row in range(first, last + 1)
+            if (f["file"], row) in fixes
+        ]
+        applicability = found[0] if found else None
+        # `ruff check --fix` applies "safe" fixes; "unsafe" needs --unsafe-fixes.
+        f["project_config_autofixes"] = applicability == "safe"
+        f["project_fix_applicability"] = applicability
+        autofixed += f["project_config_autofixes"]
+    return {
+        "ran": True,
+        "files": len(files),
+        "hits_checked": len(hits),
+        # Hits whose `except ... as NAME` the project's `ruff check --fix`
+        # would remove: the closure then raises NameError. A live defect.
+        "autofixed_by_project_config": autofixed,
+        "note": (
+            "Measured with this run's ruff binary, which may differ from the "
+            "project's pinned ruff."
+        ),
+    }
+
+
 def analyze(
     target: str,
     *,
@@ -592,6 +1438,7 @@ def analyze(
             "findings": [],
         }
 
+    project_pin = detect_project_ruff_pin(project_root)
     codes = _tier_codes(tier)
     validation = validate_rules(ruff_bin, codes)
     # Never send ruff a code it will reject; an unknown code aborts the whole run.
@@ -608,7 +1455,7 @@ def analyze(
     dismissed: list[dict] = []
     closures: dict = {}
     for raw_finding in raw[:max_findings]:
-        finding = normalize(raw_finding, project_root, tier, cache)
+        finding = normalize(raw_finding, project_root, cache)
         filename = raw_finding.get("filename")
         path = Path(filename) if filename else None
         # Flagged, not dismissed: the same F821 is a real NameError when the
@@ -618,10 +1465,14 @@ def analyze(
                 finding["code"], finding["message"], finding["line"], path, closures
             )
         )
-        reason = dismissal_reason(finding, path, trees, cache)
+        located = {**finding, "end": raw_finding.get("end_location")}
+        reason = dismissal_reason(located, path, trees, cache)
         if reason:
             dismissed.append({**finding, "dismissal_reason": reason})
         else:
+            # A B023 lambda passed to a callee that could not be verified:
+            # one callee to read instead of every call site.
+            finding.update(closure_argument_hint(finding, path, trees, cache))
             findings.append(finding)
 
     preview_findings: list[dict] = []
@@ -635,8 +1486,7 @@ def analyze(
             target_version=target_version,
         )
         preview_findings = [
-            normalize(f, project_root, tier, cache, preview=True)
-            for f in praw[:max_findings]
+            normalize(f, project_root, cache, preview=True) for f in praw[:max_findings]
         ]
 
     # by_code counts every hit ruff returned, dismissed ones included, so it
@@ -648,6 +1498,8 @@ def analyze(
     for f in dismissed:
         reason = f["dismissal_reason"]
         dismissed_by_reason[reason] = dismissed_by_reason.get(reason, 0) + 1
+
+    autofix = project_autofix_check(ruff_bin, findings, project_root)
 
     merged = [f for f in findings if f["shape_id"]]
     suppressed = [f for f in findings if f["has_suppression_comment"]]
@@ -663,6 +1515,13 @@ def analyze(
         # A mismatch does not fail the run, but it makes every count in this
         # envelope non-comparable with a calibrated one. Say so.
         "version_matches_pin": version == PINNED_RUFF_VERSION,
+        # The ruff the PROJECT pins (lock file, pre-commit, requirements).
+        # When it differs from both this run and PINNED_RUFF_VERSION, run once
+        # per version and report the difference.
+        "project_ruff_pin": project_pin,
+        "version_matches_project_pin": version_matches_project_pin(
+            version, project_pin
+        ),
         "tier": tier,
         "target_version": target_version,
         "rules_selected": len(runnable),
@@ -697,10 +1556,19 @@ def analyze(
                 }
             ),
             "has_suppression_comment": len(suppressed),
+            # Suppressed hits whose comment must be VERIFIED, not trusted: a
+            # security rule, a `nosec`, or a comment naming a different rule.
+            "suppression_needs_verification": sum(
+                1 for f in suppressed if not f["suppression_is_dismissal_signal"]
+            ),
             # Hits matching a known ruff false-positive mode (see each hit's
             # `known_tool_issue` and `tool_bug_note`). Flagged, not dismissed.
             "suspect_tool_bug": sum(1 for f in findings if f.get("suspect_tool_bug")),
         },
+        # Whether the project's own ruff config would autofix the
+        # except-closure (ruff#6878) bindings away; see each hit's
+        # `project_config_autofixes`.
+        "project_autofix_check": autofix,
         "findings_capped": len(raw) > max_findings,
         "findings": findings + preview_findings,
         # Hits dismissed by a mechanical rule, each with its `dismissal_reason`

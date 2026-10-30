@@ -30,11 +30,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from run_lint_rules import (  # noqa: E402
+    closure_argument_hint,
+    detect_project_ruff_pin,
     detect_target_version,
     dismissal_reason,
     except_closure_annotation,
     unlinted_error,
     unlinted_paths,
+    version_matches_project_pin,
 )
 from scan_common import (  # noqa: E402
     find_project_root,
@@ -90,16 +93,22 @@ def make_relative(filepath: str, project_root: Path) -> str:
     return filepath
 
 
+# The first version-looking token: `mypy 1.19.0 (compiled: yes)` ends in
+# "yes)", so the last whitespace token is not the version.
+_VERSION_TOKEN = re.compile(r"\b\d+(?:\.\d+)+\S*")
+
+
 def get_tool_version(cmd: str) -> str | None:
-    """Get a tool's version string."""
+    """Get a tool's version string, or None when --version names none."""
     try:
         result = subprocess.run(
             [cmd, "--version"],
             capture_output=True, text=True, timeout=10,
         )
-        return result.stdout.strip().split()[-1] if result.stdout else None
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    except (subprocess.TimeoutExpired, OSError):
         return None
+    match = _VERSION_TOKEN.search(result.stdout or "")
+    return match.group(0).rstrip(",;)") if match else None
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +392,98 @@ def _flag_known_tool_bugs(
     return finding
 
 
+# ruff 0.16.0 changed its default rule set (59 -> 413 rules, not a superset).
+_RUFF_DEFAULT_SET_CHANGE = (0, 16, 0)
+
+
+def _version_tuple(version: str | None) -> tuple[int, ...] | None:
+    parts = re.findall(r"\d+", version or "")[:3]
+    return tuple(int(p) for p in parts) if parts else None
+
+
+def ruff_config_selection(project_root: Path) -> dict | None:
+    """Does the project's ruff config set `select`, or only extend the default?
+
+    None when there is no ruff config, or it cannot be parsed. A config
+    without `select` runs on ruff's DEFAULT set, so its results move with the
+    ruff version.
+    """
+    import_ok = True
+    data: dict | None = None
+    for name in ("ruff.toml", ".ruff.toml"):
+        path = project_root / name
+        if path.exists():
+            try:
+                import tomllib
+
+                data = tomllib.loads(path.read_text(encoding="utf-8"))
+            except (ImportError, ValueError, OSError):
+                import_ok = False
+            break
+    else:
+        pyproject = _read_pyproject(project_root)
+        if pyproject is not None:
+            data = pyproject.get("tool", {}).get("ruff")
+    if data is None or not import_ok:
+        return None
+    lint = data.get("lint", {}) if isinstance(data.get("lint"), dict) else {}
+    return {
+        "select": "select" in data or "select" in lint,
+        "extend_select": "extend-select" in data or "extend-select" in lint,
+    }
+
+
+def ruff_version_report(
+    project_root: Path, version: str | None, config_source: str
+) -> dict:
+    """The ruff *version* that ran against the project's pin, with warnings."""
+    pin = detect_project_ruff_pin(project_root)
+    matches = version_matches_project_pin(version, pin)
+    if config_source == "project":
+        selection = ruff_config_selection(project_root)
+        default_set = None if selection is None else not selection["select"]
+    else:
+        selection = None
+        default_set = config_source == "ruff-default"
+    warnings: list[str] = []
+    pinned = (pin or {}).get("version")
+    if matches is False:
+        warnings.append(
+            f"ruff {version} is not the project's pinned ruff {pinned} "
+            f"({pin['source']}): the project pass may not match what the "
+            "project's own `ruff check` reports."
+        )
+    if default_set:
+        how = (
+            "extends ruff's default rule set (`extend-select` without `select`)"
+            if selection and selection["extend_select"]
+            else "uses ruff's default rule set (no `select`)"
+        )
+        ours, theirs = _version_tuple(version), _version_tuple(pinned)
+        cut = _RUFF_DEFAULT_SET_CHANGE
+        if ours and theirs and (ours >= cut) != (theirs >= cut):
+            warnings.append(
+                f"The project config {how}, and ruff 0.16.0 changed that default "
+                f"from 59 to 413 rules. This run (ruff {version}) and the "
+                f"project's pin ({pinned}) are on opposite sides of that change: "
+                "the extra findings are pending debt for a ruff upgrade, not "
+                "what the project's lint reports today."
+            )
+        elif ours and not theirs:
+            warnings.append(
+                f"The project config {how}, and no exact ruff pin was found: "
+                "the project pass depends on the ruff version (0.16.0 changed "
+                "the default from 59 to 413 rules)."
+            )
+    return {
+        "ruff_version": version,
+        "project_ruff_pin": pin,
+        "version_matches_project_pin": matches,
+        "uses_default_rule_set": default_set,
+        "warnings": warnings,
+    }
+
+
 def _extract_rules_applied(findings: list[dict]) -> list[str]:
     """Extract the set of unique rule codes from ruff findings."""
     return sorted({f.get("code", "") for f in findings if f.get("code")})
@@ -555,19 +656,17 @@ def run_ruff_toolkit_pass(
             continue
         filename = item.get("filename")
         path = Path(filename) if filename else None
-        reason = dismissal_reason(
-            {
-                "code": finding["rule"],
-                "line": finding["line"],
-                "column": finding["column"],
-            },
-            path,
-            trees,
-            lines,
-        )
+        located = {
+            "code": finding["rule"],
+            "line": finding["line"],
+            "column": finding["column"],
+            "end": item.get("end_location"),
+        }
+        reason = dismissal_reason(located, path, trees, lines)
         if reason:
             dismissed[reason] = dismissed.get(reason, 0) + 1
             continue
+        finding.update(closure_argument_hint(located, path, trees, lines))
         finding["selection"] = "toolkit"
         added.append(_flag_known_tool_bugs(finding, filename, closures))
 
@@ -654,12 +753,23 @@ def run_mypy(
     """Run mypy and return normalized findings."""
     cmd = ["mypy", "--output=json"]
 
-    if args.ignore_config or not has_project_config("mypy", project_root):
+    # mypy looks for its config in the WORKING directory (walking up to the
+    # repository root), not next to the files it checks. Run from an agent's
+    # private temp directory, a project's `[tool.mypy]` was silently ignored
+    # while the output still said `config_source: "project"`. So name the
+    # config file explicitly, and disable discovery (`--config-file=`) for the
+    # curated run so a stray config in the caller's cwd cannot leak in either.
+    config_file = find_config_file("mypy", project_root)
+    if args.ignore_config or config_file is None:
         cmd.extend(["--ignore-missing-imports", "--no-error-summary"])
         if args.mypy_strict:
             cmd.append("--strict")
+        cmd.append("--config-file=")
         config_source = "curated"
+        config_used = None
     else:
+        config_used = str(project_root / config_file)
+        cmd.extend(["--config-file", config_used])
         config_source = "project"
 
     # mypy's default cache is `.mypy_cache/` in the working directory, which is
@@ -671,9 +781,11 @@ def run_mypy(
     cmd.append(str(scan_root))
 
     try:
+        # cwd: relative paths in the config (`mypy_path`, `files`) resolve
+        # against the working directory, as when the project runs mypy itself.
         result = subprocess.run(
             cmd, capture_output=True, text=True,
-            timeout=_TOOL_TIMEOUTS["mypy"],
+            timeout=_TOOL_TIMEOUTS["mypy"], cwd=str(project_root),
         )
     finally:
         shutil.rmtree(cache_dir, ignore_errors=True)
@@ -689,6 +801,8 @@ def run_mypy(
 
     return {
         "config_source": config_source,
+        # The config file mypy was told to read (None for the curated run).
+        "config_file": config_used,
         "strict_mode": args.mypy_strict,
         "total_findings": len(findings),
         "findings_capped": len(findings) > args.max_findings,
@@ -1112,7 +1226,22 @@ def build_skipped_report(
         if name in tools_run:
             continue
         info = availability.get(name, {})
-        if not info.get("available"):
+        if name == "coverage" and not info.get("available"):
+            # Coverage is read from artifacts, not run: "available" means an
+            # artifact exists. Whether coverage.py is installed is a separate
+            # fact, and calling a missing artifact "not installed" sent
+            # reviews looking for a missing package.
+            skipped.append({
+                "tool": name,
+                "reason": "no coverage artifacts",
+                "coverage_importable": info.get("coverage_importable"),
+                "hint": (
+                    "Run the test suite under coverage (e.g. `coverage run -m "
+                    "pytest && coverage json`) to produce .coverage, "
+                    "coverage.xml or coverage.json."
+                ),
+            })
+        elif not info.get("available"):
             skipped.append({"tool": name, "reason": "not installed"})
         else:
             skipped.append({"tool": name, "reason": "excluded by user"})
@@ -1248,6 +1377,16 @@ def analyze(argv: list[str] | None = None) -> dict:
     results: dict[str, dict] = {}
     for tool in tools_to_run:
         results[tool] = run_tool_safely(tool, args, project_root, scan_root)
+    if "config_source" in results.get("ruff", {}):
+        # The ruff that ran, against the project's own pin: a "project" pass
+        # from a different ruff is not the project's lint (see `warnings`).
+        results["ruff"].update(
+            ruff_version_report(
+                project_root,
+                availability["ruff"].get("version"),
+                results["ruff"]["config_source"],
+            )
+        )
 
     return build_output(
         project_root, scan_root, availability,

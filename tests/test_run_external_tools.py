@@ -758,6 +758,27 @@ class TestGetToolVersion(unittest.TestCase):
             result = mod.get_tool_version("nonexistent")
             self.assertIsNone(result)
 
+    def test_mypy_trailing_build_note_is_not_the_version(self):
+        # `mypy --version` ends in "(compiled: yes)"; the last token was taken.
+        with patch.object(mod.subprocess, "run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="mypy 1.19.0 (compiled: yes)\n")
+            self.assertEqual(mod.get_tool_version("mypy"), "1.19.0")
+
+    def test_other_version_formats(self):
+        cases = {
+            "vulture 2.16\n": "2.16",
+            "mypy 2.4.1+dev.0abc (compiled: no)\n": "2.4.1+dev.0abc",
+        }
+        for stdout, expected in cases.items():
+            with patch.object(mod.subprocess, "run") as mock_run:
+                mock_run.return_value = MagicMock(stdout=stdout)
+                self.assertEqual(mod.get_tool_version("tool"), expected, stdout)
+
+    def test_no_version_token_is_none(self):
+        with patch.object(mod.subprocess, "run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="unknown build\n")
+            self.assertIsNone(mod.get_tool_version("tool"))
+
 
 # ---------------------------------------------------------------------------
 # Safe runner
@@ -834,6 +855,44 @@ class TestNoCacheInReviewedProject(unittest.TestCase):
             self.assertFalse(seen["cache"].is_relative_to(root))
             self.assertFalse(seen["cache"].exists(), "cache left behind")
             self.assertFalse((root / ".mypy_cache").exists())
+
+    def _mypy_call(self, files, argv_extra=()):
+        seen: dict = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            seen["cwd"] = kwargs.get("cwd")
+            return MagicMock(stdout="", stderr="")
+
+        with TempProject(files) as root:
+            with patch.object(mod.subprocess, "run", side_effect=fake_run):
+                result = mod.run_mypy(
+                    mod.parse_args([str(root), *argv_extra]), root, root
+                )
+            return root, seen, result
+
+    def test_mypy_reads_the_project_config_whatever_the_cwd(self):
+        # mypy discovers its config from the working directory, which is the
+        # agent's private temp dir: the project's [tool.mypy] was ignored.
+        root, seen, result = self._mypy_call(
+            {"m.py": "x = 1\n", "mypy.ini": "[mypy]\nstrict = True\n"}
+        )
+        cmd = seen["cmd"]
+        self.assertEqual(result["config_source"], "project")
+        self.assertEqual(cmd[cmd.index("--config-file") + 1], str(root / "mypy.ini"))
+        self.assertEqual(result["config_file"], str(root / "mypy.ini"))
+        self.assertEqual(seen["cwd"], str(root))
+
+    def test_curated_mypy_run_reads_no_config_at_all(self):
+        # Neither a config in the caller's cwd nor the ignored project one.
+        for files, extra in (
+            ({"m.py": "x = 1\n"}, ()),
+            ({"m.py": "x = 1\n", "mypy.ini": "[mypy]\n"}, ("--ignore-config",)),
+        ):
+            _root, seen, result = self._mypy_call(files, extra)
+            self.assertEqual(result["config_source"], "curated")
+            self.assertIn("--config-file=", seen["cmd"])
+            self.assertIsNone(result["config_file"])
 
     def test_mypy_cache_is_removed_even_when_mypy_times_out(self):
         seen: dict = {}
@@ -1040,6 +1099,37 @@ class TestToolkitRuffPass(unittest.TestCase):
             out["toolkit_pass"]["dismissed"], {"fastapi-dependency-marker": 1}
         )
 
+    def test_the_lint_dismissals_and_closure_hint_apply_to_the_feed(self):
+        source = (
+            "def main(run, items, helper):\n"
+            "    try:\n"
+            "        run()\n"
+            "    except KeyError:\n"
+            "        raise SystemExit(2)\n"
+            "    for item in items:\n"
+            "        helper(lambda: item)\n"
+        )
+
+        def fake_run(cmd, **kwargs):
+            toolkit = "--select" in cmd
+            hits = [
+                _hit(root, "B904", 5, 9),
+                _hit(root, "B023", 7, 24),
+            ] if toolkit else []
+            return MagicMock(stdout=json.dumps(hits), stderr="")
+
+        with (
+            TempProject({"app.py": source}) as root,
+            patch.object(mod.subprocess, "run", side_effect=fake_run),
+        ):
+            out = mod.run_ruff(mod.parse_args([str(root)]), root, root)
+        self.assertEqual(
+            out["toolkit_pass"]["dismissed"], {"raise-systemexit-in-except": 1}
+        )
+        (b023,) = [f for f in out["findings"] if f["rule"] == "B023"]
+        self.assertTrue(b023["closure_passed_as_argument"])
+        self.assertEqual(b023["callee"], "helper")
+
     def test_toolkit_command_keeps_the_project_config_and_no_cache(self):
         _, calls = self._run()
         toolkit_cmd = calls[1]
@@ -1119,6 +1209,67 @@ class TestIntegrationConfiguredMissing(unittest.TestCase):
                 self.assertEqual(configured[0]["tool"], "ruff")
 
 
+class TestRuffVersionReport(unittest.TestCase):
+    """A project pass from a ruff other than the project's own is flagged."""
+
+    LOCK = '[[package]]\nname = "ruff"\nversion = "0.14.10"\n'
+
+    def _report(self, ruff_section, version, lock=LOCK, source="project"):
+        with TempProject({"uv.lock": lock} if lock else {}) as root:
+            (root / "pyproject.toml").write_text(
+                '[project]\nname = "x"\n\n' + ruff_section, encoding="utf-8"
+            )
+            return mod.ruff_version_report(root, version, source)
+
+    def test_extend_select_across_the_default_set_change(self):
+        out = self._report('[tool.ruff.lint]\nextend-select = ["I"]\n', "0.17.1")
+        self.assertEqual(out["project_ruff_pin"]["version"], "0.14.10")
+        self.assertFalse(out["version_matches_project_pin"])
+        self.assertTrue(out["uses_default_rule_set"])
+        self.assertEqual(len(out["warnings"]), 2)
+        self.assertIn("not the project's pinned ruff 0.14.10", out["warnings"][0])
+        self.assertIn("opposite sides", out["warnings"][1])
+        self.assertIn("extend-select", out["warnings"][1])
+
+    def test_an_explicit_select_is_not_version_dependent(self):
+        out = self._report('[tool.ruff.lint]\nselect = ["E", "F"]\n', "0.17.1")
+        self.assertFalse(out["uses_default_rule_set"])
+        self.assertEqual(len(out["warnings"]), 1)  # the version mismatch only
+
+    def test_the_pinned_version_is_clean(self):
+        out = self._report('[tool.ruff.lint]\nextend-select = ["I"]\n', "0.14.10")
+        self.assertTrue(out["version_matches_project_pin"])
+        self.assertEqual(out["warnings"], [])
+
+    def test_no_pin_with_the_default_set_is_flagged(self):
+        out = self._report("[tool.ruff]\nline-length = 80\n", "0.17.1", lock=None)
+        self.assertIsNone(out["project_ruff_pin"])
+        self.assertIsNone(out["version_matches_project_pin"])
+        self.assertEqual(len(out["warnings"]), 1)
+        self.assertIn("no exact ruff pin", out["warnings"][0])
+
+    def test_analyze_attaches_the_report_to_the_ruff_section(self):
+        def fake_run(cmd, **kwargs):
+            if "--version" in cmd:
+                return MagicMock(stdout="ruff 0.17.1\n", stderr="")
+            return MagicMock(stdout="[]", stderr="")
+
+        with TempProject({"uv.lock": self.LOCK, "m.py": "x = 1\n"}) as root:
+            (root / "pyproject.toml").write_text(
+                '[project]\nname = "x"\n\n[tool.ruff.lint]\nextend-select = ["I"]\n',
+                encoding="utf-8",
+            )
+            with (
+                patch.object(mod.shutil, "which", return_value="/bin/ruff"),
+                patch.object(mod.subprocess, "run", side_effect=fake_run),
+            ):
+                result = mod.analyze([str(root), "--tools", "ruff"])
+        ruff = result["ruff"]
+        self.assertEqual(ruff["ruff_version"], "0.17.1")
+        self.assertFalse(ruff["version_matches_project_pin"])
+        self.assertEqual(len(ruff["warnings"]), 2)
+
+
 class TestBuildSkippedReport(unittest.TestCase):
     """Test build_skipped_report distinguishes reasons."""
 
@@ -1133,7 +1284,24 @@ class TestBuildSkippedReport(unittest.TestCase):
         reasons = {s["tool"]: s["reason"] for s in skipped}
         self.assertEqual(reasons["mypy"], "not installed")
         self.assertEqual(reasons["vulture"], "excluded by user")
-        self.assertEqual(reasons["coverage"], "not installed")
+        # Coverage is read from artifacts: a missing artifact is not a missing
+        # package.
+        self.assertEqual(reasons["coverage"], "no coverage artifacts")
+
+    def test_coverage_installed_without_artifacts(self):
+        availability = {
+            "ruff": {"available": True},
+            "mypy": {"available": True},
+            "vulture": {"available": True},
+            "coverage": {
+                "available": False, "artifacts": [], "coverage_importable": True,
+            },
+        }
+        skipped = mod.build_skipped_report(availability, ["ruff", "mypy", "vulture"])
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["reason"], "no coverage artifacts")
+        self.assertTrue(skipped[0]["coverage_importable"])
+        self.assertIn("coverage run", skipped[0]["hint"])
 
 
 FAKE_RUFF = """\
