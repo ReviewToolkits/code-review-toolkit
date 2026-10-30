@@ -1345,6 +1345,173 @@ def get_commit_details(
 SWEEP_FILES = 10
 
 
+# Commit types whose subject promises no behaviour change.
+_NON_BEHAVIOURAL_TYPES = ("docs", "chore")
+_MAX_BEHAVIOUR_COMMITS = 200
+_MAX_BEHAVIOUR_FILES = 20
+
+
+def _strip_docstrings(tree: ast.AST) -> None:
+    """Drop the docstring statement of the module and of every def/class."""
+    for node in ast.walk(tree):
+        if isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                node.body = body[1:] or [ast.Pass()]
+
+
+class _BlankConstants(ast.NodeTransformer):
+    def visit_Constant(self, node: ast.Constant) -> ast.Constant:
+        return ast.Constant(value=type(node.value).__name__)
+
+
+def code_fingerprint(source: str | None, blank_constants: bool = False) -> str | None:
+    """The AST of `source` without docstrings, comments or layout.
+
+    Two versions with the same fingerprint behave the same: the change was
+    to comments, docstrings, formatting or line wrapping. None when the
+    source does not parse; "" for an absent file. With `blank_constants`,
+    literal values are replaced by their type, so a change of a version string
+    or a message compares equal.
+    """
+    if source is None:
+        return ""
+    try:
+        tree = ast.parse(source.removeprefix("\ufeff"))
+    except (SyntaxError, ValueError):
+        return None
+    _strip_docstrings(tree)
+    if all(isinstance(stmt, ast.Pass) for stmt in tree.body):
+        return ""
+    if blank_constants:
+        tree = _BlankConstants().visit(tree)
+    # Reordering a block of imports (isort) is layout too.
+    parts: list[str] = []
+    run: list[str] = []
+    for stmt in tree.body:
+        dumped = ast.dump(stmt, include_attributes=False)
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            run.append(dumped)
+            continue
+        parts.extend(sorted(run))
+        run = []
+        parts.append(dumped)
+    parts.extend(sorted(run))
+    return "\n".join(parts)
+
+
+def find_behavioural_non_code_commits(
+    commits: list[dict],
+    git_root: Path,
+    allowed_prefix: str = "",
+) -> dict:
+    """docs/chore commits whose Python changes alter the code, not just its text.
+
+    A `docs:` commit on a validation project added `str()`/`int()` coercions
+    and was counted as documentation, so it never reached fix-completeness or
+    fix-propagation review. Each in-scope `.py` file the commit touched is
+    compared before and after with docstrings, comments and layout stripped.
+    """
+    candidates = [
+        c
+        for c in commits
+        if c["type"] in _NON_BEHAVIOURAL_TYPES
+        and any(f.endswith(".py") and f.startswith(allowed_prefix) for f in c["files"])
+    ]
+    checked = candidates[:_MAX_BEHAVIOUR_COMMITS]
+    result: dict = {
+        "types_checked": list(_NON_BEHAVIOURAL_TYPES),
+        "candidates": len(candidates),
+        "commits_checked": 0,
+        "commits_not_checked": len(candidates) - len(checked),
+        "flagged": [],
+        # Only literal values changed (a version string, a message, a number).
+        "constants_only": [],
+        "undetermined": [],
+    }
+    if not checked:
+        return result
+    parents = _parents(git_root, [c["hash"] for c in checked])
+    reader = BlobFunctionIndex(git_root)
+    try:
+        for commit in checked:
+            if _check_script_timeout() or reader.broken:
+                result["commits_not_checked"] += 1
+                continue
+            sha = commit["hash"]
+            commit_parents = parents.get(sha)
+            if commit_parents is None or len(commit_parents) > 1:
+                # A merge's diff is the merged branch's work; unknown parents
+                # mean the check could not run.
+                result["commits_not_checked"] += 1
+                continue
+            parent = commit_parents[0] if commit_parents else None
+            changed: list[str] = []
+            literal: list[str] = []
+            unparsed: list[str] = []
+            paths = [
+                f
+                for f in commit["files"]
+                if f.endswith(".py") and f.startswith(allowed_prefix)
+            ][:_MAX_BEHAVIOUR_FILES]
+            for path in paths:
+                after = reader._read_blob(f"{sha}:{path}")
+                before = reader._read_blob(f"{parent}:{path}") if parent else None
+                old_fp, new_fp = code_fingerprint(before), code_fingerprint(after)
+                if old_fp is None or new_fp is None:
+                    unparsed.append(path)
+                elif old_fp != new_fp:
+                    if code_fingerprint(before, True) == code_fingerprint(after, True):
+                        literal.append(path)
+                    else:
+                        changed.append(path)
+            result["commits_checked"] += 1
+            entry = {
+                "commit": sha,
+                "commit_short": sha[:7],
+                "message": commit["message"],
+                "type": commit["type"],
+                "date": commit["date"],
+            }
+            if changed:
+                result["flagged"].append({**entry, "files_changing_code": changed})
+            elif literal:
+                result["constants_only"].append({**entry, "files": literal})
+            elif unparsed:
+                result["undetermined"].append({**entry, "files_unparseable": unparsed})
+    finally:
+        reader.close()
+    return result
+
+
+def _parents(git_root: Path, shas: list[str]) -> dict[str, list[str]]:
+    """{sha: [parent shas]} for the given commits (missing on failure)."""
+    found: dict[str, list[str]] = {}
+    for start in range(0, len(shas), 200):
+        batch = shas[start : start + 200]
+        try:
+            result = _run_git(
+                ["show", "-s", "--no-walk=unsorted", "--format=%H %P", *batch],
+                git_root,
+            )
+        except subprocess.TimeoutExpired:
+            continue
+        if result.returncode != 0:
+            continue
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if parts:
+                found[parts[0]] = parts[1:]
+    return found
+
+
 def compute_co_change_clusters(
     commits: list[dict],
     min_co_changes: int = 3,
@@ -1935,6 +2102,13 @@ def analyze(argv: list[str] | None = None) -> dict:
         if len(set(c.get("canonical_files") or c["files"])) > sweep_files
     )
 
+    scope_prefix = _relative_scope(scan_root, git_root)
+    if scope_prefix == ".":
+        scope_prefix = ""
+    elif not scan_root.is_file():
+        scope_prefix = scope_prefix.rstrip("/") + "/"
+    behavioural = find_behavioural_non_code_commits(commits, git_root, scope_prefix)
+
     if args["no_branches"]:
         unmerged = {
             "available": False,
@@ -1993,6 +2167,7 @@ def analyze(argv: list[str] | None = None) -> dict:
         "recent_fixes": recent_fixes,
         "recent_features": recent_features,
         "recent_refactors": recent_refactors,
+        "behavioural_non_code_commits": behavioural,
         "co_change_clusters": co_change_clusters,
         "co_change_meta": {
             "sweep_files_threshold": sweep_files,
@@ -2043,6 +2218,14 @@ def analyze(argv: list[str] | None = None) -> dict:
             "dates use the committer date, so do not read velocity, bursts or "
             "the order of a feature and its follow-up fixes from these dates; "
             "the author date (`date`) is closer to when the work was written."
+        )
+    if behavioural["flagged"]:
+        result["notes"].append(
+            f"{len(behavioural['flagged'])} docs/chore commit(s) change Python "
+            "code, not only comments, docstrings or layout (see "
+            "behavioural_non_code_commits.flagged). Review them as you would "
+            "a fix or a feature: they are missing from recent_fixes and "
+            "recent_features."
         )
     unknown = commits_by_type.get("unknown", 0)
     if commits and unknown / len(commits) > 0.15:

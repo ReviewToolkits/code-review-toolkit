@@ -728,6 +728,80 @@ class TestRenamesSweepsAndDeletions(unittest.TestCase):
         self.assertEqual(mod.parse_args(["--sweep-files", "5"])["sweep_files"], 5)
 
 
+class TestBehaviouralNonCodeCommits(unittest.TestCase):
+    """docs/chore commits that change code are flagged; text-only ones are not."""
+
+    _V1 = 'def f(x):\n    """Return x."""\n    return x\n'
+
+    def _run(self, change, message):
+        with GitTempProject(
+            [
+                {"files": {"pkg/m.py": self._V1}, "message": "Add f"},
+                {"files": {"pkg/m.py": change}, "message": message},
+            ]
+        ) as root:
+            return mod.analyze([str(root / "pkg"), "--since", "2000-01-01"])
+
+    def test_docs_commit_that_changes_code_is_flagged(self):
+        changed = 'def f(x):\n    """Return x as text."""\n    return str(x)\n'
+        result = self._run(changed, "docs: clarify f")
+        check = result["behavioural_non_code_commits"]
+        self.assertEqual(check["commits_checked"], 1)
+        self.assertEqual(len(check["flagged"]), 1)
+        self.assertEqual(check["flagged"][0]["files_changing_code"], ["pkg/m.py"])
+        self.assertTrue(any("docs/chore commit" in n for n in result["notes"]))
+
+    def test_docstring_comment_and_layout_changes_are_not_flagged(self):
+        text_only = (
+            "# A comment.\n"
+            "def f(\n    x,\n):\n"
+            '    """Return the argument unchanged."""\n'
+            "    return x  # same\n"
+        )
+        result = self._run(text_only, "docs: reword f")
+        check = result["behavioural_non_code_commits"]
+        self.assertEqual(check["commits_checked"], 1)
+        self.assertEqual(check["flagged"], [])
+        self.assertFalse(any("docs/chore commit" in n for n in result["notes"]))
+
+    def test_literal_only_change_is_listed_apart(self):
+        bumped = 'def f(x):\n    """Return x."""\n    return x\n\nVERSION = "2"\n'
+        with GitTempProject(
+            [
+                {
+                    "files": {"pkg/m.py": self._V1 + '\nVERSION = "1"\n'},
+                    "message": "Add f",
+                },
+                {"files": {"pkg/m.py": bumped}, "message": "chore(release): v2"},
+            ]
+        ) as root:
+            result = mod.analyze([str(root / "pkg"), "--since", "2000-01-01"])
+        check = result["behavioural_non_code_commits"]
+        self.assertEqual(check["flagged"], [])
+        self.assertEqual(len(check["constants_only"]), 1)
+
+    def test_feature_commits_are_not_checked(self):
+        changed = 'def f(x):\n    """Return x."""\n    return str(x)\n'
+        result = self._run(changed, "feat: stringify f")
+        self.assertEqual(result["behavioural_non_code_commits"]["candidates"], 0)
+
+    def test_fingerprint_ignores_docstrings_only(self):
+        self.assertEqual(
+            mod.code_fingerprint('"""Doc."""\nx = 1\n'),
+            mod.code_fingerprint("x = 1  # c\n"),
+        )
+        self.assertNotEqual(
+            mod.code_fingerprint("x = 1\n"), mod.code_fingerprint("x = 2\n")
+        )
+        self.assertEqual(mod.code_fingerprint('"""Only a docstring."""\n'), "")
+        # An isort pass reorders imports without changing behaviour.
+        self.assertEqual(
+            mod.code_fingerprint("import sys\nimport os\nx = 1\n"),
+            mod.code_fingerprint("import os\nimport sys\nx = 1\n"),
+        )
+        self.assertIsNone(mod.code_fingerprint("def (:\n"))
+
+
 class TestParseGitLogStreaming(unittest.TestCase):
     """Test that parse_git_log works with a list of lines (iterable)."""
 
