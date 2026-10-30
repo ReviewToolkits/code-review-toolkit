@@ -65,9 +65,9 @@ code-review-toolkit/
 ├── CHANGELOG.md                     # Keep a Changelog format
 ├── plugins/code-review-toolkit/
 │   ├── .claude-plugin/plugin.json
-│   ├── agents/                      # 18 agent prompt definitions (markdown)
+│   ├── agents/                      # 19 agent prompt definitions (markdown)
 │   ├── commands/                    # 8 command definitions (markdown)
-│   ├── scripts/                     # 16 Python scripts (the core code)
+│   ├── scripts/                     # 17 Python scripts (the core code)
 │   └── data/                        # bug-shape catalog + FP taxonomy
 └── tests/                           # unittest suite
 ```
@@ -83,6 +83,7 @@ candidates, and prints JSON to stdout.
 |---|---|
 | `scan_common.py` | **Shared utilities — every other script imports from here** |
 | `scan_python_pitfalls.py` | Correctness defects; 39 checks mapping 1:1 to `data/python_bug_shapes.json` (2 of them project-level) |
+| `scan_concurrency.py` | Concurrency defects; 12 project-level checks (lock-guard inference, lock discipline, blocking under locks and in `async def`, through the call graph) |
 | `analyze_imports.py` | Import graph, module boundaries, circular dependencies |
 | `analyze_history.py` | Git history: churn, co-change, fix density |
 | `measure_complexity.py` | Per-function complexity metrics |
@@ -135,13 +136,13 @@ is the calibration loop.**
 
 ### Agents
 
-18 markdown files with YAML frontmatter (name, description) plus a structured prompt. Agents contain
+19 markdown files with YAML frontmatter (name, description) plus a structured prompt. Agents contain
 no analysis logic — they run a script, read the JSON, then do the qualitative review the script
 cannot. Scripts find candidates (with a real false-positive rate); agents confirm or dismiss them.
 
 Seven agents are **qualitative** (no backing script — they use Grep/Read directly):
 api-surface-reviewer, consistency-auditor, documentation-auditor, git-history-analyzer,
-pattern-consistency-checker, project-docs-auditor, silent-failure-hunter. The other eleven are
+pattern-consistency-checker, project-docs-auditor, silent-failure-hunter. The other twelve are
 script-backed, and each ends with a `## Running the script` section (timeout, private `mktemp -d`
 output, no retry after a failure); `test_release_discipline` fails if a new one omits it.
 
@@ -205,14 +206,14 @@ Tracked honestly so the next session does not have to re-derive them:
 
 1. **Five validation corpora** (`reports/`): idlelib (v1–v4), `_pyrepl`, coverage.py (v1–v3),
    asyncio and tkinter. They are deliberately different — idlelib is mature and careful, `_pyrepl`
-   is young and takes chances, coverage.py is a large third-party project. None is a threaded
-   *application*: asyncio is library code, and the catalog has no threading shapes (lock
-   discipline, check-then-act, lock ordering). A threading-heavy application is the right next one.
-2. **82 of 101 shapes are `confirmed`; 19 remain `documented`.** Most of the catalog is grounded in
-   this toolkit's own findings rather than in documented semantics alone.
-3. **39 of 101 shapes are executable.** `scan_python_pitfalls.py` implements 39 (37 per-file, 2
-   project-level). The rest are `implementable` or `agent-only` — `detectability` in the catalog
-   says which.
+   is young and takes chances, coverage.py is a large third-party project. A threaded/async
+   application has since been reviewed privately for its maintainer; its report stays outside this
+   repo, so the threading shapes it motivated are `documented` until its findings can be cited.
+2. **82 of 114 shapes are `confirmed`; 32 remain `documented`**, including all 13 threading
+   shapes.
+3. **51 of 114 shapes are executable.** `scan_python_pitfalls.py` implements 39 (37 per-file, 2
+   project-level) and `scan_concurrency.py` 12 (all project-level). The rest are `implementable` or
+   `agent-only` — `detectability` in the catalog says which.
 4. **The companion findings repository is `devdanzin/code-review-findings`** (`coveragepy/`,
    `cpython-idlelib/`, `cpython-pyrepl/`). The `.code-review/findings.json` schema written by
    `informed-explore` is wire-compatible with its `project-local/findings.json`, so a project's

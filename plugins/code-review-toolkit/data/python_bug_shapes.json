@@ -2039,6 +2039,256 @@
       "differential": "A module-level singleton that is meant to live for the process is not this shape. It needs an object with a lifecycle shorter than the process -- one the API invites you to create more than once.",
       "detected_by": null,
       "detectability": "implementable"
+    },
+    {
+      "id": "unguarded-access-to-lock-guarded-state",
+      "title": "State written under a lock at most sites is written (or iterated) without it at another",
+      "agent": "concurrency-auditor",
+      "severity": "FIX",
+      "pattern": "A class attribute or module global is accessed with lock L held at most of its sites (`with self._lock: self._items[k] = v`), but one method writes, mutates or iterates it without L. The lock's purpose is visible in the majority; the outlier breaks it.",
+      "guarded_twin": "The other sites: take the same lock around the access, or call the access only from a `_locked` helper that every caller enters with the lock held (and say so in its docstring).",
+      "hunt": "For every lock attribute, list the attributes accessed inside its `with` blocks, then grep every other access to those attributes. Helpers called only under the lock are fine; a helper also called from an unlocked path is the defect.",
+      "expected": "every write to guarded state happens with its guard held; readers that iterate hold it too.",
+      "caught_as": "SILENT -- lost updates, torn multi-field updates, or `RuntimeError: dictionary changed size during iteration` under load; never reproduces in single-threaded tests.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "ft-review-toolkit shared-state-auditor (critical-section inference), ported to Python",
+        "threading docs, 'Lock Objects'"
+      ],
+      "differential": "Writes in `__init__` (the object isn't shared yet) are not sites. A plain read of a reference under the GIL is atomic and not flagged. A deliberately racy flag (`self._closed = True`) is benign if every reader tolerates staleness: check the readers.",
+      "detected_by": "scan_concurrency.py",
+      "detectability": "implemented"
+    },
+    {
+      "id": "check-then-act-without-lock",
+      "title": "Lazy init or check-then-insert on shared state without holding the lock across check and act",
+      "agent": "concurrency-auditor",
+      "severity": "FIX",
+      "pattern": "`if self._x is None: self._x = build()` or `if k not in self._cache: self._cache[k] = make()` on state that other code guards with a lock, executed without it. Two threads both see the empty state and both act.",
+      "guarded_twin": "Double-checked locking: check, take the lock, re-check, act. Or an atomic primitive: `dict.setdefault`, `functools.cache` on a module function, building in `__init__`.",
+      "hunt": "Grep for `is None:` and `not in self.` guards on attributes that also appear inside `with <lock>:` blocks; the unlocked twin is usually in a getter.",
+      "expected": "the expensive object is built once, and every thread sees the same instance.",
+      "caught_as": "SILENT -- two instances get built (double connections, leaked worker processes, a cache entry overwritten with a different object that other threads already hold).",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "Python FAQ, 'What kinds of global value mutation are thread-safe?'"
+      ],
+      "differential": "Harmless when building twice is idempotent and cheap and nobody keeps a reference to the loser. Reported `low` when the owning class has a lock but this attribute is never touched under it.",
+      "detected_by": "scan_concurrency.py",
+      "detectability": "implemented"
+    },
+    {
+      "id": "acquire-without-finally-release",
+      "title": "`lock.acquire()` not paired with a `release()` in `finally`",
+      "agent": "concurrency-auditor",
+      "severity": "FIX",
+      "pattern": "`lock.acquire()` followed by work and `lock.release()` on the success path only. An exception (including `KeyboardInterrupt` or a cancellation) between them leaves the lock held forever.",
+      "guarded_twin": "`with lock:`; or `lock.acquire()` immediately followed by `try: ... finally: lock.release()`.",
+      "hunt": "Grep `.acquire(` and check each for a `finally` release in the same function. An acquire whose release is in another function (a hand-off) needs that function checked on every exit path.",
+      "expected": "the lock is released on every exit path.",
+      "caught_as": "SILENT until the exceptional path runs; then every later caller deadlocks.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "ft-review-toolkit scan_lock_discipline (missing release on error path), ported"
+      ],
+      "differential": "`__enter__`/`acquire` methods of a lock wrapper (the protocol itself) and `@contextmanager` bodies that release in `finally` are not defects. A release in another function is reported `low`: follow the hand-off.",
+      "detected_by": "scan_concurrency.py",
+      "detectability": "implemented"
+    },
+    {
+      "id": "lock-acquire-result-ignored",
+      "title": "`acquire(timeout=...)` / `acquire(False)` whose result is discarded",
+      "agent": "concurrency-auditor",
+      "severity": "FIX",
+      "pattern": "`lock.acquire(timeout=5)` as a bare statement. On timeout it returns False and the code runs the critical section unlocked, then releases a lock it doesn't hold.",
+      "guarded_twin": "`if not lock.acquire(timeout=5): raise TimeoutError(...)`, then try/finally.",
+      "hunt": "Grep `acquire(` with `timeout=`, `blocking=False` or a positional False; check the return value is tested.",
+      "expected": "the timeout path is handled explicitly.",
+      "caught_as": "SILENT -- unlocked access on the timeout path, then `RuntimeError: release unlocked lock` (or a release of another thread's acquisition on a Semaphore).",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "threading docs, Lock.acquire return value"
+      ],
+      "differential": "`acquire(True)` and `acquire()` block until acquired; their result is always True.",
+      "detected_by": "scan_concurrency.py",
+      "detectability": "implemented"
+    },
+    {
+      "id": "lock-order-inversion",
+      "title": "Two locks acquired in opposite orders on different paths (deadlock)",
+      "agent": "concurrency-auditor",
+      "severity": "FIX",
+      "pattern": "Path 1 holds A and then takes B; path 2 holds B and then takes A. Either directly (nested `with`) or through calls: a method holding A calls a helper that takes B.",
+      "guarded_twin": "One documented global order (e.g. sort per-key locks by key before taking them), or merge the locks.",
+      "hunt": "Build the lock-order graph from nested `with` blocks and from calls made while holding a lock; any cycle is a candidate. Check the `chain` of each edge: a weak call edge (method resolved by name only) may not be real.",
+      "expected": "all paths take shared locks in one order.",
+      "caught_as": "SILENT -- an intermittent hang under concurrent load, two threads each waiting on the other.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "ft-review-toolkit scan_lock_discipline (lock-order graph), ported"
+      ],
+      "differential": "Edges through weak (name-only) call resolution are reported `low`. Two instances of one lock family (per-collection locks) nested is an ordering question only if two threads can nest them in opposite orders.",
+      "detected_by": "scan_concurrency.py",
+      "detectability": "implemented"
+    },
+    {
+      "id": "non-reentrant-lock-reacquired",
+      "title": "A non-reentrant lock re-acquired by the thread that holds it, or a read-to-write upgrade",
+      "agent": "concurrency-auditor",
+      "severity": "FIX",
+      "pattern": "A method holding `self._lock` (a `threading.Lock`, a `Semaphore`, or a `Condition(Lock())`) calls a helper that takes `self._lock` again; or code holding a reader/writer lock's read side asks for its write side.",
+      "guarded_twin": "Split a `_locked` helper that assumes the lock is held; use an `RLock` when re-entry is intended; for RW locks, release the read side before taking the write side (and re-validate).",
+      "hunt": "For every `Lock` attribute, follow calls made while it is held (same instance: `self.` calls) to any acquisition of the same attribute.",
+      "expected": "a thread never waits for a lock it holds.",
+      "caught_as": "SILENT -- an immediate, permanent self-deadlock on that path, often an error or maintenance path no test exercises.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "threading docs, 'RLock Objects'"
+      ],
+      "differential": "`RLock`, a default `Condition()` (wraps an RLock), and project RW locks that track their owner thread (`get_ident`) allow re-entry; only their read-to-write upgrade is flagged. A call on another instance (`self.parent.m()`) takes a different lock.",
+      "detected_by": "scan_concurrency.py",
+      "detectability": "implemented"
+    },
+    {
+      "id": "condition-wait-outside-predicate-loop",
+      "title": "`Condition.wait()` not inside a `while <predicate>` loop",
+      "agent": "concurrency-auditor",
+      "severity": "FIX",
+      "pattern": "`with cv: if not ready: cv.wait()` then proceeds. Wakeups can be spurious, and another consumer can take the item between notify and wake.",
+      "guarded_twin": "`while not predicate: cv.wait()`, or `cv.wait_for(predicate)`.",
+      "hunt": "Grep `.wait(` on Condition objects; each must sit inside a `while` that re-tests the state.",
+      "expected": "the waiter proceeds only when its predicate holds.",
+      "caught_as": "SILENT -- an IndexError/None from an empty queue, or work done on a stale state, under contention only.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "threading docs, 'Condition Objects' (spurious wakeups)"
+      ],
+      "differential": "`Event.wait()` and `wait(timeout)` used as a sleep are not conditions; the scanner only matches attributes built from `Condition(...)` or named like one (`_cv`, `cond`).",
+      "detected_by": "scan_concurrency.py",
+      "detectability": "implemented"
+    },
+    {
+      "id": "condition-notify-without-lock",
+      "title": "`Condition.notify()` called without holding the condition's lock",
+      "agent": "concurrency-auditor",
+      "severity": "FIX",
+      "pattern": "`cv.notify_all()` outside `with cv:`.",
+      "guarded_twin": "Change the shared state and notify inside the same `with cv:` block.",
+      "hunt": "Grep `.notify(` / `.notify_all(`; each must be inside `with <that condition>`, or in a helper only called with it held.",
+      "expected": "waiters observe the state change that triggered the notify.",
+      "caught_as": "`RuntimeError: cannot notify on un-acquired lock` at runtime (threading); lost wakeups for hand-rolled variants.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "threading docs, Condition.notify"
+      ],
+      "differential": "A helper called only with the condition held (entry lockset) is fine.",
+      "detected_by": "scan_concurrency.py",
+      "detectability": "implemented"
+    },
+    {
+      "id": "blocking-call-under-lock",
+      "title": "Sleep, I/O, a subprocess or a wait on another thread while holding a lock",
+      "agent": "concurrency-auditor",
+      "severity": "FIX",
+      "pattern": "Inside `with lock:` (directly or through calls): `time.sleep`, network or subprocess calls, `thread.join()`, `future.result()`, `queue.get()`, `event.wait()`, file I/O. Every thread that needs the lock waits for the slow work, and waiting on another thread under a lock deadlocks if that thread needs the lock.",
+      "guarded_twin": "Compute outside the lock, then lock only to publish the result. Hoist embedding/IO/model work before the lock (a sibling path that already does is the guarded twin).",
+      "hunt": "Follow the `chain` of each finding. Look for the same operation on a sibling path that already does the slow work before taking the lock.",
+      "expected": "critical sections are short and never wait on other threads.",
+      "caught_as": "SILENT -- throughput collapse and tail-latency spikes under load; deadlock when the awaited thread needs the same lock.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "ft-review-toolkit scan_stw_safety (unsafe calls in a critical region), ported"
+      ],
+      "differential": "Locks whose purpose is to serialize the slow operation (one writer per file, one request per pipe) are by design: CONSIDER, and check the timeout story instead. File I/O and pipe waits are reported `low` for this reason.",
+      "detected_by": "scan_concurrency.py",
+      "detectability": "implemented"
+    },
+    {
+      "id": "await-while-holding-thread-lock",
+      "title": "`await` inside a sync `with <threading lock>` block",
+      "agent": "concurrency-auditor",
+      "severity": "FIX",
+      "pattern": "`with self._lock: ... await something()` in an `async def`. The coroutine suspends holding a thread lock; any other task on the loop that takes the lock blocks the loop thread, and the holder can never resume.",
+      "guarded_twin": "`asyncio.Lock` with `async with`, or release before awaiting.",
+      "hunt": "Grep `async def` bodies for sync `with` blocks on locks that contain `await`.",
+      "expected": "no thread lock is held across a suspension point.",
+      "caught_as": "SILENT -- the whole event loop freezes the first time two tasks contend.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "asyncio docs, 'Synchronization Primitives' (not thread-safe, and vice versa)"
+      ],
+      "differential": "None for threading locks. An `asyncio.Lock` (with `async with`) is the guarded twin.",
+      "detected_by": "scan_concurrency.py",
+      "detectability": "implemented"
+    },
+    {
+      "id": "transitive-blocking-call-in-async",
+      "title": "`async def` calls a sync project function that blocks or waits for a slow thread lock",
+      "agent": "concurrency-auditor",
+      "severity": "FIX",
+      "pattern": "A coroutine calls a sync function inline (not via `to_thread`/`run_in_executor`), and that function -- possibly several calls down -- sleeps, does network or subprocess work, or takes a thread lock that other code holds across blocking work. `blocking-call-in-async-function` misses it because no blocking name appears in the coroutine.",
+      "guarded_twin": "`await asyncio.to_thread(fn, ...)` / `await loop.run_in_executor(None, fn)`. A sibling coroutine in the same module that already offloads its sync call is the guarded twin, and raises confidence.",
+      "hunt": "For each `async def`, list its inline calls to sync project functions and follow them to a lock or a blocking call. Then ask which other code holds that lock, and for how long (the finding's `meanwhile` hop).",
+      "expected": "the event loop never waits on another thread's critical section.",
+      "caught_as": "SILENT -- the whole server (health checks included) stops answering while another thread holds the lock, e.g. for the duration of a restore.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "asyncio developer guide, 'Running Blocking Code'",
+        "ft-review-toolkit scan_stw_safety (unsafe-call propagation through an intra-file call graph), ported"
+      ],
+      "differential": "A lock that is only ever held for a few bytecodes (counters) costs microseconds: reported `low`. Startup/shutdown code before the server accepts requests is usually acceptable.",
+      "detected_by": "scan_concurrency.py",
+      "detectability": "implemented"
+    },
+    {
+      "id": "signal-handler-does-real-work",
+      "title": "A `signal.signal` handler that takes locks, logs or does I/O",
+      "agent": "concurrency-auditor",
+      "severity": "FIX",
+      "pattern": "A handler registered with `signal.signal` acquires a lock, logs, or does I/O. Python runs it between two bytecodes of the main thread, which may already hold that lock -- including the `logging` module's handler locks.",
+      "guarded_twin": "Set a flag or write a byte to a self-pipe (`signal.set_wakeup_fd`, `loop.add_signal_handler`), and do the work in the main loop.",
+      "hunt": "Find every `signal.signal(..., handler)` and read the handler and what it calls.",
+      "expected": "the handler returns immediately without touching shared locks.",
+      "caught_as": "SILENT -- a rare deadlock when the signal lands while the main thread holds the lock (often in logging).",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "Python docs, 'signal -- Note on signal handlers and exceptions'"
+      ],
+      "differential": "Handlers that only log are CONSIDER: the deadlock needs the main thread to be inside the same handler's lock. `loop.add_signal_handler` callbacks run on the loop, not in signal context.",
+      "detected_by": "scan_concurrency.py",
+      "detectability": "implemented"
+    },
+    {
+      "id": "request-reply-channel-desync-after-timeout",
+      "title": "A request/reply channel without request ids, retried or reused after a timeout",
+      "agent": "concurrency-auditor",
+      "severity": "FIX",
+      "pattern": "`conn.send(req); if not conn.poll(timeout): raise/retry; reply = conn.recv()` over a pipe, socket or queue shared across calls, with no request id in the reply. After a timeout the late reply stays in the channel, and the next caller receives the previous caller's answer -- forever after, every reply is shifted by one.",
+      "guarded_twin": "Tag each request with an id and discard replies whose id doesn't match; or tear down and recreate the channel (or the worker) on every timeout path, including the last retry.",
+      "hunt": "Find every send/poll/recv sequence; check what happens to the channel on each timeout or exception path, especially the final attempt of a retry loop.",
+      "expected": "a timed-out request's reply can never be returned to a later request.",
+      "caught_as": "SILENT -- plausible but wrong results (here, another tenant's embeddings), with no error.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "multiprocessing docs, Connection.poll/recv",
+        "the response-desync bug class of pipelined HTTP/1.1 and Redis clients"
+      ],
+      "differential": "Channels recreated on every failure, or protocols that carry and check a correlation id, are the guarded twin.",
+      "detected_by": null,
+      "detectability": "agent-only"
     }
   ]
 }

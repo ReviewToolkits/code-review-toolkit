@@ -4,7 +4,7 @@ A comprehensive collection of specialized agents for exploring and analyzing exi
 
 ## Overview
 
-This plugin bundles 18 expert analysis agents and 8 commands. Each agent focuses on a specific aspect of code quality and is designed for codebase-scale analysis — scanning entire modules or projects rather than reviewing diffs.
+This plugin bundles 19 expert analysis agents and 8 commands. Each agent focuses on a specific aspect of code quality and is designed for codebase-scale analysis — scanning entire modules or projects rather than reviewing diffs.
 
 ### Key Design Principles
 
@@ -77,7 +77,7 @@ No third-party Python packages are required — all scripts use only the standar
 The primary command. Runs the foundational context providers (architecture-mapper + git-history-context) first, then dispatches selected agents with both structural and temporal context.
 
 ```bash
-# Full exploration (all 18 agents)
+# Full exploration (all 19 agents)
 /code-review-toolkit:explore
 
 # Specific directory
@@ -90,7 +90,7 @@ The primary command. Runs the foundational context providers (architecture-mappe
 /code-review-toolkit:explore . all summary
 ```
 
-**Aspects**: `architecture`, `history-context`, `history`, `history-full`, `consistency`, `complexity`, `tests`, `pitfalls`, `lint`, `errors`, `docs`, `project-docs`, `types`, `typing`, `dead-code`, `tech-debt`, `test-invariants`, `patterns`, `api`, `all`
+**Aspects**: `architecture`, `history-context`, `history`, `history-full`, `consistency`, `complexity`, `tests`, `pitfalls`, `concurrency`, `lint`, `errors`, `docs`, `project-docs`, `types`, `typing`, `dead-code`, `tech-debt`, `test-invariants`, `patterns`, `api`, `all`
 
 **Options**: `deep` (full detail), `summary` (top-level only), `parallel` (concurrent agents), `--runs N` (independent naive passes, deduplicated), `--informed-reruns` (with `--runs 3`, the third pass targets adjacent code and siblings of what runs 1–2 confirmed)
 
@@ -176,6 +176,7 @@ turns "file a new issue" into "comment on the existing one" when the issue is al
 | **test-coverage-analyzer** | Source↔test correlation, undertested modules, coverage gaps | pr-test-analyzer |
 | **pattern-consistency-checker** | Same concern solved different ways across modules | New |
 | **python-pitfall-scanner** | Concrete correctness defects: mutable defaults, late-binding closures, `except` ordering, `return`-in-`finally`, asyncio pitfalls, mutation-during-iteration | New |
+| **concurrency-auditor** | Lock-guard inference (state and helpers touched without the lock that guards them elsewhere), check-then-act, lock discipline and lock-order cycles, re-entry and RW upgrades, `Condition` misuse, blocking work under locks, and event-loop stalls followed through the call graph | ft-review-toolkit |
 | **silent-failure-hunter** | Swallowed exceptions, bare except, silent error patterns | silent-failure-hunter |
 | **lint-rule-triager** | Defect-grade ruff rules in explicit tiers, merged with the shape catalog; harvests rules with no shape yet | New |
 | **typing-integrity-auditor** | mypy-provable defects, and annotations silently degraded to `Any` by phantom `TYPE_CHECKING` imports | New |
@@ -265,7 +266,7 @@ All agents use `model: opus` for highest analysis quality. Each agent:
 | **Discovery** | Knows what changed | Must discover structure first |
 | **Output** | All findings shown | Ranked, capped, drill-down available |
 | **Architecture** | Not needed (small diff) | Foundation for all analysis |
-| **Agents** | 6 | 18 |
+| **Agents** | 6 | 19 |
 | **Use when** | Before creating a PR | Exploring, planning cleanup, health checks |
 
 ## Tips
@@ -288,6 +289,7 @@ code-review-toolkit/
 │   ├── api-surface-reviewer.md
 │   ├── architecture-mapper.md
 │   ├── complexity-simplifier.md
+│   ├── concurrency-auditor.md
 │   ├── consistency-auditor.md
 │   ├── dead-code-finder.md
 │   ├── documentation-auditor.md
@@ -331,6 +333,7 @@ code-review-toolkit/
     ├── run_external_tools.py
     ├── run_lint_rules.py
     ├── scan_common.py
+    ├── scan_concurrency.py
     └── scan_python_pitfalls.py
 ```
 

@@ -1,9 +1,9 @@
 """Helpers for importing scripts as modules and creating test fixtures."""
 
 import importlib.util
+import sys
 import tempfile
 from pathlib import Path
-
 
 _SCRIPTS_DIR = (
     Path(__file__).resolve().parent.parent
@@ -23,8 +23,18 @@ def import_script(name: str):
     script_path = _SCRIPTS_DIR / f"{name}.py"
     spec = importlib.util.spec_from_file_location(name, script_path)
     module = importlib.util.module_from_spec(spec)
-    # Don't add to sys.modules to avoid side-effects between tests.
-    spec.loader.exec_module(module)
+    # Registered only while it executes: `@dataclass` resolves string annotations
+    # (`from __future__ import annotations`) through sys.modules[cls.__module__].
+    # Removed afterwards so tests don't share module state.
+    previous = sys.modules.get(name)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if previous is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
     return module
 
 
