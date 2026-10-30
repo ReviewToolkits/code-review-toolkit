@@ -72,6 +72,63 @@ class TestMarkerDetection(unittest.TestCase):
         skip_items = [i for i in items if i["category"] == "SKIP"]
         self.assertEqual(len(skip_items), 1)
 
+    def test_pytest_skip_spellings(self):
+        src = (
+            "import pytest\n"
+            "from pytest import mark\n"
+            "@pytest.mark.skip(reason='flaky')\n"
+            "def test_a(): pass\n"
+            "@mark.skip('later')\n"
+            "def test_b(): pass\n"
+            "@pytest.mark.skipif(True, reason='x')\n"
+            "def test_c(): pass\n"
+            "def test_d():\n"
+            "    pytest.skip('not on CI')\n"
+            "class T:\n"
+            "    def test_e(self):\n"
+            "        self.skipTest('needs network')\n"
+        )
+        items = self._scan(src, "test_mod.py")
+        self.assertEqual(
+            [(i["line"], i["category"]) for i in items],
+            [(3, "SKIP"), (5, "SKIP"), (7, "SKIP"), (10, "SKIP"), (13, "SKIP")],
+        )
+
+    def test_xfail_spellings(self):
+        src = (
+            "import pytest, unittest\n"
+            "@pytest.mark.xfail(strict=True)\n"
+            "def test_a(): pass\n"
+            "def test_b():\n    pytest.xfail('known bug')\n"
+            "@unittest.expectedFailure\n"
+            "def test_c(): pass\n"
+        )
+        items = self._scan(src, "test_mod.py")
+        self.assertEqual(
+            [(i["line"], i["category"]) for i in items],
+            [(2, "XFAIL"), (5, "XFAIL"), (6, "XFAIL")],
+        )
+
+    def test_skip_lookalikes_are_not_markers(self):
+        src = (
+            "bookmark.skip(1)\n"
+            "self.mark.skip = True\n"
+            "# pytest.skip('in a comment')\n"
+            "def skip_rows(n): pass\n"
+        )
+        self.assertEqual(self._scan(src), [])
+
+    def test_nosec_and_pylint_disable(self):
+        src = (
+            "result = eval(code)  # nosec B307\n"
+            "import pickle  # pylint: disable=import-outside-toplevel\n"
+        )
+        items = self._scan(src)
+        self.assertEqual(
+            [(i["category"], i["text"]) for i in items],
+            [("NOSEC", "B307"), ("PYLINT_DISABLE", "import-outside-toplevel")],
+        )
+
     def test_multiple_markers(self):
         items = self._scan(
             "# TODO: first thing\n"

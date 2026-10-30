@@ -2,7 +2,8 @@
 """Collect and categorize technical debt markers from a Python codebase.
 
 Searches for TODO, FIXME, HACK, XXX, NOQA, type: ignore, pragma: no cover,
-and unittest.skip markers. Cross-references with git blame for age data.
+nosec and pylint: disable comments, and skipped or xfail tests (unittest and
+pytest spellings). Cross-references with git blame for age data.
 
 Optionally (``--key-regex``) inventories tracker keys -- ``ABC-12``-style
 issue keys or a project's own scheme -- cited in comments, docstrings and
@@ -41,10 +42,25 @@ _MARKER_PATTERNS: dict[str, re.Pattern[str]] = {
     "NOQA": re.compile(r"#\s*noqa\b[:\s]*(.*)", re.IGNORECASE),
     "TYPE_IGNORE": re.compile(r"#\s*type:\s*ignore\b(.*)", re.IGNORECASE),
     "PRAGMA_NO_COVER": re.compile(r"#\s*pragma:\s*no\s*cover\b(.*)", re.IGNORECASE),
+    # Linter suppressions: a project whose only inline suppressions are
+    # bandit's must not read as "suppresses nothing".
+    "NOSEC": re.compile(r"#\s*nosec\b[:\s]*(.*)", re.IGNORECASE),
+    "PYLINT_DISABLE": re.compile(r"#\s*pylint:\s*disable\b[=:\s]*(.*)", re.IGNORECASE),
 }
 
-# Decorator-based markers (searched in AST-like fashion via regex).
-_SKIP_PATTERN = re.compile(r"@(?:unittest\.)?skip(?:If|Unless)?\s*\(", re.IGNORECASE)
+# Skipped and expected-to-fail tests, in unittest and pytest spellings.
+_SKIP_PATTERN = re.compile(
+    r"@(?:unittest\.)?skip(?:If|Unless)?\s*\("  # @unittest.skip(...), @skipIf(...)
+    r"|(?<![\w.])(?:pytest\.)?mark\.skip(?:if)?\b"  # @pytest.mark.skip, @mark.skipif
+    r"|(?<![\w.])pytest\.(?:skip|importorskip)\s*\("  # pytest.skip("...")
+    r"|\.skipTest\s*\(",  # self.skipTest("...")
+    re.IGNORECASE,
+)
+_XFAIL_PATTERN = re.compile(
+    r"(?<![\w.])(?:pytest\.)?mark\.xfail\b"
+    r"|(?<![\w.])pytest\.xfail\s*\("
+    r"|@(?:unittest\.)?expectedFailure\b"
+)
 
 
 def _has_git(project_root: Path) -> bool:
@@ -146,12 +162,21 @@ def scan_file(filepath: Path, project_root: Path, use_git: bool) -> list[dict]:
 
                 items.append(item)
 
-        # Check skip decorators.
-        if _SKIP_PATTERN.search(line):
+        # Check skip and xfail markers (not in a comment-only line).
+        if line.lstrip().startswith("#"):
+            continue
+        test_category = (
+            "SKIP"
+            if _SKIP_PATTERN.search(line)
+            else "XFAIL"
+            if _XFAIL_PATTERN.search(line)
+            else None
+        )
+        if test_category:
             item = {
                 "file": rel,
                 "line": i,
-                "category": "SKIP",
+                "category": test_category,
                 "text": line.strip(),
                 "full_line": line.rstrip(),
                 "context_before": lines[i - 2].strip() if i > 1 else "",
