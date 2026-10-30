@@ -211,6 +211,43 @@ class TestCacheDirectory(unittest.TestCase):
             self.assertFalse((root / "pkg" / ".mypy_cache").exists())
 
 
+class TestMaxFiles(unittest.TestCase):
+    """#61: --max-files was accepted and silently ignored, and the output had
+    no files_capped field."""
+
+    _FILES = {"pkg/__init__.py": "", **{f"pkg/m{i}.py": "x = 1\n" for i in range(5)}}
+
+    def test_cap_hands_mypy_only_the_first_n_files(self):
+        with TempProject(self._FILES) as root, FakeMypy(_CLEAN_RUN) as fake:
+            result = mod.analyze(str(root / "pkg"), max_files=2, mypy_bin=str(fake.bin))
+            self.assertTrue(result["files_capped"])
+            self.assertEqual(result["files_total"], 6)
+            self.assertEqual(result["files_analyzed"], 2)
+            for call in fake.calls():
+                targets = [a for a in call["argv"] if a.endswith(".py")]
+                self.assertEqual(len(targets), 2)
+                self.assertNotIn(str(root / "pkg"), call["argv"])
+                self.assertIn("--follow-imports=silent", call["argv"])
+
+    def test_uncapped_run_checks_the_directory_and_says_so(self):
+        with TempProject(self._FILES) as root, FakeMypy(_CLEAN_RUN) as fake:
+            result = mod.analyze(str(root / "pkg"), mypy_bin=str(fake.bin))
+            self.assertFalse(result["files_capped"])
+            self.assertEqual(result["files_analyzed"], result["files_total"])
+            for call in fake.calls():
+                self.assertIn(str(root / "pkg"), call["argv"])
+                self.assertNotIn("--follow-imports=silent", call["argv"])
+
+    def test_cap_at_or_above_the_file_count_is_not_capped(self):
+        with TempProject(self._FILES) as root, FakeMypy(_CLEAN_RUN) as fake:
+            result = mod.analyze(str(root / "pkg"), max_files=6, mypy_bin=str(fake.bin))
+            self.assertFalse(result["files_capped"])
+
+    def test_failed_run_still_carries_the_envelope(self):
+        result = mod.analyze(".", mypy_bin="definitely-not-a-real-mypy-binary")
+        self.assertIn("files_capped", result)
+
+
 class TestConfigDiscovery(unittest.TestCase):
     def test_pyproject_without_a_mypy_section_is_not_a_config(self):
         import tempfile

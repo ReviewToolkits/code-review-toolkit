@@ -50,7 +50,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scan_common import emit, find_project_root  # noqa: E402
+from scan_common import (  # noqa: E402
+    build_envelope,
+    discover_python_files,
+    emit,
+    find_project_root,
+)
 
 _MYPY_TIMEOUT = 600
 
@@ -193,7 +198,7 @@ def parse_output(stdout: str) -> tuple[list[dict], dict]:
 
 def _run_mypy(
     mypy_bin: str,
-    target: Path,
+    targets: list[str],
     config: str | None,
     extra: list[str],
     cache_dir: str,
@@ -221,7 +226,7 @@ def _run_mypy(
     if config:
         cmd.extend(["--config-file", config])
     cmd.extend(extra)
-    cmd.append(str(target))
+    cmd.extend(targets)
     env = {**os.environ, "FORCE_COLOR": "0", "MYPY_FORCE_COLOR": "0", "NO_COLOR": "1"}
     try:
         out = subprocess.run(
@@ -279,11 +284,26 @@ def analyze(
     """Run mypy over *target*, plus a labelled --disallow-any-unimported pass."""
     scan_root = Path(target).resolve()
     project_root = find_project_root(scan_root)
+    # --max-files is honoured, not just accepted: a capped run hands mypy the
+    # first N discovered files instead of the directory, with imports followed
+    # silently so errors in the files left out are not reported either. The
+    # envelope's files_capped says the result is partial.
+    files = sorted(discover_python_files(scan_root))
+    files_total = len(files)
+    capped = max_files > 0 and files_total > max_files
+    envelope = build_envelope(
+        project_root, scan_root, files_total, max_files if capped else files_total
+    )
+    if capped:
+        targets = [str(p) for p in files[:max_files]]
+        cap_flags = ["--follow-imports=silent"]
+    else:
+        targets = [str(scan_root)]
+        cap_flags = []
     version = mypy_version(mypy_bin)
     if version is None:
         return {
-            "project_root": str(project_root),
-            "scan_root": str(scan_root),
+            **envelope,
             "status": "FAILED",
             "error": f"mypy not runnable as {mypy_bin!r}",
             "findings": [],
@@ -296,8 +316,9 @@ def analyze(
     try:
         return _analyze_with_cache(
             mypy_bin=mypy_bin,
-            scan_root=scan_root,
-            project_root=project_root,
+            envelope=envelope,
+            targets=targets,
+            cap_flags=cap_flags,
             version=version,
             config=config,
             strict_pass=strict_pass,
@@ -310,15 +331,16 @@ def analyze(
 def _analyze_with_cache(
     *,
     mypy_bin: str,
-    scan_root: Path,
-    project_root: Path,
+    envelope: dict,
+    targets: list[str],
+    cap_flags: list[str],
     version: str,
     config: str | None,
     strict_pass: bool,
     cache_root: str,
 ) -> dict:
     stdout, stderr, returncode = _run_mypy(
-        mypy_bin, scan_root, config, [], os.path.join(cache_root, "baseline")
+        mypy_bin, targets, config, cap_flags, os.path.join(cache_root, "baseline")
     )
     findings, stats = parse_output(stdout)
 
@@ -339,9 +361,9 @@ def _analyze_with_cache(
     if strict_pass and status == "OK":
         s_out, _, _s_rc = _run_mypy(
             mypy_bin,
-            scan_root,
+            targets,
             config,
-            ["--disallow-any-unimported"],
+            [*cap_flags, "--disallow-any-unimported"],
             os.path.join(cache_root, "disallow-any-unimported"),
         )
         strict_findings, strict_stats = parse_output(s_out)
@@ -376,8 +398,7 @@ def _analyze_with_cache(
         by_code[f["code"] or "(none)"] = by_code.get(f["code"] or "(none)", 0) + 1
 
     return {
-        "project_root": str(project_root),
-        "scan_root": str(scan_root),
+        **envelope,
         "status": status,
         "failure_reason": failure_reason,
         "mypy_version": version,
@@ -417,7 +438,12 @@ def main() -> None:
         action="store_true",
         help="skip the labelled --disallow-any-unimported second pass",
     )
-    parser.add_argument("--max-files", type=int, default=0)
+    parser.add_argument(
+        "--max-files",
+        type=int,
+        default=0,
+        help="check only the first N discovered files (files_capped says so)",
+    )
     args = parser.parse_args()
     try:
         result = analyze(
