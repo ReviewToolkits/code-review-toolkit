@@ -1972,6 +1972,39 @@ def _flag_assignments(fn: ast.AST) -> dict[str, list[tuple[int, ast.AST]]]:
     return found
 
 
+# Flags whose TRUE state means "free to proceed": clearing one at entry is the
+# busy state, so an early exit that skips setting it back blocks later calls.
+_PERMISSION_FLAG_WORDS = (
+    "enabled",
+    "idle",
+    "available",
+    "allow",
+    "can_",
+    "accepting",
+)
+
+
+def _flag_polarity_confidence(name: str, entry: object, final: object) -> str | None:
+    """Grade a set/reset pair by which state an early exit leaves behind.
+
+    The shape is a BUSY marker (`busy = True` ... `busy = False`): an early exit
+    leaves the guard blocking. The inverse, `done = False` ... `done = True`, is a
+    COMPLETION marker -- leaving it at the entry value on an error path makes
+    the next call retry, which is the safe state. Returns None for a
+    completion marker.
+    """
+    if bool(entry) and not bool(final):
+        return "high"
+    if not bool(entry) and bool(final):
+        attr = name.rsplit(".", 1)[-1].lower()
+        if any(word in attr for word in _PERMISSION_FLAG_WORDS):
+            return "medium"
+        return None
+    # Two truthy or two falsy values (`state = "running"` ... `"idle"`): the
+    # polarity cannot be read from the constants.
+    return "medium"
+
+
 def _check_flag_not_reset_on_early_exit(tree: ast.AST) -> list[dict]:
     """A guard flag set at entry but reset only on the success path.
 
@@ -2007,6 +2040,13 @@ def _check_flag_not_reset_on_early_exit(tree: ast.AST) -> list[dict]:
             values = {a[1].value.value for a in (assigns[0], assigns[-1])}  # type: ignore[attr-defined]
             if len(values) < 2:
                 continue
+            confidence = _flag_polarity_confidence(
+                name,
+                assigns[0][1].value.value,  # type: ignore[attr-defined]
+                assigns[-1][1].value.value,  # type: ignore[attr-defined]
+            )
+            if confidence is None:
+                continue
             # An exit between them skips the reset.
             exits = [
                 n
@@ -2020,7 +2060,7 @@ def _check_flag_not_reset_on_early_exit(tree: ast.AST) -> list[dict]:
                 _finding(
                     "flag-not-reset-on-early-exit",
                     "FIX",
-                    "high",
+                    confidence,
                     set_node,
                     f"`{name}` is set at line {set_line} but reset only at line "
                     f"{reset_line}; {len(exits)} earlier exit(s) skip the reset",
@@ -2497,6 +2537,15 @@ def _check_duplicated_guard(tree: ast.AST) -> list[dict]:
                 continue
             # Only guards -- a test whose body just raises or returns.
             if not any(isinstance(n, (ast.Raise, ast.Return)) for n in stmt.body):
+                continue
+            # A test that calls something other than a pure helper (`len`,
+            # `isinstance`) is a POLL whose answer changes over time --
+            # `if self._cancelled(job): return` repeated between the steps of a
+            # long job -- not a comparison copied with a stale operand.
+            if any(
+                isinstance(n, ast.Call) and _call_tail(n) not in _PURE_CALLS
+                for n in ast.walk(stmt.test)
+            ):
                 continue
             if key in seen:
                 first = seen[key]

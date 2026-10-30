@@ -896,6 +896,28 @@ class TestFlagNotResetOnEarlyExit(unittest.TestCase):
         )
         self.assertNotIn("flag-not-reset-on-early-exit", shapes(src))
 
+    def test_completion_marker_is_silent(self):
+        # `bootstrapped = False` at entry, `= True` on
+        # success. An early exit leaves it False, so the next call retries --
+        # the safe state, not a wedge.
+        src = (
+            "class Store:\n    def ensure(self):\n        self.bootstrapped = False\n"
+            "        if not self.open_catalog():\n            return\n"
+            "        self.seed()\n        self.bootstrapped = True\n"
+        )
+        self.assertNotIn("flag-not-reset-on-early-exit", shapes(src))
+
+    def test_permission_flag_cleared_at_entry_is_reported(self):
+        # The inverse polarity of a busy flag: `enabled = False` blocks callers.
+        src = (
+            "class C:\n    def go(self):\n        self.enabled = False\n"
+            "        if not self.ready():\n            return\n"
+            "        self.work()\n        self.enabled = True\n"
+        )
+        f = [x for x in scan(src) if x["shape"] == "flag-not-reset-on-early-exit"]
+        self.assertEqual(len(f), 1)
+        self.assertEqual(f[0]["confidence"], "medium")
+
 
 class TestGuardRechecksCallReceiver(unittest.TestCase):
     """idlelib replace.py:214 -- `m = prog.match(..)` then `if not prog:`."""
@@ -1106,6 +1128,30 @@ class TestDuplicatedGuard(unittest.TestCase):
             "    return value\n"
         )
         self.assertNotIn("duplicated-guard-wrong-operand", shapes(src))
+
+    def test_repeated_poll_call_is_silent(self):
+        # A cancellation poll re-checked between the
+        # steps of a long job. Its answer changes over time; nothing was copied.
+        src = (
+            "class S:\n    def run(self, job_id, src):\n"
+            "        if self._cancelled(job_id):\n            return\n"
+            "        rids = self._manifest(src)\n"
+            "        if self._cancelled(job_id):\n            return\n"
+            "        target = self._embedder(src)\n"
+            "        if self._cancelled(job_id):\n            return\n"
+            "        return rids, target\n"
+        )
+        self.assertNotIn("duplicated-guard-wrong-operand", shapes(src))
+
+    def test_repeated_pure_call_guard_is_still_reported(self):
+        # `len()`/`isinstance()` are not polls: the confirmed _pyrepl shape.
+        src = (
+            "def f(data, offset, n):\n    if not isinstance(data, bytes):\n"
+            "        raise TypeError\n    end = offset + n\n"
+            "    if not isinstance(data, bytes):\n        raise TypeError\n"
+            "    return data[offset:end]\n"
+        )
+        self.assertIn("duplicated-guard-wrong-operand", shapes(src))
 
     def test_nested_rebinding_is_silent(self):
         src = (
