@@ -641,6 +641,89 @@ class TestReferencedOnlyFromTests(unittest.TestCase):
         self.assertNotIn("percentiles", test_only)
 
 
+class TestDecoratedTopLevelFunctions(unittest.TestCase):
+    """A registering decorator is how a top-level function is reached."""
+
+    FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/render.py": (
+            "from functools import singledispatch\n"
+            "@singledispatch\n"
+            "def render(value):\n"
+            "    return str(value)\n"
+            "@render.register(int)\n"
+            "@render.register(float)\n"
+            "def _render_number(value):\n"
+            "    return format(value, '.2f')\n"
+            "@staticmethod\n"
+            "def _inert_but_dead():\n"
+            "    return 1\n"
+            "def _plain_dead():\n"
+            "    return 2\n"
+        ),
+        "pkg/app.py": "from pkg.render import render\nprint(render(1.5))\n",
+    }
+
+    def test_singledispatch_overload_is_not_dead(self):
+        with TempProject(self.FILES) as root:
+            out = _run_main(root, root)
+        names = {u["name"] for u in out["unreferenced_symbols"]}
+        self.assertNotIn("_render_number", names)
+        # `render` (@singledispatch) and the overload.
+        self.assertEqual(
+            out["summary"]["functions_excluded_by_reason"], {"decorated": 2}
+        )
+
+    def test_inert_decorator_and_plain_function_are_still_reported(self):
+        with TempProject(self.FILES) as root:
+            out = _run_main(root, root)
+        names = {u["name"] for u in out["unreferenced_symbols"]}
+        self.assertIn("_plain_dead", names)
+        self.assertIn("_inert_but_dead", names)
+
+
+class TestTemplateReferences(unittest.TestCase):
+    """A Jinja template inside the scanned tree is a production reference."""
+
+    FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/run.py": (
+            "class Run:\n"
+            "    def passed(self):\n"
+            "        return True\n"
+            "    def failed(self):\n"
+            "        return False\n"
+            "    def summary(self):\n"
+            "        return ''\n"
+        ),
+        "pkg/report.py": "from pkg.run import Run\nRun().summary()\n",
+        "pkg/views/page.jinja2": (
+            "<p>failed</p>\n{% if run.passed() %}<b>ok</b>{% endif %}\n"
+        ),
+        "tests/test_run.py": (
+            "from pkg.run import Run\n"
+            "def test_run():\n"
+            "    assert Run().passed()\n"
+            "    assert not Run().failed()\n"
+        ),
+    }
+
+    def test_attribute_read_in_a_template_is_a_production_use(self):
+        with TempProject(self.FILES) as root:
+            out = _run_main(root, root / "pkg")
+        test_only = {u["name"] for u in out["referenced_only_from_tests"]}
+        self.assertNotIn("Run.passed", test_only)
+        self.assertEqual(
+            out["summary"]["template_files_scanned"], ["views/page.jinja2"]
+        )
+
+    def test_template_text_outside_blocks_is_not_a_reference(self):
+        # "failed" appears in the HTML, but not inside {{ }} or {% %}.
+        with TempProject(self.FILES) as root:
+            out = _run_main(root, root / "pkg")
+        test_only = {u["name"] for u in out["referenced_only_from_tests"]}
+        self.assertIn("Run.failed", test_only)
+
 if __name__ == "__main__":
     unittest.main()
 

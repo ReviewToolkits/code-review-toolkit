@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scan_common import (  # noqa: E402
+    _is_excluded,
     discover_python_files,
     find_project_root,
 )
@@ -400,10 +401,14 @@ def _framework_classes(all_files: list[dict]) -> set[str]:
 
 
 def _candidates(
-    all_files: list[dict], excluded: dict[str, int] | None = None
+    all_files: list[dict],
+    excluded: dict[str, int] | None = None,
+    excluded_functions: dict[str, int] | None = None,
 ):
     """Yield (file_analysis, symbol, bare_name) for every symbol the dead-code
-    checks may report, counting each method left out in *excluded* by reason.
+    checks may report, counting each method left out in *excluded* by reason,
+    and each top-level function left out by its decorator in
+    *excluded_functions*.
 
     Methods were once skipped wholesale ("too noisy") while the summary still
     read `unreferenced_symbols: 0`. They are now checked, minus the shapes a
@@ -462,6 +467,15 @@ def _candidates(
             # Skip magic methods — called implicitly.
             if sym.get("is_magic"):
                 continue
+            # A registering decorator is how the function is reached:
+            # `@dispatcher.register(list)`, `@app.get("/")`, `@pytest.fixture`.
+            # This exclusion used to apply to methods only, so a top-level
+            # `singledispatch` overload was reported as high-confidence dead.
+            if sym["type"] == "function" and sym.get("decorator_kind"):
+                if excluded_functions is not None:
+                    kind = sym["decorator_kind"]
+                    excluded_functions[kind] = excluded_functions.get(kind, 0) + 1
+                continue
             # Skip test methods — called by test runner.
             if sym.get("is_test_method"):
                 continue
@@ -512,6 +526,7 @@ def find_unreferenced_symbols(
     test_refs: set[str] | None = None,
     doc_refs: set[str] | None = None,
     excluded: dict[str, int] | None = None,
+    excluded_functions: dict[str, int] | None = None,
 ) -> list[dict]:
     """Find functions, classes and methods defined but never referenced anywhere.
 
@@ -528,7 +543,7 @@ def find_unreferenced_symbols(
     )
 
     unreferenced = []
-    for fa, sym, bare_name in _candidates(all_files, excluded):
+    for fa, sym, bare_name in _candidates(all_files, excluded, excluded_functions):
         if bare_name in global_refs:
             continue
         if sym["type"] == "method":
@@ -706,6 +721,38 @@ def find_commented_code(filepath: Path, project_root: Path) -> list[dict]:
     return blocks
 
 
+# Template files read attributes and call helpers by name: `{{ order.total }}`
+# in a Jinja template is a production use no Python file shows.
+_TEMPLATE_SUFFIXES = frozenset({".html", ".htm", ".jinja", ".jinja2", ".j2"})
+_TEMPLATE_BLOCK = re.compile(r"\{\{(.*?)\}\}|\{%(.*?)%\}", re.DOTALL)
+_MAX_TEMPLATE_BYTES = 2_000_000
+
+
+def template_refs(scan_root: Path) -> tuple[set[str], list[str]]:
+    """Identifiers inside `{{ ... }}` and `{% ... %}` blocks of the template
+    files under *scan_root*, and the files read (relative to *scan_root*)."""
+    names: set[str] = set()
+    files: list[str] = []
+    for path in sorted(scan_root.rglob("*")):
+        if path.suffix.lower() not in _TEMPLATE_SUFFIXES or not path.is_file():
+            continue
+        if _is_excluded(path, scan_root):
+            continue
+        try:
+            if path.stat().st_size > _MAX_TEMPLATE_BYTES:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        found = False
+        for match in _TEMPLATE_BLOCK.finditer(text):
+            found = True
+            names |= set(_IDENTIFIER.findall(match.group(1) or match.group(2) or ""))
+        if found:
+            files.append(str(path.relative_to(scan_root)))
+    return names, files
+
+
 # Where references from outside the scanned tree come from, by kind.
 _TEST_SCOPES = ("conftest.py", "tests", "test")
 _DOC_SCOPES = ("doc", "Doc", "docs")
@@ -822,18 +869,24 @@ def main() -> None:
                     continue
                 bucket |= set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", body))
 
+    # Templates inside the scanned tree are production code too.
+    from_templates, template_files = template_refs(scan_root)
+    external_refs |= from_templates
+
     # Find issues (before converting sets to lists).
     unused_imports: list[dict] = []
     for fa in file_analyses:
         unused_imports.extend(find_unused_imports(fa))
 
     excluded_methods: dict[str, int] = {}
+    excluded_functions: dict[str, int] = {}
     unreferenced = find_unreferenced_symbols(
         file_analyses,
         external_refs,
         test_refs=test_refs,
         doc_refs=doc_refs,
         excluded=excluded_methods,
+        excluded_functions=excluded_functions,
     )
     test_only = find_test_only_symbols(
         file_analyses, external_refs, test_refs=test_refs, doc_refs=doc_refs
@@ -883,9 +936,15 @@ def main() -> None:
             "methods_defined": methods_defined,
             "methods_excluded": sum(excluded_methods.values()),
             "methods_excluded_by_reason": dict(sorted(excluded_methods.items())),
+            # Top-level functions left out because a decorator registers them
+            # (`@dispatcher.register`, `@app.get`, `@pytest.fixture`).
+            "functions_excluded_by_reason": dict(sorted(excluded_functions.items())),
             "referenced_only_from_tests": len(test_only),
             "external_reference_scopes": external_scopes,
             "external_reference_scope_kinds": scope_kinds,
+            # Template files (Jinja/HTML) whose `{{ }}`/`{% %}` blocks were read
+            # as production references.
+            "template_files_scanned": template_files,
             "orphan_files": len(orphans),
             "commented_code_blocks": len(commented_code),
             "high_confidence_items": len(high_confidence),
