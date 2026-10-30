@@ -12,7 +12,7 @@ cannot see. The second is your target.
 ## Phase 1 — Run the checker
 
 ```bash
-python <plugin_root>/scripts/check_typing.py [scope]
+python3 <plugin_root>/scripts/check_typing.py [scope]
 ```
 
 **Read `status` before anything else.**
@@ -149,11 +149,14 @@ These rules apply to every script call this agent makes.
 
   ```bash
   d=$(mktemp -d "${TMPDIR:-/tmp}/crt-typing-integrity-auditor.XXXXXX") && echo "$d" &&
-  python <plugin_root>/scripts/check_typing.py [scope] [options] > "$d/out.json" 2> "$d/out.err"; echo "exit=$?"
+  python3 <plugin_root>/scripts/check_typing.py [scope] [options] > "$d/out.json" 2> "$d/out.err"; echo "exit=$?"
   ```
 
   Each Bash call is a fresh shell: a `$$` suffix or a shell variable does not survive into the next
   call. Reuse the literal path `echo` printed.
+- **Running the project's own code** (its tests, a reproducer, an import check): do it in an
+  exported copy, never in the checkout, and set `TMPDIR` to your private directory so the project's
+  own temp files land there instead of a shared `/tmp`.
 - **Forward `--max-files N`** when the caller gave one, and say so in the report whenever the
   envelope's `files_capped` is true.
 - **Check before you read.** A non-zero `exit` or an empty `out.json` means the run did not

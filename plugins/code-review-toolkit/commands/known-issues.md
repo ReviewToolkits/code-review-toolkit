@@ -14,7 +14,7 @@ the findings repo at `<project>/catalog/known_findings.tsv`.
 ## Run it
 
 ```bash
-python <plugin_root>/scripts/check_known_findings.py [scope] --catalog <catalog.tsv>
+python3 <plugin_root>/scripts/check_known_findings.py [scope] --catalog <catalog.tsv>
 ```
 
 Record the commit you checked (`git -C <project> rev-parse --short HEAD`). The catalog was captured
