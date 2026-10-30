@@ -3136,7 +3136,11 @@ def _manual_codec(nodes: list[ast.AST], method: str) -> tuple[str | None, str | 
 
 
 def _check_asymmetric_encode_decode(tree: ast.AST) -> list[dict]:
-    """The same path opened for read and for write with different text codecs.
+    """Two forms: a file and an accessor pair.
+
+    The same path opened for read and for write with different text codecs,
+    and a `_get_X`/`_set_X` (`parse_X`/`format_X`, ...) pair whose decode and
+    encode sides use different codecs (see _check_asymmetric_accessor_pair).
 
     A lenient read (`errors='replace'`) paired with a strict write means the
     program's own round-trip destroys data: the substitution characters the read
@@ -3216,6 +3220,185 @@ def _check_asymmetric_encode_decode(tree: ast.AST) -> list[dict]:
                 detail,
             )
         )
+    out.extend(_check_asymmetric_accessor_pair(tree))
+    return out
+
+
+# Accessor-pair verbs: (decode side, encode side).
+_PAIR_VERBS = (
+    ("get", "set"),
+    ("load", "dump"),
+    ("load", "save"),
+    ("loads", "dumps"),
+    ("read", "write"),
+    ("parse", "format"),
+    ("parse", "serialize"),
+    ("parse", "dump"),
+    ("deserialize", "serialize"),
+    ("decode", "encode"),
+    ("from", "to"),
+    ("unpack", "pack"),
+    ("unescape", "escape"),
+    ("unquote", "quote"),
+)
+# Codec calls by family: (decoders, encoders). Method tails count for `decode`/`encode`.
+_CODEC_FAMILIES = {
+    "json": ({"json.loads", "json.load"}, {"json.dumps", "json.dump"}),
+    "yaml": (
+        {"yaml.safe_load", "yaml.load", "yaml.full_load"},
+        {"yaml.safe_dump", "yaml.dump"},
+    ),
+    "pickle": ({"pickle.loads", "pickle.load"}, {"pickle.dumps", "pickle.dump"}),
+    "toml": ({"tomllib.loads", "tomllib.load", "toml.loads"}, {"toml.dumps"}),
+    "query": (
+        {"urllib.parse.parse_qs", "urllib.parse.parse_qsl", "parse_qs", "parse_qsl"},
+        {"urllib.parse.urlencode", "urlencode"},
+    ),
+    "percent": (
+        {
+            "urllib.parse.unquote",
+            "urllib.parse.unquote_plus",
+            "unquote",
+            "unquote_plus",
+        },
+        {"urllib.parse.quote", "urllib.parse.quote_plus", "quote", "quote_plus"},
+    ),
+    "base64": (
+        {"base64.b64decode", "base64.urlsafe_b64decode"},
+        {"base64.b64encode", "base64.urlsafe_b64encode"},
+    ),
+}
+
+
+def _codec_calls(fn: ast.AST, side: int) -> list[tuple[str, ast.Call]]:
+    """``(family, call)`` for each decoder (*side* 0) or encoder (*side* 1) call."""
+    out: list[tuple[str, ast.Call]] = []
+    for node in _walk_same_scope(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _call_name(node)
+        for family, sides in _CODEC_FAMILIES.items():
+            if name in sides[side]:
+                out.append((family, node))
+        tail = node.func.attr if isinstance(node.func, ast.Attribute) else ""
+        if tail == ("decode", "encode")[side] and not name.startswith(
+            ("base64.", "codecs.")
+        ):
+            out.append(("text", node))
+    return out
+
+
+def _pair_stem(name: str, side: int) -> tuple[str, str] | None:
+    """``(verb, stem)`` when *name* is the decode (0) or encode (1) side of a pair."""
+    bare = name.lstrip("_")
+    for verbs in _PAIR_VERBS:
+        verb = verbs[side]
+        if bare.startswith(verb + "_") and len(bare) > len(verb) + 1:
+            return verb, bare[len(verb) + 1 :]
+    return None
+
+
+def _same_subject(dec_fn: ast.FunctionDef, enc_fn: ast.FunctionDef) -> bool:
+    """`get_x(obj)` / `set_x(obj, value)`: an accessor over an object both take
+    first (not `self`), the setter also taking the new value."""
+    a = [x.arg for x in dec_fn.args.args]
+    b = [x.arg for x in enc_fn.args.args]
+    return bool(a and len(b) > len(a) and a[0] == b[0] and a[0] not in ("self", "cls"))
+
+
+def _codec_args(call: ast.Call) -> tuple[str, ...]:
+    return tuple(ast.unparse(a) for a in call.args) + tuple(
+        sorted(ast.unparse(k) for k in call.keywords)
+    )
+
+
+def _check_asymmetric_accessor_pair(tree: ast.AST) -> list[dict]:
+    """`_get_json_body` parses with json.loads; `_set_json_body` writes with
+    something else -- the pair's round-trip is not the identity."""
+    out: list[dict] = []
+    scopes: list[list[ast.AST]] = [
+        [n for n in getattr(tree, "body", []) if isinstance(n, ast.FunctionDef)]
+    ]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            scopes.append([n for n in node.body if isinstance(n, ast.FunctionDef)])
+    for funcs in scopes:
+        by_name = {f.name: f for f in funcs}
+        for dec_fn in funcs:
+            parsed = _pair_stem(dec_fn.name, 0)
+            if parsed is None:
+                continue
+            verb, stem = parsed
+            prefix = dec_fn.name[: len(dec_fn.name) - len(dec_fn.name.lstrip("_"))]
+            partners = [
+                by_name[prefix + verbs[1] + "_" + stem]
+                for verbs in _PAIR_VERBS
+                if verbs[0] == verb and prefix + verbs[1] + "_" + stem in by_name
+            ]
+            decoders = _codec_calls(dec_fn, 0)
+            if not decoders:
+                continue
+            dec_family, dec_call = decoders[0]
+            for enc_fn in partners:
+                encoders = _codec_calls(enc_fn, 1)
+                if not encoders:
+                    continue
+                families = {fam for fam, _ in encoders}
+                if dec_family not in families:
+                    enc_call = encoders[0][1]
+                    confidence = "medium"
+                    message = (
+                        f"{dec_fn.name}() decodes with {_call_name(dec_call) or 'decode'}() "
+                        f"but {enc_fn.name}() encodes with {_call_name(enc_call) or 'encode'}(): "
+                        f"the pair's round-trip is not the identity"
+                    )
+                else:
+                    enc_call = next(c for fam, c in encoders if fam == dec_family)
+                    if dec_family == "text":
+                        dec_args, enc_args = (
+                            _codec_args(dec_call),
+                            _codec_args(enc_call),
+                        )
+                        if dec_args == enc_args:
+                            continue
+                        lenient = any(
+                            e.strip("'\"") in _LENIENT_ERRORS for e in dec_args
+                        ) or any(
+                            k.arg == "errors"
+                            and isinstance(k.value, ast.Constant)
+                            and k.value.value in _LENIENT_ERRORS
+                            for k in dec_call.keywords
+                        )
+                        confidence = "high" if lenient else "medium"
+                        message = (
+                            f"{dec_fn.name}() decodes with decode({', '.join(dec_args)}) but "
+                            f"{enc_fn.name}() encodes with encode({', '.join(enc_args)})"
+                        )
+                    elif dec_family == "json" and _same_subject(dec_fn, enc_fn):
+                        # An accessor over someone else's object (an HTTP
+                        # message): what it parsed was not this code's own
+                        # output, so re-serializing it rewrites every field.
+                        confidence = "low"
+                        message = (
+                            f"{enc_fn.name}() re-serializes what {dec_fn.name}() parsed with "
+                            f"{_call_name(enc_call)}({', '.join(_codec_args(enc_call))}): "
+                            f"spacing, escaping and number formatting of every field change, "
+                            f"not just the one edited"
+                        )
+                    else:
+                        continue
+                out.append(
+                    _finding(
+                        "asymmetric-encode-decode-pair",
+                        "FIX" if confidence != "low" else "CONSIDER",
+                        confidence,
+                        enc_call,
+                        message,
+                        f"accessor pair {dec_fn.name}() (line {dec_fn.lineno}) / "
+                        f"{enc_fn.name}(): check that set(get(x)) round-trips the bytes "
+                        f"a caller did not mean to change",
+                    )
+                )
     return out
 
 

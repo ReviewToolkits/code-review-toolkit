@@ -1425,6 +1425,53 @@ class TestSignedLengthFromHeader(unittest.TestCase):
         self.assertNotIn("signed-length-from-untrusted-header", shapes(src))
 
 
+class TestAsymmetricAccessorPair(unittest.TestCase):
+    shape = "asymmetric-encode-decode-pair"
+
+    def _found(self, src: str) -> list[dict]:
+        return [f for f in scan(src) if f["shape"] == self.shape]
+
+    def test_get_set_pair_with_different_codecs(self):
+        src = (
+            "import json, pickle\n"
+            "def _get_state(msg):\n    return json.loads(msg.body)\n"
+            "def _set_state(msg, value):\n    msg.body = pickle.dumps(value)\n"
+        )
+        found = self._found(src)
+        self.assertEqual([f["confidence"] for f in found], ["medium"])
+        self.assertIn("_get_state", found[0]["message"])
+
+    def test_lenient_decode_strict_encode_pair(self):
+        src = (
+            "class Note:\n"
+            "    def parse_text(self, raw):\n        return raw.decode('utf-8', errors='replace')\n"
+            "    def format_text(self, text):\n        return text.encode('utf-8')\n"
+        )
+        self.assertEqual([f["confidence"] for f in self._found(src)], ["high"])
+
+    def test_json_accessor_over_a_foreign_object_is_a_low_lead(self):
+        src = (
+            "import json\n"
+            "def _get_json_body(msg):\n    return json.loads(msg.content)\n"
+            "def _set_json_body(msg, value):\n    msg.content = json.dumps(value).encode('utf-8')\n"
+        )
+        self.assertEqual([f["confidence"] for f in self._found(src)], ["low"])
+
+    def test_own_storage_pair_and_matching_codecs_are_silent(self):
+        src = (
+            "import json\n"
+            "class Settings:\n"
+            "    def get_setting(self, key):\n        return json.loads(self.db[key])\n"
+            "    def set_setting(self, key, value):\n"
+            "        self.db[key] = json.dumps(value, sort_keys=True)\n"
+            "def load_blob(raw):\n    return raw.decode('utf-8')\n"
+            "def dump_blob(text):\n    return text.encode('utf-8')\n"
+            "def _load_doc(payload):\n    return json.loads(payload)\n"
+            "def _dump_doc(payload):\n    return json.dumps(payload)\n"
+        )
+        self.assertEqual(self._found(src), [])
+
+
 class TestAsymmetricEncodeDecode(unittest.TestCase):
     """_pyrepl readline.py:443 vs :460 -- lenient read, strict write-back."""
 
