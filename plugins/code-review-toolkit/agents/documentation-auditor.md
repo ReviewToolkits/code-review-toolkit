@@ -162,6 +162,37 @@ Assess inline comments:
 - **TODO/FIXME/HACK**: Categorize and assess age (cross-reference with git blame if possible)
 - **Misleading comments**: Describe behavior that doesn't match the code
 
+### 3b. Suppression comments are claims
+
+`# nosec`, `# noqa`, `# type: ignore`, `# pyright: ignore`, `# pylint: disable` and
+`# pragma: no cover` each say "this rule doesn't apply here, because ...". Linter triage treats
+them as the strongest reason to dismiss a hit, so a wrong one hides a real defect. Work through
+the survey's `suppressions` (each has `tool`, `rules`, `reason`, `code`, `scope`):
+
+1. **`scope: "standalone"`**: the comment sits on a line of its own. bandit, ruff/flake8, mypy
+   and pyright only read it on the flagged line, so it suppresses nothing. If it carries a reason,
+   that reason is still a claim to check.
+2. **Right rule id**: in an export, run the tool with the project's own config on that file and
+   confirm it reports exactly that rule on exactly that line. An id for a different check (a
+   pickle rule over an `eval`, say) means the comment is wrong even when the line is fine.
+3. **Removing it changes the output**: run the tool again without the comment. If nothing new is
+   reported, the suppression is stale. Remove it, so it can't hide a future hit.
+4. **The reason holds**: `reason` usually names a guard ("constrained by the allow-list", "input
+   is constant", "validated above"). Find the guard and check it the way §2b checks a safety
+   claim. A security suppression (`nosec`, ruff `S` rules) whose reason doesn't hold is a FIX, at
+   the severity of the rule it silences.
+5. **`blanket: true`** (no rule id) silences every future error on that line too: CONSIDER, and
+   name the rule it should have been.
+
+A small loop for steps 2 and 3, run in the export:
+
+```bash
+tool_out() { bandit -q -f custom --msg-template '{line} {test_id}' "$1"; }   # or: ruff check --output-format concise
+cp "$f" "$f.orig" && tool_out "$f" > with.txt
+sed -i "${line}s/#\s*nosec[^#]*//" "$f" && tool_out "$f" > without.txt; mv "$f.orig" "$f"
+diff with.txt without.txt   # no difference: the comment suppresses nothing
+```
+
 ### 4. Docstring Style Consistency
 
 Check whether docstrings follow a consistent style:
