@@ -68,6 +68,37 @@ PINNED_RUFF_VERSION = "0.16.0"
 
 _RUFF_TIMEOUT = 300
 
+# ruff reports a file it could not read on stderr only -- "warning: Failed to
+# lint <path>: <reason>" -- and still exits 0 with an empty result. A
+# confined ruff (the snap package cannot see /tmp) therefore prints "All
+# checks passed!" for a tree it never read. That must be an error.
+_FAILED_TO_LINT = re.compile(r"Failed to lint (?P<path>.+?): (?P<reason>.+)$")
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def unlinted_paths(stderr: str) -> list[dict]:
+    """Every ``Failed to lint`` warning on ruff's stderr, as {path, reason}."""
+    found = []
+    for line in _ANSI.sub("", stderr or "").splitlines():
+        match = _FAILED_TO_LINT.search(line)
+        if match:
+            found.append(
+                {"path": match.group("path"), "reason": match.group("reason").strip()}
+            )
+    return found
+
+
+def unlinted_error(unlinted: list[dict]) -> str | None:
+    """The error message for a run that skipped files, or None."""
+    if not unlinted:
+        return None
+    return (
+        f"ruff could not read {len(unlinted)} path(s) (see `unlinted`); the "
+        "result is incomplete, not clean. A sandboxed ruff (e.g. the snap "
+        "package) cannot read some directories: pass a different binary."
+    )
+
+
 # ---------------------------------------------------------------------------
 # The tiers. These were measured once and then lost; they live here now so a
 # future run reproduces rather than re-derives them.
@@ -621,6 +652,9 @@ def analyze(
     merged = [f for f in findings if f["shape_id"]]
     suppressed = [f for f in findings if f["has_suppression_comment"]]
 
+    unlinted = unlinted_paths(stderr) + unlinted_paths(preview_stderr)
+    error = error or unlinted_error(unlinted)
+
     return {
         "project_root": str(project_root),
         "scan_root": str(scan_root),
@@ -636,6 +670,9 @@ def analyze(
         # Remapped and preview-gated codes warn on stderr and nowhere else.
         "stderr": (stderr + preview_stderr).strip(),
         "error": error,
+        # Paths ruff reported it could not read ("Failed to lint"). Non-empty
+        # means `error` is set: their absence of findings is not a clean result.
+        "unlinted": unlinted,
         "summary": {
             # Every hit ruff returned, dismissed ones included (the calibrated
             # number); `reported` is what is left in `findings` to triage.

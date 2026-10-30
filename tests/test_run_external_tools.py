@@ -1136,6 +1136,54 @@ class TestBuildSkippedReport(unittest.TestCase):
         self.assertEqual(reasons["coverage"], "not installed")
 
 
+FAKE_RUFF = """\
+#!{python}
+import sys
+
+if {fail}:
+    # What a sandboxed (snap) ruff prints for a path it cannot see.
+    sys.stderr.write(
+        "warning: Failed to lint " + sys.argv[-1] + ": No such file or directory"
+        " (os error 2)\\n"
+    )
+sys.stdout.write("[]")
+"""
+
+
+class TestUnlintedPaths(unittest.TestCase):
+    """ruff exits 0 with no findings for a path it could not read."""
+
+    def _run(self, *, fail):
+        import sys
+        import tempfile
+
+        with (
+            tempfile.TemporaryDirectory() as bindir,
+            TempProject({"m.py": "x = 1\n"}) as root,
+        ):
+            ruff = Path(bindir) / "ruff"
+            ruff.write_text(
+                FAKE_RUFF.format(python=sys.executable, fail=fail), encoding="utf-8"
+            )
+            os.chmod(ruff, 0o755)
+            path = bindir + os.pathsep + os.environ.get("PATH", "")
+            with patch.dict(os.environ, {"PATH": path}):
+                return mod.run_ruff(mod.parse_args([str(root)]), root, root)
+
+    def test_failed_to_lint_is_an_error_not_a_clean_result(self):
+        out = self._run(fail=True)
+        self.assertIn("could not read", out["error"])
+        self.assertEqual(len(out["unlinted"]), 1)
+        self.assertIn("could not read", out["toolkit_pass"]["error"])
+        self.assertEqual(len(out["toolkit_pass"]["unlinted"]), 1)
+
+    def test_a_clean_run_has_no_error(self):
+        out = self._run(fail=False)
+        self.assertNotIn("error", out)
+        self.assertEqual(out["unlinted"], [])
+        self.assertNotIn("error", out["toolkit_pass"])
+
+
 VULTURE_OUTPUT = """\
 pkg/a.py:3: unused import 'os' (90% confidence)
 pkg/a.py:10: unused method '_open_writer' (60% confidence)

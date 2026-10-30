@@ -33,6 +33,8 @@ from run_lint_rules import (  # noqa: E402
     detect_target_version,
     dismissal_reason,
     except_closure_annotation,
+    unlinted_error,
+    unlinted_paths,
 )
 from scan_common import (  # noqa: E402
     find_project_root,
@@ -417,7 +419,8 @@ def run_ruff(
 
     cmd.append(str(scan_root))
 
-    findings = _run_ruff_json(cmd)
+    findings, stderr = _run_ruff_json(cmd)
+    unlinted = unlinted_paths(stderr)
 
     closures: dict = {}
     normalized = [
@@ -433,7 +436,7 @@ def run_ruff(
         args, project_root, scan_root, normalized, closures,
     )
 
-    return {
+    output = {
         "config_source": config_source,
         "rules_applied": _extract_rules_applied(findings),
         "total_findings": len(findings),
@@ -447,18 +450,25 @@ def run_ruff(
         # `findings` with `selection: "toolkit"`; `total_findings` and
         # `rules_applied` above describe the project's own pass only.
         "toolkit_pass": toolkit_pass,
+        # Paths ruff could not read ("Failed to lint" on stderr, exit 0).
+        "unlinted": unlinted,
         "findings": normalized + toolkit_findings,
     }
+    if unlinted:
+        # Never a clean result: those files were not linted at all.
+        output["error"] = unlinted_error(unlinted)
+    return output
 
 
-def _run_ruff_json(cmd: list[str]) -> list[dict]:
+def _run_ruff_json(cmd: list[str]) -> tuple[list[dict], str]:
     result = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
         timeout=_TOOL_TIMEOUTS["ruff"],
     )
-    return json.loads(result.stdout) if result.stdout else []
+    findings = json.loads(result.stdout) if result.stdout else []
+    return findings, result.stderr or ""
 
 
 def run_ruff_toolkit_pass(
@@ -518,11 +528,14 @@ def run_ruff_toolkit_pass(
     cmd.append(str(scan_root))
 
     try:
-        raw = _run_ruff_json(cmd)
+        raw, stderr = _run_ruff_json(cmd)
     except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
         meta["error"] = f"toolkit ruff pass failed: {exc}"
         return [], meta
     meta["ran"] = True
+    meta["unlinted"] = unlinted_paths(stderr)
+    if meta["unlinted"]:
+        meta["error"] = unlinted_error(meta["unlinted"])
 
     seen = {(f["rule"], f["file"], f["line"], f["column"]) for f in project_findings}
     added: list[dict] = []

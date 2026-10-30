@@ -303,5 +303,76 @@ class TestMissingRuff(unittest.TestCase):
         self.assertEqual(result["findings"], [])
 
 
+FAKE_RUFF = """\
+#!{python}
+import sys
+
+args = sys.argv[1:]
+if args[:1] == ["--version"]:
+    print("ruff 0.16.0")
+elif args[:1] == ["rule"]:
+    print("[]")
+else:
+    if {fail}:
+        # What a sandboxed (snap) ruff prints for a path it cannot see.
+        sys.stderr.write(
+            "warning: Failed to lint " + args[-1] + ": No such file or directory"
+            " (os error 2)\\n"
+        )
+    sys.stdout.write("[]")
+"""
+
+
+def write_fake_ruff(directory, *, fail):
+    """An executable `ruff` in *directory*; *fail* makes it skip every path."""
+    import os
+    import sys
+    from pathlib import Path
+
+    path = Path(directory) / "ruff"
+    path.write_text(
+        FAKE_RUFF.format(python=sys.executable, fail=fail), encoding="utf-8"
+    )
+    os.chmod(path, 0o755)
+    return path
+
+
+class TestUnlintedPaths(unittest.TestCase):
+    """ruff exits 0 with no findings for a path it could not read."""
+
+    def _analyze(self, *, fail):
+        import tempfile
+
+        from helpers import TempProject
+
+        with (
+            tempfile.TemporaryDirectory() as bindir,
+            TempProject({"m.py": "x = 1\n"}) as root,
+        ):
+            ruff = write_fake_ruff(bindir, fail=fail)
+            return mod.analyze(str(root), ruff_bin=str(ruff)), root
+
+    def test_failed_to_lint_is_an_error_not_a_clean_result(self):
+        result, root = self._analyze(fail=True)
+        self.assertIn("could not read", result["error"])
+        self.assertEqual(result["unlinted"][0]["path"], str(root.resolve()))
+        self.assertIn("No such file", result["unlinted"][0]["reason"])
+
+    def test_a_clean_run_has_no_error(self):
+        result, _ = self._analyze(fail=False)
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["unlinted"], [])
+
+    def test_parses_coloured_and_plain_warnings(self):
+        stderr = (
+            "\x1b[33mwarning\x1b[0m: Failed to lint /a/b.py: Permission denied\n"
+            "warning: Selection `X` has no effect\n"
+        )
+        self.assertEqual(
+            mod.unlinted_paths(stderr),
+            [{"path": "/a/b.py", "reason": "Permission denied"}],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

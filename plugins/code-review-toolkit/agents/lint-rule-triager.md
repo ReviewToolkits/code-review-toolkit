@@ -32,6 +32,7 @@ likely-defects and strong smells; run it only when tier 1 is exhausted or the us
 | `rule_validation.preview_gated` non-empty | Those rules **silently did nothing**. Their absence from the findings is not evidence of absence in the code. |
 | `stderr` non-empty | Remapped codes and no-effect selections warn here and nowhere else. Read it. |
 | `error` non-null | The run is incomplete. An incomplete lint pass reported as clean is worse than no pass. |
+| `unlinted` non-empty | ruff could not read those paths ("Failed to lint" on stderr), and it still exits 0 with no findings. A sandboxed ruff, such as the snap package, cannot read `/tmp`. `error` is set. Re-run with `--ruff-bin` pointing at a different ruff; never report those paths as clean. |
 
 ## Phase 2 — Merge, do not double-report
 
