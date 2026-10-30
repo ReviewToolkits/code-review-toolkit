@@ -52,6 +52,8 @@ Filter the ruff output for `category: "dead-code"` findings:
 
 **Auto-fixable findings** (significance: "reduced"): ruff can auto-fix `F401` and some `F841` findings. Include these but classify as CONSIDER rather than FIX unless our script also flags them with high confidence (in which case classify as FIX — the double detection increases confidence).
 
+**Never recommend the F841 autofix on an `except ... as NAME` binding without reading the handler.** If NAME is used inside a lambda or nested def in that handler, the linter is wrong (it doesn't see the closure use; ruff reports a matching F821 there), and the autofix deletes `as NAME`, turning the error path into a `NameError`. Report these as false positives, and as a hazard if the project runs `--fix` anywhere (shape `linter-autofix-breaks-closure-capture`). The same caution applies to any "unused" name whose only use is in a closure.
+
 ### Vulture Findings
 
 Filter vulture output for all findings:

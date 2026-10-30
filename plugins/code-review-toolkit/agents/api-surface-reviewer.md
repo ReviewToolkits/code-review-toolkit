@@ -94,6 +94,27 @@ Evaluate:
 - **Concept mapping**: Do API concepts map naturally to user mental models?
 - **Progressive complexity**: Can users start simple and learn advanced features incrementally?
 
+### 6b. One operation through every transport
+
+When the same API is reachable several ways (an HTTP API and its SDK, a remote client and an
+embedded/local client, a CLI and a library call, sync and async variants), **run the same
+operation through each and diff the results**: status/exception types, return shapes, defaults,
+validation, pagination, error messages. Write one small script that drives the operation through
+each transport in-process (e.g. the SDK over a test client and over the embedded client) and
+prints the differences. Transport divergence is where API defects concentrate, because each
+transport is tested on its own and nobody compares them.
+
+### 6c. REST/OpenAPI surface (if applicable)
+
+For an HTTP API, compare the documented contract (OpenAPI schema, docs) with behavior:
+- Documented vs actual status codes and error envelopes, especially for validation and not-found
+  errors.
+- Path-parameter and field naming consistency across routes.
+- Unknown request-body fields: silently ignored, or rejected? (Silently ignored typos are a
+  user-facing defect.)
+- Response-model changes that only break **generated clients** (a field becoming optional, an enum
+  gaining a value): a breaking-change category of its own.
+
 ### 7. Breaking Change Classification
 
 When recommending API changes, classify each as:
@@ -102,7 +123,9 @@ When recommending API changes, classify each as:
 - **Additive**: Extends the API without affecting existing calls. Existing user code continues to work unchanged. Examples: adding an optional parameter with a default, adding a new function, adding a type alias.
 - **Deprecation**: Marks existing API as deprecated while maintaining backward compatibility. Existing code works but produces warnings. Should include a migration path and timeline.
 
-Tag each recommendation with `[breaking]`, `[additive]`, or `[deprecation]` so the cost of each change is immediately visible.
+- **Breaks generated clients only**: hand-written callers keep working, but clients generated from the schema (OpenAPI codegen, typed SDKs) fail to compile or deserialize. Examples: a new enum value, a field becoming nullable, a renamed schema component.
+
+Tag each recommendation with `[breaking]`, `[breaks-generated-clients]`, `[additive]`, or `[deprecation]` so the cost of each change is immediately visible.
 
 ## Output Format
 

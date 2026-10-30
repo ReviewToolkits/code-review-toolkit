@@ -85,6 +85,20 @@ Look for patterns that indicate debt without explicit markers:
 - **Magic numbers/strings**: Unexplained literal values that should be constants
 - **Overly permissive permissions**: File operations without explicit mode, broad exception catching noted as temporary
 
+### Dependency Debt
+
+- **Unbounded dependencies combined with reliance on internals**: a dependency declared without an
+  upper bound, while the project subclasses its classes, imports its private modules (`_internal`,
+  leading-underscore names) or patches it at runtime. That breaks on a routine upgrade; check
+  whether it already has (run the import, or the tests, against the latest release).
+- **Runtime deprecations**: APIs the code calls that the installed Python or libraries already
+  deprecate. If the test suite can run (in an exported copy), run it once with
+  `python -W error::DeprecationWarning -m pytest` (or `-W default` and bucket the warnings) and
+  list each deprecated call with the version that removes it.
+- **Tracker keys as debt**: projects that track work by keys (`ABC-123`, `B92`) in a roadmap file
+  and cite them in code comments carry debt in that form; resolve each cited key's status rather
+  than counting only TODO markers.
+
 ### Structural Debt
 
 Higher-level debt that appears as patterns:

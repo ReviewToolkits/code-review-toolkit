@@ -39,6 +39,21 @@ For documented code, verify accuracy:
 - Do references to other functions/classes still exist?
 - Do described behaviors match the actual implementation?
 
+### 2b. Concurrency and availability claims
+
+Docstrings and comments in threaded or async code make promises that tests rarely check:
+"lock-free", "called with the lock held", "thread-safe", "does not block the event loop", "other
+collections keep serving during X", "safe to call concurrently", "idempotent". Each is a testable
+claim and, in practice, one of the most productive places to look:
+
+- For "called with the lock held": find every caller and check it holds the lock.
+- For "does not block" / "keeps serving": follow the call to any lock or blocking call it reaches,
+  and ask who else holds that lock and for how long.
+- For "thread-safe": find the shared state and check every access is guarded.
+
+A claim the code doesn't keep is a FIX when callers rely on it. Where you can, force the
+interleaving to check it (see `docs/reproduction-convention.md`).
+
 ### 3. Comment Quality
 
 Assess inline comments:

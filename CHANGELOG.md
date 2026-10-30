@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Enhanced — agent prompts, from a full review of a threaded application
+
+- **silent-failure-hunter**: correct ruff codes (`S110`/`SIM105` are try-except-pass, `B025` is a
+  duplicate handler, `S101` is `assert` and not a FIX), a note that the rules it can see depend on
+  the selection that ran, a new step for handlers and `finally` blocks that *raise* (cleanup that
+  triggers a rollback, side channels in `finally`, `CancelledError` bypassing `except Exception`),
+  plain-text severity labels, and `Status` / `Failure scenario` / `Guarded twin` fields.
+- **dead-code-finder** and **silent-failure-hunter** never recommend the F841 autofix on an
+  `except ... as NAME` used by a closure.
+- **architecture-mapper** tests each cycle member's import in a fresh interpreter instead of
+  guessing whether a cycle crashes.
+- **pattern-consistency-checker** checks whether a fix reached every sibling implementation, and
+  diffs producer/consumer maps; **consistency-auditor** compares close siblings' *behavior*
+  (offloading, locking, validation, cleanup).
+- **documentation-auditor** treats concurrency and availability claims in docstrings as testable.
+- **api-surface-reviewer** runs one operation through every transport and diffs the results, audits
+  the REST/OpenAPI surface, and has a `breaks-generated-clients` change class.
+- **project-docs-auditor** audits Dockerfiles, compose files, `*.example`, Makefiles and CI
+  configuration, and no longer assumes `pyproject.toml` holds the metadata.
+- **tech-debt-inventory** covers dependency debt (no upper bound plus reliance on internals,
+  runtime deprecations, tracker keys).
+- **test-coverage-analyzer** no longer assumes `unittest` (a leftover from an earlier target) and
+  recommends measured coverage of other agents' FIX paths; **type-design-analyzer** reports
+  annotation accuracy as "not measured" without mypy data; **git-history-analyzer** annotates every
+  FIX in explore runs and checks unmerged branches.
+- **explore** requires a `status` and a failure scenario on every finding, from every agent.
+
 ### Enhanced
 
 - **`explore` runs into a run directory, and its synthesis consolidates, re-anchors and

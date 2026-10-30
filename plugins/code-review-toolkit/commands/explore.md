@@ -160,6 +160,11 @@ Based on the requested aspects (default: all), launch the appropriate agents. Ea
 - The architecture-mapper output as structural context
 - The git-history-context output as temporal context
 - Any relevant CLAUDE.md content
+- Its report path and artifacts directory in the run directory, and the run-directory rules
+- This requirement, whatever the agent's own template says: **every finding carries a `status`**
+  (`reproduced`, `confirmed` or `candidate`, per `docs/reproduction-convention.md`) **and a
+  concrete failure scenario** (inputs or interleaving → wrong outcome). A finding without one is a
+  candidate, and the consolidation step treats it as such.
 
 **Agent dispatch order** (sequential by default):
 

@@ -233,7 +233,8 @@ For each:
 - **Recent history is more relevant**: Weight the last 30 days more heavily than the 60-90 day range. Recent fixes are more likely to have propagation targets.
 - **Truncated diffs are not enough**: For fix completeness and similar bug detection, if the diff in the script output is truncated, run `git show HASH` to get the full picture before making a judgment.
 - **Cross-reference generously**: This agent's unique value is combining temporal data with other agents' output. Always cross-reference when data is available.
-- **Cap output**: Max 10 fix-completeness findings, 10 similar-bug findings, 5 feature findings, 15 risk matrix entries, 10 historical annotations, 10 coupling pairs.
+- **Cap output**: Max 10 fix-completeness findings, 10 similar-bug findings, 5 feature findings, 15 risk matrix entries, 10 historical annotations, 10 coupling pairs in the summary. When run as part of `explore` with a run directory, annotate **every** confirmed FIX finding from the other agents in your report file (introducing commit, related fixes, unmerged branches touching it): the consolidation step needs them all.
+- **Unmerged branches are history too**: list them (`git branch -r --no-merged origin/HEAD`) and check `git log origin/HEAD..<branch>` for fixes to the code other agents flagged. A fix that exists on an unmerged branch changes how a finding is reported.
 
 ### Classification Guide
 - **FIX**: Incomplete fix with remaining bug, same bug pattern found elsewhere with high confidence, or new feature with a clear bug

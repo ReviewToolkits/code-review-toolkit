@@ -26,8 +26,14 @@ Filter the ruff output for `category: "bug-risk"` and `category: "security"` fin
 - **`B006`** (mutable default argument): `def f(x=[])` — a classic Python bug where the default list is shared across calls. Classify as FIX.
 - **`B007`** (unused loop variable): Loop variable never used in the body — may indicate a logic error. Classify as CONSIDER.
 - **`B017`** (assertRaises with no match): `assertRaises(Exception)` is too broad for tests. Classify as CONSIDER.
-- **`B025`** (try-except-pass): Empty except block — directly relevant to this agent's core mission. Classify as FIX.
-- **`S` rules** (security): Hardcoded passwords, insecure hashing, SQL injection patterns. Classify as FIX for high-confidence rules (S101, S105, S106), CONSIDER for others.
+- **`S110`** (try-except-pass) and **`SIM105`** (use `contextlib.suppress`): an empty except block — directly relevant to this agent's core mission. Judge each: FIX when it hides a failure the caller needed to know about.
+- **`BLE001`** (blind `except Exception`): the raw material for "caught too broadly"; triage by what the handler does with the failure, not by the catch itself.
+- **`B025`** (duplicate exception in one `try`): the second handler for the same exception is dead code. CONSIDER, or FIX if the dead handler was the one meant to run.
+- **`S` rules** (security): hardcoded credentials (S105, S106, S107), `pickle`/`marshal` loads of untrusted data (S301, S302), `shell=True` (S602), SQL built by string formatting (S608). FIX when the input can be attacker-controlled; CONSIDER otherwise. **`S101` is `assert` usage** — a policy question, not a defect, except where the assert is the only runtime validation (it vanishes under `python -O`).
+
+**Which rules can appear at all** depends on the selection `run_external_tools.py` ran: the project's own ruff configuration, plus the toolkit's curated bug-risk/security pass when the project's selection is narrow. If the `bug-risk` category is empty, check the output's selection before concluding the code is clean. When a `lint-rule-triager` report exists for the same run, use its tiered output instead of re-triaging the raw hits.
+
+**F821 on an `except ... as NAME` binding used inside a lambda or nested def** is a known false positive (the name is in scope there), not an undefined name. The F841 on the same handler has an autofix that deletes `as NAME` and breaks the closure: never recommend it (shape `linter-autofix-breaks-closure-capture`).
 
 **Auto-fixable findings** (significance: "reduced"): Most B and S rules are NOT auto-fixable, so significance is usually "normal". When it is "reduced", still report the finding but note it's a simpler issue.
 
@@ -64,26 +70,26 @@ For each error handling site, classify it:
 
 **Severity levels:**
 
-🔴 **CRITICAL** — Error is completely silenced:
+**CRITICAL** — Error is completely silenced:
 - Bare `except:` or `except Exception:` with `pass` or no action
 - `except` blocks that only log at DEBUG level
 - Context managers that return True from `__exit__` (suppress all exceptions)
 - Functions that catch and return a default value without logging or indication
 
-🟡 **HIGH** — Error is poorly handled:
+**HIGH** — Error is poorly handled:
 - Exception caught too broadly (catches more than intended)
 - Error logged but user receives no indication of failure
 - Fallback behavior that masks the real problem
 - Exception caught, logged, but wrong information logged (e.g., missing traceback)
 - Re-raising a different exception without chaining (`raise X` instead of `raise X from e`)
 
-🟠 **MEDIUM** — Error handling could be improved:
+**MEDIUM** — Error handling could be improved:
 - Missing error handling on operations that can reasonably fail
 - Error message is generic/unhelpful ("An error occurred")
 - Exception type hierarchy is inappropriate (catching parent when child is expected)
 - Logging at wrong level (logError for recoverable, logDebug for critical)
 
-🟢 **LOW** — Minor improvements possible:
+**LOW** — Minor improvements possible:
 - Error handling is functional but could be more specific
 - Exception message could include more context
 - Finally blocks that could be context managers
@@ -153,6 +159,26 @@ def get_items():
         return  # May mask bugs in source() that raise StopIteration incorrectly
 ```
 
+### Step 3b: What if the handler itself raises?
+
+The most damaging error-handling defects are often not swallowed exceptions but handlers, `finally`
+blocks and cleanup code that **raise the wrong thing**. For every handler and every `finally`, ask
+what happens if a statement *inside it* raises:
+
+- **Cleanup inside the `try` whose `except` rolls back** (`cleanup-inside-try-triggers-rollback`):
+  post-success cleanup (`rmtree` of a backup, temp-file removal) as the last statement of the `try`
+  turns a cleanup failure into a rollback of the success.
+- **Side channels in `finally`** (`side-channel-raise-in-finally`): logging, metrics or audit
+  writes that can raise replace the function's result, or the exception that was propagating.
+- **Names bound only on some paths** used in the handler (`UnboundLocalError` masking the real
+  error).
+- **Exceptions that `except Exception` doesn't catch.** `asyncio.CancelledError`,
+  `KeyboardInterrupt` and `SystemExit` are `BaseException`s: a release, rollback or slot return
+  placed in `except Exception:` (or only on the success path) never runs for them.
+
+Reproduce environmental failures cheaply where you can: a read-only directory (`chmod 0555`) for
+undeletable files, `/dev/full` as a log or output path for "disk full".
+
 ### Step 4: Assess Impact
 
 For each finding, consider:
@@ -179,10 +205,12 @@ For each finding, consider:
 
 For each:
 - **Location**: file:line
+- **Status**: reproduced | confirmed | candidate (see `docs/reproduction-convention.md`)
 - **Pattern**: [What the code does]
 - **Problem**: [Why this is dangerous]
 - **Hidden errors**: [Specific exception types that could be silently caught]
-- **User impact**: [What the user experiences when this fails silently]
+- **Failure scenario**: [Concrete trigger → what the user experiences]
+- **Guarded twin**: [Where the project already handles the same case correctly, if anywhere]
 - **Fix**: [Specific code change needed]
 
 ## High Severity Issues
@@ -211,7 +239,7 @@ For each:
 - **Context matters**: A broad except in a CLI entry point (catching and displaying errors) is very different from a broad except in a library function (hiding bugs). Use architecture-mapper output to calibrate severity.
 - **Not all catching is bad**: Sometimes catching broadly and logging is the right thing — in top-level handlers, cleanup code, and logging utilities. Assess intent, not just pattern.
 - **Python-specific**: Python's exception model has unique pitfalls (bare except catching SystemExit, StopIteration semantics, exception chaining). Flag these specifically.
-- **Cap output**: Report at most 10 critical, 10 high, and 15 medium issues. If there are more, note the total count and offer to provide the full list.
+- **Cap output**: Report at most 10 critical, 10 high, and 15 medium issues in the summary. If there are more, note the total count. When run as part of `explore` with a run directory, write **every** critical and high finding to your report file: the consolidation step needs them all.
 - **Be actionable**: Every finding should include a specific fix, not just "handle this error better."
 
 ### Classification Guide
