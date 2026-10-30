@@ -2323,6 +2323,121 @@ def _check_falsy_check_for_none_default(tree: ast.AST) -> list[dict]:
     return out
 
 
+# Attribute segments that name an inherited or fallback source of a value.
+_INHERIT_SEGMENTS = frozenset(
+    {
+        "parent",
+        "parents",
+        "base",
+        "defaults",
+        "default",
+        "inherited",
+        "outer",
+        "enclosing",
+        "ancestor",
+        "global_settings",
+        "settings",
+    }
+)
+
+
+def _falsy_get_default(node: ast.AST) -> ast.AST | None:
+    """`d.get(k, 0)` / `d.get(k, False)` / `d.get(k, "")`: the falsy default."""
+    if isinstance(node, ast.Call) and node.args and not node.keywords:
+        node_func = node.func
+        if (
+            isinstance(node_func, ast.Attribute)
+            and node_func.attr == "get"
+            and len(node.args) == 2
+        ):
+            default = node.args[1]
+            if isinstance(default, ast.Constant) and default.value in (0, "", False):
+                return default
+            if isinstance(default, (ast.List, ast.Dict, ast.Tuple)) and not (
+                default.elts if not isinstance(default, ast.Dict) else default.keys
+            ):
+                return default
+    return None
+
+
+def _inherits(node: ast.AST) -> bool:
+    """`self.parent.delay`, `defaults.timeout`, `getattr(self.parent, k, 0)`:
+    a value read from a fallback scope."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "getattr"
+        and node.args
+    ):
+        return any(
+            p in _INHERIT_SEGMENTS for p in _dotted_name(node.args[0]).split(".")
+        )
+    parts = _dotted_name(node).split(".")
+    return len(parts) >= 2 and any(p in _INHERIT_SEGMENTS for p in parts[:-1])
+
+
+def _check_falsy_or_inheritance(tree: ast.AST) -> list[dict]:
+    """`own = spec.get(K, 0)` then `own or inherited`: an explicit 0 can't override.
+
+    The `or` cannot tell an explicit falsy override (0, False, '') from
+    "unset", so a child can never turn an inherited setting off.
+    """
+    out: list[dict] = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+            continue
+        # `own = spec.get(K, 0)` earlier in the same scope.
+        from_get: dict[str, ast.AST] = {}
+        for node in _walk_same_scope(fn):
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+            ):
+                default = _falsy_get_default(node.value)
+                if default is not None:
+                    from_get[node.targets[0].id] = default
+        for node in _walk_same_scope(fn):
+            if not isinstance(node, ast.BoolOp) or not isinstance(node.op, ast.Or):
+                continue
+            first, rest = node.values[0], node.values[1:]
+            default = _falsy_get_default(first)
+            if default is None and isinstance(first, ast.Name):
+                default = from_get.get(first.id)
+            inherited = any(_inherits(v) for v in rest)
+            if default is None and not (
+                inherited and isinstance(first, (ast.Name, ast.Attribute))
+            ):
+                continue
+            numeric = default is not None and (
+                isinstance(default, ast.Constant)
+                and default.value is not None
+                and not isinstance(default.value, str)
+            )
+            if default is not None and inherited:
+                confidence = "high"
+            elif numeric:
+                confidence = "medium"
+            else:
+                confidence = "low"
+            own = ast.unparse(first)
+            out.append(
+                _finding(
+                    "falsy-or-inheritance",
+                    "CONSIDER" if confidence == "low" else "FIX",
+                    confidence,
+                    node,
+                    f"`{own} or ...` treats an explicit falsy value "
+                    f"({ast.unparse(default) if default is not None else '0, False, empty'}) "
+                    f"as unset, so it can never override the fallback",
+                    "use `x if x is not None else fallback` with a None default, or "
+                    "`spec[k] if k in spec else fallback`; fine when a falsy value "
+                    "documentedly means 'inherit'",
+                )
+            )
+    return out
+
+
 # unittest assertion methods whose arguments decide whether a test can fail.
 _ASSERT_PREFIXES = ("assert", "failUnless", "failIf")
 _FIXTURE_NAMES = frozenset(
@@ -4174,6 +4289,7 @@ _CHECKS = {
     "flag-not-reset-on-early-exit": _check_flag_not_reset_on_early_exit,
     "guard-rechecks-call-receiver": _check_guard_rechecks_call_receiver,
     "falsy-check-for-none-default": _check_falsy_check_for_none_default,
+    "falsy-or-inheritance": _check_falsy_or_inheritance,
     "test-cannot-fail": _check_test_cannot_fail,
     "self-referential-accumulate": _check_self_referential_accumulate,
     "duplicated-guard-wrong-operand": _check_duplicated_guard,

@@ -444,6 +444,23 @@
       "detectability": "implemented"
     },
     {
+      "id": "falsy-or-inheritance",
+      "title": "`own or inherited` where `own` came from `.get(k, 0)`: an explicit falsy override is read as unset",
+      "agent": "python-pitfall-scanner",
+      "severity": "FIX",
+      "pattern": "`own = spec.get(K, 0)` (or any falsy default) followed by `own or inherited` / `int(own or parent.K)`, or `x or self.parent.x` directly. An explicit falsy override (0, '', False, []) is indistinguishable from 'unset', so a child scope can never turn an inherited setting off or down to zero.",
+      "guarded_twin": "`spec[K] if K in spec else inherited`, or a None sentinel: `own = spec.get(K)` then `own if own is not None else inherited`.",
+      "hunt": "Every `x or parent_value` / `x or self.parent.attr` in tree- or scope-inheritance code (config layers, nested specs, CLI over file over defaults). Also settings merges that drop only `None` while a CLI parser supplies `False`/`0` defaults for flags the user never passed: there the falsy value wins instead.",
+      "expected": "an explicit 0/False in a child overrides the parent.",
+      "caught_as": "SILENT: the parent's value is used (`delay: 0` in a child still waits the parent's delay).",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [],
+      "differential": "Fine when a falsy value is documented to mean 'inherit', or when the value is a string where '' genuinely means unset. A `.get(k)` with no default (None) or `x or 'literal'` alone is not flagged.",
+      "detected_by": "scan_python_pitfalls.py",
+      "detectability": "implemented"
+    },
+    {
       "id": "test-cannot-fail",
       "title": "A test that passes regardless of what the code under test does",
       "agent": "python-pitfall-scanner",

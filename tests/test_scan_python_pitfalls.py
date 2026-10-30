@@ -1007,6 +1007,37 @@ class TestRaiseWithoutFromDifferentials(unittest.TestCase):
         self.assertEqual(len(found), 1)
 
 
+class TestFalsyOrInheritance(unittest.TestCase):
+    shape = "falsy-or-inheritance"
+
+    def _found(self, src: str) -> list[dict]:
+        return [f for f in scan(src) if f["shape"] == self.shape]
+
+    def test_get_with_zero_default_or_parent(self):
+        src = (
+            "class Node:\n    @property\n    def retries(self):\n"
+            "        own = self.spec.get('retries', 0)\n"
+            "        return int(own or getattr(self.parent, 'retries', 0))\n"
+        )
+        found = self._found(src)
+        self.assertEqual([f["confidence"] for f in found], ["high"])
+
+    def test_inline_get_or_value(self):
+        src = "def timeout(cfg, fallback):\n    return cfg.get('timeout', 0) or fallback\n"
+        self.assertEqual([f["confidence"] for f in self._found(src)], ["medium"])
+
+    def test_name_or_parent_attribute(self):
+        src = "def level(node, own):\n    return own or node.parent.level\n"
+        self.assertEqual([f["confidence"] for f in self._found(src)], ["low"])
+
+    def test_none_default_and_plain_or_are_silent(self):
+        src = (
+            "def name(cfg, other):\n    a = cfg.get('name') or 'anon'\n"
+            "    b = cfg.get('n', None) or other\n    return a or b\n"
+        )
+        self.assertEqual(self._found(src), [])
+
+
 class TestFlagNotResetOnEarlyExit(unittest.TestCase):
     """idlelib pyshell.py:488 -- a stuck guard flag wedges the component."""
 
