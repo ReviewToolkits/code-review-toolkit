@@ -22,7 +22,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from correlate_tests import (  # noqa: E402
     HTTP_VERBS,
-    router_prefixes,
     best_routes,
     build_module_index,
     classify_files,
@@ -31,6 +30,7 @@ from correlate_tests import (  # noqa: E402
     module_name,
     path_segments,
     route_templates,
+    router_prefixes,
     template_segments,
 )
 from scan_common import (  # noqa: E402
@@ -38,7 +38,6 @@ from scan_common import (  # noqa: E402
     collect_python_files,
     find_project_root,
 )
-
 
 # ---------------------------------------------------------------------------
 # Assertion extraction
@@ -1146,7 +1145,7 @@ class CallIndex:
                 if alias.asname
             }
 
-            def called(call: ast.Call) -> str | None:
+            def called(call: ast.Call, aliases: dict[str, str] = aliases) -> str | None:
                 name = _get_call_name(call.func)
                 if isinstance(call.func, ast.Name):
                     name = aliases.get(name, name)

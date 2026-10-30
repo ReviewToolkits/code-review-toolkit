@@ -20,7 +20,6 @@ from scan_common import (  # noqa: E402
     parse_source,
 )
 
-
 _TEST_DIR_NAMES = frozenset({"test", "tests"})
 
 

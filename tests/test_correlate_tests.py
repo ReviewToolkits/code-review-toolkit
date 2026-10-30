@@ -31,7 +31,7 @@ class TestClassifyFiles(unittest.TestCase):
             "pkg/core_test.py": "def test_core():\n    pass\n",
         }) as root:
             files = mod.discover_python_files(root)
-            source, test = mod.classify_files(files, root)
+            _source, test = mod.classify_files(files, root)
             test_names = {f.name for f in test}
             self.assertIn("core_test.py", test_names)
 
@@ -41,7 +41,7 @@ class TestClassifyFiles(unittest.TestCase):
             "test/helpers.py": "",
         }) as root:
             files = mod.discover_python_files(root)
-            source, test = mod.classify_files(files, root)
+            _source, test = mod.classify_files(files, root)
             test_names = {f.name for f in test}
             self.assertIn("helpers.py", test_names)
 
@@ -51,7 +51,7 @@ class TestClassifyFiles(unittest.TestCase):
             "pkg/__init__.py": "",
         }) as root:
             files = mod.discover_python_files(root)
-            source, test = mod.classify_files(files, root)
+            source, _test = mod.classify_files(files, root)
             source_names = {f.name for f in source}
             self.assertNotIn("setup.py", source_names)
 
