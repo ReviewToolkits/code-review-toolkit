@@ -76,6 +76,25 @@ For code blocks in README and docs, check:
 
 Don't execute the examples — just verify they're structurally valid against the current API.
 
+### Documented `make` Targets
+
+For every `make X` (or `just X`, `nox -s X`, `tox -e X`) in the docs, check that `X` is a target.
+Watch for one silent failure in particular: `X` is not a target, but a file or directory named
+`X` exists. A documented `make tests`, with a `tests/` directory and only a `test` target,
+prints "Nothing to be done for 'tests'" and exits 0, so the reader believes the tests passed. A
+real target that shares its name with a directory and is missing from `.PHONY` fails the same
+way.
+
+```bash
+# Command-shaped mentions only: a line that starts with `make`/`$ make`, or `make` in backticks.
+for t in $(grep -rhoE '(^\s*(\$ )?|`)make [a-z][a-z0-9_.-]*' README* CONTRIBUTING* docs/ 2>/dev/null | awk '{print $NF}' | sort -u); do
+  grep -qE "^$t:" Makefile || echo "not a target: make $t$( [ -e "$t" ] && echo '  (a path of that name exists: silent no-op)')"
+  grep -qE "^$t:" Makefile && [ -e "$t" ] && ! grep -qE "^\.PHONY:.*\b$t\b" Makefile && echo "not .PHONY, collides with a path: make $t"
+done
+```
+
+Confirm a hit with `make -n X` in an export ("Nothing to be done" / "is up to date", exit 0).
+
 ### Link Validation
 
 - Internal links (relative paths in markdown) → do the targets exist?
