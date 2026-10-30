@@ -24,7 +24,7 @@ Each ruff finding carries `selection`. `project` (or `ruff-default` / `explicit`
 Filter the ruff output for `category: "bug-risk"` and `category: "security"` findings:
 
 - **`F821`** (undefined name): A variable or function used but never defined — potential runtime NameError. These are high-confidence bug risks. Classify as FIX.
-  - Exception: hits with `category: "suspected-tool-false-positive"` (`known_tool_issue: "ruff#6878"`) are an `except ... as exc` name read by a closure inside that handler. That is valid Python, and the hit is a false positive, unless the closure escapes the handler (stored, returned, scheduled) and runs after it ends. Check that one question; do not report it as FIX by default.
+  - Exception: an `except ... as NAME` binding read by a lambda or nested def inside that handler is valid Python, so the F821 is a false positive. Such hits usually carry `category: "suspected-tool-false-positive"` (`known_tool_issue: "ruff#6878"`). It is a real bug only if the closure escapes the handler (stored, returned, scheduled) and runs after the handler ends, because Python deletes NAME at the end of the handler. Check that one question; do not report it as FIX by default. The F841 on the same handler has an autofix that deletes `as NAME` and breaks the closure: never recommend it (shape `linter-autofix-breaks-closure-capture`).
 - **`F811`** (redefined unused): A name is defined twice and the first definition is never used — possible logic error where the wrong variable is being checked. Classify as CONSIDER.
 - **`B006`** (mutable default argument): `def f(x=[])` — a classic Python bug where the default list is shared across calls. Classify as FIX.
 - **`B007`** (unused loop variable): Loop variable never used in the body — may indicate a logic error. Classify as CONSIDER.
@@ -35,8 +35,6 @@ Filter the ruff output for `category: "bug-risk"` and `category: "security"` fin
 - **`S` rules** (security): hardcoded credentials (S105, S106, S107), `pickle`/`marshal` loads of untrusted data (S301, S302), `shell=True` (S602), SQL built by string formatting (S608). FIX when the input can be attacker-controlled; CONSIDER otherwise. **`S101` is `assert` usage** — a policy question, not a defect, except where the assert is the only runtime validation (it vanishes under `python -O`).
 
 **Which rules can appear at all** depends on the selection `run_external_tools.py` ran: the project's own ruff configuration, plus the toolkit's curated bug-risk/security pass when the project's selection is narrow. If the `bug-risk` category is empty, check the output's selection before concluding the code is clean. When a `lint-rule-triager` report exists for the same run, use its tiered output instead of re-triaging the raw hits.
-
-**F821 on an `except ... as NAME` binding used inside a lambda or nested def** is a known false positive (the name is in scope there), not an undefined name. The F841 on the same handler has an autofix that deletes `as NAME` and breaks the closure: never recommend it (shape `linter-autofix-breaks-closure-capture`).
 
 **Auto-fixable findings** (significance: "reduced"): Most B and S rules are NOT auto-fixable, so significance is usually "normal". When it is "reduced", still report the finding but note it's a simpler issue.
 
