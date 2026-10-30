@@ -6,6 +6,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — regressions from 1.15.0 (#72)
+
+- **The docs that prompts cite now ship with the plugin.** `reproduction-convention.md` (cited by
+  six prompts) and `searching-trackers.md` (cited by `prior-art`) lived at the repo root, so an
+  installed plugin had neither. Both moved to `plugins/code-review-toolkit/docs/`. Prompts cite them
+  as `<plugin_root>/docs/...`, and a release-discipline test checks that every plugin path a prompt
+  cites exists.
+
+### Enhanced — orchestration (#73)
+
+- **explore Phase 0** builds the review venv from the project's lockfile and records the tool
+  versions. Unpinned tools had produced spurious lint findings and a crashing test suite. The
+  orchestrator itself never runs Python from the checkout.
+- **Run rules:**
+  - agents delete their private temp dir;
+  - the run-directory report overrides generic "don't write report files" instructions;
+  - template caps apply to the summary, and every finding still goes in the report.
+- **`brief.md`** gives each agent a unique finding-id prefix. In a re-run, it puts earlier runs'
+  reports off-limits.
+- **Scheduling and synthesis:**
+  - a free slot may start the next group;
+  - consolidation works report by report into an on-disk file and shards above ~300 KB;
+  - Step 3 also tries to reproduce CONSIDER and POLICY findings.
+
+### Added — catalog (#73)
+
+- Shapes `duration-measured-with-wall-clock`, `deferred-annotation-names-unimported-symbol` and
+  `lenient-template-undefined-hides-renamed-attribute`.
+- FP taxonomy #48: a `finally` release around an anyio/Starlette thread offload is correct
+  (cancellation waits for the worker). Around an abandoning offload, the same release is the bug.
+
+### Fixed — catalog (#73)
+
+- The `naive-datetime-in-a-persisted-artifact` differential no longer excludes in-process
+  durations.
+- The differentials of `except-exception-too-broad`, `flag-not-reset-on-early-exit` and
+  `duplicated-guard-wrong-operand` now state the discriminators the scanner already applies.
+
 ## [1.15.0] - 2026-10-30
 
 The first threading-aware release, and the fixes from the toolkit's first full review of a
