@@ -665,9 +665,9 @@ def run_mypy(
     finally:
         shutil.rmtree(cache_dir, ignore_errors=True)
 
-    findings = parse_mypy_output(
-        result.stdout, max_findings=args.max_findings,
-    )
+    # Parse everything, then cap: stopping the parse at max_findings made
+    # `total_findings` equal the cap and `findings_capped` never true.
+    findings = parse_mypy_output(result.stdout)
 
     normalized = [
         normalize_mypy_finding(f, project_root)
@@ -734,16 +734,31 @@ def run_vulture(
         timeout=_TOOL_TIMEOUTS["vulture"],
     )
 
-    findings = parse_vulture_output(
-        result.stdout, project_root,
-        max_findings=args.max_findings,
-    )
+    # Parse everything, then cap: stopping the parse at max_findings made
+    # `total_findings` equal the cap and `findings_capped` never true.
+    findings = parse_vulture_output(result.stdout, project_root)
     normalized = findings[:args.max_findings]
+
+    by_confidence: dict[str, int] = {}
+    by_type: dict[str, int] = {}
+    for finding in findings:
+        key = str(finding["confidence"])
+        by_confidence[key] = by_confidence.get(key, 0) + 1
+        by_type[finding["type"]] = by_type.get(finding["type"], 0) + 1
 
     return {
         "min_confidence": min_confidence,
         "total_findings": len(findings),
         "findings_capped": len(findings) > args.max_findings,
+        # Each finding keeps its own `confidence`. Vulture scores unused
+        # functions, methods, classes and attributes at 60% -- it cannot see
+        # dynamic dispatch -- so these buckets say how much of the output is
+        # that verify-first tier, and how much is 90-100% (imports,
+        # unreachable code, unused arguments).
+        "by_confidence": dict(
+            sorted(by_confidence.items(), key=lambda kv: -int(kv[0]))
+        ),
+        "by_type": dict(sorted(by_type.items())),
         "findings": normalized,
     }
 
@@ -1166,8 +1181,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # Vulture options.
     parser.add_argument(
-        "--vulture-min-confidence", type=int, default=80,
-        help="Minimum confidence threshold (default: 80)",
+        # 60, not 80: vulture caps unused functions, methods, classes and
+        # attributes at 60%, so at 80 every one of them is dropped: a review
+        # then saw only `__exit__`-style parameters, and every real dead
+        # method had to come from a manual re-run at 60.
+        "--vulture-min-confidence", type=int, default=60,
+        help=(
+            "Minimum confidence threshold (default: 60, which keeps unused "
+            "functions and methods; each finding reports its confidence)"
+        ),
     )
 
     # Coverage options.

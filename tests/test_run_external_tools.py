@@ -626,7 +626,7 @@ class TestParseArgs(unittest.TestCase):
         self.assertIsNone(args.skip)
         self.assertEqual(args.max_findings, 200)
         self.assertFalse(args.mypy_strict)
-        self.assertEqual(args.vulture_min_confidence, 80)
+        self.assertEqual(args.vulture_min_confidence, 60)
         self.assertFalse(args.ignore_config)
 
     def test_tools_flag(self):
@@ -650,8 +650,8 @@ class TestParseArgs(unittest.TestCase):
         self.assertTrue(args.mypy_strict)
 
     def test_vulture_min_confidence(self):
-        args = mod.parse_args(["--vulture-min-confidence", "60"])
-        self.assertEqual(args.vulture_min_confidence, 60)
+        args = mod.parse_args(["--vulture-min-confidence", "80"])
+        self.assertEqual(args.vulture_min_confidence, 80)
 
     def test_ignore_config(self):
         args = mod.parse_args(["--ignore-config"])
@@ -1134,6 +1134,69 @@ class TestBuildSkippedReport(unittest.TestCase):
         self.assertEqual(reasons["mypy"], "not installed")
         self.assertEqual(reasons["vulture"], "excluded by user")
         self.assertEqual(reasons["coverage"], "not installed")
+
+
+VULTURE_OUTPUT = """\
+pkg/a.py:3: unused import 'os' (90% confidence)
+pkg/a.py:10: unused method '_open_writer' (60% confidence)
+pkg/a.py:20: unused function 'helper' (60% confidence)
+pkg/a.py:30: unused variable 'exc_tb' (100% confidence)
+"""
+
+
+class TestVultureConfidence(unittest.TestCase):
+    """Unused methods are scored 60% by vulture: the default must keep them."""
+
+    def _run(self, argv=()):
+        with TempProject({"pkg/a.py": "x = 1\n"}) as root:
+            with patch.object(mod.subprocess, "run") as run:
+                run.return_value = MagicMock(stdout=VULTURE_OUTPUT, stderr="")
+                out = mod.run_vulture(mod.parse_args([str(root), *argv]), root, root)
+        return out, run.call_args.args[0]
+
+    def test_default_threshold_keeps_unused_methods(self):
+        _, cmd = self._run()
+        self.assertIn("--min-confidence=60", cmd)
+
+    def test_confidence_is_reported_per_hit_and_bucketed(self):
+        out, _ = self._run()
+        self.assertEqual(
+            {f["name"]: f["confidence"] for f in out["findings"]},
+            {"os": 90, "_open_writer": 60, "helper": 60, "exc_tb": 100},
+        )
+        self.assertEqual(out["by_confidence"], {"100": 1, "90": 1, "60": 2})
+        self.assertEqual(
+            out["by_type"],
+            {
+                "unused-function": 1,
+                "unused-import": 1,
+                "unused-method": 1,
+                "unused-variable": 1,
+            },
+        )
+
+    def test_capping_is_reported_and_buckets_count_every_hit(self):
+        out, _ = self._run(["--max-findings", "2"])
+        self.assertEqual(len(out["findings"]), 2)
+        self.assertEqual(out["total_findings"], 4)
+        self.assertTrue(out["findings_capped"])
+        self.assertEqual(sum(out["by_confidence"].values()), 4)
+
+    def test_mypy_capping_is_reported(self):
+        lines = "\n".join(f"a.py:{i}: error: Bad [misc]" for i in range(5))
+        with TempProject({"a.py": "x = 1\n"}) as root:
+            with patch.object(mod.subprocess, "run") as run:
+                run.return_value = MagicMock(stdout=lines, stderr="")
+                out = mod.run_mypy(
+                    mod.parse_args([str(root), "--max-findings", "2"]), root, root
+                )
+        self.assertEqual(len(out["findings"]), 2)
+        self.assertEqual(out["total_findings"], 5)
+        self.assertTrue(out["findings_capped"])
+
+    def test_an_explicit_threshold_is_still_honoured(self):
+        _, cmd = self._run(["--vulture-min-confidence", "80"])
+        self.assertIn("--min-confidence=80", cmd)
 
 
 class TestEarlyStopParsing(unittest.TestCase):

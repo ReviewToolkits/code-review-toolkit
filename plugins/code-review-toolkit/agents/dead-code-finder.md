@@ -59,7 +59,8 @@ Filter the ruff output for `category: "dead-code"` findings:
 Filter vulture output for all findings:
 - Merge vulture's unused functions/variables with the script's output
 - Vulture catches unused code inside function bodies that our script misses (unused local variables, unreachable code after returns)
-- Vulture uses confidence percentages — map 90%+ to high confidence, 80-89% to medium confidence
+- Vulture uses confidence percentages, and every finding carries its own `confidence`. `vulture.by_confidence` and `vulture.by_type` bucket them. Map 90%+ to high confidence and 80-89% to medium.
+- **60% is where unused functions, methods, classes and attributes live.** Vulture scores them no higher, because it cannot see dynamic dispatch. The script runs at `--min-confidence 60` so they appear; at 80 every one was dropped. Treat a 60% hit as a candidate, not a finding: Grep for the name (including `getattr` strings, framework registration, and tests) before you classify it.
 
 **Deduplication**: When vulture and our script flag the same symbol, merge and note both sources. When they disagree (one flags, the other doesn't), investigate the discrepancy and use your judgment.
 
