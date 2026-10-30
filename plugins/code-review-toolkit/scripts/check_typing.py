@@ -101,6 +101,13 @@ _DEFECT_CODES = frozenset(
         "valid-type",
         "type-var",
         "has-type",
+        # A name that does not resolve (often a quoted forward reference that
+        # silently stops checking), a path that falls off the end of a function
+        # declared to return a value, and a method replaced on an instance:
+        # each was a real root cause on review, not noise.
+        "name-defined",
+        "return",
+        "method-assign",
     }
 )
 

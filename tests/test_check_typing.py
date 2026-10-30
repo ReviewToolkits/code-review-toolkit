@@ -212,6 +212,16 @@ class TestParseOutput(unittest.TestCase):
         )
 
 
+    def test_root_cause_codes_are_defects(self):
+        """`name-defined`, `return` and `method-assign` used to land in `other`."""
+        findings, _ = mod.parse_output(
+            'a.py:1: error: Name "Sequnce" is not defined  [name-defined]\n'
+            "a.py:2: error: Missing return statement  [return]\n"
+            "a.py:3: error: Cannot assign to a method  [method-assign]\n"
+        )
+        self.assertEqual([f["kind"] for f in findings], ["defect"] * 3)
+
+
 class TestFailureIsNeverClean(unittest.TestCase):
     """The single most important behaviour: analyzed-nothing is not clean."""
 
