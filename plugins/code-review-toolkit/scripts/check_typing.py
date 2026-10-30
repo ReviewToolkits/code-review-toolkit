@@ -39,16 +39,21 @@ blocks a wrong annotation has silently removed from checking -- a module-level
 the phantom-import pass cannot see that. ``--warn-unused-ignores``
 measures stale ignores when the project's config does not; without it a 0 would
 mean "not measured", so an unmeasured count is reported as null with a reason.
+``--check-untyped-defs`` runs when the config leaves the bodies of unannotated
+functions unchecked (mypy's default): ``unchecked_untyped_bodies`` says how many
+bodies a clean baseline never looked at, and the pass says what is in them.
 The passes are independent and run concurrently.
 
 Usage:
     python check_typing.py [path] [--mypy-bin PATH] [--max-files N]
         [--no-strict-pass] [--no-unreachable-pass] [--no-unused-ignores-pass]
+        [--no-untyped-defs-pass]
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import configparser
 import os
 import re
@@ -66,6 +71,7 @@ from scan_common import (  # noqa: E402
     discover_python_files,
     emit,
     find_project_root,
+    parse_source,
 )
 
 _MYPY_TIMEOUT = 600
@@ -346,6 +352,24 @@ def _run_mypy(
     return out.stdout, out.stderr, out.returncode
 
 
+def _count_untyped_defs(files: list[Path]) -> int:
+    """Functions with no parameter or return annotation (mypy's "untyped")."""
+    count = 0
+    for path in files:
+        tree = parse_source(path)
+        if tree is None:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            a = node.args
+            params = a.posonlyargs + a.args + a.kwonlyargs
+            params += [x for x in (a.vararg, a.kwarg) if x is not None]
+            if node.returns is None and all(p.annotation is None for p in params):
+                count += 1
+    return count
+
+
 def _diagnose_failure(stderr: str, stdout: str, returncode: int | None) -> str:
     """Turn a raw mypy failure into something a reviewer can act on.
 
@@ -452,13 +476,15 @@ def analyze(
     strict_pass: bool = True,
     unreachable_pass: bool = True,
     unused_ignores_pass: bool = True,
+    untyped_defs_pass: bool = True,
 ) -> dict:
     """Run mypy over *target*, plus labelled extra passes.
 
     The passes are ``--disallow-any-unimported`` (phantom imports),
     ``--warn-unreachable`` (code a wrong annotation has silently removed from
-    checking), and ``--warn-unused-ignores`` when the project's own config does
-    not already enable it (stale ignores). Each is diffed against the baseline
+    checking), ``--warn-unused-ignores`` when the project's own config does
+    not already enable it (stale ignores), and ``--check-untyped-defs`` when
+    the config leaves the bodies of unannotated functions unchecked. Each is diffed against the baseline
     and reported separately, so the baseline count stays the project's own.
     """
     scan_root = Path(target).resolve()
@@ -504,7 +530,11 @@ def analyze(
                 "disallow-any-unimported": strict_pass,
                 "warn-unreachable": unreachable_pass,
                 "warn-unused-ignores": unused_ignores_pass,
+                "check-untyped-defs": untyped_defs_pass,
             },
+            untyped_defs=_count_untyped_defs(
+                files[:max_files] if capped else files
+            ),
             cache_root=cache_root,
         )
     finally:
@@ -521,6 +551,7 @@ def _analyze_with_cache(
     config: str | None,
     passes: dict[str, bool],
     cache_root: str,
+    untyped_defs: int | None = None,
 ) -> dict:
     stdout, stderr, returncode = _run_mypy(
         mypy_bin, targets, config, cap_flags, os.path.join(cache_root, "baseline")
@@ -562,6 +593,11 @@ def _analyze_with_cache(
     unreachable_in_config = config_enables(config, "warn_unreachable")
     if unreachable_in_config:
         wanted.pop("warn-unreachable", None)
+    # Without check_untyped_defs, mypy skips the body of every function that
+    # has no annotation at all, and a clean run says nothing about them.
+    untyped_checked = config_enables(config, "check_untyped_defs")
+    if untyped_checked:
+        wanted.pop("check-untyped-defs", None)
     baseline = {_finding_key(f) for f in findings}
     labelled: dict[str, dict] = {}
     if wanted:
@@ -595,6 +631,8 @@ def _analyze_with_cache(
     else:
         unreachable = pass_findings("warn-unreachable")
         unreachable_source = None if unreachable is None else "warn-unreachable-pass"
+
+    untyped_body = pass_findings("check-untyped-defs")
 
     stale_reason = None
     stale_ignores: list[dict] | None
@@ -641,6 +679,15 @@ def _analyze_with_cache(
         "mypy_version": version,
         "config_file": config,
         "uses_project_config": config is not None,
+        # What the baseline ran with, for the options this script reasons
+        # about. With no config these are mypy's defaults (all off), and a
+        # clean run means correspondingly less.
+        "effective_flags": {
+            "source": "project-config" if config else "mypy-defaults",
+            "check_untyped_defs": untyped_checked,
+            "warn_unreachable": unreachable_in_config,
+            "warn_unused_ignores": config_enables(config, "warn_unused_ignores"),
+        },
         "returncode": returncode,
         "stderr": stderr.strip(),
         "files_checked": checked,
@@ -676,6 +723,23 @@ def _analyze_with_cache(
             # `project-config` (the baseline reports it; no extra pass ran) or
             # `warn-unreachable-pass`; null when nothing measured it.
             "unreachable_source": unreachable_source,
+            # Functions with no annotation at all, whose bodies mypy skips
+            # unless check_untyped_defs is on. Counted from the AST of the
+            # files handed to mypy (a config `exclude` is not applied).
+            "untyped_defs": untyped_defs,
+            "unchecked_untyped_bodies": (
+                None
+                if untyped_defs is None
+                else 0
+                if untyped_checked
+                else untyped_defs
+            ),
+            # Errors inside those bodies, from the labelled
+            # --check-untyped-defs pass; null if it did not run (including
+            # when the config already checks them: they are then in findings).
+            "untyped_body_errors": (
+                None if untyped_body is None else len(untyped_body)
+            ),
             "parse_mismatch": parse_mismatch,
             "strict_pass_ran": phantom_imports is not None,
             "labelled_passes": {
@@ -692,6 +756,7 @@ def _analyze_with_cache(
         "phantom_import_findings": phantom_imports or [],
         "unreachable_findings": unreachable or [],
         "stale_ignore_findings": stale_ignores or [],
+        "untyped_body_findings": untyped_body or [],
         # Notes that belong to no error: `annotation-unchecked` (an annotated
         # variable inside an untyped function body mypy skips), reveal_type.
         "standalone_notes": standalone_notes,
@@ -719,6 +784,11 @@ def main() -> None:
         "then null unless the project's config enables the warning)",
     )
     parser.add_argument(
+        "--no-untyped-defs-pass",
+        action="store_true",
+        help="skip the labelled --check-untyped-defs pass",
+    )
+    parser.add_argument(
         "--max-files",
         type=int,
         default=0,
@@ -733,6 +803,7 @@ def main() -> None:
             strict_pass=not args.no_strict_pass,
             unreachable_pass=not args.no_unreachable_pass,
             unused_ignores_pass=not args.no_unused_ignores_pass,
+            untyped_defs_pass=not args.no_untyped_defs_pass,
         )
         emit(result)
         sys.exit(1 if result["status"] == "FAILED" else 0)

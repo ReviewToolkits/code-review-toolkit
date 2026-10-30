@@ -32,7 +32,8 @@ with open(os.path.join(cache, "marker"), "w") as fh:
 with open(os.environ["FAKE_MYPY_RESPONSES"]) as fh:
     responses = json.load(fh)
 key = ""
-for flag in ("--disallow-any-unimported", "--warn-unreachable", "--warn-unused-ignores"):
+for flag in ("--disallow-any-unimported", "--warn-unreachable", "--warn-unused-ignores",
+             "--check-untyped-defs"):
     if flag in args:
         key = flag
 out = responses.get(key, responses.get("", ""))
@@ -522,6 +523,66 @@ class TestLineGroups(unittest.TestCase):
         result, _ = _run(_PKG, {"": _BASE_ERR + _ONE_ERROR})
         self.assertEqual(result["line_groups"], [])
         self.assertEqual(result["summary"]["distinct_lines"], 1)
+
+
+class TestUntypedBodies(unittest.TestCase):
+    """With check_untyped_defs off (mypy's default), the bodies of unannotated
+    functions are never checked, and nothing in the output said how many."""
+
+    _FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/m.py": (
+            "def untyped(a, b):\n"
+            "    def inner():\n"
+            "        return 1\n"
+            "    return a + b\n"
+            "def typed(a: int):\n"
+            "    return a\n"
+            "def returns() -> None:\n"
+            "    pass\n"
+            "class C:\n"
+            "    def __init__(self):\n"
+            "        self.x = 1\n"
+        ),
+    }
+    _BODY_ERR = "pkg/m.py:4: error: Unsupported operand  [operator]\n"
+
+    def test_unchecked_bodies_are_counted_and_the_pass_reports_their_errors(self):
+        result, flags_seen = _run(
+            self._FILES,
+            {
+                "": _BASE_ERR + _ONE_ERROR,
+                "--check-untyped-defs": _BASE_ERR + self._BODY_ERR + _TWO_ERRORS,
+            },
+        )
+        summary = result["summary"]
+        # untyped, inner, C.__init__ -- not the two with any annotation.
+        self.assertEqual(summary["untyped_defs"], 3)
+        self.assertEqual(summary["unchecked_untyped_bodies"], 3)
+        self.assertEqual(summary["untyped_body_errors"], 1)
+        self.assertEqual(result["untyped_body_findings"][0]["line"], 4)
+        self.assertEqual(summary["total"], 1)
+        self.assertFalse(result["effective_flags"]["check_untyped_defs"])
+        self.assertEqual(result["effective_flags"]["source"], "mypy-defaults")
+        self.assertTrue(any("--check-untyped-defs" in f for f in flags_seen))
+
+    def test_project_config_that_checks_them_needs_no_pass(self):
+        files = {**self._FILES, "mypy.ini": "[mypy]\ncheck_untyped_defs = True\n"}
+        result, flags_seen = _run(files, {"": _BASE_ERR + _ONE_ERROR})
+        summary = result["summary"]
+        self.assertEqual(summary["untyped_defs"], 3)
+        self.assertEqual(summary["unchecked_untyped_bodies"], 0)
+        self.assertIsNone(summary["untyped_body_errors"])
+        self.assertTrue(result["effective_flags"]["check_untyped_defs"])
+        self.assertEqual(result["effective_flags"]["source"], "project-config")
+        self.assertFalse(any("--check-untyped-defs" in f for f in flags_seen))
+
+    def test_skipped_pass_is_null_not_zero(self):
+        result, _ = _run(
+            self._FILES, {"": _BASE_ERR + _ONE_ERROR}, untyped_defs_pass=False
+        )
+        self.assertIsNone(result["summary"]["untyped_body_errors"])
+        self.assertEqual(result["summary"]["unchecked_untyped_bodies"], 3)
 
 
 class TestConfigDiscovery(unittest.TestCase):
