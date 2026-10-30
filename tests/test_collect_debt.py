@@ -337,5 +337,120 @@ class TestTrackerKeys(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 2)
 
 
+_CONFIG_PROJECT = {
+    "pkg/__init__.py": "",
+    "pyproject.toml": (
+        "[project]\n"
+        'name = "demo"\n'
+        "dependencies = [\n"
+        '  "alpha==1.3.0",  # fork until upstream merges the fix\n'
+        '  "beta>=1.2,<2.0.0",\n'
+        '  "gamma>=1.0,<1.4",\n'
+        "  # pinned below 3 until the new API is adopted\n"
+        '  "delta>=2,<3",\n'
+        '  "epsilon!=2.1.0",\n'
+        '  "zeta>=1.0",\n'
+        "]\n"
+        "[tool.ruff.lint]\n"
+        "ignore = [\n"
+        '  "E501",\n'
+        '  "B008",\n'
+        "]\n"
+        "[tool.ruff.lint.per-file-ignores]\n"
+        '"tests/*" = ["S101"]\n'
+        "[tool.mypy]\n"
+        "ignore_missing_imports = true\n"
+        "ignore_errors = false\n"
+        "[tool.pytest.ini_options]\n"
+        'filterwarnings = ["error", "ignore::DeprecationWarning"]\n'
+        "[tool.codespell]\n"
+        'ignore-words-list = "te"\n'
+    ),
+    "setup.cfg": "[flake8]\nextend-ignore =\n    E203,\n    W503\nmax-line-length = 100\n",
+    "tox.ini": "[tox]\n# TODO: drop py38 once the CI image is updated\nenvlist = py310\n",
+    "requirements-lock.txt": "".join(f"pkg{i}==1.{i}\n" for i in range(25)),
+    ".github/workflows/ci.yml": (
+        "jobs:\n"
+        "  test:\n"
+        "    continue-on-error: true\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - uses: some-org/shared-action@main\n"
+        "      - uses: ./local-action\n"
+        "      - run: make lint || true\n"
+        "      # continue-on-error: true\n"
+    ),
+}
+
+
+class TestConfigDebt(unittest.TestCase):
+    """Pins, project-wide suppressions and CI failure allowances live outside
+    the .py files the marker scan reads."""
+
+    @classmethod
+    def setUpClass(cls):
+        files = dict(_CONFIG_PROJECT)
+        pyproject = files.pop("pyproject.toml")
+        with TempProject(files) as root:
+            # TempProject writes its own minimal pyproject.toml last.
+            (root / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+            cls.out = _run_main([str(root / "pkg")])
+        cls.debt = cls.out["config_debt"]
+
+    def test_pins_with_a_decision_are_listed_with_their_comment(self):
+        pins = {p["name"]: p for p in self.debt["pins"]}
+        self.assertEqual(set(pins), {"alpha", "gamma", "delta", "epsilon"})
+        self.assertEqual(pins["alpha"]["kinds"], ["exact"])
+        self.assertEqual(pins["alpha"]["comment"], "fork until upstream merges the fix")
+        self.assertEqual(
+            pins["delta"]["comment_above"],
+            "pinned below 3 until the new API is adopted",
+        )
+        self.assertEqual(pins["epsilon"]["kinds"], ["exclusion"])
+
+    def test_routine_major_caps_are_listed_compactly(self):
+        self.assertEqual(
+            self.debt["routine_caps"], ["beta>=1.2,<2.0.0 (pyproject.toml:5)"]
+        )
+
+    def test_lockfile_is_skipped_not_reported_pin_by_pin(self):
+        self.assertEqual(self.debt["skipped_lockfiles"], ["requirements-lock.txt"])
+
+    def test_project_wide_suppressions(self):
+        found = {(s["tool"], s["setting"]) for s in self.debt["suppressions"]}
+        self.assertEqual(
+            found,
+            {
+                ("ruff", "ignore"),
+                ("ruff", "tests/*"),
+                ("mypy", "ignore_missing_imports"),
+                ("pytest", "filterwarnings"),
+                ("flake8", "extend-ignore"),
+            },
+        )
+        ruff = next(s for s in self.debt["suppressions"] if s["setting"] == "ignore")
+        self.assertIn("B008", ruff["value"])
+        flake8 = next(s for s in self.debt["suppressions"] if s["tool"] == "flake8")
+        self.assertIn("W503", flake8["value"])
+
+    def test_ci_failure_allowances_and_floating_actions(self):
+        self.assertEqual(
+            [(c["line"], c["kind"]) for c in self.debt["ci"]],
+            [(3, "continue_on_error"), (6, "unpinned_action"), (8, "error_ignored")],
+        )
+
+    def test_todo_in_a_config_comment(self):
+        self.assertEqual(
+            [(m["file"], m["category"]) for m in self.debt["markers"]],
+            [("tox.ini", "TODO")],
+        )
+
+    def test_summary_counts(self):
+        self.assertEqual(
+            self.out["summary"]["config_debt"],
+            {"pins": 4, "routine_caps": 1, "suppressions": 5, "ci": 3, "markers": 1},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -446,6 +446,388 @@ def collect_tracker_keys(
     }
 
 
+# --- configuration and CI debt ---------------------------------------------
+#
+# Debt that lives outside .py files: version pins with a comment explaining
+# why, tool suppressions configured once for the whole project, and CI steps
+# allowed to fail. Read from the project root, whatever the scan scope.
+
+_CONFIG_FILES = (
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "tox.ini",
+    "mypy.ini",
+    ".mypy.ini",
+    "ruff.toml",
+    ".ruff.toml",
+    ".flake8",
+    ".bandit",
+    "pytest.ini",
+    ".coveragerc",
+    ".pylintrc",
+    "pylintrc",
+)
+_REQUIREMENT_GLOBS = ("requirements*.txt", "constraints*.txt", "requirements/*.txt")
+_CI_GLOBS = (
+    ".github/workflows/*.yml",
+    ".github/workflows/*.yaml",
+    ".gitlab-ci.yml",
+    "gitlab-ci.yml",
+    ".circleci/config.yml",
+    "azure-pipelines.yml",
+    ".travis.yml",
+)
+_CONFIG_MARKER = re.compile(
+    r"#\s*(TODO|FIXME|HACK|WORKAROUND|XXX)\b[:\s]*(.*)", re.IGNORECASE
+)
+_REQUIREMENT = re.compile(
+    r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(\[[^\]]*\])?\s*((?:[<>=!~]=?=?\s*[^,;\s]+\s*,?\s*)+)"
+)
+_QUOTED = re.compile(r'"([^"\n]*)"|\'([^\'\n]*)\'')
+_SECTION = re.compile(r"^\s*\[+\s*([^\]]+?)\s*\]+\s*$")
+
+# (tool, setting) pairs that switch a check off project-wide. A section whose
+# name ends in `per-file-ignores` is a suppression on every line.
+_SUPPRESSION_KEYS: dict[str, frozenset[str]] = {
+    "ruff": frozenset(
+        {"ignore", "extend-ignore", "per-file-ignores", "extend-per-file-ignores"}
+    ),
+    "flake8": frozenset(
+        {"ignore", "extend-ignore", "per-file-ignores", "extend_ignore"}
+    ),
+    "mypy": frozenset(
+        {
+            "ignore_missing_imports",
+            "ignore_errors",
+            "disable_error_code",
+            "follow_imports",
+        }
+    ),
+    "pylint": frozenset({"disable"}),
+    "bandit": frozenset({"skips"}),
+    "coverage": frozenset({"omit", "exclude_lines", "exclude_also"}),
+    "pytest": frozenset({"filterwarnings", "addopts"}),
+    "pyright": frozenset({"ignore"}),
+}
+
+
+def _tool_of(section: str, filename: str) -> str | None:
+    """Which tool a config section configures."""
+    name = section.lower().removeprefix("tool.").removeprefix("tool:")
+    for tool in (
+        "ruff",
+        "flake8",
+        "mypy",
+        "pylint",
+        "bandit",
+        "coverage",
+        "pytest",
+        "pyright",
+    ):
+        if name.startswith(tool):
+            return tool
+    if filename in ("ruff.toml", ".ruff.toml"):
+        return "ruff"
+    if filename == ".coveragerc":
+        return "coverage"
+    if filename in (".pylintrc", "pylintrc") or name == "messages control":
+        return "pylint"
+    if filename == ".bandit":
+        return "bandit"
+    return None
+
+
+def _value_lines(lines: list[str], start: int, is_toml: bool) -> tuple[str, int]:
+    """The (joined) value of the setting on ``lines[start]`` and its last line
+    index: a TOML array runs to its closing bracket, an INI value continues on
+    indented lines."""
+    _, _, value = lines[start].partition("=")
+    parts = [value.strip()]
+    end = start
+    if is_toml:
+        depth = value.count("[") - value.count("]")
+        while depth > 0 and end + 1 < len(lines):
+            end += 1
+            parts.append(lines[end].strip())
+            depth += lines[end].count("[") - lines[end].count("]")
+    else:
+        while end + 1 < len(lines) and lines[end + 1][:1] in (" ", "\t"):
+            if not lines[end + 1].strip():
+                break
+            end += 1
+            parts.append(lines[end].strip())
+    return " ".join(p for p in parts if p)[:300], end
+
+
+def _suppressions(path: Path, rel: str, lines: list[str]) -> list[dict]:
+    is_toml = path.suffix == ".toml"
+    section = ""
+    out: list[dict] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        header = _SECTION.match(line)
+        if header:
+            section = header.group(1)
+            i += 1
+            continue
+        key, sep, _ = line.partition("=")
+        key = key.strip().strip('"')
+        tool = _tool_of(section, path.name)
+        if not sep or not key or key.startswith("#") or tool is None:
+            i += 1
+            continue
+        per_file_section = section.lower().endswith("per-file-ignores")
+        if per_file_section or key.lower() in _SUPPRESSION_KEYS.get(tool, ()):
+            value, end = _value_lines(lines, i, is_toml)
+            setting = "per-file-ignores" if per_file_section else key
+            # These two settings suppress only in some values.
+            relevant = (
+                (setting.lower() == "filterwarnings" and "ignore" in value.lower())
+                or (
+                    setting.lower() == "addopts"
+                    and re.search(
+                        r"disable-warnings|-p\s*no:warnings|-W\s*ignore", value
+                    )
+                )
+                or (
+                    setting.lower() == "follow_imports"
+                    and re.search(r"skip|silent", value)
+                )
+                or (
+                    setting.lower()
+                    not in ("filterwarnings", "addopts", "follow_imports")
+                    and value.lower() not in ("false", "[]", '""', "''")
+                )
+            )
+            if relevant:
+                out.append(
+                    {
+                        "file": rel,
+                        "line": i + 1,
+                        "tool": tool,
+                        "section": section or None,
+                        "setting": key if per_file_section else setting,
+                        "value": value,
+                    }
+                )
+            i = end + 1
+            continue
+        i += 1
+    return out
+
+
+def _pin_kinds(spec: str) -> list[str]:
+    kinds = []
+    if re.search(r"(?<![<>!~=])===?", spec):
+        kinds.append("exact")
+    if "~=" in spec:
+        kinds.append("compatible")
+    if "<" in spec:
+        kinds.append("upper_bound")
+    if "!=" in spec:
+        kinds.append("exclusion")
+    return kinds
+
+
+def _is_routine_cap(spec: str, kinds: list[str]) -> bool:
+    """An upper bound at the next breaking boundary (`<2`, `<2.0.0`, `<0.3`):
+    semver hygiene rather than a workaround. A cap mid-series (`<1.4`), an
+    exact pin or an exclusion is not routine."""
+    if kinds != ["upper_bound"] or "<=" in spec:
+        return False
+    caps = re.findall(r"<\s*([\d.]+)", spec)
+    for cap in caps:
+        parts = [int(p) for p in cap.split(".") if p.isdigit()]
+        while parts and parts[0] == 0:
+            parts.pop(0)
+        if not parts or any(parts[1:]):
+            return False
+    return bool(caps)
+
+
+def _comment_of(line: str) -> str | None:
+    """The `# ...` comment of a line, ignoring `#` inside quotes."""
+    in_quote = None
+    for i, ch in enumerate(line):
+        if in_quote:
+            if ch == in_quote:
+                in_quote = None
+        elif ch in "\"'":
+            in_quote = ch
+        elif ch == "#":
+            return line[i + 1 :].strip() or None
+    return None
+
+
+def _is_lockfile(lines: list[str]) -> bool:
+    """pip-compile/uv export output: every line is an exact pin, by design."""
+    text = "\n".join(lines[:200])
+    if "--hash=" in text or "# via" in text or "autogenerated" in text.lower():
+        return True
+    reqs = [m for m in map(_REQUIREMENT.match, lines) if m]
+    exact = sum(1 for m in reqs if "==" in m.group(3))
+    return len(reqs) >= 20 and exact / len(reqs) > 0.8
+
+
+def _pins(path: Path, rel: str, lines: list[str]) -> list[dict]:
+    """Version pins (`==`, `~=`, `<`, `!=`) and the comment that explains them."""
+    out: list[dict] = []
+    quoted_only = path.suffix in (".toml", ".py")
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", "-", ";")):
+            continue
+        if quoted_only:
+            candidates = [a or b for a, b in _QUOTED.findall(line)]
+        else:
+            candidates = [line.split("#", 1)[0]]
+        for candidate in candidates:
+            match = _REQUIREMENT.match(candidate)
+            if not match or not re.search(r"\d", match.group(3)):
+                continue
+            kinds = _pin_kinds(match.group(3))
+            if not kinds:
+                continue
+            above = lines[i - 1].strip() if i else ""
+            comment = _comment_of(line)
+            out.append(
+                {
+                    "file": rel,
+                    "line": i + 1,
+                    "name": match.group(1),
+                    "spec": match.group(3).strip().rstrip(","),
+                    "kinds": kinds,
+                    "comment": comment,
+                    # A comment on its own line just above often explains it.
+                    "comment_above": above[1:].strip()
+                    if above.startswith("#")
+                    else None,
+                    "routine": _is_routine_cap(match.group(3), kinds)
+                    and not comment
+                    and not above.startswith("#"),
+                }
+            )
+    return out
+
+
+_CI_CHECKS = (
+    (
+        "continue_on_error",
+        re.compile(r"^\s*continue-on-error:\s*true\b", re.IGNORECASE),
+    ),
+    ("allow_failure", re.compile(r"^\s*allow_failure:\s*true\b", re.IGNORECASE)),
+    ("error_ignored", re.compile(r"\|\|\s*(?:true|:|exit 0)\b")),
+)
+_USES = re.compile(r"^\s*-?\s*uses:\s*['\"]?([^'\"\s#]+)")
+_FLOATING_REFS = frozenset(
+    {"main", "master", "latest", "head", "develop", "dev", "trunk"}
+)
+
+
+def _ci_items(rel: str, lines: list[str]) -> list[dict]:
+    out: list[dict] = []
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("#"):
+            continue
+        for kind, pattern in _CI_CHECKS:
+            if pattern.search(line):
+                out.append(
+                    {
+                        "file": rel,
+                        "line": i + 1,
+                        "kind": kind,
+                        "text": line.strip()[:200],
+                    }
+                )
+        uses = _USES.match(line)
+        if uses:
+            action = uses.group(1)
+            if action.startswith(("./", "docker://")):
+                continue
+            _, at, ref = action.partition("@")
+            if not at or ref.lower() in _FLOATING_REFS:
+                out.append(
+                    {
+                        "file": rel,
+                        "line": i + 1,
+                        "kind": "unpinned_action",
+                        "text": line.strip()[:200],
+                    }
+                )
+    return out
+
+
+def collect_config_debt(project_root: Path) -> dict:
+    """Pins, tool suppressions, CI failure allowances and TODO-style comments
+    in the project's configuration, requirements and CI files."""
+    files: list[Path] = [project_root / name for name in _CONFIG_FILES]
+    for pattern in (*_REQUIREMENT_GLOBS, *_CI_GLOBS):
+        files.extend(sorted(project_root.glob(pattern)))
+    result: dict = {
+        "files_scanned": [],
+        # Exact pins, exclusions, compatible-release pins, mid-series caps
+        # and any pin with a comment: the ones that encode a decision.
+        "pins": [],
+        # `name<next-major>` caps with no comment, listed compactly.
+        "routine_caps": [],
+        "suppressions": [],
+        "ci": [],
+        "markers": [],
+        "skipped_lockfiles": [],
+    }
+    seen: set[Path] = set()
+    for path in files:
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+        try:
+            if path.stat().st_size > _MAX_DOC_BYTES:
+                continue
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        rel = str(path.relative_to(project_root))
+        result["files_scanned"].append(rel)
+        is_ci = path.suffix in (".yml", ".yaml")
+        if is_ci:
+            result["ci"].extend(_ci_items(rel, lines))
+        elif path.suffix == ".txt" and _is_lockfile(lines):
+            result["skipped_lockfiles"].append(rel)
+        else:
+            if path.suffix == ".txt" or path.name in (
+                "pyproject.toml",
+                "setup.cfg",
+                "setup.py",
+            ):
+                for pin in _pins(path, rel, lines):
+                    if pin.pop("routine"):
+                        result["routine_caps"].append(
+                            f"{pin['name']}{pin['spec']} ({rel}:{pin['line']})"
+                        )
+                    else:
+                        result["pins"].append(pin)
+            if path.suffix not in (".txt", ".py"):
+                result["suppressions"].extend(_suppressions(path, rel, lines))
+        if path.suffix == ".py":
+            continue  # its comments are scanned with the code when in scope
+        for i, line in enumerate(lines):
+            marker = _CONFIG_MARKER.search(line)
+            if marker:
+                result["markers"].append(
+                    {
+                        "file": rel,
+                        "line": i + 1,
+                        "category": marker.group(1)
+                        .upper()
+                        .replace("WORKAROUND", "HACK"),
+                        "text": marker.group(2).strip()[:200],
+                    }
+                )
+    return result
+
+
 def _extract_options(argv: list[str]) -> tuple[list[str], str | None]:
     """Pull ``--key-regex PATTERN`` out of argv, returning the remainder."""
     rest: list[str] = []
@@ -518,6 +900,14 @@ def main() -> None:
             "top_files": [{"file": f, "count": c} for f, c in top_files],
         },
         "items": all_items,
+        # Read from the project root whatever the scan scope: pins with their
+        # comments, project-wide tool suppressions, CI failure allowances and
+        # TODO-style comments in config, requirements and CI files.
+        "config_debt": collect_config_debt(project_root),
+    }
+    output["summary"]["config_debt"] = {
+        key: len(output["config_debt"][key])
+        for key in ("pins", "routine_caps", "suppressions", "ci", "markers")
     }
     if key_pattern is not None:
         output["tracker_keys"] = collect_tracker_keys(
