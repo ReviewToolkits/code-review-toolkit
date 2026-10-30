@@ -317,9 +317,15 @@ code-review-toolkit/
 ├── data/
 │   ├── python_bug_shapes.json
 │   └── python_non_bugs.md
+├── docs/
+│   ├── reproduction-convention.md
+│   └── searching-trackers.md
 └── scripts/
+    ├── pytest_plugins/
+    │   └── crt_leaktrack.py
     ├── analyze_history.py
     ├── analyze_imports.py
+    ├── annotate_findings.py
     ├── build_informed_briefing.py
     ├── check_known_findings.py
     ├── check_typing.py
@@ -329,12 +335,17 @@ code-review-toolkit/
     ├── diff_findings.py
     ├── extract_test_invariants.py
     ├── find_dead_symbols.py
+    ├── map_exceptions.py
+    ├── map_findings_coverage.py
     ├── measure_complexity.py
     ├── run_external_tools.py
     ├── run_lint_rules.py
     ├── scan_common.py
     ├── scan_concurrency.py
-    └── scan_python_pitfalls.py
+    ├── scan_python_pitfalls.py
+    ├── survey_conventions.py
+    ├── survey_docstrings.py
+    └── survey_error_handling.py
 ```
 
 ## Author

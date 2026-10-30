@@ -17,7 +17,9 @@ module boundaries:
    ``acquire(timeout=...)`` result, lock-order cycles (from nested ``with``
    blocks AND from calls made while holding a lock), a non-reentrant lock taken
    again through a call chain (including a read-to-write upgrade on a project's
-   own reader/writer lock), and ``Condition`` misuse.
+   own reader/writer lock), ``Condition`` misuse, and a slot or semaphore taken
+   before the ``try`` that releases it (or released only in ``except
+   Exception``, which cancellation skips).
 3. Forbidden work in a critical region, followed through the project call graph:
    blocking calls while holding a lock, ``await`` while holding a thread lock,
    ``async def`` code that calls a sync project function which blocks or takes a
@@ -27,13 +29,16 @@ What counts as a lock: objects built from ``threading``/``multiprocessing``/
 ``asyncio`` primitives; names that look like locks (``_lock``, ``mutex``,
 ``_cv``, ``cond``, ``sem``); and the project's own context managers whose body
 holds a lock around ``yield`` (e.g. ``read_lock()``/``write_lock()`` on a
-custom reader/writer lock, or ``_collection_write_lock(key)``).
+custom reader/writer lock, or ``_guard_for(key)``).
 
 Calls are resolved through ``self.method``, module functions, ``from x import
-f`` aliases, attributes whose type is known from a constructor call or an
-annotation, and -- marked ``weak`` -- a method name defined by exactly one project
-class. Every chain-based finding carries its ``chain`` so the agent can check
-each hop.
+f`` aliases, attributes and locals whose type is known from a constructor call,
+an annotation or a return annotation (an interface stub resolves to its
+implementations), and -- marked ``weak`` -- a method name defined by at most a
+few project classes, narrowed to the class the receiver's name points at
+(``index`` -> ``SearchIndex``). Every chain-based finding carries its ``chain``
+so the agent can check each hop; a weak hop ends in ``[weak: name-only]`` (with
+the candidate count when more than one class remains).
 
 Confidence levels:
     high    -- the mechanism holds on every resolved hop
@@ -42,7 +47,11 @@ Confidence levels:
 
 Usage:
     python scan_concurrency.py [path] [--max-files N] [--check ID[,ID...]]
-        [--exclude PAT[,PAT...]] [--blocking NAME[,NAME...]]
+        [--exclude PAT[,PAT...]] [--blocking NAME[,NAME...]] [--all-blocking]
+
+``--all-blocking`` reports every file-I/O and pipe wait under a lock as a
+finding; by default they are summarized per lock in
+``summary.blocking_low_signal``, because they are mostly by design.
 """
 
 from __future__ import annotations
@@ -455,8 +464,16 @@ class Project:
         self.extra_blocking = extra_blocking
         # contextmanager func key -> ("own", None) | ("param", index) | None
         self.lock_cms: dict[str, tuple[str, int | None] | None] = {}
+        # For a lock CM: the kind and mode it inherits from the locks it holds at
+        # `yield`, and (when it holds another project lock CM) the one it wraps.
+        self.lock_cm_kind: dict[str, str] = {}
+        self.lock_cm_mode: dict[str, str] = {}
+        self.lock_cm_via: dict[str, str] = {}
+        self.lock_cm_alias: dict[str, str] = {}  # derived CM -> wrapped lock's key
+        self._subclasses: dict[str, list[str]] | None = None
         for rel, tree in corpus:
             self._index_module(rel, tree)
+        self._infer_attr_types()
         self._resolve_lock_cms()
         for func in self.funcs.values():
             _FunctionScanner(self, func).run()
@@ -656,7 +673,7 @@ class Project:
             return mod.functions[name]
         if name in mod.classes:
             return self.classes[mod.classes[name]].methods.get("__init__")
-        # A re-export: `from .local import LocalStore` in a package __init__.
+        # A re-export: `from .impl import Store` in a package __init__.
         target = mod.imports.get(name)
         if target and target != dotted:
             return self.func_by_dotted(target, _depth + 1)
@@ -703,48 +720,262 @@ class Project:
             cls_key = nxt
         return None
 
+    # -- pass 1a: what type an attribute or a local holds --------------------
+
+    def annotation_class(self, mod: ModuleInfo, ann: ast.AST | None) -> str | None:
+        """The project class an annotation names (`X`, `X | None`, `Optional[X]`)."""
+        if ann is None:
+            return None
+        if isinstance(ann, ast.Constant) and isinstance(ann.value, str):
+            try:
+                ann = ast.parse(ann.value, mode="eval").body
+            except SyntaxError:
+                return None
+        if isinstance(ann, ast.BinOp):  # X | None
+            return self.annotation_class(mod, ann.left) or self.annotation_class(
+                mod, ann.right
+            )
+        if isinstance(ann, ast.Subscript):
+            # Only wrappers that still mean "an X": `list[X]` is not an X.
+            if _dotted(ann.value).split(".")[-1] not in _TYPE_WRAPPERS:
+                return None
+            inner = ann.slice
+            elts = inner.elts if isinstance(inner, ast.Tuple) else [inner]
+            for elt in elts:
+                found = self.annotation_class(mod, elt)
+                if found:
+                    return found
+            return None
+        return self.resolve_class(mod, ann)
+
+    def return_class(self, func_key: str) -> str | None:
+        func = self.funcs[func_key]
+        return self.annotation_class(self.modules[func.module], func.node.returns)
+
+    def value_class(
+        self,
+        mod: ModuleInfo,
+        cls_key: str | None,
+        value: ast.AST | None,
+        env: dict[str, str],
+    ) -> str | None:
+        """The project class *value* evaluates to, when its provenance shows it:
+        a constructor, a call with a return annotation, an annotated parameter
+        (*env*), an attribute of known type, or either side of `a or b`."""
+        if isinstance(value, ast.Call):
+            found = self.resolve_class(mod, value.func)
+            if found:
+                return found
+            func = value.func
+            callee = None
+            method = _self_attr(func)
+            if method and cls_key:
+                callee = self.method_of(cls_key, method)
+            elif isinstance(func, ast.Name) and func.id in mod.functions:
+                callee = mod.functions[func.id]
+            return self.return_class(callee) if callee else None
+        if isinstance(value, ast.BoolOp):
+            for operand in value.values:
+                found = self.value_class(mod, cls_key, operand, env)
+                if found:
+                    return found
+            return None
+        if isinstance(value, ast.IfExp):
+            return self.value_class(mod, cls_key, value.body, env) or self.value_class(
+                mod, cls_key, value.orelse, env
+            )
+        if isinstance(value, ast.Name):
+            return env.get(value.id)
+        attr = _self_attr(value)
+        if attr and cls_key and cls_key in self.classes:
+            return self.classes[cls_key].attr_types.get(attr)
+        return None
+
+    def param_env(
+        self, mod: ModuleInfo, fn: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> dict[str, str]:
+        args = fn.args
+        env: dict[str, str] = {}
+        for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs]:
+            found = self.annotation_class(mod, arg.annotation)
+            if found:
+                env[arg.arg] = found
+        return env
+
+    def _infer_attr_types(self) -> None:
+        """`self.x = param`, `self.x = a or Factory()`, `self.x: X = ...`: the
+        attribute's class, beyond the direct constructor call pass 1 sees."""
+        for info in self.classes.values():
+            mod = self.modules[info.module]
+            for func_key in info.methods.values():
+                fn = self.funcs[func_key].node
+                env = self.param_env(mod, fn)
+                for sub in _walk_scope(fn):
+                    if isinstance(sub, ast.AnnAssign):
+                        attr = _self_attr(sub.target)
+                        found = self.annotation_class(mod, sub.annotation)
+                    elif isinstance(sub, ast.Assign) and len(sub.targets) == 1:
+                        attr = _self_attr(sub.targets[0])
+                        found = (
+                            self.value_class(mod, info.key, sub.value, env)
+                            if attr
+                            else None
+                        )
+                    else:
+                        continue
+                    if attr and found and attr not in info.lock_attrs:
+                        info.attr_types.setdefault(attr, found)
+
+    def implementations(self, cls_key: str, name: str) -> list[str]:
+        """Non-stub definitions of *name* in the project subclasses of *cls_key*."""
+        if self._subclasses is None:
+            self._subclasses = {}
+            for key, info in self.classes.items():
+                mod = self.modules[info.module]
+                for base in info.bases:
+                    try:
+                        base_node = ast.parse(base, mode="eval").body
+                    except SyntaxError:
+                        continue
+                    base_key = self.resolve_class(mod, base_node) if base else None
+                    if base_key:
+                        self._subclasses.setdefault(base_key, []).append(key)
+        out: list[str] = []
+        seen = {cls_key}
+        queue = list(self._subclasses.get(cls_key, ()))
+        while queue:
+            sub = queue.pop(0)
+            if sub in seen:
+                continue
+            seen.add(sub)
+            found = self.classes[sub].methods.get(name)
+            if found and not _is_stub(self.funcs[found].node):
+                out.append(found)
+            queue.extend(self._subclasses.get(sub, ()))
+        return out
+
     # -- pass 1b: which context managers hold a lock -------------------------
 
     def _resolve_lock_cms(self) -> None:
-        """Decide, for each project @contextmanager, whether it holds a lock at `yield`."""
-        for key, func in self.funcs.items():
-            if not _is_contextmanager(func.node):
-                continue
-            params = [a.arg for a in func.node.args.args]
-            result: tuple[str, int | None] | None = None
-            for node in ast.walk(func.node):
-                if not isinstance(node, (ast.With, ast.AsyncWith)):
+        """Decide, for each project @contextmanager, whether it holds a lock at `yield`.
+
+        Three rounds:
+
+        1. Direct: a `with` around `yield` on a lock (or on a parameter), or an
+           `acquire()` in the body.
+        2. A fixpoint over the project's own context managers: a CM whose `with`
+           around `yield` enters another lock CM holds that lock too
+           (`with self._locks(key): yield`), however deep the nesting.
+        3. A second fixpoint for the kind: a CM inherits the reentrancy of the
+           locks it holds at `yield`, so a CM over an `RLock` is reentrant and one
+           over a plain `Lock` is not.
+        """
+        cms = {k: f for k, f in self.funcs.items() if _is_contextmanager(f.node)}
+        for key, func in cms.items():
+            self.lock_cms[key] = self._direct_lock_cm(func)
+        scanners: dict[str, _FunctionScanner] = {}
+
+        def scanner(key: str) -> _FunctionScanner:
+            if key not in scanners:
+                scanners[key] = _FunctionScanner(self, cms[key])
+            return scanners[key]
+
+        for _ in range(len(cms) + 1):
+            changed = False
+            for key, func in cms.items():
+                if self.lock_cms[key] is not None:
                     continue
-                if not any(
-                    isinstance(n, (ast.Yield, ast.YieldFrom)) for n in ast.walk(node)
+                for expr, is_async in _yield_with_items(func.node):
+                    if not isinstance(expr, ast.Call):
+                        continue
+                    inner = scanner(key)._lock_of(expr, is_async)
+                    if inner is not None:
+                        self.lock_cms[key] = ("own", None)
+                        self.lock_cm_via[key] = inner.text
+                        if not inner.anonymous:
+                            # Same lock, two spellings: `with self._guard(k)` and
+                            # `with self._guards(k)` must count as one guard.
+                            self.lock_cm_alias[key] = inner.key
+                        changed = True
+                        break
+            if not changed:
+                break
+        for _ in range(len(cms) + 1):
+            changed = False
+            for key, func in cms.items():
+                if self.lock_cms[key] != ("own", None):
+                    continue
+                held = self._cm_held(scanner(key), func)
+                kind = _combine_kinds([h.kind for h in held])
+                modes = {h.mode for h in held}
+                mode = modes.pop() if len(modes) == 1 else ""
+                if (
+                    self.lock_cm_kind.get(key) != kind
+                    or self.lock_cm_mode.get(key) != mode
                 ):
-                    continue
-                for item in node.items:
-                    expr = item.context_expr
-                    base = expr.func if isinstance(expr, ast.Call) else expr
-                    while isinstance(base, ast.Attribute) and _MODE_METHODS.match(
-                        base.attr
-                    ):
-                        base = base.value
-                    if isinstance(base, ast.Name) and base.id in params:
-                        result = ("param", params.index(base.id))
-                        break
-                    if self._looks_like_lock(func, expr):
-                        result = ("own", None)
-                        break
-                if result:
-                    break
-            if result is None:
-                # `lock.acquire()` ... `yield` ... `lock.release()`
-                acquired = any(
-                    isinstance(n, ast.Call)
-                    and isinstance(n.func, ast.Attribute)
-                    and n.func.attr == "acquire"
-                    for n in ast.walk(func.node)
-                )
-                if acquired:
-                    result = ("own", None)
-            self.lock_cms[key] = result
+                    self.lock_cm_kind[key] = kind
+                    self.lock_cm_mode[key] = mode
+                    changed = True
+            if not changed:
+                break
+
+    def _direct_lock_cm(self, func: Func) -> tuple[str, int | None] | None:
+        params = [a.arg for a in func.node.args.args]
+        for expr, _is_async in _yield_with_items(func.node):
+            base = expr.func if isinstance(expr, ast.Call) else expr
+            while isinstance(base, ast.Attribute) and _MODE_METHODS.match(base.attr):
+                base = base.value
+            if isinstance(base, ast.Name) and base.id in params:
+                return ("param", params.index(base.id))
+            if self._looks_like_lock(func, expr):
+                return ("own", None)
+        # `lock.acquire()` ... `yield` ... `lock.release()`
+        receivers = [
+            n.func.value
+            for n in ast.walk(func.node)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "acquire"
+        ]
+        if not receivers:
+            return None
+        # `lock.acquire()` on a parameter: the caller's argument is the lock.
+        if len(receivers) == 1:
+            recv = receivers[0]
+            if isinstance(recv, ast.Name) and recv.id in params:
+                return ("param", params.index(recv.id))
+        return ("own", None)
+
+    @staticmethod
+    def _cm_held(scanner: _FunctionScanner, func: Func) -> list[Held]:
+        """The locks a context manager holds at `yield`, as far as they resolve.
+
+        A `with` item that resolves to no lock (an `ExitStack`, a helper CM) or an
+        `enter_context()` call may hold a lock this cannot see, so it adds an
+        unknown (`custom`) entry: the CM is then never taken to be reentrant.
+        """
+        held: list[Held] = []
+        unknown = Held("?", "", False, "custom", "?")
+        for expr, is_async in _yield_with_items(func.node):
+            lock = scanner._lock_of(expr, is_async)
+            held.append(lock if lock is not None else unknown)
+        if any(
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr in ("enter_context", "enter_async_context")
+            for n in ast.walk(func.node)
+        ):
+            held.append(unknown)
+        for n in ast.walk(func.node):
+            if (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "acquire"
+            ):
+                lock = scanner._lock_of(n.func.value, False, explicit=True)
+                if lock is not None:
+                    held.append(lock)
+        return held
 
     def _looks_like_lock(self, func: Func, expr: ast.AST) -> bool:
         base = expr.func if isinstance(expr, ast.Call) else expr
@@ -755,6 +986,93 @@ class Project:
             return True
         name = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", "")
         return bool(name and _LOCKISH_NAME.search(name))
+
+
+def _yield_with_items(fn: ast.AST) -> list[tuple[ast.expr, bool]]:
+    """`with` items whose block contains the function's own `yield`."""
+    out: list[tuple[ast.expr, bool]] = []
+    for node in _walk_scope(fn):
+        if not isinstance(node, (ast.With, ast.AsyncWith)):
+            continue
+        if not any(
+            isinstance(n, (ast.Yield, ast.YieldFrom))
+            for stmt in node.body
+            for n in [stmt, *_walk_scope(stmt)]
+        ):
+            continue
+        out.extend(
+            (item.context_expr, isinstance(node, ast.AsyncWith)) for item in node.items
+        )
+    return out
+
+
+_REENTRANT_KINDS = ("custom-reentrant", "RLock", "Condition")
+_TYPE_WRAPPERS = frozenset(
+    {"Optional", "Union", "Annotated", "Final", "ClassVar", "type", "Type"}
+)
+
+
+def _is_stub(fn: ast.AST) -> bool:
+    """A body that does nothing: `...`, `pass`, a docstring, `raise NotImplementedError`."""
+    body = list(getattr(fn, "body", []))
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    for stmt in body:
+        if isinstance(stmt, ast.Pass):
+            continue
+        if (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and stmt.value.value is Ellipsis
+        ):
+            continue
+        if isinstance(stmt, ast.Raise) and stmt.exc is not None:
+            exc = stmt.exc.func if isinstance(stmt.exc, ast.Call) else stmt.exc
+            if _dotted(exc).endswith("NotImplementedError"):
+                continue
+        return False
+    return True
+
+
+def _receiver_matches(receiver: ast.AST, func: Func) -> bool:
+    """Does the receiver's name point at the class that defines *func*?
+
+    `index.query(...)` -> `SearchIndex`, `self._cache.put(...)` -> `DiskCache`.
+    """
+    if not func.cls:
+        return False
+    if isinstance(receiver, ast.Call):
+        receiver = receiver.func
+    name = (
+        receiver.attr
+        if isinstance(receiver, ast.Attribute)
+        else getattr(receiver, "id", "")
+    )
+    cls_name = func.cls.split(":", 1)[-1].lower()
+    tokens = [t for t in name.lower().split("_") if len(t) >= 3]
+    tokens = [t for t in tokens if t not in ("get", "ensure", "make", "new", "self")]
+    return any(t in cls_name for t in tokens)
+
+
+def _combine_kinds(kinds: list[str]) -> str:
+    """The kind of a context manager that holds all of *kinds* at once.
+
+    One non-reentrant lock makes the whole CM non-reentrant; it is reentrant only
+    when every lock it holds is known to be. Anything else is unknown (`custom`).
+    """
+    for kind in kinds:
+        if kind in _NON_REENTRANT:
+            return kind
+    if kinds and all(k == "async" for k in kinds):
+        return "async"
+    if kinds and all(k in _REENTRANT_KINDS for k in kinds):
+        return next(k for k in _REENTRANT_KINDS if k in kinds)
+    return "custom"
 
 
 def _walk_scope(node: ast.AST):
@@ -794,6 +1112,7 @@ class _FunctionScanner:
         for extra in (args.vararg, args.kwarg):
             if extra:
                 self.locals.add(extra.arg)
+        self.local_types = self._local_types()
         for node in _walk_scope(func.node):
             if (
                 isinstance(node, ast.Name)
@@ -803,18 +1122,43 @@ class _FunctionScanner:
                 self.locals.add(node.id)
 
     def _annotation_class(self, ann: ast.AST | None) -> str | None:
-        if ann is None:
-            return None
-        if isinstance(ann, ast.Constant) and isinstance(ann.value, str):
-            try:
-                ann = ast.parse(ann.value, mode="eval").body
-            except SyntaxError:
-                return None
-        if isinstance(ann, ast.BinOp):  # X | None
-            return self._annotation_class(ann.left) or self._annotation_class(ann.right)
-        if isinstance(ann, ast.Subscript):  # Optional[X]
-            return self._annotation_class(ann.slice)
-        return self.p.resolve_class(self.mod, ann)
+        return self.p.annotation_class(self.mod, ann)
+
+    def _local_types(self) -> dict[str, str]:
+        """`index = self._index`, `db = self._open_db()`: a local's class, when
+        every assignment to it agrees."""
+        seen: dict[str, str | None] = {}
+        for node in _walk_scope(self.f.node):
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                name = node.target.id
+                found = self._annotation_class(node.annotation)
+            elif (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+            ):
+                name = node.targets[0].id
+                found = self.p.value_class(
+                    self.mod, self.f.cls, node.value, self.param_types
+                )
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.withitem)):
+                target = (
+                    node.target
+                    if not isinstance(node, ast.withitem)
+                    else node.optional_vars
+                )
+                if isinstance(target, ast.Name):
+                    seen[target.id] = None
+                continue
+            else:
+                continue
+            if name in self.param_types:
+                continue
+            if name in seen and seen[name] != found:
+                seen[name] = None
+            else:
+                seen.setdefault(name, found)
+        return {k: v for k, v in seen.items() if v}
 
     def run(self) -> None:
         self._body(self.f.node.body, (), loop_depth=0)
@@ -1087,12 +1431,17 @@ class _FunctionScanner:
                             return self._lock_of(expr.args[idx], is_async)
                     family = self.p.funcs[key].qualname
                     instance = ", ".join(_text(a) for a in expr.args)
-                    mode = _mode_of(self.p.funcs[key].name)
+                    mode = _mode_of(self.p.funcs[key].name) or self.p.lock_cm_mode.get(
+                        key, ""
+                    )
+                    kind = self.p.lock_cm_kind.get(key, "custom")
                     return Held(
-                        f"{self.p.funcs[key].module}:{family}",
+                        self.p.lock_cm_alias.get(
+                            key, f"{self.p.funcs[key].module}:{family}"
+                        ),
                         mode,
-                        is_async,
-                        "custom",
+                        is_async or kind == "async",
+                        kind,
                         _text(expr),
                         instance,
                     )
@@ -1288,14 +1637,43 @@ class _FunctionScanner:
         if attr and self.f.cls:
             cls_key = self.p.classes[self.f.cls].attr_types.get(attr)
         elif isinstance(receiver, ast.Name):
-            cls_key = self.param_types.get(receiver.id)
+            cls_key = self.param_types.get(receiver.id) or self.local_types.get(
+                receiver.id
+            )
         if cls_key:
             found = self.p.method_of(cls_key, method)
+            if found and _is_stub(self.p.funcs[found].node):
+                # An interface (Protocol / ABC): the code that runs is an
+                # implementation. One subclass is as good as the class itself.
+                impls = self.p.implementations(cls_key, method)
+                if impls:
+                    return [(k, len(impls) == 1) for k in impls]
+                return self._weak_candidates(method, receiver) or [(found, True)]
             return [(found, True)] if found else []
         # Any other receiver: a method name only a few project classes define.
+        return self._weak_candidates(method, receiver)
+
+    def _weak_candidates(
+        self, method: str, receiver: ast.AST
+    ) -> list[tuple[str, bool]]:
+        """Name-only resolution: the project classes that define *method*.
+
+        Interface stubs are dropped when a real body exists, and when the
+        receiver's name points at one class (`index` -> `SearchIndex`) the
+        others are dropped too. What is left is a weak edge each.
+        """
         if method in _BUILTIN_METHOD_NAMES or method.startswith("__"):
             return []
         candidates = self.p.method_index.get(method, [])
+        real = [c for c in candidates if not _is_stub(self.p.funcs[c].node)]
+        if real:
+            candidates = real
+        if len(candidates) > 1:
+            named = [
+                c for c in candidates if _receiver_matches(receiver, self.p.funcs[c])
+            ]
+            if named:
+                candidates = named
         if 0 < len(candidates) <= _MAX_WEAK_CANDIDATES:
             return [(c, False) for c in candidates]
         return []
@@ -1386,9 +1764,26 @@ class Step:
     rel: str
     line: int
     text: str
+    weak: str = ""  # why this hop is uncertain ("weak: 1 of 2 candidates")
 
     def render(self) -> str:
-        return f"{self.rel}:{self.line} {self.func}: {self.text}"
+        out = f"{self.rel}:{self.line} {self.func}: {self.text}"
+        return f"{out} [{self.weak}]" if self.weak else out
+
+
+def _call_step(func: Func, call: Call, strong: bool, text: str = "") -> Step:
+    """The chain step for *call*, marked `[weak]` when resolved by method name only."""
+    weak = ""
+    if not strong:
+        n = sum(1 for _c, st in call.callees if not st)
+        weak = f"weak: name-only, 1 of {n} candidates" if n > 1 else "weak: name-only"
+    return Step(
+        func.qualname,
+        func.rel,
+        getattr(call.node, "lineno", 0),
+        text or f"calls {_text(call.node.func)}(...)",
+        weak,
+    )
 
 
 class Summaries:
@@ -1468,9 +1863,7 @@ class Summaries:
             changed = False
             rounds += 1
             for key, func, call, callee, strong in edges:
-                step = self._step(
-                    func, call.node, f"calls {_text(call.node.func)}(...)"
-                )
+                step = _call_step(func, call, strong)
                 for category, (chain, cstrong) in self.blocks[callee].items():
                     if len(chain) >= _MAX_CHAIN:
                         continue
@@ -1579,8 +1972,10 @@ class Summaries:
                 for call in func.calls:
                     if not call.held:
                         continue
-                    step = self._step(func, call.node, f"calls {_text(call.node.func)}")
                     for callee, strong in call.callees:
+                        step = _call_step(
+                            func, call, strong, f"calls {_text(call.node.func)}"
+                        )
                         for category, (chain, cstrong) in self.blocks.get(
                             callee, {}
                         ).items():
@@ -2056,12 +2451,7 @@ def _check_lock_order_and_reentry(p: Project, s: Summaries) -> list[dict]:
                 for lock_key, (lock, chain, cstrong, same) in s.acquires[
                     callee
                 ].items():
-                    step = Step(
-                        func.qualname,
-                        func.rel,
-                        call.node.lineno,
-                        f"calls {_text(call.node.func)}(...)",
-                    )
+                    step = _call_step(func, call, strong)
                     for h in call.held:
                         if h.anonymous:
                             continue
@@ -2228,10 +2618,49 @@ def _check_conditions(p: Project, s: Summaries) -> list[dict]:
     return out
 
 
-def _check_blocking_under_lock(p: Project, s: Summaries) -> list[dict]:
+# Worst first: a call that reaches both a sleep and a file read is reported as the sleep.
+_BLOCKING_ORDER = (
+    "sleep",
+    "network",
+    "subprocess",
+    "thread-wait",
+    "custom",
+    "ipc",
+    "file-io",
+)
+# Categories whose hits under a lock are mostly by design (one writer per file, one
+# request per pipe): summarized per lock unless --all-blocking asks for each one.
+_LOW_SIGNAL_BLOCKING = frozenset({"file-io", "ipc"})
+
+
+def _check_blocking_under_lock(
+    p: Project,
+    s: Summaries,
+    low_signal: list[dict] | None = None,
+) -> list[dict]:
+    """blocking-call-under-lock.
+
+    With *low_signal* given, file-I/O and pipe hits go there (for the per-lock
+    summary) instead of becoming findings.
+    """
     out: list[dict] = []
+
+    def emit(finding: dict, category: str, lock_key: str, leaf: str) -> None:
+        if low_signal is not None and category in _LOW_SIGNAL_BLOCKING:
+            low_signal.append(
+                {
+                    "lock": lock_key.split(":", 1)[-1],
+                    "category": category,
+                    "site": f"{finding['file']}:{finding['line']}",
+                    "leaf": leaf,
+                }
+            )
+        else:
+            out.append(finding)
+
     for func in p.funcs.values():
         entry = s.entry_held.get(func.key, frozenset())
+        direct_nodes = {id(node) for _c, _n, node, _h in func.direct_blocking}
         for category, name, node, held in func.direct_blocking:
             thread_held = [h for h in held if not h.is_async]
             if not thread_held and not entry:
@@ -2242,7 +2671,8 @@ def _check_blocking_under_lock(p: Project, s: Summaries) -> list[dict]:
                 if thread_held
                 else f"{min(entry).split(':', 1)[-1]} (held by every caller)"
             )
-            out.append(
+            lock_key = thread_held[0].key if thread_held else min(entry)
+            emit(
                 _finding(
                     "blocking-call-under-lock",
                     severity,
@@ -2253,45 +2683,72 @@ def _check_blocking_under_lock(p: Project, s: Summaries) -> list[dict]:
                     f"the lock waits for it",
                     "move the slow work out of the critical section (compute, then lock and "
                     "publish), or document why the lock must cover it",
-                )
+                ),
+                category,
+                lock_key,
+                f"{func.qualname}: {name}(...)",
             )
         for call in func.calls:
             thread_held = [h for h in call.held if not h.is_async]
-            if not thread_held:
-                continue
+            if not thread_held or id(call.node) in direct_nodes:
+                continue  # a call that is itself designated slow is reported once
             for callee, strong in call.callees:
                 if callee not in s.blocks or p.funcs[callee].is_async:
                     continue
-                for category, (chain, cstrong) in sorted(s.blocks[callee].items()):
-                    if category not in _BLOCKING_CATEGORIES:
-                        continue
-                    severity, confidence, label = _CATEGORY[category]
-                    confidence = _lower(
-                        confidence
-                    )  # through a call: one more hop to verify
-                    if not (strong and cstrong):
-                        confidence = _lower(confidence)
-                    step = Step(
-                        func.qualname,
-                        func.rel,
-                        call.node.lineno,
-                        f"calls {_text(call.node.func)}(...)",
-                    )
-                    out.append(
-                        _finding(
-                            "blocking-call-under-lock",
-                            severity,
-                            confidence,
-                            func,
-                            call.node,
-                            f"{_text(call.node.func)}(...) {label} (via {len(chain)} call"
-                            f"{'s' if len(chain) > 1 else ''}) while holding {thread_held[0].text}",
-                            "move the slow work out of the critical section, or document why the "
-                            "lock must cover it",
-                            [step, *chain],
-                        )
-                    )
-                    break  # one finding per call site: the worst category first
+                blocks = s.blocks[callee]
+                category = next((c for c in _BLOCKING_ORDER if c in blocks), None)
+                if category is None:
+                    continue
+                chain, cstrong = blocks[category]
+                severity, confidence, label = _CATEGORY[category]
+                confidence = _lower(
+                    confidence
+                )  # through a call: one more hop to verify
+                if not (strong and cstrong):
+                    confidence = _lower(confidence)
+                step = _call_step(func, call, strong)
+                emit(
+                    _finding(
+                        "blocking-call-under-lock",
+                        severity,
+                        confidence,
+                        func,
+                        call.node,
+                        f"{_text(call.node.func)}(...) {label} (via {len(chain)} call"
+                        f"{'s' if len(chain) > 1 else ''}) while holding {thread_held[0].text}",
+                        "move the slow work out of the critical section, or document why the "
+                        "lock must cover it",
+                        [step, *chain],
+                    ),
+                    category,
+                    thread_held[0].key,
+                    f"{chain[-1].func}: {chain[-1].text}",
+                )
+    return out
+
+
+def _summarize_low_signal(low_signal: list[dict]) -> list[dict]:
+    """Group summarized blocking hits by lock, then by the leaf they end in."""
+    by_lock: dict[str, list[dict]] = {}
+    for hit in low_signal:
+        by_lock.setdefault(hit["lock"], []).append(hit)
+    out: list[dict] = []
+    for lock, hits in by_lock.items():
+        categories: dict[str, int] = {}
+        leaves: dict[str, int] = {}
+        for hit in hits:
+            categories[hit["category"]] = categories.get(hit["category"], 0) + 1
+            leaves[hit["leaf"]] = leaves.get(hit["leaf"], 0) + 1
+        out.append(
+            {
+                "lock": lock,
+                "sites": len(hits),
+                "by_category": dict(sorted(categories.items())),
+                "leaves": dict(sorted(leaves.items(), key=lambda kv: (-kv[1], kv[0]))),
+                "examples": sorted({h["site"] for h in hits})[:5],
+            }
+        )
+    out.sort(key=lambda g: (-g["sites"], g["lock"]))
     return out
 
 
@@ -2356,12 +2813,7 @@ def _check_transitive_blocking_in_async(p: Project, s: Summaries) -> list[dict]:
                 if verdict is None:
                     continue
                 confidence, label, chain = verdict
-                step = Step(
-                    func.qualname,
-                    func.rel,
-                    call.node.lineno,
-                    f"calls {_text(call.node.func)}(...)",
-                )
+                step = _call_step(func, call, strong)
                 detail = (
                     "a coroutine in this module already offloads sync work "
                     "(run_in_executor/to_thread): this call is its unguarded twin. "
@@ -2485,6 +2937,453 @@ def _check_signal_handlers(p: Project, s: Summaries) -> list[dict]:
     return out
 
 
+# Calls that cannot plausibly raise or suspend between an acquire and its try.
+_SAFE_CALLS = frozenset(
+    {
+        "len",
+        "isinstance",
+        "issubclass",
+        "any",
+        "all",
+        "repr",
+        "id",
+        "type",
+        "bool",
+        "str",
+        "getattr",
+        "hasattr",
+        "min",
+        "max",
+        "sorted",
+        "list",
+        "dict",
+        "tuple",
+        "set",
+        "frozenset",
+        "range",
+        "enumerate",
+        "zip",
+        "time.monotonic",
+        "time.time",
+        "time.perf_counter",
+    }
+)
+_SAFE_METHODS = frozenset(
+    {
+        "get",
+        "items",
+        "keys",
+        "values",
+        "copy",
+        "format",
+        "join",
+        "split",
+        "strip",
+        "lower",
+        "upper",
+        "startswith",
+        "endswith",
+        "append",
+        "add",
+        "setdefault",
+    }
+)
+
+
+def _releases(node: ast.AST, res: str) -> bool:
+    """Does *node* (not a nested def) call `<res>.release(...)`?"""
+    for sub in [node, *_walk_scope(node)]:
+        if (
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Attribute)
+            and sub.func.attr == "release"
+            and _text(sub.func.value) == res
+        ):
+            return True
+    return False
+
+
+def _risky_expr(p: Project, func: Func, node: ast.AST) -> ast.AST | None:
+    """The first `await` or call in *node* that can raise or suspend."""
+    mod = p.modules[func.module]
+    for sub in [node, *_walk_scope(node)]:
+        if isinstance(sub, ast.Await):
+            return sub
+        if not isinstance(sub, ast.Call):
+            continue
+        name = p.qualify(mod, sub.func)
+        method = ""
+        receiver = ""
+        if isinstance(sub.func, ast.Attribute):
+            method = sub.func.attr
+            receiver = (_dotted(sub.func.value) or "").split(".")[-1]
+        if name in _SAFE_CALLS or method in _SAFE_METHODS:
+            continue
+        if re.search(r"(Error|Exception)$", name or method):
+            continue  # building the exception a guard raises
+        if method in _LOG_METHODS and _LOG_RECEIVERS.match(receiver):
+            continue
+        return sub
+    return None
+
+
+def _risky_in(
+    p: Project, func: Func, stmts: list[ast.stmt], res: str
+) -> ast.AST | None:
+    """The first statement-level hazard in *stmts* before *res* is released."""
+    for st in stmts:
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(st, ast.If):
+            found = _risky_expr(p, func, st.test)
+            # `if slot is None: raise Busy()`: a branch on the resource itself is
+            # the not-taken path (or its own release), not a hazard.
+            if found is None and res not in {
+                n.id for n in ast.walk(st.test) if isinstance(n, ast.Name)
+            }:
+                found = _risky_in(p, func, st.body, res) or _risky_in(
+                    p, func, st.orelse, res
+                )
+        elif isinstance(st, (ast.With, ast.AsyncWith)):
+            found = next(
+                (
+                    n
+                    for item in st.items
+                    if (n := _risky_expr(p, func, item.context_expr))
+                ),
+                None,
+            ) or _risky_in(p, func, st.body, res)
+        elif isinstance(st, (ast.For, ast.AsyncFor, ast.While)):
+            header = st.test if isinstance(st, ast.While) else st.iter
+            found = _risky_expr(p, func, header) or _risky_in(p, func, st.body, res)
+        elif isinstance(st, ast.Try):
+            if _releases_in(st.finalbody, res):
+                return None
+            found = _risky_in(p, func, st.body, res)
+        else:
+            # An explicit exit is a path of its own (often the not-acquired one);
+            # the hazard this looks for is an exception nobody planned for.
+            if _releases(st, res) or isinstance(st, (ast.Return, ast.Raise)):
+                return None
+            found = _risky_expr(p, func, st)
+        if found is not None:
+            return found
+    return None
+
+
+def _releases_in(stmts: list[ast.stmt], res: str) -> bool:
+    return any(_releases(st, res) for st in stmts)
+
+
+def _catches_cancellation(handler: ast.ExceptHandler) -> bool:
+    if handler.type is None:
+        return True
+    types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    return any(
+        _dotted(t).split(".")[-1] in ("BaseException", "CancelledError") for t in types
+    )
+
+
+def _acquired_resources(st: ast.stmt, released: set[str]) -> list[str]:
+    """`x = take_slot()`, `x, err = gate()`, `sem.acquire()`: what *st* takes,
+    when the function releases it somewhere (`x.release()`)."""
+    if (
+        isinstance(st, ast.Expr)
+        and isinstance(st.value, ast.Call)
+        and isinstance(st.value.func, ast.Attribute)
+        and st.value.func.attr == "acquire"
+        and not st.value.args
+        and not st.value.keywords
+    ):
+        res = _text(st.value.func.value)
+        return [res] if res in released else []
+    value = getattr(st, "value", None)
+    if isinstance(value, ast.Await):
+        value = value.value
+    if not isinstance(st, (ast.Assign, ast.AnnAssign)) or not isinstance(
+        value, ast.Call
+    ):
+        return []
+    targets = st.targets if isinstance(st, ast.Assign) else [st.target]
+    names: list[str] = []
+    for tgt in targets:
+        elts = tgt.elts if isinstance(tgt, (ast.Tuple, ast.List)) else [tgt]
+        names.extend(e.id for e in elts if isinstance(e, ast.Name))
+    return [n for n in names if n in released]
+
+
+def _stmt_lists(fn: ast.FunctionDef | ast.AsyncFunctionDef):
+    """Every statement list in *fn*'s own scope."""
+    stack: list[list[ast.stmt]] = [fn.body]
+    while stack:
+        stmts = stack.pop()
+        yield stmts
+        for st in stmts:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            for name in ("body", "orelse", "finalbody"):
+                sub = getattr(st, name, None)
+                if isinstance(sub, list) and sub and isinstance(sub[0], ast.stmt):
+                    stack.append(sub)
+            for handler in getattr(st, "handlers", []):
+                stack.append(handler.body)
+            for case in getattr(st, "cases", []):
+                stack.append(case.body)
+
+
+def _check_slot_release(p: Project) -> list[dict]:
+    """slot-acquired-before-the-try-that-releases-it."""
+    out: list[dict] = []
+    for func in p.funcs.values():
+        released = {
+            _text(n.func.value)
+            for n in ast.walk(func.node)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "release"
+        }
+        if not released:
+            continue
+        for stmts in _stmt_lists(func.node):
+            for i, st in enumerate(stmts):
+                for res in _acquired_resources(st, released):
+                    finding = _slot_verdict(p, func, st, stmts[i + 1 :], res)
+                    if finding is not None:
+                        out.append(finding)
+    return out
+
+
+def _slot_verdict(
+    p: Project, func: Func, acq: ast.stmt, rest: list[ast.stmt], res: str
+) -> dict | None:
+    shape = "slot-acquired-before-the-try-that-releases-it"
+    risk: ast.AST | None = None
+    for st in rest:
+        if isinstance(st, ast.Try):
+            if _releases_in(st.finalbody, res):
+                if risk is None:
+                    return None
+                return _finding(
+                    shape,
+                    "FIX",
+                    "high" if isinstance(risk, ast.Await) else "medium",
+                    func,
+                    acq,
+                    f"{res} is taken at line {acq.lineno}, but the try whose `finally` "
+                    f"releases it starts at line {st.lineno}; line {risk.lineno} can raise "
+                    f"or be cancelled first, and then nothing releases it",
+                    "open the try immediately after the acquire (or move the acquire to just "
+                    "before it); every exit between them leaks the slot until restart",
+                )
+            handlers = [h for h in st.handlers if _releases_in(h.body, res)]
+            if handlers:
+                awaited = _first_await(st.body)
+                if (
+                    func.is_async
+                    and awaited is not None
+                    and not any(_catches_cancellation(h) for h in st.handlers)
+                ):
+                    return _finding(
+                        shape,
+                        "FIX",
+                        "medium",
+                        func,
+                        acq,
+                        f"{res} is released only in `except` handlers that do not catch "
+                        f"CancelledError (a BaseException): cancelling the `await` at line "
+                        f"{awaited.lineno} skips them and leaks it",
+                        "release in `finally` (guarded by a flag set once ownership is handed "
+                        "off), or add `except BaseException: release(); raise`",
+                    )
+                return None
+        if not isinstance(st, ast.Try) and _releases(st, res) and _is_simple(st):
+            break  # released on the straight-line path
+        if isinstance(st, ast.Return) and res in {
+            n.id for n in ast.walk(st) if isinstance(n, ast.Name)
+        }:
+            break  # handed off to the caller
+        if risk is None:
+            risk = _risky_in(p, func, [st], res)
+        if isinstance(st, (ast.Return, ast.Raise)):
+            break
+    if risk is None:
+        return None
+    return _finding(
+        shape,
+        "FIX",
+        "high" if isinstance(risk, ast.Await) else "medium",
+        func,
+        acq,
+        f"{res} is taken at line {acq.lineno} and released (or handed off) only on the "
+        f"straight-line path: line {risk.lineno} can raise or be cancelled first, and no "
+        f"try/finally covers it",
+        "wrap everything after the acquire in try/finally (release unless ownership was "
+        "handed off), or use a context manager",
+    )
+
+
+def _is_simple(st: ast.stmt) -> bool:
+    return isinstance(st, (ast.Expr, ast.Assign, ast.AnnAssign, ast.AugAssign))
+
+
+def _first_await(stmts: list[ast.stmt]) -> ast.AST | None:
+    for st in stmts:
+        for sub in [st, *_walk_scope(st)]:
+            if isinstance(sub, ast.Await):
+                return sub
+    return None
+
+
+_CONTAINER_FACTORIES = frozenset(
+    {
+        "dict",
+        "list",
+        "set",
+        "collections.defaultdict",
+        "collections.OrderedDict",
+        "collections.deque",
+        "collections.Counter",
+        "weakref.WeakValueDictionary",
+        "weakref.WeakKeyDictionary",
+        "weakref.WeakSet",
+    }
+)
+
+
+def _module_state(p: Project) -> list[dict]:
+    """Process-global state: the starting point for a re-entrancy review.
+
+    Module-level instances of project classes (singletons), module-level
+    containers that some function mutates, and globals a function rebinds
+    (`global _client; _client = Client()`). Listed whether or not any lock is
+    involved: in a project with no threads, a second in-process call (a test
+    runner, an embedding application, a server) is the concurrency.
+    """
+    out: list[dict] = []
+    for mod in p.modules.values():
+        defined: dict[str, tuple[str, str, int]] = {}  # name -> (kind, class, line)
+        for stmt in mod.tree.body:
+            if isinstance(stmt, ast.Assign):
+                targets, value = stmt.targets, stmt.value
+            elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+                targets, value = [stmt.target], stmt.value
+            else:
+                continue
+            for tgt in targets:
+                if not isinstance(tgt, ast.Name) or tgt.id in mod.lock_globals:
+                    continue
+                kind, cls = "", ""
+                if isinstance(value, ast.Call):
+                    cls_key = p.resolve_class(mod, value.func)
+                    if cls_key and not p.classes[cls_key].is_lock_class:
+                        kind, cls = "instance", cls_key.split(":", 1)[-1]
+                    elif p.qualify(mod, value.func) in _CONTAINER_FACTORIES:
+                        kind = "container"
+                elif isinstance(
+                    value,
+                    (
+                        ast.Dict,
+                        ast.List,
+                        ast.Set,
+                        ast.DictComp,
+                        ast.ListComp,
+                        ast.SetComp,
+                    ),
+                ):
+                    kind = "container"
+                else:
+                    kind = "value"
+                defined[tgt.id] = (kind, cls, stmt.lineno)
+        if not defined:
+            continue
+        importers = {mod.name: {n: n for n in defined}}
+        for other in p.modules.values():
+            if other is mod:
+                continue
+            names = {
+                alias: target.rsplit(".", 1)[-1]
+                for alias, target in other.imports.items()
+                if target.rsplit(".", 1)[0] == mod.name
+                and target.rsplit(".", 1)[-1] in defined
+            }
+            if names:
+                importers[other.name] = names
+        mutated: dict[str, set[str]] = {}
+        rebound: dict[str, set[str]] = {}
+        used: dict[str, set[str]] = {}
+        for func in p.funcs.values():
+            names = importers.get(func.module)
+            if not names:
+                continue
+            declared = {
+                n
+                for node in _walk_scope(func.node)
+                if isinstance(node, ast.Global)
+                for n in node.names
+            }
+            local = {
+                node.id
+                for node in _walk_scope(func.node)
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+            } | {a.arg for a in ast.walk(func.node.args) if isinstance(a, ast.arg)}
+            for node in _walk_scope(func.node):
+                if not isinstance(node, ast.Name) or node.id not in names:
+                    continue
+                name = names[node.id]
+                if isinstance(node.ctx, ast.Store):
+                    if node.id in declared:
+                        rebound.setdefault(name, set()).add(func.qualname)
+                    continue
+                if node.id in local and node.id not in declared:
+                    continue
+                used.setdefault(name, set()).add(func.qualname)
+            for node in _walk_scope(func.node):
+                base = None
+                if isinstance(node, (ast.Subscript,)) and isinstance(
+                    node.ctx, (ast.Store, ast.Del)
+                ):
+                    base = node.value
+                elif (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in _MUTATING_METHODS
+                ):
+                    base = node.func.value
+                if (
+                    isinstance(base, ast.Name)
+                    and base.id in names
+                    and (base.id not in local or base.id in declared)
+                ):
+                    mutated.setdefault(names[base.id], set()).add(func.qualname)
+        for name, (kind, cls, line) in defined.items():
+            entry = None
+            if name in rebound:
+                entry = {"kind": "rebound", "by": sorted(rebound[name])}
+            elif kind == "instance":
+                entry = {
+                    "kind": "instance",
+                    "class": cls,
+                    "by": sorted(used.get(name, ())),
+                }
+            elif kind == "container" and name in mutated:
+                entry = {"kind": "container", "by": sorted(mutated[name])}
+            if entry is None:
+                continue
+            by = entry.pop("by")
+            out.append(
+                {
+                    "name": f"{mod.name}:{name}",
+                    "file": mod.rel,
+                    "line": line,
+                    **entry,
+                    "functions": by[:10],
+                    "function_count": len(by),
+                }
+            )
+    out.sort(key=lambda e: (e["file"], e["line"]))
+    return out
+
+
 # --------------------------------------------------------------------------
 # Driver
 # --------------------------------------------------------------------------
@@ -2502,6 +3401,7 @@ _CHECKS = (
     "await-while-holding-thread-lock",
     "transitive-blocking-call-in-async",
     "signal-handler-does-real-work",
+    "slot-acquired-before-the-try-that-releases-it",
 )
 
 
@@ -2512,8 +3412,13 @@ def analyze(
     checks: list[str] | None = None,
     exclude: list[str] | None = None,
     blocking: list[str] | None = None,
+    all_blocking: bool = False,
 ) -> dict:
-    """Scan *target* (a directory or a file) for concurrency defects."""
+    """Scan *target* (a directory or a file) for concurrency defects.
+
+    File-I/O and pipe waits under a lock are summarized per lock in
+    ``summary["blocking_low_signal"]`` unless *all_blocking* reports each one.
+    """
     resolved = Path(target).resolve()
     project_root = find_project_root(resolved)
     scan_root = resolved
@@ -2532,6 +3437,7 @@ def analyze(
     selected = set(checks or _CHECKS)
 
     findings: list[dict] = []
+    low_signal: list[dict] = []
     guard_findings, guards = _check_guards(project, summaries)
     if "unguarded-access-to-lock-guarded-state" in selected:
         findings.extend(guard_findings)
@@ -2547,7 +3453,7 @@ def analyze(
             project, summaries
         ),
         "blocking-call-under-lock": lambda: _check_blocking_under_lock(
-            project, summaries
+            project, summaries, None if all_blocking else low_signal
         ),
         "await-while-holding-thread-lock": lambda: _check_await_under_lock(project),
         "transitive-blocking-call-in-async": lambda: (
@@ -2555,6 +3461,9 @@ def analyze(
         ),
         "signal-handler-does-real-work": lambda: _check_signal_handlers(
             project, summaries
+        ),
+        "slot-acquired-before-the-try-that-releases-it": lambda: _check_slot_release(
+            project
         ),
     }
     # Some checks produce two shapes; run each producer once if either is selected.
@@ -2596,6 +3505,7 @@ def analyze(
         for kind in mod.lock_globals.values():
             lock_kinds[kind] = lock_kinds.get(kind, 0) + 1
 
+    module_state = _module_state(project)
     result = build_envelope(project_root, scan_root, files_total, len(files))
     result["summary"] = {
         "total_findings": len(findings),
@@ -2609,10 +3519,37 @@ def analyze(
         "lock_context_managers": sorted(
             project.funcs[k].qualname for k, v in project.lock_cms.items() if v
         ),
+        # The reentrancy each lock CM inherits from the locks it holds at `yield`
+        # (`custom` = unknown), and the project lock CM a nested one wraps.
+        "lock_context_manager_kinds": {
+            project.funcs[k].qualname: project.lock_cm_kind.get(k, "custom")
+            for k, v in sorted(project.lock_cms.items())
+            if v == ("own", None)
+        },
+        "lock_context_managers_wrapping": {
+            project.funcs[k].qualname: via
+            for k, via in sorted(project.lock_cm_via.items())
+        },
+        # Context managers with a `with` around `yield` that did not resolve to
+        # a lock: check each by hand, a missed lock CM hides every site using it.
+        "possible_lock_cms_missed": sorted(
+            f"{project.funcs[k].qualname}: with {', '.join(_text(e) for e, _ in items)}"
+            for k, v in project.lock_cms.items()
+            if v is None and (items := _yield_with_items(project.funcs[k].node))
+        ),
         "guards_inferred": len(guards),
+        "module_state_entries": len(module_state),
         "slow_locks": sorted(k.split(":", 1)[-1] for k in summaries.slow_locks),
+        # File I/O and pipe waits under a lock: mostly by design, so summarized
+        # per lock instead of one finding each (--all-blocking lists them).
+        "blocking_low_signal": {
+            "reported_as": "findings" if all_blocking else "summary",
+            "sites": None if all_blocking else len(low_signal),
+            "by_lock": [] if all_blocking else _summarize_low_signal(low_signal),
+        },
     }
     result["guards"] = guards
+    result["module_state"] = module_state
     result["findings"] = findings
     return result
 
@@ -2649,7 +3586,10 @@ def _extract_options(argv: list[str]) -> tuple[list[str], dict[str, list[str] | 
 
 
 def main() -> None:
-    argv, opts = _extract_options(sys.argv[1:])
+    argv = sys.argv[1:]
+    all_blocking = "--all-blocking" in argv
+    argv = [a for a in argv if a != "--all-blocking"]
+    argv, opts = _extract_options(argv)
     target, max_files = parse_common_args(argv)
     checks = opts["check"]
     if checks:
@@ -2669,6 +3609,7 @@ def main() -> None:
             checks=checks,
             exclude=opts["exclude"],
             blocking=opts["blocking"],
+            all_blocking=all_blocking,
         )
     )
 

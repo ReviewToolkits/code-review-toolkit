@@ -1752,12 +1752,75 @@ def _check_except_exception_too_broad(tree: ast.AST) -> list[dict]:
     return out
 
 
+def _tries_in_scope(tree: ast.AST):
+    """Yield ``(try, enclosing_scope, in_finally)`` for every `try`.
+
+    *enclosing_scope* is the innermost function (or the module); *in_finally*
+    is true when the `try` sits anywhere inside a `finally:` block of that
+    scope, i.e. it already is the cleanup path.
+    """
+
+    def visit(stmts: list[ast.stmt], scope: ast.AST, in_finally: bool):
+        for stmt in stmts:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                yield from visit(stmt.body, stmt, False)
+                continue
+            if isinstance(stmt, ast.Try):
+                yield stmt, scope, in_finally
+            for name in ("body", "orelse"):
+                sub = getattr(stmt, name, None)
+                if isinstance(sub, list) and sub and isinstance(sub[0], ast.stmt):
+                    yield from visit(sub, scope, in_finally)
+            for handler in getattr(stmt, "handlers", []):
+                yield from visit(handler.body, scope, in_finally)
+            for case in getattr(stmt, "cases", []):
+                yield from visit(case.body, scope, in_finally)
+            finalbody = getattr(stmt, "finalbody", None)
+            if finalbody:
+                yield from visit(finalbody, scope, True)
+
+    yield from visit(getattr(tree, "body", []), tree, False)
+
+
+def _bound_targets(node: ast.AST) -> list[ast.AST]:
+    """The names *node* itself binds (`x = ...`, `with ... as x`, `for x in`)."""
+    if isinstance(node, ast.Assign):
+        bound = list(node.targets)
+    elif isinstance(node, (ast.AnnAssign, ast.NamedExpr, ast.For, ast.AsyncFor)):
+        bound = [node.target]
+    elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+        bound = [node.optional_vars]
+    else:
+        return []
+    out: list[ast.AST] = []
+    for tgt in bound:
+        out.extend(tgt.elts if isinstance(tgt, (ast.Tuple, ast.List)) else [tgt])
+    return out
+
+
+def _acquired_in_scope(scope: ast.AST, target: str, before: int) -> bool:
+    """Is *target* a parameter of *scope*, or bound in it before line *before*?
+
+    A resource the function never binds (`self._handle.close()` on a handle
+    opened elsewhere) is not this function's acquire.
+    """
+    args = getattr(scope, "args", None)
+    if args is not None:
+        root = target.split(".")[0]
+        params = {a.arg for a in [*args.posonlyargs, *args.args, *args.kwonlyargs]}
+        if root in params and root not in ("self", "cls"):
+            return True
+    return any(
+        tgt.lineno < before and _dotted_name(tgt) == target
+        for node in _walk_same_scope(scope)
+        for tgt in _bound_targets(node)
+    )
+
+
 def _check_cleanup_only_on_success(tree: ast.AST) -> list[dict]:
     out: list[dict] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Try) or not node.handlers or node.finalbody:
-            continue
-        if not node.body:
+    for node, scope, in_finally in _tries_in_scope(tree):
+        if not node.handlers or node.finalbody or not node.body:
             continue
         last = node.body[-1]
         if not (isinstance(last, ast.Expr) and isinstance(last.value, ast.Call)):
@@ -1779,17 +1842,26 @@ def _check_cleanup_only_on_success(tree: ast.AST) -> list[dict]:
         )
         if released_in_handler:
             continue
-        out.append(
-            _finding(
-                "cleanup-only-on-success-path",
-                "FIX",
-                "high" if len(node.body) > 1 else "medium",
-                last,
-                f"`{target}.{verb}()` runs only when the try body succeeds; an "
-                f"exception above it leaks the resource",
-                "move it to a `finally:` block, or use a `with` statement",
-            )
+        finding = _finding(
+            "cleanup-only-on-success-path",
+            "FIX",
+            "high" if len(node.body) > 1 else "medium",
+            last,
+            f"`{target}.{verb}()` runs only when the try body succeeds; an "
+            f"exception above it leaks the resource",
+            "move it to a `finally:` block, or use a `with` statement",
         )
+        # Differentials: the release is already on the cleanup path, nothing
+        # above it can raise, or the resource was not acquired here.
+        if in_finally:
+            finding["suppressed"] = "inside-finally"
+        elif len(node.body) == 1:
+            finding["suppressed"] = "release-is-the-whole-try"
+        elif isinstance(call.func.value, ast.Call):
+            finding["suppressed"] = "release-chained-on-acquire"
+        elif not _acquired_in_scope(scope, target, last.lineno):
+            finding["suppressed"] = "not-acquired-here"
+        out.append(finding)
     return out
 
 
@@ -1813,18 +1885,26 @@ def _check_error_reported_below_warning(tree: ast.AST) -> list[dict]:
                 quiet.append(name)
         if loud or not quiet:
             continue
-        out.append(
-            _finding(
-                "error-reported-below-warning",
-                "CONSIDER",
-                "medium",
-                node,
-                f"the only report of this failure is {quiet[0]}(...), which default "
-                f"logging configuration discards",
-                "an operator running with defaults sees nothing; use warning/exception "
-                "if the condition is actionable",
-            )
+        finding = _finding(
+            "error-reported-below-warning",
+            "CONSIDER",
+            "medium",
+            node,
+            f"the only report of this failure is {quiet[0]}(...), which default "
+            f"logging configuration discards",
+            "an operator running with defaults sees nothing; use warning/exception "
+            "if the condition is actionable",
         )
+        # The caller is told: a rejection returned as `{"ok": False, ...}` or
+        # an error response is reported, and INFO is the right level for it.
+        if any(
+            isinstance(n, ast.Return) and _is_error_result(n.value)
+            for n in _walk_same_scope(node)
+        ):
+            finding["suppressed"] = "returns-error-result"
+        elif _carries_exception(node):
+            finding["suppressed"] = "exception-carried-as-value"
+        out.append(finding)
     return out
 
 
@@ -1923,15 +2003,67 @@ def _check_except_in_loop_without_exit(tree: ast.AST) -> list[dict]:
     return out
 
 
+def _raised_name(node: ast.Raise) -> str:
+    exc = node.exc.func if isinstance(node.exc, ast.Call) else node.exc
+    return _dotted_name(exc).split(".")[-1] if exc is not None else ""
+
+
+def _handler_catches(handler: ast.ExceptHandler, raised: str) -> bool:
+    """Does *handler* catch an exception of class *raised*?"""
+    if handler.type is None:
+        return True
+    types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    caught = {_dotted_name(t).split(".")[-1] for t in types}
+    if caught & {"Exception", "BaseException", raised}:
+        # `Exception` does not catch the BaseException-only family.
+        return not (
+            raised in ("SystemExit", "KeyboardInterrupt", "GeneratorExit")
+            and not caught & {"BaseException", raised}
+        )
+    return bool(caught & _EXC_ANCESTORS.get(raised, set()))
+
+
+def _raises_in_handler(handler: ast.ExceptHandler):
+    """Yield ``(raise, caught_inside)`` for each `raise` in *handler*'s own body.
+
+    *caught_inside* is true when a `try` inside the handler has an `except`
+    that catches the raised class, so the raise never leaves the handler.
+    Nested handlers and functions are skipped: they are visited on their own.
+    """
+
+    def visit(stmts: list[ast.stmt], catchers: list[list[ast.ExceptHandler]]):
+        for stmt in stmts:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(stmt, ast.Raise):
+                name = _raised_name(stmt)
+                caught = bool(name) and any(
+                    _handler_catches(h, name) for hs in catchers for h in hs
+                )
+                yield stmt, caught
+                continue
+            if isinstance(stmt, ast.Try):
+                yield from visit(stmt.body, [*catchers, stmt.handlers])
+                yield from visit(stmt.orelse, catchers)
+                yield from visit(stmt.finalbody, catchers)
+                continue
+            for name in ("body", "orelse"):
+                sub = getattr(stmt, name, None)
+                if isinstance(sub, list) and sub and isinstance(sub[0], ast.stmt):
+                    yield from visit(sub, catchers)
+            for case in getattr(stmt, "cases", []):
+                yield from visit(case.body, catchers)
+
+    yield from visit(handler.body, [])
+
+
 def _check_raise_without_from(tree: ast.AST) -> list[dict]:
     out: list[dict] = []
     for candidate in ast.walk(tree):
         if not isinstance(candidate, ast.ExceptHandler):
             continue
         handler = candidate
-        for node in ast.walk(handler):
-            if not isinstance(node, ast.Raise):
-                continue
+        for node, caught_inside in _raises_in_handler(handler):
             if node.exc is None:  # bare `raise` re-raises; correct
                 continue
             if node.cause is not None:  # explicit `from err` / `from None`
@@ -1939,17 +2071,21 @@ def _check_raise_without_from(tree: ast.AST) -> list[dict]:
             # Re-raising the caught name itself needs no cause.
             if isinstance(node.exc, ast.Name) and node.exc.id == handler.name:
                 continue
-            out.append(
-                _finding(
-                    "raise-without-from-in-except",
-                    "CONSIDER",
-                    "medium",
-                    node,
-                    "raising a new exception inside `except` without `from` loses the "
-                    "explicit cause",
-                    "use `from err` to chain or `from None` to suppress deliberately",
-                )
+            finding = _finding(
+                "raise-without-from-in-except",
+                "CONSIDER",
+                "medium",
+                node,
+                "raising a new exception inside `except` without `from` loses the "
+                "explicit cause",
+                "use `from err` to chain or `from None` to suppress deliberately",
             )
+            if _raised_name(node) == "SystemExit":
+                # An exit prints no traceback, so there is no chain to show.
+                finding["suppressed"] = "system-exit"
+            elif caught_inside:
+                finding["suppressed"] = "caught-inside-the-handler"
+            out.append(finding)
     return out
 
 
@@ -2182,6 +2318,121 @@ def _check_falsy_check_for_none_default(tree: ast.AST) -> list[dict]:
                     f"the check also fires for 0, '', [] and False",
                     f"use `{name} is None` if the intent is 'argument omitted'; this "
                     f"matters whenever a falsy value is legitimate input",
+                )
+            )
+    return out
+
+
+# Attribute segments that name an inherited or fallback source of a value.
+_INHERIT_SEGMENTS = frozenset(
+    {
+        "parent",
+        "parents",
+        "base",
+        "defaults",
+        "default",
+        "inherited",
+        "outer",
+        "enclosing",
+        "ancestor",
+        "global_settings",
+        "settings",
+    }
+)
+
+
+def _falsy_get_default(node: ast.AST) -> ast.AST | None:
+    """`d.get(k, 0)` / `d.get(k, False)` / `d.get(k, "")`: the falsy default."""
+    if isinstance(node, ast.Call) and node.args and not node.keywords:
+        node_func = node.func
+        if (
+            isinstance(node_func, ast.Attribute)
+            and node_func.attr == "get"
+            and len(node.args) == 2
+        ):
+            default = node.args[1]
+            if isinstance(default, ast.Constant) and default.value in (0, "", False):
+                return default
+            if isinstance(default, (ast.List, ast.Dict, ast.Tuple)) and not (
+                default.elts if not isinstance(default, ast.Dict) else default.keys
+            ):
+                return default
+    return None
+
+
+def _inherits(node: ast.AST) -> bool:
+    """`self.parent.delay`, `defaults.timeout`, `getattr(self.parent, k, 0)`:
+    a value read from a fallback scope."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "getattr"
+        and node.args
+    ):
+        return any(
+            p in _INHERIT_SEGMENTS for p in _dotted_name(node.args[0]).split(".")
+        )
+    parts = _dotted_name(node).split(".")
+    return len(parts) >= 2 and any(p in _INHERIT_SEGMENTS for p in parts[:-1])
+
+
+def _check_falsy_or_inheritance(tree: ast.AST) -> list[dict]:
+    """`own = spec.get(K, 0)` then `own or inherited`: an explicit 0 can't override.
+
+    The `or` cannot tell an explicit falsy override (0, False, '') from
+    "unset", so a child can never turn an inherited setting off.
+    """
+    out: list[dict] = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+            continue
+        # `own = spec.get(K, 0)` earlier in the same scope.
+        from_get: dict[str, ast.AST] = {}
+        for node in _walk_same_scope(fn):
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+            ):
+                default = _falsy_get_default(node.value)
+                if default is not None:
+                    from_get[node.targets[0].id] = default
+        for node in _walk_same_scope(fn):
+            if not isinstance(node, ast.BoolOp) or not isinstance(node.op, ast.Or):
+                continue
+            first, rest = node.values[0], node.values[1:]
+            default = _falsy_get_default(first)
+            if default is None and isinstance(first, ast.Name):
+                default = from_get.get(first.id)
+            inherited = any(_inherits(v) for v in rest)
+            if default is None and not (
+                inherited and isinstance(first, (ast.Name, ast.Attribute))
+            ):
+                continue
+            numeric = default is not None and (
+                isinstance(default, ast.Constant)
+                and default.value is not None
+                and not isinstance(default.value, str)
+            )
+            if default is not None and inherited:
+                confidence = "high"
+            elif numeric:
+                confidence = "medium"
+            else:
+                confidence = "low"
+            own = ast.unparse(first)
+            out.append(
+                _finding(
+                    "falsy-or-inheritance",
+                    "CONSIDER" if confidence == "low" else "FIX",
+                    confidence,
+                    node,
+                    f"`{own} or ...` treats an explicit falsy value "
+                    f"({ast.unparse(default) if default is not None else '0, False, empty'}) "
+                    f"as unset, so it can never override the fallback",
+                    "use `x if x is not None else fallback` with a None default, or "
+                    "`spec[k] if k in spec else fallback`; fine when a falsy value "
+                    "documentedly means 'inherit'",
                 )
             )
     return out
@@ -2885,7 +3136,11 @@ def _manual_codec(nodes: list[ast.AST], method: str) -> tuple[str | None, str | 
 
 
 def _check_asymmetric_encode_decode(tree: ast.AST) -> list[dict]:
-    """The same path opened for read and for write with different text codecs.
+    """Two forms: a file and an accessor pair.
+
+    The same path opened for read and for write with different text codecs,
+    and a `_get_X`/`_set_X` (`parse_X`/`format_X`, ...) pair whose decode and
+    encode sides use different codecs (see _check_asymmetric_accessor_pair).
 
     A lenient read (`errors='replace'`) paired with a strict write means the
     program's own round-trip destroys data: the substitution characters the read
@@ -2965,6 +3220,630 @@ def _check_asymmetric_encode_decode(tree: ast.AST) -> list[dict]:
                 detail,
             )
         )
+    out.extend(_check_asymmetric_accessor_pair(tree))
+    return out
+
+
+_JSON_PARSE_CALLS = frozenset({"json.loads", "orjson.loads", "ujson.loads"})
+# Names and calls that suggest bytes straight off the wire or a binary file.
+_BYTESISH_TOKENS = frozenset(
+    {
+        "body",
+        "content",
+        "bytes",
+        "buf",
+        "buffer",
+        "payload",
+        "chunk",
+        "packet",
+        "blob",
+    }
+)
+_BYTESISH_CALLS = frozenset({"read", "recv", "read_bytes", "getvalue", "recv_bytes"})
+
+
+def _is_json_parse(node: ast.AST, helpers: set[str]) -> bool:
+    """`json.loads(...)`, `resp.json()`, or a same-module helper returning one."""
+    if not isinstance(node, ast.Call):
+        return False
+    name = _call_name(node)
+    if name in _JSON_PARSE_CALLS or name in helpers:
+        return True
+    return (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == "json"
+        and not node.args
+        and not node.keywords
+    )
+
+
+def _json_helpers(tree: ast.AST) -> set[str]:
+    """Module functions that return `json.loads(...)` directly."""
+    out: set[str] = set()
+    for fn in getattr(tree, "body", []):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in _walk_same_scope(fn):
+            if isinstance(node, ast.Return) and _is_json_parse(node.value, set()):
+                out.add(fn.name)
+    return out
+
+
+def _guarded_as_mapping(scope: ast.AST, name: str) -> bool:
+    """`isinstance(name, dict)` / `type(name) is dict` anywhere in the scope."""
+    for node in _walk_same_scope(scope):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in ("isinstance", "type")
+            and node.args
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == name
+        ):
+            return True
+    return False
+
+
+def _used_as_mapping(node: ast.AST, name: str) -> bool:
+    """`key in name` or `name[key]` (a non-integer subscript)."""
+    if isinstance(node, ast.Compare):
+        return any(isinstance(op, (ast.In, ast.NotIn)) for op in node.ops) and any(
+            isinstance(c, ast.Name) and c.id == name for c in node.comparators
+        )
+    return (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == name
+        and isinstance(node.slice, (ast.Constant, ast.Name))
+        and not (
+            isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, int)
+        )
+    )
+
+
+def _external_json(call: ast.AST, scope: ast.AST) -> bool:
+    """Parsed from a message body (`resp.json()`, `json.loads(body)`), not a file."""
+    if not isinstance(call, ast.Call):
+        return False
+    if isinstance(call.func, ast.Attribute) and call.func.attr == "json":
+        return True
+    return bool(call.args) and _is_bytesish(call.args[0], scope)
+
+
+def _check_parsed_json_assumed_object(tree: ast.AST) -> list[dict]:
+    """`body = json.loads(raw)` then `key in body` / `body[key]`: valid JSON may
+    be a list, a string, a number or `null`, and none of them is a dict."""
+    out: list[dict] = []
+    helpers = _json_helpers(tree)
+    for scope in _iter_scopes(tree):
+        parsed: dict[str, ast.Assign] = {}
+        for node in _walk_same_scope(scope):
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and _is_json_parse(node.value, helpers)
+            ):
+                parsed[node.targets[0].id] = node
+        for name, assign in parsed.items():
+            if _guarded_as_mapping(scope, name):
+                continue
+            use = next(
+                (
+                    node
+                    for node in _walk_same_scope(scope)
+                    if getattr(node, "lineno", 0) > assign.lineno
+                    and _used_as_mapping(node, name)
+                ),
+                None,
+            )
+            if use is None:
+                continue
+            # A helper's result counts as external: helpers wrap message bodies.
+            value = assign.value
+            external = _call_name(value) in helpers or _external_json(value, scope)
+            out.append(
+                _finding(
+                    "parsed-json-assumed-object",
+                    "FIX" if external else "CONSIDER",
+                    "medium" if external else "low",
+                    use,
+                    f"`{name}` comes from parsing JSON (line {assign.lineno}) and is used as "
+                    f"a dict with no isinstance check: a body that is a list, string, "
+                    f"number or null raises TypeError here",
+                    "guard with `isinstance(x, dict)` (skip or report other shapes), or "
+                    "validate against a schema first",
+                )
+            )
+    return out
+
+
+def _is_bytesish(arg: ast.AST, scope: ast.AST) -> bool:
+    """Does *arg* look like bytes (off the wire, or a binary read)?"""
+    if isinstance(arg, ast.Constant):
+        return isinstance(arg.value, bytes)
+    if isinstance(arg, ast.Call):
+        tail = arg.func.attr if isinstance(arg.func, ast.Attribute) else ""
+        if tail in ("decode", "read_text") or _call_name(arg) == "str":
+            return False
+        if tail in _BYTESISH_CALLS:
+            return True
+        return any(t in _BYTESISH_TOKENS for t in _call_name(arg).lower().split("_"))
+    name = _dotted_name(arg).split(".")[-1].lower()
+    if name in ("text",):
+        return False
+    if isinstance(arg, ast.Name):
+        # `body = _get_body(msg)`: follow one local assignment.
+        for node in _walk_same_scope(scope):
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == arg.id
+            ):
+                value = node.value
+                if isinstance(value, ast.Call) and _call_tail(value) in (
+                    "decode",
+                    "read_text",
+                ):
+                    return False
+    return any(t in _BYTESISH_TOKENS for t in name.strip("_").split("_"))
+
+
+def _check_narrow_parse_except(tree: ast.AST) -> list[dict]:
+    """`json.loads(raw_bytes)` caught by `except JSONDecodeError` only.
+
+    On bytes, json.loads first detects and decodes the encoding, and that step
+    raises UnicodeDecodeError: a sibling ValueError the handler does not list.
+    """
+    out: list[dict] = []
+    for scope in _iter_scopes(tree):
+        for node in _walk_same_scope(scope):
+            if not isinstance(node, ast.Try) or not node.handlers:
+                continue
+            caught: set[str] = set()
+            for handler in node.handlers:
+                if handler.type is None:
+                    caught.add("BaseException")
+                    continue
+                types = (
+                    handler.type.elts
+                    if isinstance(handler.type, ast.Tuple)
+                    else [handler.type]
+                )
+                caught |= {_dotted_name(t).split(".")[-1] for t in types}
+            if "JSONDecodeError" not in caught or caught & {
+                "ValueError",
+                "UnicodeDecodeError",
+                "UnicodeError",
+                "Exception",
+                "BaseException",
+            }:
+                continue
+            for stmt in node.body:
+                for call in [stmt, *_walk_same_scope(stmt)]:
+                    if not (
+                        isinstance(call, ast.Call)
+                        and _call_name(call) in _JSON_PARSE_CALLS
+                        and call.args
+                        and _is_bytesish(call.args[0], scope)
+                    ):
+                        continue
+                    out.append(
+                        _finding(
+                            "narrow-parse-except-misses-decode-error",
+                            "FIX",
+                            "medium",
+                            call,
+                            f"`{ast.unparse(call)}` may be given bytes, and the handler "
+                            f"catches only JSONDecodeError: undecodable bytes raise "
+                            f"UnicodeDecodeError, which escapes",
+                            "catch ValueError (the common base of both), or decode with "
+                            "an explicit `errors=` before parsing",
+                        )
+                    )
+    return out
+
+
+# Removing something after the fact: the post-success cleanup.
+_REMOVAL_VERBS = (
+    "rmtree",
+    "unlink",
+    "remove",
+    "rmdir",
+    "cleanup",
+    "delete",
+    "discard",
+    "purge",
+)
+# Undoing an operation: what a rollback handler calls.
+_ROLLBACK_VERBS = ("rollback", "restore", "revert", "undo", "move", "rename", "replace")
+
+
+def _tail_cleanups(stmts: list[ast.stmt], is_body: bool) -> list[ast.Call]:
+    """Removal calls that are the last action of a path through *stmts*.
+
+    A removal followed only by `return`/`pass` in its block counts when the
+    block is the try body itself or ends by returning (the path leaves the try
+    right after it).
+    """
+    out: list[ast.Call] = []
+    exits = bool(stmts) and isinstance(stmts[-1], ast.Return)
+    for index, stmt in enumerate(stmts):
+        if isinstance(stmt, ast.If):
+            out.extend(_tail_cleanups(stmt.body, False))
+            out.extend(_tail_cleanups(stmt.orelse, False))
+            continue
+        if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)):
+            continue
+        if not _verb_match(_call_tail(stmt.value), _REMOVAL_VERBS):
+            continue
+        after = stmts[index + 1 :]
+        if all(isinstance(a, (ast.Return, ast.Pass)) for a in after) and (
+            is_body or exits
+        ):
+            out.append(stmt.value)
+    return out
+
+
+def _check_cleanup_inside_try_triggers_rollback(tree: ast.AST) -> list[dict]:
+    """`try: install(); remove_backup() / except: rollback()`.
+
+    The cleanup after a successful operation sits inside the try, so a
+    cleanup failure runs the rollback: the success is undone, and a partial
+    cleanup (rmtree deletes as it goes) may already have destroyed the backup
+    the rollback needs.
+    """
+    out: list[dict] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try) or not node.handlers or len(node.body) < 2:
+            continue
+        undo_tails = {
+            _call_tail(n)
+            for h in node.handlers
+            for n in ast.walk(h)
+            if isinstance(n, ast.Call)
+        }
+        rollback = any(_verb_match(t, _ROLLBACK_VERBS) for t in undo_tails)
+        removal = any(_verb_match(t, _REMOVAL_VERBS) for t in undo_tails)
+        if not (rollback or removal):
+            continue
+        for call in _tail_cleanups(node.body, True):
+            out.append(
+                _finding(
+                    "cleanup-inside-try-triggers-rollback",
+                    "FIX",
+                    "high" if rollback else "medium",
+                    call,
+                    f"`{ast.unparse(call.func)}(...)` cleans up after the operation "
+                    f"succeeded, but inside the try: if it fails, the handler at line "
+                    f"{node.handlers[0].lineno} undoes the successful operation",
+                    "move the cleanup after the try/except, in its own try that only "
+                    "warns; check what a half-done cleanup leaves for the rollback",
+                )
+            )
+    return out
+
+
+# Calls that feed a side channel (audit, metrics, events): they should never
+# change the data plane's result.
+_SIDE_CHANNEL_VERBS = (
+    "emit",
+    "audit",
+    "record",
+    "track",
+    "publish",
+    "report",
+    "observe",
+    "inc",
+    "increment",
+    "gauge",
+    "histogram",
+    "timing",
+    "send_event",
+    "log_event",
+    "write_event",
+)
+_SIDE_CHANNEL_RECEIVERS = ("audit", "metric", "stats", "telemetry", "event", "ops_log")
+
+
+def _side_channel_call(call: ast.Call) -> bool:
+    tail = _call_tail(call)
+    if _logger_level(call) is not None:
+        return False  # stdlib logging handlers swallow their own errors
+    if _verb_match(tail, _SIDE_CHANNEL_VERBS):
+        return True
+    if isinstance(call.func, ast.Attribute) and not _verb_match(tail, _CLEANUP_VERBS):
+        receiver = _dotted_name(call.func.value).lower()
+        return any(hint in receiver for hint in _SIDE_CHANNEL_RECEIVERS)
+    return False
+
+
+def _unguarded_calls(stmts: list[ast.stmt]):
+    """Calls in *stmts* that no inner try with a broad handler protects."""
+    for stmt in stmts:
+        if isinstance(stmt, ast.Try):
+            broad = any(
+                h.type is None
+                or _dotted_name(h.type).split(".")[-1] in ("Exception", "BaseException")
+                for h in stmt.handlers
+            )
+            if not broad:
+                yield from _unguarded_calls(stmt.body)
+            yield from _unguarded_calls(stmt.finalbody)
+            continue
+        if isinstance(stmt, (ast.With, ast.AsyncWith)) and any(
+            _call_name(i.context_expr) in ("suppress", "contextlib.suppress")
+            for i in stmt.items
+            if isinstance(i.context_expr, ast.Call)
+        ):
+            continue
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for node in [stmt, *_walk_same_scope(stmt)]:
+            if isinstance(node, ast.Call):
+                yield node
+
+
+def _check_side_channel_raise_in_finally(tree: ast.AST) -> list[dict]:
+    """`try: return do_write() finally: audit.emit(event)`.
+
+    If the side-channel call raises (disk full, a closed handle), its
+    exception replaces the function's result -- or the original exception.
+    """
+    out: list[dict] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try) or not node.finalbody:
+            continue
+        for call in _unguarded_calls(node.finalbody):
+            if not _side_channel_call(call):
+                continue
+            out.append(
+                _finding(
+                    "side-channel-raise-in-finally",
+                    "FIX",
+                    "medium",
+                    call,
+                    f"`{ast.unparse(call.func)}(...)` in `finally` can raise, and its "
+                    f"exception replaces the result (or the real error) of the try",
+                    "make the side channel total: wrap it in its own try/except "
+                    "Exception that counts or warns once",
+                )
+            )
+            break  # one per finally block
+    return out
+
+
+def _simple_statements(stmts: list[ast.stmt]) -> int:
+    count = 0
+    for stmt in stmts:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            count += 1
+            continue
+        nested = [
+            sub
+            for name in ("body", "orelse", "finalbody")
+            for sub in getattr(stmt, name, []) or []
+            if isinstance(sub, ast.stmt)
+        ] + [sub for h in getattr(stmt, "handlers", []) for sub in h.body]
+        count += 1 + _simple_statements(nested) if nested else 1
+    return count
+
+
+def _check_wide_suppress_exception(tree: ast.AST) -> list[dict]:
+    """`with suppress(Exception):` around a block, not a single best-effort call.
+
+    The first failing statement silently skips every statement after it, and
+    no linter rule fires on the block form.
+    """
+    out: list[dict] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.With, ast.AsyncWith)):
+            continue
+        for item in node.items:
+            expr = item.context_expr
+            if not (
+                isinstance(expr, ast.Call)
+                and _call_name(expr).split(".")[-1] == "suppress"
+                and any(
+                    _dotted_name(a).split(".")[-1] in ("Exception", "BaseException")
+                    for a in expr.args
+                )
+            ):
+                continue
+            size = _simple_statements(node.body)
+            if size < 4:
+                continue
+            out.append(
+                _finding(
+                    "wide-suppress-exception-block",
+                    "FIX" if size >= 10 else "CONSIDER",
+                    "high" if size >= 10 else "medium",
+                    node,
+                    f"`with {ast.unparse(expr)}:` covers {size} statements: the first "
+                    f"one that fails silently skips all the rest",
+                    "suppress around the single best-effort call, or catch narrowly and "
+                    "log; decide per statement which failures are acceptable",
+                )
+            )
+    return out
+
+
+# Accessor-pair verbs: (decode side, encode side).
+_PAIR_VERBS = (
+    ("get", "set"),
+    ("load", "dump"),
+    ("load", "save"),
+    ("loads", "dumps"),
+    ("read", "write"),
+    ("parse", "format"),
+    ("parse", "serialize"),
+    ("parse", "dump"),
+    ("deserialize", "serialize"),
+    ("decode", "encode"),
+    ("from", "to"),
+    ("unpack", "pack"),
+    ("unescape", "escape"),
+    ("unquote", "quote"),
+)
+# Codec calls by family: (decoders, encoders). Method tails count for `decode`/`encode`.
+_CODEC_FAMILIES = {
+    "json": ({"json.loads", "json.load"}, {"json.dumps", "json.dump"}),
+    "yaml": (
+        {"yaml.safe_load", "yaml.load", "yaml.full_load"},
+        {"yaml.safe_dump", "yaml.dump"},
+    ),
+    "pickle": ({"pickle.loads", "pickle.load"}, {"pickle.dumps", "pickle.dump"}),
+    "toml": ({"tomllib.loads", "tomllib.load", "toml.loads"}, {"toml.dumps"}),
+    "query": (
+        {"urllib.parse.parse_qs", "urllib.parse.parse_qsl", "parse_qs", "parse_qsl"},
+        {"urllib.parse.urlencode", "urlencode"},
+    ),
+    "percent": (
+        {
+            "urllib.parse.unquote",
+            "urllib.parse.unquote_plus",
+            "unquote",
+            "unquote_plus",
+        },
+        {"urllib.parse.quote", "urllib.parse.quote_plus", "quote", "quote_plus"},
+    ),
+    "base64": (
+        {"base64.b64decode", "base64.urlsafe_b64decode"},
+        {"base64.b64encode", "base64.urlsafe_b64encode"},
+    ),
+}
+
+
+def _codec_calls(fn: ast.AST, side: int) -> list[tuple[str, ast.Call]]:
+    """``(family, call)`` for each decoder (*side* 0) or encoder (*side* 1) call."""
+    out: list[tuple[str, ast.Call]] = []
+    for node in _walk_same_scope(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _call_name(node)
+        for family, sides in _CODEC_FAMILIES.items():
+            if name in sides[side]:
+                out.append((family, node))
+        tail = node.func.attr if isinstance(node.func, ast.Attribute) else ""
+        if tail == ("decode", "encode")[side] and not name.startswith(
+            ("base64.", "codecs.")
+        ):
+            out.append(("text", node))
+    return out
+
+
+def _pair_stem(name: str, side: int) -> tuple[str, str] | None:
+    """``(verb, stem)`` when *name* is the decode (0) or encode (1) side of a pair."""
+    bare = name.lstrip("_")
+    for verbs in _PAIR_VERBS:
+        verb = verbs[side]
+        if bare.startswith(verb + "_") and len(bare) > len(verb) + 1:
+            return verb, bare[len(verb) + 1 :]
+    return None
+
+
+def _same_subject(dec_fn: ast.FunctionDef, enc_fn: ast.FunctionDef) -> bool:
+    """`get_x(obj)` / `set_x(obj, value)`: an accessor over an object both take
+    first (not `self`), the setter also taking the new value."""
+    a = [x.arg for x in dec_fn.args.args]
+    b = [x.arg for x in enc_fn.args.args]
+    return bool(a and len(b) > len(a) and a[0] == b[0] and a[0] not in ("self", "cls"))
+
+
+def _codec_args(call: ast.Call) -> tuple[str, ...]:
+    return tuple(ast.unparse(a) for a in call.args) + tuple(
+        sorted(ast.unparse(k) for k in call.keywords)
+    )
+
+
+def _check_asymmetric_accessor_pair(tree: ast.AST) -> list[dict]:
+    """`_get_json_body` parses with json.loads; `_set_json_body` writes with
+    something else -- the pair's round-trip is not the identity."""
+    out: list[dict] = []
+    scopes: list[list[ast.AST]] = [
+        [n for n in getattr(tree, "body", []) if isinstance(n, ast.FunctionDef)]
+    ]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            scopes.append([n for n in node.body if isinstance(n, ast.FunctionDef)])
+    for funcs in scopes:
+        by_name = {f.name: f for f in funcs}
+        for dec_fn in funcs:
+            parsed = _pair_stem(dec_fn.name, 0)
+            if parsed is None:
+                continue
+            verb, stem = parsed
+            prefix = dec_fn.name[: len(dec_fn.name) - len(dec_fn.name.lstrip("_"))]
+            partners = [
+                by_name[prefix + verbs[1] + "_" + stem]
+                for verbs in _PAIR_VERBS
+                if verbs[0] == verb and prefix + verbs[1] + "_" + stem in by_name
+            ]
+            decoders = _codec_calls(dec_fn, 0)
+            if not decoders:
+                continue
+            dec_family, dec_call = decoders[0]
+            for enc_fn in partners:
+                encoders = _codec_calls(enc_fn, 1)
+                if not encoders:
+                    continue
+                families = {fam for fam, _ in encoders}
+                if dec_family not in families:
+                    enc_call = encoders[0][1]
+                    confidence = "medium"
+                    message = (
+                        f"{dec_fn.name}() decodes with {_call_name(dec_call) or 'decode'}() "
+                        f"but {enc_fn.name}() encodes with {_call_name(enc_call) or 'encode'}(): "
+                        f"the pair's round-trip is not the identity"
+                    )
+                else:
+                    enc_call = next(c for fam, c in encoders if fam == dec_family)
+                    if dec_family == "text":
+                        dec_args, enc_args = (
+                            _codec_args(dec_call),
+                            _codec_args(enc_call),
+                        )
+                        if dec_args == enc_args:
+                            continue
+                        lenient = any(
+                            e.strip("'\"") in _LENIENT_ERRORS for e in dec_args
+                        ) or any(
+                            k.arg == "errors"
+                            and isinstance(k.value, ast.Constant)
+                            and k.value.value in _LENIENT_ERRORS
+                            for k in dec_call.keywords
+                        )
+                        confidence = "high" if lenient else "medium"
+                        message = (
+                            f"{dec_fn.name}() decodes with decode({', '.join(dec_args)}) but "
+                            f"{enc_fn.name}() encodes with encode({', '.join(enc_args)})"
+                        )
+                    elif dec_family == "json" and _same_subject(dec_fn, enc_fn):
+                        # An accessor over someone else's object (an HTTP
+                        # message): what it parsed was not this code's own
+                        # output, so re-serializing it rewrites every field.
+                        confidence = "low"
+                        message = (
+                            f"{enc_fn.name}() re-serializes what {dec_fn.name}() parsed with "
+                            f"{_call_name(enc_call)}({', '.join(_codec_args(enc_call))}): "
+                            f"spacing, escaping and number formatting of every field change, "
+                            f"not just the one edited"
+                        )
+                    else:
+                        continue
+                out.append(
+                    _finding(
+                        "asymmetric-encode-decode-pair",
+                        "FIX" if confidence != "low" else "CONSIDER",
+                        confidence,
+                        enc_call,
+                        message,
+                        f"accessor pair {dec_fn.name}() (line {dec_fn.lineno}) / "
+                        f"{enc_fn.name}(): check that set(get(x)) round-trips the bytes "
+                        f"a caller did not mean to change",
+                    )
+                )
     return out
 
 
@@ -4038,6 +4917,7 @@ _CHECKS = {
     "flag-not-reset-on-early-exit": _check_flag_not_reset_on_early_exit,
     "guard-rechecks-call-receiver": _check_guard_rechecks_call_receiver,
     "falsy-check-for-none-default": _check_falsy_check_for_none_default,
+    "falsy-or-inheritance": _check_falsy_or_inheritance,
     "test-cannot-fail": _check_test_cannot_fail,
     "self-referential-accumulate": _check_self_referential_accumulate,
     "duplicated-guard-wrong-operand": _check_duplicated_guard,
@@ -4053,6 +4933,11 @@ _CHECKS = {
     "save-state-clobbered-by-reentry": _check_save_state_clobbered,
     "return-ignored-against-checked-family": _check_return_ignored_against_family,
     "unformatted-format-string-literal": _check_unformatted_format_string,
+    "parsed-json-assumed-object": _check_parsed_json_assumed_object,
+    "narrow-parse-except-misses-decode-error": _check_narrow_parse_except,
+    "cleanup-inside-try-triggers-rollback": _check_cleanup_inside_try_triggers_rollback,
+    "side-channel-raise-in-finally": _check_side_channel_raise_in_finally,
+    "wide-suppress-exception-block": _check_wide_suppress_exception,
 }
 
 

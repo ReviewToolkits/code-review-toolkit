@@ -19,12 +19,12 @@ If external tool output is available (from `run_external_tools.py`), incorporate
 
 ### Ruff Bug-Risk Findings
 
-Each ruff finding carries `selection`. `project` (or `ruff-default` / `explicit`) marks the project's own ruff pass. `toolkit` marks the second pass described in `ruff.toolkit_pass`, which fills this feed even when the project's config selects none of these rules. A `toolkit` hit is a rule the project did not opt into: judge it on its own merits, never as a breach of the project's conventions.
+Each ruff finding carries `selection`. `project` (or `ruff-default` / `explicit`) marks the project's own ruff pass. `toolkit` marks the second pass described in `ruff.toolkit_pass`, which fills this feed even when the project's config selects none of these rules. A `toolkit` hit is a rule the project did not opt into: judge it on its own merits, never as a breach of the project's conventions. If `ruff.warnings` is non-empty, the ruff that ran is not the project's pin: hits the pinned ruff would not report are upgrade debt, not current lint.
 
 Filter the ruff output for `category: "bug-risk"` and `category: "security"` findings:
 
 - **`F821`** (undefined name): A variable or function used but never defined — potential runtime NameError. These are high-confidence bug risks. Classify as FIX.
-  - Exception: hits with `category: "suspected-tool-false-positive"` (`known_tool_issue: "ruff#6878"`) are an `except ... as exc` name read by a closure inside that handler. That is valid Python, and the hit is a false positive, unless the closure escapes the handler (stored, returned, scheduled) and runs after it ends. Check that one question; do not report it as FIX by default.
+  - Exception: an `except ... as NAME` binding read by a lambda or nested def inside that handler is valid Python, so the F821 is a false positive. Such hits usually carry `category: "suspected-tool-false-positive"` (`known_tool_issue: "ruff#6878"`). It is a real bug only if the closure escapes the handler (stored, returned, scheduled) and runs after the handler ends, because Python deletes NAME at the end of the handler. Check that one question; do not report it as FIX by default. The F841 on the same handler has an autofix that deletes `as NAME` and breaks the closure: never recommend it (shape `linter-autofix-breaks-closure-capture`).
 - **`F811`** (redefined unused): A name is defined twice and the first definition is never used — possible logic error where the wrong variable is being checked. Classify as CONSIDER.
 - **`B006`** (mutable default argument): `def f(x=[])` — a classic Python bug where the default list is shared across calls. Classify as FIX.
 - **`B007`** (unused loop variable): Loop variable never used in the body — may indicate a logic error. Classify as CONSIDER.
@@ -36,8 +36,6 @@ Filter the ruff output for `category: "bug-risk"` and `category: "security"` fin
 
 **Which rules can appear at all** depends on the selection `run_external_tools.py` ran: the project's own ruff configuration, plus the toolkit's curated bug-risk/security pass when the project's selection is narrow. If the `bug-risk` category is empty, check the output's selection before concluding the code is clean. When a `lint-rule-triager` report exists for the same run, use its tiered output instead of re-triaging the raw hits.
 
-**F821 on an `except ... as NAME` binding used inside a lambda or nested def** is a known false positive (the name is in scope there), not an undefined name. The F841 on the same handler has an autofix that deletes `as NAME` and breaks the closure: never recommend it (shape `linter-autofix-breaks-closure-capture`).
-
 **Auto-fixable findings** (significance: "reduced"): Most B and S rules are NOT auto-fixable, so significance is usually "normal". When it is "reduced", still report the finding but note it's a simpler issue.
 
 Integrate these findings into your systematic traversal — they supplement your manual analysis of try/except blocks and error handling patterns. Ruff catches patterns you might miss when scanning the entire codebase, especially mutable defaults and bare excepts in code you haven't read closely.
@@ -48,7 +46,32 @@ If external tool output is not available, proceed with your standard analysis un
 
 ### Step 1: Find All Error Handling Sites
 
-Systematically locate every error handling site in scope:
+Start from the inventory: run `survey_error_handling.py` on the scope (see
+[Running the script](#running-the-script)). It lists every site; you judge them.
+
+- `handlers`: every `except` clause, with `caught`, `broad`/`bare`, `function`, `in_loop`, its
+  `outcome` (`reraise`, `raise-chained`, `raise-unchained`, `raise-from-none`, `exit`, `return`,
+  `continue`, `break`, `report-and-continue`, `pass`, `fall-through`), all its `actions`, its `logs`
+  (level, traceback or not) and a `body` preview. `outcome` is the strongest action anywhere in the
+  body; `outcome_conditional: true` means it happens only on some branch.
+- `suppress`: every `with suppress(...)`, with its size. A broad one around many statements
+  (`summary.broad_suppress_multi_statement`) is invisible to every lint rule.
+- `exit_methods`: `__exit__`/`__aexit__` that can return a true value and so swallow the exception.
+- `finally`: each block's `unguarded_calls` and any `control_flow_exit` (feeds Step 3b).
+- `implicit`: `getattr` with a default, `hasattr`, `.get(key, {})`-style empty defaults, and
+  `subprocess.run`/`call` without `check=`.
+- Leads for Step 3b on each handler: `maybe_unbound` (names the handler reads that only the `try`
+  assigns) and the `cleanup-last-in-try` flag.
+
+Triage in this order: `broad_not_propagating`, `neither_raise_nor_report`, the Step 3b leads,
+`exception_exposed` (the exception's text reaches a return value or response), then
+`logs_without_traceback`. The script does not judge intent: a `pass` handler for an optional import
+is fine. It also cannot see missing error handling or false success (Step 3c). Find those by reading.
+
+If the script fails, fall back to grep for `try`, `except`, `suppress(`, `finally` and `__exit__`,
+and say in the report that the inventory is hand-built.
+
+The site kinds to cover:
 
 **Explicit exception handling:**
 - All `try/except` blocks
@@ -162,11 +185,25 @@ def get_items():
         return  # May mask bugs in source() that raise StopIteration incorrectly
 ```
 
-### Step 3b: What if the handler itself raises?
+### Step 3b (required): What if the handler itself raises?
 
-The most damaging error-handling defects are often not swallowed exceptions but handlers, `finally`
-blocks and cleanup code that **raise the wrong thing**. For every handler and every `finally`, ask
-what happens if a statement *inside it* raises:
+This pass is mandatory, not optional depth. The most damaging error-handling defects are often not
+swallowed exceptions but handlers, `finally` blocks and cleanup code that **raise the wrong thing**,
+and no lint rule sees them. For every handler and every `finally` in the survey, ask what happens
+if a statement *inside it* raises.
+
+Start from the survey's leads, then cover the rest:
+
+1. Handlers with `maybe_unbound` names.
+2. Handlers flagged `cleanup-last-in-try` (`cleanup_call` names the call).
+3. `finally` blocks with `unguarded_calls` that do I/O (an ops log, metrics, an audit write,
+   `close()` on a file being written), and any `control_flow_exit`.
+4. Broad `suppress` blocks with more than one statement: everything after the first failing
+   statement is skipped, silently.
+5. Handlers whose body does work before it re-raises (rollback, status writes): a failure there
+   replaces the original exception.
+
+The shapes:
 
 - **Cleanup inside the `try` whose `except` rolls back** (`cleanup-inside-try-triggers-rollback`):
   post-success cleanup (`rmtree` of a backup, temp-file removal) as the last statement of the `try`
@@ -181,6 +218,37 @@ what happens if a statement *inside it* raises:
 
 Reproduce environmental failures cheaply where you can: a read-only directory (`chmod 0555`) for
 undeletable files, `/dev/full` as a log or output path for "disk full".
+
+State in the report that the pass ran and how many handlers and `finally` blocks it covered. A
+report with no Step 3b section is incomplete.
+
+### Step 3c: False success (no exception involved)
+
+Some of the worst silent failures contain no `try` at all: the code finishes normally and reports
+success for work it did not do, or checked the wrong thing. The survey cannot list these. Look for
+them in the code that produces a verdict, a count, a report or an exit status:
+
+- **Discarded parse remainders.** A parser that consumes a prefix and drops the rest: `re.match`
+  where `fullmatch` was meant, the first regex match of several, `raw_decode()` ignoring the end
+  index, `split()[0]`. Ask: does extra input raise, or vanish?
+- **Unvalidated config read with an empty default.** `cfg.get("section", {})` turns a misspelled
+  key into "no settings" with no warning. Unknown keys are accepted silently too. The survey's
+  `get-empty-default` implicit sites list the candidates.
+- **An `if`/`elif` chain with no `else`.** An unrecognized value (a new option, a typo in a spec)
+  falls through and does nothing. Ask what the missing `else` should do: raise, or warn.
+- **Truthiness as a verdict.** `if result:` or `return bool(check())` where the check can return a
+  non-empty error object, a list, a status code or the string `"False"`. A pass/fail flag should be
+  a `bool`, compared as one.
+- **A lenient template `Undefined`.** Jinja2's default `Undefined` renders a missing or renamed
+  attribute as an empty string, so a report loses sections with no error. Render the templates
+  once with `StrictUndefined` over the real object types to find them.
+- **Zero work counted as success.** Zero tests collected or zero items processed reported as
+  "passed"; a lazy generator whose consumption is left to caller code, so its errors never surface
+  (or it never runs); planned items that never reach the tally. Ask: is every planned item counted,
+  and does "nothing ran" fail?
+
+Report these with the same severity scale. A false success in a verdict (a test runner, a
+validator, a health check) is usually CRITICAL.
 
 ### Step 4: Assess Impact
 
@@ -198,17 +266,20 @@ For each finding, consider:
 [2-3 sentence overview: How healthy is the error handling in this codebase? What's the biggest systemic issue?]
 
 ### Statistics
-- Total error handling sites found: N
-- Critical (silenced errors): N
-- High (poorly handled): N
-- Medium (improvable): N
-- Low (minor): N
+Sites are places in the code; findings are what you report. Keep the two apart.
+
+- Explicit sites surveyed: N (`summary.explicit_sites`: H handlers + S `suppress` blocks + E
+  suppressing `__exit__`), plus F `finally` blocks checked in Step 3b
+- Implicit sites listed: N, by kind (`summary.implicit_by_kind`), or "not surveyed"
+- Sites found by reading, outside the survey (missing handling, Step 3c): N
+- Findings by severity (a finding can cover several sites; ACCEPTABLE sites are not findings):
+  Critical N, High N, Medium N, Low N
 
 ## Critical Issues (must fix)
 
 For each:
 - **Location**: file:line
-- **Status**: reproduced | confirmed | candidate (see `docs/reproduction-convention.md`)
+- **Status**: reproduced | confirmed | candidate (see `<plugin_root>/docs/reproduction-convention.md`)
 - **Pattern**: [What the code does]
 - **Problem**: [Why this is dangerous]
 - **Hidden errors**: [Specific exception types that could be silently caught]
@@ -238,7 +309,7 @@ For each:
 
 ## Important Guidelines
 
-- **Systematic coverage**: Don't sample — find every error handling site in scope. Use grep/search for `try`, `except`, `raise`, `finally`, `__exit__`, `subprocess`, `open(`, etc.
+- **Systematic coverage**: Don't sample. The survey lists every explicit site in scope; account for each one, even if only as ACCEPTABLE in bulk. Use grep for what it can't list: `raise`, `subprocess`, `open(` and the like.
 - **Context matters**: A broad except in a CLI entry point (catching and displaying errors) is very different from a broad except in a library function (hiding bugs). Use architecture-mapper output to calibrate severity.
 - **Not all catching is bad**: Sometimes catching broadly and logging is the right thing — in top-level handlers, cleanup code, and logging utilities. Assess intent, not just pattern.
 - **Python-specific**: Python's exception model has unique pitfalls (bare except catching SystemExit, StopIteration semantics, exception chaining). Flag these specifically.
@@ -250,3 +321,35 @@ For each:
 - **CONSIDER**: Error handling that works but could be improved — overly broad catches, missing traceback in logs, generic error messages
 - **POLICY**: Project-wide error handling strategy decisions (e.g., adopt a custom exception hierarchy, standardize logging levels for errors)
 - **ACCEPTABLE**: Intentional broad catches in appropriate contexts — top-level CLI handlers, cleanup code, logging utilities where suppression is the correct behavior
+
+## Running the script
+
+These rules apply to every script call this agent makes.
+
+- **Timeout.** Give the Bash call `timeout: 300000` (5 min). The 120 s default kills the script on
+  large projects. If it may run longer still, use `run_in_background` and wait for the completion
+  notification rather than polling.
+- **A private output location.** Other agents run the toolkit's scripts concurrently in `parallel`
+  mode, so never write to a fixed path. Create a directory of your own and keep stdout and stderr
+  apart, in one Bash call:
+
+  ```bash
+  d=$(mktemp -d "${TMPDIR:-/tmp}/crt-silent-failure-hunter.XXXXXX") && echo "$d" &&
+  python3 <plugin_root>/scripts/survey_error_handling.py [scope] [options] > "$d/out.json" 2> "$d/out.err"; echo "exit=$?"
+  ```
+
+  Options: `--max-files N`, and `--no-implicit` to skip the implicit-site list on a very large
+  scope (the summary then reports `implicit_sites: null`, not 0).
+
+  Each Bash call is a fresh shell: a `$$` suffix or a shell variable does not survive into the next
+  call. Reuse the literal path `echo` printed.
+- **Running the project's own code** (its tests, a reproducer, an import check): do it in an
+  exported copy, never in the checkout, and set `TMPDIR` to your private directory so the project's
+  own temp files land there instead of a shared `/tmp`.
+- **Forward `--max-files N`** when the caller gave one, and say so in the report whenever the
+  envelope's `files_capped` is true. List `files_unparsed` too: those files were not surveyed.
+- **Check before you read.** A non-zero `exit` or an empty `out.json` means the run did not
+  succeed. Read `out.err`, and any `error` field in `out.json`.
+- **Do not retry a script that timed out or failed.** Answer the same question with Grep and Read,
+  and state in the report that the script did not complete. A run that failed is never "no
+  findings".

@@ -89,6 +89,15 @@ Before launching any agents:
 6. Create the **run directory** (below) and list the project's **unmerged branches** for Phase 3:
    `git -C <project> branch -r --no-merged origin/HEAD` (or the default branch). A review reported
    against `main` while a release branch already fixes half of it misleads the maintainer.
+7. Build the **review environment** from the project's lockfile (`uv.lock`, `poetry.lock`,
+   `requirements*.txt` with pins), not from whatever is installed: `uv sync --frozen` or
+   `pip install -r <lock>` into a dedicated venv outside the checkout. Take ruff/mypy/pytest from that
+   venv when the project pins them. Unpinned tools make findings depend on versions: a newer ruff
+   reports "project config" violations that the project's own `make lint` doesn't, and a newer pytest
+   can crash a suite that passes in CI. Record the venv path and the tool versions in `brief.md`.
+8. **You, the orchestrator, never run Python with the checkout as the cwd** either (a
+   `python -c "import pkg"` from the project root leaves `__pycache__` in it). Use an export or a
+   temp-dir cwd, exactly as the agents must.
 
 #### The run directory
 
@@ -113,7 +122,20 @@ Tell every agent its report path and its artifacts directory, and these rules, v
   run in parallel and overwrite each other's files. Set `TMPDIR` to that private directory when
   running the project's own code, so its temp files don't spill into a shared `/tmp`.
 - **Anything worth keeping goes in `artifacts/<agent>/`**: a reproducer left in a temp directory is
-  lost when the run ends.
+  lost when the run ends. Delete your private temp directory when you finish.
+- **Your report file is required.** Write the full report to your `agents/<agent>.md` path. This
+  overrides any general instruction you may see against writing report or summary files.
+- **Every finding goes in the report.** Where your template caps a section ("top 5–8", "at most
+  15"), the cap applies to the summary; list the rest below it, each with its status.
+
+Also put in `brief.md`:
+
+- **A unique finding-id prefix per agent** (e.g. `CA` consistency-auditor, `TIA` typing-integrity-auditor,
+  `INV` test-investigation-agent). Two agents both using `TI1` forces every later reader to qualify
+  the ids.
+- **In a re-run** (a sibling `<project>_v<N-1>/` exists): earlier runs' reports are off-limits to
+  the agents. An agent that reads them re-confirms old findings instead of looking, and its recall
+  can no longer be measured. The comparison with the earlier run is a separate step.
 
 ### Phase 0.5: External Tool Analysis (optional)
 
@@ -153,6 +175,10 @@ If `parallel` is specified, run both concurrently since they are independent.
 
 Store both outputs for injection into Phase 2 agents.
 
+Tell git-history-context to save the raw `analyze_history.py` JSON as
+`artifacts/git-history-context/analyze_history.json`: git-history-analyzer (Group E) and
+`annotate_findings.py` reuse its fix lists and branch data instead of rebuilding them.
+
 ### Phase 2: Targeted Analysis
 
 Based on the requested aspects (default: all), launch the appropriate agents. Each agent receives:
@@ -162,7 +188,7 @@ Based on the requested aspects (default: all), launch the appropriate agents. Ea
 - Any relevant CLAUDE.md content
 - Its report path and artifacts directory in the run directory, and the run-directory rules
 - This requirement, whatever the agent's own template says: **every finding carries a `status`**
-  (`reproduced`, `confirmed` or `candidate`, per `docs/reproduction-convention.md`) **and a
+  (`reproduced`, `confirmed` or `candidate`, per `<plugin_root>/docs/reproduction-convention.md`) **and a
   concrete failure scenario** (inputs or interleaving → wrong outcome). A finding without one is a
   candidate, and the consolidation step treats it as such.
 
@@ -197,6 +223,10 @@ Based on the requested aspects (default: all), launch the appropriate agents. Ea
 
 If `parallel` is specified, run agents within each group concurrently. Run at most `--max-parallel` agents concurrently within each group (default: 2). On memory-constrained systems, use `--max-parallel 1` to run agents sequentially. Groups still execute sequentially because later groups may benefit from earlier findings. Group E runs last because it cross-references all other agents' output.
 
+The group order is about inputs, not a barrier: when a slot frees up and the only agents still
+running are ones the next group doesn't read (dead-code-finder, complexity-simplifier, tech-debt-inventory),
+start the next group's first agent in that slot. Only Group E waits for everything.
+
 ### Phase 3: Synthesis
 
 After all agents complete, consolidate, re-anchor and reproduce, then write the summary.
@@ -218,6 +248,12 @@ hundreds of kilobytes. Dispatch **one consolidation agent** that reads every `ag
 | `propagation_gap_of`, `prior_art`, `introduced_by` | fix-propagation and history context |
 | `notes` | dedup decisions, corrections |
 
+Tell the consolidation agent to work **report by report into an on-disk working file**
+(`<run_dir>/consolidation-work.json`), appending and merging as it goes, rather than reading every
+report first: 19 reports came to 545 KB, at the edge of one agent's context. Above ~300 KB of
+reports, shard instead: one agent per area (e.g. Groups A+B, C, D+E) writes a partial file, and a
+final pass merges the partials.
+
 Then **spot-check it yourself**: re-read a sample of locations (all FIX findings if feasible), and
 every finding whose agents disagreed. The deduplication and contradiction rules below are the
 consolidation agent's instructions.
@@ -232,10 +268,15 @@ already fixed on a branch is reported as "fixed on `<branch>`, not merged", not 
 
 #### Step 3: Reproduce
 
-Promote what you can from `confirmed` to `reproduced`, following `docs/reproduction-convention.md`
+Promote what you can from `confirmed` to `reproduced`, following `<plugin_root>/docs/reproduction-convention.md`
 (minimal, deterministic reproducers with a shared harness; races forced with Events, never timed).
 A reproducer that fails to show the defect makes the finding `refuted` (or narrows it): keep it in
 the report with the evidence.
+
+Try the CONSIDER and POLICY findings too, not only FIX. Look for the concrete behavioural
+consequence of each one: a docs claim run as written, a design choice driven to the input that
+breaks it. A reproduction regularly shows that a judgment call is a defect, and promotes it to FIX.
+When none exists, record that, with the structural evidence.
 
 #### Deduplication and Conflict Resolution
 

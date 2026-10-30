@@ -35,21 +35,36 @@ Parse the JSON output. Key fields:
   owned by one candidate only), `constructor`, `test_name_convention`, `first_call`. `result_asserted` says the test
   checks that call's outcome; `via_helper` that the call is made inside a helper in the test file. Treat the last four
   methods as hints and read the test before relying on them
-- `bug_fix_tests[]`: Tests associated with bug-fix commits (highest signal). Each entry names the `test_functions` the
-  fix added or changed (`attribution: "function"`); `attribution: "file"` with an empty list means the fix touched only
-  fixtures or helpers in that file. The list is capped (`bug_fix_tests_total` is the real count), but selection draws
+- `invariant_types`: an `assert` on a response's `status_code` / `status` that pins a 4xx/5xx status is
+  `error_condition` (`detail: "HTTP 409"`), like `pytest.raises`: in a web API that is the error-condition idiom
+- `bug_fix_tests[]`: Tests associated with bug-fix commits (highest signal). A commit counts as a fix by its
+  conventional type or tag (`fix:`, `[fix]`), and never when typed `chore:`, `ci:`, `test:`, `docs:`, `[bench]` and
+  the like, whatever its subject says; only an untyped subject falls back to fix vocabulary. Each entry names the
+  `test_functions` the fix added or changed (`attribution: "function"`); `attribution: "file"` with an empty list means
+  the fix touched only fixtures or helpers in that file. `touches_source: false` means the commit changed no product
+  file (only tests, benchmarks, tooling): its tests encode harness slack more often than a failure mode, and they are
+  selected after the product fixes'. The list is capped (`bug_fix_tests_total` is the real count), but selection draws
   from all of them. Within each tier, tests are taken round-robin across files; concurrency, cancellation, rollback,
   lock and timeout tests come first in the error/boundary tier
 - `untested_similar_functions[]`: Functions similar to tested ones but with no tests
 - `similar_functions[]` (per invariant) and `untested_similar_functions[]` list only candidates with a name relation:
   the same name elsewhere (a sibling implementation, an override, or the same operation in another layer) or the
-  same leading words (two for a generic first word such as `get_`). Parameter count and module only rank them. They
-  stay within the tested function's top-level directory and skip private helpers of public functions
+  same leading words (two for a generic first word such as `get_`; one only with the same shape or a second shared
+  word). Parameter count and module only rank them. They stay within the tested function's top-level directory, skip
+  private helpers of public functions, bare verbs (`_check` for `_check_spec_version`) and abstract declarations
+  (`...`, `raise NotImplementedError`, `@abstractmethod`, `pass` in an ABC or Protocol)
+- `entry_point_siblings[]` (per invariant, and deduplicated at the top level with `sibling_of` and `tested`): other
+  entry points into the same operation, found by what they call rather than their names. The tested function's chain
+  (itself and the same-named functions it calls in deeper layers: route, service, store) calls some project helpers;
+  a sibling calls at least two of them (`shared_calls`), or one rare one. `missing_guards` lists the checks the tested
+  path makes (`validate_*`, `require_*`, a project predicate in an `if ...: raise`) that the sibling does not: the
+  first place to look for the invariant it fails to keep. Name-based similarity finds none of these
 - `summary`: Aggregate statistics
 - `status`, `test_discovery`, `warnings`: where the tests came from. When the scope (e.g. `pkg/`) holds no tests, the script
   takes them from the project's pytest `testpaths` or a `tests/`/`test/` directory and says so in `warnings`
-  (`test_discovery.method` is then `pytest_testpaths` or `conventional_dir`). `status: "no_tests_found"` means no test
-  file was found anywhere: report that the extraction did not run, never "no invariants"
+  (`test_discovery.method` is then `pytest_testpaths` or `conventional_dir`). A source module merely *named* like a
+  test (a `test_*.py` module that defines no tests) is treated as source, with a warning. `status: "no_tests_found"`
+  means no test file was found anywhere: report that the extraction did not run, never "no invariants"
 
 The script handles the mechanical work (AST parsing, assertion extraction, name-similarity matching). You handle the judgment work: Is this invariant meaningful? Is the similar function truly analogous? Is the violation real?
 
@@ -83,6 +98,15 @@ For each high-priority test (up to 15), read the actual test code and formulate 
 - Assertions on trivial constants or configuration values.
 - Tests that only exercise code without checking outcomes.
 
+**Check that the test's inputs are ones production can produce.** A test that hand-builds its input (a literal name,
+a dict standing in for a parsed object, a fixture value) may feed a value the real producer never generates, such as
+a path with an empty segment that the node constructor never builds, or a config key the loader always normalizes.
+Then the test's invariant holds on an input nobody sends, and says nothing about the inputs real callers do send.
+Find the producer (the constructor, parser or upstream function the real caller uses), and build the same case
+through it. If it cannot produce the value, the test is out of range: rerun the scenario with an input the producer
+does generate (in an exported copy). A defect that appears only then is a FIX the test was hiding. A defect that
+appears only with the impossible input is ACCEPTABLE.
+
 ### Phase 3: Source Mapping and Similar Function Discovery
 
 For each extracted invariant:
@@ -94,6 +118,13 @@ For each extracted invariant:
    - Same module role (both are validators, both are parsers, etc.)
    - Same architectural layer (both are in the data access layer, both are API handlers, etc.)
 3. **Also check the `untested_similar_functions` from the script** — these are high-value targets.
+4. **Check the `entry_point_siblings`.** They are other ways into the same operation (a restore beside a create, a
+   bulk path beside a single one, another plugin implementing the same hook). Start with those that have
+   `missing_guards`: read whether the sibling enforces the same check some other way before calling it a violation.
+   Also follow the tested function one call down: same-named functions in sibling modules of *its* callee are
+   candidates the name relation misses.
+5. **For converters, parsers and validators, enumerate the input shapes** the format allows (each spelling of a
+   scheme, each media type, an empty or root-only name) and check each, rather than relying on name siblings.
 
 Use architecture-mapper output (if available) to understand module boundaries and identify which similar functions are in peer modules.
 

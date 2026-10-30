@@ -1,6 +1,7 @@
 """Tests for run_lint_rules.py -- the tiered, pinned ruff selection."""
 
 import unittest
+from pathlib import Path
 
 from helpers import import_script
 
@@ -85,6 +86,58 @@ class TestSuppressionDetection(unittest.TestCase):
         self.assertIsNone(mod._SUPPRESSION.search("x = 1  # this is fine"))
 
 
+class TestSuppressionDetails(unittest.TestCase):
+    """A suppression is a dismissal signal only where it was calibrated."""
+
+    def test_a_security_rule_under_nosec_is_not_a_dismissal_signal(self):
+        out = mod.suppression_details(
+            "S307", "result = eval(code, ctx)  # nosec B307 - sandboxed"
+        )
+        self.assertEqual(out["suppression_comment"], "# nosec B307 - sandboxed")
+        # B307 is bandit's name for S307.
+        self.assertTrue(out["suppression_names_rule"])
+        self.assertFalse(out["suppression_is_dismissal_signal"])
+
+    def test_a_security_rule_under_noqa_is_not_a_dismissal_signal(self):
+        out = mod.suppression_details("S608", "q = f'...{t}'  # noqa: S608")
+        self.assertTrue(out["suppression_names_rule"])
+        self.assertFalse(out["suppression_is_dismissal_signal"])
+
+    def test_a_suppression_naming_another_rule_is_flagged(self):
+        out = mod.suppression_details("S307", "x = eval(s)  # nosec B301")
+        self.assertFalse(out["suppression_names_rule"])
+        out = mod.suppression_details("E722", "except:  # noqa: E501")
+        self.assertFalse(out["suppression_names_rule"])
+        self.assertFalse(out["suppression_is_dismissal_signal"])
+
+    def test_a_non_security_suppression_stays_a_signal(self):
+        out = mod.suppression_details(
+            "PLW0127", "open = open  # pylint: disable=redefined-builtin"
+        )
+        self.assertIsNone(out["suppression_names_rule"])
+        self.assertTrue(out["suppression_is_dismissal_signal"])
+        out = mod.suppression_details("E722", "except:  # noqa: E722")
+        self.assertTrue(out["suppression_is_dismissal_signal"])
+
+    def test_no_comment(self):
+        out = mod.suppression_details("S307", "x = eval(s)")
+        self.assertIsNone(out["suppression_comment"])
+        self.assertFalse(out["suppression_is_dismissal_signal"])
+
+    def test_summary_counts_the_claims_to_verify(self):
+        from helpers import TempProject
+
+        source = "x = eval(s)  # nosec B307\ntry:\n    f()\nexcept:  # noqa: E722\n    pass\n"
+        with TempProject({"m.py": source}) as root:
+            hits = [
+                _fake_hit(root, "m.py", 1, "eval", code="S307"),
+                _fake_hit(root, "m.py", 4, "except", code="E722"),
+            ]
+            result = _analyze_with_fake_ruff(root, hits)
+        self.assertEqual(result["summary"]["has_suppression_comment"], 2)
+        self.assertEqual(result["summary"]["suppression_needs_verification"], 1)
+
+
 class TestNormalize(unittest.TestCase):
     def test_null_filename_and_location_are_tolerated(self):
         # ruff 0.16.0's JSON notes that filename and location "may now be null".
@@ -93,7 +146,6 @@ class TestNormalize(unittest.TestCase):
         out = mod.normalize(
             {"code": "B006", "filename": None, "location": None, "message": "m"},
             Path("/p"),
-            tier=1,
             cache={},
         )
         self.assertEqual(out["file"], "")
@@ -106,10 +158,36 @@ class TestNormalize(unittest.TestCase):
         out = mod.normalize(
             {"code": "S608", "filename": None, "location": None, "message": "m"},
             Path("/p"),
-            tier=1,
             cache={},
         )
         self.assertIsNone(out["shape_id"])
+
+
+class TestPerFindingTier(unittest.TestCase):
+    """A finding's `tier` is its rule's tier, not the run's --tier."""
+
+    def test_tier_one_rule_in_a_tier_two_run_is_tagged_tier_one(self):
+        from helpers import TempProject
+
+        source = "import yaml\n\ndef f(s, x):\n    raise ValueError(x)\n"
+        with TempProject({"m.py": source}) as root:
+            hits = [
+                _fake_hit(root, "m.py", 1, "yaml", code="S506"),
+                _fake_hit(root, "m.py", 4, "raise", code="B904"),
+                _fake_hit(root, "m.py", 4, "raise", code="RUF069"),
+            ]
+            result = _analyze_with_fake_ruff(root, hits, tier=2)
+        self.assertEqual(result["tier"], 2)
+        tiers = {f["code"]: f["tier"] for f in result["findings"]}
+        self.assertEqual(tiers, {"S506": 1, "B904": 2, "RUF069": None})
+
+    def test_rule_tier(self):
+        self.assertEqual(mod.rule_tier("F821"), 1)
+        self.assertEqual(mod.rule_tier("B904"), 2)
+        self.assertIsNone(mod.rule_tier("B909"))
+
+    def test_docstring_names_only_the_tiers_argparse_accepts(self):
+        self.assertNotIn("1|2|3", mod.__doc__)
 
 
 class TestRuffInvocation(unittest.TestCase):
@@ -147,10 +225,11 @@ def _fake_hit(root, relpath, line, needle, code="B008"):
     }
 
 
-def _analyze_with_fake_ruff(root, hits):
+def _analyze_with_fake_ruff(root, hits, project_hits=(), **kwargs):
     from unittest.mock import patch
 
     with (
+        patch.object(mod, "_run_project_ruff", return_value=(list(project_hits), None)),
         patch.object(mod, "ruff_version", return_value=mod.PINNED_RUFF_VERSION),
         patch.object(
             mod,
@@ -159,7 +238,7 @@ def _analyze_with_fake_ruff(root, hits):
         ),
         patch.object(mod, "_run_ruff", return_value=(hits, "", None)),
     ):
-        return mod.analyze(str(root))
+        return mod.analyze(str(root), **kwargs)
 
 
 class TestFastapiMarkerDismissal(unittest.TestCase):
@@ -286,6 +365,90 @@ class TestExceptClosureFlag(unittest.TestCase):
         # The genuine F821 keeps F821 a novel-shape candidate ...
         self.assertEqual(result["summary"]["novel_shape_candidates"], ["F821"])
 
+    def test_flagged_hits_carry_the_catalogued_shape(self):
+        from helpers import TempProject
+
+        with TempProject({"m.py": self.SOURCE}) as root:
+            result = _analyze_with_fake_ruff(
+                root,
+                [
+                    _fake_hit(root, "m.py", 5, "exc", code="F821"),
+                    _fake_hit(root, "m.py", 4, "exc", code="F841"),
+                ],
+                tier=2,
+            )
+        for hit in result["findings"]:
+            self.assertEqual(hit["shape_id"], "linter-autofix-breaks-closure-capture")
+            self.assertEqual(hit["except_lines"][0], 4)
+
+    def _project_f841(self, root, fix):
+        return {
+            "code": "F841",
+            "filename": str(root / "m.py"),
+            "location": {"row": 4, "column": 25},
+            "message": "Local variable `exc` is assigned to but never used",
+            "fix": fix,
+        }
+
+    def test_the_projects_own_safe_autofix_is_reported(self):
+        from helpers import TempProject
+
+        with TempProject({"m.py": self.SOURCE}) as root:
+            result = _analyze_with_fake_ruff(
+                root,
+                [_fake_hit(root, "m.py", 5, "exc", code="F821")],
+                project_hits=[self._project_f841(root, {"applicability": "safe"})],
+            )
+        (hit,) = result["findings"]
+        # The tier-1 F821 is enough: the project's F841 fix is the defect.
+        self.assertTrue(hit["project_config_autofixes"])
+        self.assertEqual(hit["project_fix_applicability"], "safe")
+        check = result["project_autofix_check"]
+        self.assertTrue(check["ran"])
+        self.assertEqual(check["autofixed_by_project_config"], 1)
+
+    def test_an_unfixable_or_unselected_f841_is_not_an_autofix(self):
+        from helpers import TempProject
+
+        # Not selected by the project (no F841), or listed as unfixable (ruff
+        # then reports the hit with no fix).
+        for unfixable in (False, True):
+            with TempProject({"m.py": self.SOURCE}) as root:
+                project_hits = [self._project_f841(root, None)] if unfixable else []
+                result = _analyze_with_fake_ruff(
+                    root,
+                    [_fake_hit(root, "m.py", 5, "exc", code="F821")],
+                    project_hits=project_hits,
+                )
+            (hit,) = result["findings"]
+            self.assertFalse(hit["project_config_autofixes"])
+            check = result["project_autofix_check"]
+            self.assertEqual(check["autofixed_by_project_config"], 0)
+
+    def test_a_failed_project_run_is_not_measured_not_clean(self):
+        from unittest.mock import patch
+
+        from helpers import TempProject
+
+        with TempProject({"m.py": self.SOURCE}) as root:
+            hit = _fake_hit(root, "m.py", 5, "exc", code="F821")
+            finding = mod.normalize(hit, root, {})
+            finding.update(
+                mod.except_closure_annotation(
+                    "F821", hit["message"], 5, root / "m.py", {}
+                )
+            )
+            with patch.object(mod, "_run_project_ruff", return_value=([], "boom")):
+                check = mod.project_autofix_check("ruff", [finding], root)
+        self.assertFalse(check["ran"])
+        self.assertEqual(check["error"], "boom")
+        self.assertIsNone(finding["project_config_autofixes"])
+
+    def test_no_except_closure_hits_skips_the_check(self):
+        check = mod.project_autofix_check("ruff", [], Path("/p"))
+        self.assertFalse(check["ran"])
+        self.assertIn("skipped", check)
+
     def test_a_known_tool_bug_alone_is_not_a_novel_shape(self):
         from helpers import TempProject
 
@@ -376,3 +539,280 @@ class TestUnlintedPaths(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _dismissed_lines(result):
+    return {f["line"]: f["dismissal_reason"] for f in result["dismissed"]}
+
+
+def _kept_lines(result):
+    return {f["line"] for f in result["findings"]}
+
+
+class TestSystemExitDismissal(unittest.TestCase):
+    """B904 on `raise SystemExit(...)`: no traceback is ever shown."""
+
+    SOURCE = (
+        "def main(run):\n"
+        "    try:\n"
+        "        run()\n"
+        "    except KeyError:\n"
+        "        raise SystemExit(2)\n"
+        "    except OSError:\n"
+        "        raise SystemExit\n"
+        "    except ValueError as e:\n"
+        "        raise RuntimeError(str(e))\n"
+    )
+
+    def test_systemexit_is_dismissed_and_other_raises_kept(self):
+        from helpers import TempProject
+
+        with TempProject({"cli.py": self.SOURCE}) as root:
+            hits = [
+                _fake_hit(root, "cli.py", n, "raise", code="B904") for n in (5, 7, 9)
+            ]
+            result = _analyze_with_fake_ruff(root, hits, tier=2)
+        self.assertEqual(
+            _dismissed_lines(result),
+            {5: "raise-systemexit-in-except", 7: "raise-systemexit-in-except"},
+        )
+        self.assertEqual(_kept_lines(result), {9})
+        self.assertIn("raise-systemexit-in-except", result["dismissal_reasons"])
+
+    def test_a_shadowed_systemexit_is_not_the_builtin(self):
+        from helpers import TempProject
+
+        source = "class SystemExit(Exception):\n    pass\n\n" + self.SOURCE
+        with TempProject({"cli.py": source}) as root:
+            result = _analyze_with_fake_ruff(
+                root, [_fake_hit(root, "cli.py", 8, "raise", code="B904")], tier=2
+            )
+        self.assertEqual(result["dismissed"], [])
+
+
+class TestYamlSafeLoaderSubclassDismissal(unittest.TestCase):
+    """S506 on a Loader that subclasses a safe yaml loader."""
+
+    SOURCE = (
+        "import yaml\n"
+        "from yaml import SafeLoader as SL\n"
+        "\n"
+        "class Safe(yaml.SafeLoader):\n"
+        "    pass\n"
+        "\n"
+        "class Safer(Safe):\n"
+        "    pass\n"
+        "\n"
+        "class Aliased(SL):\n"
+        "    pass\n"
+        "\n"
+        "class Unsafe(yaml.Loader):\n"
+        "    pass\n"
+        "\n"
+        "class Mixed(yaml.SafeLoader, Helper):\n"
+        "    pass\n"
+        "\n"
+        "def load(f, chosen):\n"
+        "    a = yaml.load(f, Safe)\n"
+        "    b = yaml.load(f, Loader=Safer)\n"
+        "    c = yaml.load(f, Aliased)\n"
+        "    d = yaml.load(f, Unsafe)\n"
+        "    e = yaml.load(f, Mixed)\n"
+        "    g = yaml.load(f, chosen)\n"
+    )
+
+    def test_only_all_safe_bases_are_dismissed(self):
+        from helpers import TempProject
+
+        with TempProject({"cfg.py": self.SOURCE}) as root:
+            hits = [
+                _fake_hit(root, "cfg.py", 20, "Safe)", code="S506"),
+                _fake_hit(root, "cfg.py", 21, "Safer", code="S506"),
+                _fake_hit(root, "cfg.py", 22, "Aliased", code="S506"),
+                _fake_hit(root, "cfg.py", 23, "Unsafe", code="S506"),
+                _fake_hit(root, "cfg.py", 24, "Mixed", code="S506"),
+                _fake_hit(root, "cfg.py", 25, "chosen", code="S506"),
+            ]
+            result = _analyze_with_fake_ruff(root, hits)
+        reason = "yaml-loader-subclasses-safeloader"
+        self.assertEqual(_dismissed_lines(result), {20: reason, 21: reason, 22: reason})
+        self.assertEqual(_kept_lines(result), {23, 24, 25})
+
+
+class TestClosureCalledSynchronouslyDismissal(unittest.TestCase):
+    """B023 on a lambda that a same-file helper calls before returning."""
+
+    SOURCE = (
+        "import threading\n"
+        "\n"
+        "def run_now(label, fn):\n"
+        "    for _ in range(2):\n"
+        "        try:\n"
+        "            return fn(label)\n"
+        "        except OSError:\n"
+        "            pass\n"
+        "\n"
+        "def keep(fn):\n"
+        "    PENDING.append(fn)\n"
+        "\n"
+        "async def run_async(fn):\n"
+        "    return fn(1)\n"
+        "\n"
+        "def run_gen(fn):\n"
+        "    yield fn(1)\n"
+        "\n"
+        "def run_later(fn):\n"
+        "    threading.Timer(1, lambda: fn(1)).start()\n"
+        "\n"
+        "class Store:\n"
+        "    def _retry(self, op, fn):\n"
+        "        return fn(op)\n"
+        "\n"
+        "    def update(self, items, external):\n"
+        "        for item in items:\n"
+        "            self._retry('u', lambda c: c.put(item))\n"
+        "            run_now('x', fn=lambda c: c.put(item))\n"
+        "            keep(lambda c: c.put(item))\n"
+        "            run_async(lambda c: c.put(item))\n"
+        "            run_gen(lambda c: c.put(item))\n"
+        "            run_later(lambda c: c.put(item))\n"
+        "            external(lambda c: c.put(item))\n"
+        "            self._retry('u', (lambda c: c.put(item)) if item else None)\n"
+    )
+
+    def test_verified_callees_are_dismissed_and_others_hinted(self):
+        from helpers import TempProject
+
+        with TempProject({"store.py": self.SOURCE}) as root:
+            hits = [
+                _fake_hit(root, "store.py", n, "item)", code="B023")
+                for n in range(28, 36)
+            ]
+            result = _analyze_with_fake_ruff(root, hits)
+        reason = "closure-called-synchronously"
+        self.assertEqual(_dismissed_lines(result), {28: reason, 29: reason})
+        kept = {f["line"]: f for f in result["findings"]}
+        self.assertEqual(set(kept), {30, 31, 32, 33, 34, 35})
+        # Stored, async, generator, deferred, unresolvable: the agent checks
+        # the one callee each names.
+        for line, callee in ((30, "keep"), (31, "run_async"), (34, "external")):
+            self.assertTrue(kept[line]["closure_passed_as_argument"])
+            self.assertEqual(kept[line]["callee"], callee)
+        # Not a direct argument: no hint.
+        self.assertNotIn("closure_passed_as_argument", kept[35])
+
+
+class TestSqlFromLiteralsDismissal(unittest.TestCase):
+    """S608 on a query whose interpolated values are all literals."""
+
+    SOURCE = (
+        "TABLE = 'events'\n"
+        "\n"
+        "def q(conn, ids, kind, table, extra):\n"
+        "    marks = ','.join(['?'] * len(ids))\n"
+        "    gen = ', '.join('?' for _ in ids)\n"
+        "    name = 'a_table' if kind else 'b_table'\n"
+        "    where = 'id=?'\n"
+        "    if kind:\n"
+        "        where += f' AND kind IN ({gen})'\n"
+        "    sets = ['updated=1']\n"
+        "    sets.append('kind=?')\n"
+        "    conn.execute(f'SELECT * FROM {name} WHERE id IN ({marks})', ids)\n"
+        "    conn.execute('UPDATE ' + TABLE + ' SET ' + ', '.join(sets) + ' WHERE ' + where)\n"
+        "    conn.execute('SELECT * FROM t WHERE id IN (%s)' % marks, ids)\n"
+        "    conn.execute(f'SELECT * FROM {table}')\n"
+        "    bad = ['a=1']\n"
+        "    bad.append(extra)\n"
+        "    conn.execute('UPDATE t SET ' + ', '.join(bad))\n"
+        "    shared = ['a=1']\n"
+        "    fill(shared)\n"
+        "    conn.execute('UPDATE t SET ' + ', '.join(shared))\n"
+        "    conn.execute('SELECT {}'.format(extra))\n"
+        '    conn.execute(f"SELECT {3 * extra}")\n'
+    )
+
+    def test_literal_only_queries_are_dismissed_and_others_kept(self):
+        from helpers import TempProject
+
+        with TempProject({"db.py": self.SOURCE}) as root:
+            hits = [
+                _fake_hit(root, "db.py", 12, "f'SELECT", code="S608"),
+                _fake_hit(root, "db.py", 13, "'UPDATE", code="S608"),
+                _fake_hit(root, "db.py", 14, "'SELECT", code="S608"),
+                _fake_hit(root, "db.py", 15, "f'SELECT", code="S608"),
+                _fake_hit(root, "db.py", 18, "'UPDATE", code="S608"),
+                _fake_hit(root, "db.py", 21, "'UPDATE", code="S608"),
+                _fake_hit(root, "db.py", 22, "'SELECT", code="S608"),
+                _fake_hit(root, "db.py", 23, 'f"SELECT', code="S608"),
+            ]
+            result = _analyze_with_fake_ruff(root, hits)
+        reason = "sql-built-from-literals"
+        self.assertEqual(_dismissed_lines(result), {12: reason, 13: reason, 14: reason})
+        # A parameter, a list fed a parameter, a list handed to another
+        # function, a .format() of a parameter, a number times a parameter.
+        self.assertEqual(_kept_lines(result), {15, 18, 21, 22, 23})
+
+
+class TestProjectRuffPin(unittest.TestCase):
+    """The ruff the project itself runs, read from its lock/pin files."""
+
+    def _pin(self, files):
+        from helpers import TempProject
+
+        with TempProject(files) as root:
+            return mod.detect_project_ruff_pin(root)
+
+    def test_lock_file(self):
+        lock = (
+            '[[package]]\nname = "requests"\nversion = "2.0"\n\n'
+            '[[package]]\nname = "ruff"\nversion = "0.14.10"\n'
+        )
+        self.assertEqual(
+            self._pin({"uv.lock": lock}), {"version": "0.14.10", "source": "uv.lock"}
+        )
+
+    def test_pre_commit_hook(self):
+        config = (
+            "repos:\n"
+            "  - repo: https://github.com/astral-sh/ruff-pre-commit\n"
+            "    rev: v0.15.2\n"
+            "    hooks:\n      - id: ruff\n"
+        )
+        pin = self._pin({".pre-commit-config.yaml": config})
+        self.assertEqual(pin["version"], "0.15.2")
+
+    def test_requirements_file(self):
+        pin = self._pin({"dev-requirements.txt": "pytest\nruff==0.13.1\n"})
+        self.assertEqual(pin, {"version": "0.13.1", "source": "dev-requirements.txt"})
+
+    def test_a_range_in_pyproject_is_not_a_pin(self):
+        from helpers import TempProject
+
+        with TempProject({}) as root:
+            (root / "pyproject.toml").write_text(
+                '[project]\nname = "x"\n'
+                '[project.optional-dependencies]\ndev = ["ruff>=0.8.0,<1.0.0"]\n',
+                encoding="utf-8",
+            )
+            pin = mod.detect_project_ruff_pin(root)
+        self.assertIsNone(pin["version"])
+        self.assertEqual(pin["specifier"], ">=0.8.0,<1.0.0")
+        self.assertIsNone(mod.version_matches_project_pin("0.16.0", pin))
+
+    def test_no_pin(self):
+        self.assertIsNone(self._pin({"m.py": "x = 1\n"}))
+        self.assertIsNone(mod.version_matches_project_pin("0.16.0", None))
+
+    def test_match(self):
+        pin = {"version": "0.14.10", "source": "uv.lock"}
+        self.assertTrue(mod.version_matches_project_pin("0.14.10", pin))
+        self.assertFalse(mod.version_matches_project_pin("0.16.0", pin))
+
+    def test_envelope_reports_the_project_pin(self):
+        from helpers import TempProject
+
+        lock = '[[package]]\nname = "ruff"\nversion = "0.14.10"\n'
+        with TempProject({"uv.lock": lock, "m.py": "x = 1\n"}) as root:
+            result = _analyze_with_fake_ruff(root, [])
+        self.assertEqual(result["project_ruff_pin"]["version"], "0.14.10")
+        self.assertFalse(result["version_matches_project_pin"])

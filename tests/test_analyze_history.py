@@ -129,6 +129,89 @@ class TestCommitClassification(unittest.TestCase):
         self.assertEqual(mod.classify_commit("Merge branch 'main'"), "chore")
 
 
+class TestSubjectSignals(unittest.TestCase):
+    """Pre-conventional subjects: domain nouns, leading verbs, lint sweeps."""
+
+    def _detail(self, subject):
+        detail = mod.classify_commit_detail(subject)
+        return detail["type"], detail["source"]
+
+    def test_domain_noun_document_is_not_docs(self):
+        # Where documents are the data, "documents" is not the docs.
+        self.assertNotEqual(
+            mod.classify_commit("[api] Paginate the documents listing"), "docs"
+        )
+        self.assertNotEqual(
+            mod.classify_commit("Purge expired documents from the archive"),
+            "docs",
+        )
+
+    def test_domain_noun_version_is_not_chore(self):
+        self.assertNotEqual(
+            mod.classify_commit("Show the schema version on the status page"),
+            "chore",
+        )
+
+    def test_document_as_leading_verb_is_still_docs(self):
+        self.assertEqual(self._detail("Document the timeout flag"), ("docs", "verb"))
+
+    def test_leading_verb_beats_a_later_keyword(self):
+        # "failure" is a fix keyword, but the commit adds a feature.
+        self.assertEqual(
+            self._detail("Add a reconnect option for socket failures"),
+            ("feature", "verb"),
+        )
+
+    def test_explicit_fix_word_beats_a_feature_verb(self):
+        self.assertEqual(
+            self._detail("Add a guard to fix the crash on empty input"),
+            ("fix", "verb"),
+        )
+
+    def test_lint_sweep_is_not_a_fix(self):
+        self.assertEqual(
+            self._detail("Fix the flake8 warnings in utils"), ("chore", "strong")
+        )
+        self.assertEqual(
+            self._detail("run black and format the package"), ("chore", "strong")
+        )
+        self.assertEqual(self._detail("Add a mypy job"), ("chore", "strong"))
+
+    def test_docstring_work_is_docs(self):
+        self.assertEqual(
+            self._detail("Add docstrings to the parser module"), ("docs", "strong")
+        )
+        self.assertEqual(
+            self._detail("fix spelling in the user guide"), ("docs", "strong")
+        )
+
+    def test_a_bug_word_keeps_a_lint_or_doc_subject_a_fix(self):
+        self.assertEqual(mod.classify_commit("Fix crash in the lint command"), "fix")
+        self.assertEqual(
+            mod.classify_commit("Fix crash when a docstring is missing"), "fix"
+        )
+
+    def test_unclosed_conventional_scope_still_states_the_type(self):
+        self.assertEqual(
+            self._detail("feat(export: write timestamps in UTC"),
+            ("feature", "conventional"),
+        )
+
+    def test_conventional_chore_with_fix_inside_stays_chore(self):
+        self.assertEqual(
+            self._detail("chore: fix spelling in comments"), ("chore", "conventional")
+        )
+        self.assertEqual(
+            self._detail("ci: fix the release job"), ("chore", "conventional")
+        )
+
+    def test_area_prefix_is_skipped_before_the_verb(self):
+        self.assertEqual(self._detail("cli: add a --quiet flag"), ("feature", "verb"))
+
+    def test_plain_format_noun_is_not_a_lint_sweep(self):
+        self.assertEqual(mod.classify_commit("Fix date format parsing"), "fix")
+
+
 class TestParseArgs(unittest.TestCase):
     """Test CLI argument parsing."""
 
@@ -557,6 +640,168 @@ class TestGitIntegration(unittest.TestCase):
             self.assertGreater(churn_map["a.py"]["churn_rate"], 0)
 
 
+class TestRenamesSweepsAndDeletions(unittest.TestCase):
+    """Co-change follows renames, discounts sweeps, and flags deleted files."""
+
+    def test_split_rename_forms(self):
+        self.assertEqual(
+            mod.split_rename("src/{a.py => b.py}"), ("src/a.py", "src/b.py")
+        )
+        self.assertEqual(
+            mod.split_rename("{src => lib}/a.py"), ("src/a.py", "lib/a.py")
+        )
+        self.assertEqual(
+            mod.split_rename("src/{ => sub}/a.py"), ("src/a.py", "src/sub/a.py")
+        )
+        self.assertEqual(mod.split_rename("old.py => new.py"), ("old.py", "new.py"))
+        self.assertEqual(mod.split_rename("plain.py"), (None, "plain.py"))
+
+    def test_history_of_a_renamed_file_is_credited_to_its_new_name(self):
+        lines = [
+            "COMMIT:" + "c" * 40 + "|2025-01-03T00:00:00+00:00|A|edit new",
+            "1\t1\tpkg/new.py",
+            "COMMIT:" + "b" * 40 + "|2025-01-02T00:00:00+00:00|A|rename",
+            "0\t0\tpkg/{old.py => new.py}",
+            "COMMIT:" + "a" * 40 + "|2025-01-01T00:00:00+00:00|A|edit old",
+            "2\t0\tpkg/old.py",
+        ]
+        commits, stats = mod.parse_git_log(lines, 100)
+        self.assertEqual([s["file"] for s in stats], ["pkg/new.py"])
+        self.assertEqual(stats[0]["commits"], 3)
+        self.assertEqual(stats[0]["renamed_from"], ["pkg/old.py"])
+        # `files` keeps the path at each commit; `canonical_files` follows.
+        self.assertEqual(commits[2]["files"], ["pkg/old.py"])
+        self.assertEqual(commits[2]["canonical_files"], ["pkg/new.py"])
+
+    def test_sweep_commits_are_discounted(self):
+        sweep = [f"f{i}.py" for i in range(12)]
+        commits = [{"files": ["a.py", "b.py"]} for _ in range(3)]
+        commits += [{"files": ["a.py", "c.py"] + sweep} for _ in range(4)]
+        clusters = mod.compute_co_change_clusters(commits, sweep_files=10)
+        by_pair = {(c["file_a"], c["file_b"]): c for c in clusters}
+        ab, ac = by_pair[("a.py", "b.py")], by_pair[("a.py", "c.py")]
+        self.assertEqual(
+            (ab["co_change_count"], ab["co_change_count_excluding_sweeps"]), (3, 3)
+        )
+        self.assertEqual(
+            (ac["co_change_count"], ac["co_change_count_excluding_sweeps"]), (4, 0)
+        )
+        # Ranked by the focused count: the real pair comes first.
+        self.assertEqual(
+            (clusters[0]["file_a"], clusters[0]["file_b"]), ("a.py", "b.py")
+        )
+
+    def test_deleted_files_are_flagged(self):
+        with GitTempProject(
+            [
+                {"files": {"a.py": "x = 1\n", "gone.py": "y = 1\n"}, "message": "Add"},
+                {"files": {"a.py": "x = 2\n", "gone.py": "y = 2\n"}, "message": "Edit"},
+            ]
+        ) as root:
+            _git(root, "rm", "-q", "gone.py")
+            _git(root, "commit", "-qm", "Drop gone")
+            result = mod.analyze([str(root), "--since", "2000-01-01", "--no-function"])
+        by_file = {f["file"]: f for f in result["file_churn"]}
+        self.assertTrue(by_file["a.py"]["exists_at_head"])
+        self.assertFalse(by_file["gone.py"]["exists_at_head"])
+        self.assertEqual(result["co_change_meta"]["sweep_files_threshold"], 10)
+
+    def test_renamed_file_in_a_real_repo(self):
+        with GitTempProject(
+            [
+                {"files": {"old.py": "x = 1\n"}, "message": "Add"},
+                {"files": {"old.py": "x = 2\n"}, "message": "Edit"},
+            ]
+        ) as root:
+            _git(root, "mv", "old.py", "new.py")
+            _git(root, "commit", "-qm", "Rename")
+            result = mod.analyze([str(root), "--since", "2000-01-01", "--no-function"])
+        files = {
+            f["file"]: f for f in result["file_churn"] if f["file"].endswith(".py")
+        }
+        self.assertEqual(sorted(files), ["new.py"])
+        self.assertEqual(files["new.py"]["commits"], 3)
+        self.assertEqual(files["new.py"]["renamed_from"], ["old.py"])
+
+    def test_sweep_files_flag(self):
+        self.assertEqual(mod.parse_args([])["sweep_files"], 10)
+        self.assertEqual(mod.parse_args(["--sweep-files", "5"])["sweep_files"], 5)
+
+
+class TestBehaviouralNonCodeCommits(unittest.TestCase):
+    """docs/chore commits that change code are flagged; text-only ones are not."""
+
+    _V1 = 'def f(x):\n    """Return x."""\n    return x\n'
+
+    def _run(self, change, message):
+        with GitTempProject(
+            [
+                {"files": {"pkg/m.py": self._V1}, "message": "Add f"},
+                {"files": {"pkg/m.py": change}, "message": message},
+            ]
+        ) as root:
+            return mod.analyze([str(root / "pkg"), "--since", "2000-01-01"])
+
+    def test_docs_commit_that_changes_code_is_flagged(self):
+        changed = 'def f(x):\n    """Return x as text."""\n    return str(x)\n'
+        result = self._run(changed, "docs: clarify f")
+        check = result["behavioural_non_code_commits"]
+        self.assertEqual(check["commits_checked"], 1)
+        self.assertEqual(len(check["flagged"]), 1)
+        self.assertEqual(check["flagged"][0]["files_changing_code"], ["pkg/m.py"])
+        self.assertTrue(any("docs/chore commit" in n for n in result["notes"]))
+
+    def test_docstring_comment_and_layout_changes_are_not_flagged(self):
+        text_only = (
+            "# A comment.\n"
+            "def f(\n    x,\n):\n"
+            '    """Return the argument unchanged."""\n'
+            "    return x  # same\n"
+        )
+        result = self._run(text_only, "docs: reword f")
+        check = result["behavioural_non_code_commits"]
+        self.assertEqual(check["commits_checked"], 1)
+        self.assertEqual(check["flagged"], [])
+        self.assertFalse(any("docs/chore commit" in n for n in result["notes"]))
+
+    def test_literal_only_change_is_listed_apart(self):
+        bumped = 'def f(x):\n    """Return x."""\n    return x\n\nVERSION = "2"\n'
+        with GitTempProject(
+            [
+                {
+                    "files": {"pkg/m.py": self._V1 + '\nVERSION = "1"\n'},
+                    "message": "Add f",
+                },
+                {"files": {"pkg/m.py": bumped}, "message": "chore(release): v2"},
+            ]
+        ) as root:
+            result = mod.analyze([str(root / "pkg"), "--since", "2000-01-01"])
+        check = result["behavioural_non_code_commits"]
+        self.assertEqual(check["flagged"], [])
+        self.assertEqual(len(check["constants_only"]), 1)
+
+    def test_feature_commits_are_not_checked(self):
+        changed = 'def f(x):\n    """Return x."""\n    return str(x)\n'
+        result = self._run(changed, "feat: stringify f")
+        self.assertEqual(result["behavioural_non_code_commits"]["candidates"], 0)
+
+    def test_fingerprint_ignores_docstrings_only(self):
+        self.assertEqual(
+            mod.code_fingerprint('"""Doc."""\nx = 1\n'),
+            mod.code_fingerprint("x = 1  # c\n"),
+        )
+        self.assertNotEqual(
+            mod.code_fingerprint("x = 1\n"), mod.code_fingerprint("x = 2\n")
+        )
+        self.assertEqual(mod.code_fingerprint('"""Only a docstring."""\n'), "")
+        # An isort pass reorders imports without changing behaviour.
+        self.assertEqual(
+            mod.code_fingerprint("import sys\nimport os\nx = 1\n"),
+            mod.code_fingerprint("import os\nimport sys\nx = 1\n"),
+        )
+        self.assertIsNone(mod.code_fingerprint("def (:\n"))
+
+
 class TestParseGitLogStreaming(unittest.TestCase):
     """Test that parse_git_log works with a list of lines (iterable)."""
 
@@ -597,6 +842,39 @@ class TestMaxFilesArg(unittest.TestCase):
     def test_max_files_set(self):
         args = mod.parse_args(["--max-files", "50"])
         self.assertEqual(args["max_files"], 50)
+
+    def _files_repo(self):
+        return GitTempProject(
+            [
+                {
+                    "files": {f"m{i}.py": f"def f{i}():\n    return {i}\n"},
+                    "message": f"Add m{i}",
+                }
+                for i in range(3)
+            ]
+        )
+
+    def test_cap_is_reported_in_the_envelope(self):
+        with self._files_repo() as root:
+            result = mod.analyze([str(root), *_WINDOW, "--max-files", "1"])
+        self.assertEqual((result["files_total"], result["files_analyzed"]), (3, 1))
+        self.assertTrue(result["files_capped"])
+        self.assertTrue(any(n.startswith("FILES CAPPED") for n in result["notes"]))
+
+    def test_no_cap_is_not_capped(self):
+        with self._files_repo() as root:
+            result = mod.analyze([str(root), *_WINDOW])
+        self.assertEqual((result["files_total"], result["files_analyzed"]), (3, 3))
+        self.assertFalse(result["files_capped"])
+
+    def test_skipped_function_churn_counts_nothing(self):
+        with self._files_repo() as root:
+            result = mod.analyze([str(root), *_WINDOW, "--no-function"])
+        self.assertIsNone(result["files_total"])
+        self.assertFalse(result["files_capped"])
+
+    def test_help_documents_max_files(self):
+        self.assertIn("--max-files", mod.__doc__)
 
 
 def _latin1_repo(testcase) -> Path:
@@ -747,10 +1025,10 @@ class TestTaggedAndKeyedClassification(unittest.TestCase):
         self.assertEqual((detail["type"], detail["source"]), ("chore", "conventional"))
         self.assertEqual(mod.classify_commit("feat(api)!: drop v1 routes"), "feature")
 
-    def test_area_tag_falls_through_to_keywords(self):
-        # [store] names an area, not a type.
+    def test_area_tag_falls_through_to_the_subject(self):
+        # [db] names an area, not a type; the subject's own verb decides.
         detail = mod.classify_commit_detail("[db] Add schema migrations (T1-32)")
-        self.assertEqual((detail["type"], detail["source"]), ("feature", "keyword"))
+        self.assertEqual((detail["type"], detail["source"]), ("feature", "verb"))
 
     def test_unmapped_key_stays_unknown(self):
         subject = "[db] Validate column types (T1-33)"
@@ -841,6 +1119,106 @@ class TestTaggedAndKeyedClassification(unittest.TestCase):
         self.assertTrue(any("--key-type" in n for n in plain["notes"]))
         self.assertEqual(keyed["summary"]["commits_by_type"], {"feature": 1, "fix": 1})
         self.assertEqual(keyed["summary"]["classified_by"], {"key": 2})
+
+    def test_single_key_entry_overrides_its_prefix(self):
+        types = mod.parse_key_types("T=feature,T4-12=fix")
+        self.assertEqual(types, {"T": "feature", "T4-12": "fix"})
+        self.assertEqual(
+            mod.classify_commit("[db] Bound the queue (T4-12)", types), "fix"
+        )
+        self.assertEqual(
+            mod.classify_commit("[db] Stream the export (T4-20)", types), "feature"
+        )
+        args = mod.parse_args(["--key-type", "T4-12=fix"])
+        self.assertEqual(args["key_types"], {"T4-12": "fix"})
+
+    def test_unknown_commit_inherits_its_keys_majority(self):
+        commits = [
+            {"type": "fix", "keys": ["T4-12"]},
+            {"type": "fix", "keys": ["T4-12"]},
+            {"type": "feature", "keys": ["T4-12"]},
+            {"type": "unknown", "keys": ["T4-12"]},
+            {"type": "unknown", "keys": ["T4-13"]},
+        ]
+        self.assertEqual(mod.inherit_key_majority(commits), 1)
+        self.assertEqual(commits[3]["type"], "fix")
+        self.assertEqual(commits[3]["type_source"], "key-majority")
+        self.assertEqual(commits[4]["type"], "unknown")
+
+    def test_no_majority_or_single_vote_inherits_nothing(self):
+        tie = [
+            {"type": "fix", "keys": ["K1"]},
+            {"type": "feature", "keys": ["K1"]},
+            {"type": "unknown", "keys": ["K1"]},
+        ]
+        lone = [
+            {"type": "fix", "keys": ["K2"]},
+            {"type": "unknown", "keys": ["K2"]},
+        ]
+        self.assertEqual(mod.inherit_key_majority(tie), 0)
+        self.assertEqual(mod.inherit_key_majority(lone), 0)
+        self.assertEqual(tie[2]["type"], "unknown")
+
+    def test_key_majority_reaches_the_analysis(self):
+        with GitTempProject(
+            [
+                {"files": {"a.py": "x = 1\n"}, "message": "[fix] Bound reads (K9)"},
+                {"files": {"a.py": "x = 2\n"}, "message": "[fix] Bound writes (K9)"},
+                {"files": {"a.py": "x = 3\n"}, "message": "[db] Queue limits (K9)"},
+            ]
+        ) as root:
+            result = mod.analyze([str(root), *_WINDOW, "--no-function"])
+        self.assertEqual(result["summary"]["commits_by_type"], {"fix": 3})
+        self.assertEqual(
+            result["summary"]["classified_by"], {"tag": 2, "key-majority": 1}
+        )
+
+
+class TestWindowWarnings(unittest.TestCase):
+    """An empty window and rebased dates are said out loud."""
+
+    def _commits(self, n, rebased):
+        commits = []
+        for i in range(n):
+            commit = {
+                "files": {"a.py": f"x = {i}\n"},
+                "message": f"Change a {i}",
+                "date": f"2025-01-{i + 1:02d}T12:00:00+00:00",
+            }
+            if i < rebased:
+                commit["committer_date"] = "2025-01-20T12:00:00+00:00"
+            commits.append(commit)
+        return commits
+
+    def test_empty_window_is_flagged_with_the_last_commit_date(self):
+        with GitTempProject(self._commits(2, 0)) as root:
+            result = mod.analyze(
+                [str(root), "--since", "2025-06-01", "--until", "2025-07-01"]
+            )
+        self.assertEqual(result["summary"]["total_commits"], 0)
+        self.assertTrue(result["time_range"]["empty"])
+        self.assertTrue(
+            result["time_range"]["last_commit_in_scope"].startswith("2025-01-02")
+        )
+        self.assertTrue(any(n.startswith("EMPTY WINDOW") for n in result["notes"]))
+
+    def test_non_empty_window_has_no_empty_note(self):
+        with GitTempProject(self._commits(2, 0)) as root:
+            result = mod.analyze([str(root), *_WINDOW, "--no-function"])
+        self.assertNotIn("empty", result["time_range"])
+        self.assertFalse(any("EMPTY WINDOW" in n for n in result["notes"]))
+
+    def test_rebased_history_is_flagged(self):
+        with GitTempProject(self._commits(8, 5)) as root:
+            result = mod.analyze([str(root), *_WINDOW, "--no-function"])
+        self.assertEqual(result["summary"]["author_committer_date_divergent"], 5)
+        self.assertTrue(any("author and committer" in n for n in result["notes"]))
+
+    def test_a_few_rebased_commits_are_counted_but_not_flagged(self):
+        with GitTempProject(self._commits(8, 1)) as root:
+            result = mod.analyze([str(root), *_WINDOW, "--no-function"])
+        self.assertEqual(result["summary"]["author_committer_date_divergent"], 1)
+        self.assertFalse(any("author and committer" in n for n in result["notes"]))
 
 
 class TestCommitterDateWindow(unittest.TestCase):
@@ -1089,6 +1467,38 @@ class TestUnmergedBranches(unittest.TestCase):
         names = {b["branch"] for b in unmerged["branches"]}
         self.assertEqual(names, {"origin/work"})
         self.assertEqual(unmerged["remote_branches_total"], 2)  # work, merged
+
+    def test_cherry_picked_commit_is_not_unmerged_work(self):
+        root = self._repo()
+        # Land the branch's fix on main as a cherry-pick: a new sha, same patch.
+        fix_sha = _git(root, "rev-parse", "origin/work~1")
+        _git(root, "cherry-pick", "-x", fix_sha)
+        _git(root, "update-ref", "refs/remotes/origin/main", "HEAD")
+        result = mod.analyze([str(root), *_WINDOW, "--no-function"])
+        work = result["unmerged_branches"]["branches"][0]
+        self.assertEqual(work["ahead"], 2)
+        self.assertEqual(work["ahead_patch_unique"], 1)
+        self.assertEqual(work["ahead_patch_in_base"], 1)
+        by_message = {c["message"]: c["patch_in_base"] for c in work["commits"]}
+        self.assertEqual(by_message, {"[doc] Notes": False, "[fix] Guard a (K7)": True})
+        self.assertEqual(work["fix_commits_shown"], 1)
+        self.assertEqual(work["fix_commits_shown_unique"], 0)
+
+    def test_unique_patches_are_all_counted(self):
+        root = self._repo()
+        result = mod.analyze([str(root), *_WINDOW, "--no-function"])
+        work = result["unmerged_branches"]["branches"][0]
+        self.assertEqual(work["ahead_patch_unique"], 2)
+        self.assertEqual(work["fix_commits_shown_unique"], 1)
+
+    def test_library_call_without_analyze_lists_branches(self):
+        # A fresh module: analyze() has never started the script clock.
+        fresh = import_script("analyze_history")
+        root = self._repo()
+        unmerged = fresh.find_unmerged_branches(root)
+        self.assertTrue(unmerged["available"])
+        self.assertEqual([b["branch"] for b in unmerged["branches"]], ["origin/work"])
+        self.assertFalse(unmerged["truncated"])
 
     def test_no_branches_flag_skips(self):
         root = self._repo()

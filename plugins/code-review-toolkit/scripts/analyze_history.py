@@ -13,10 +13,16 @@ Options:
     --until DATE      End date (ISO format, default: today)
     --last N          Analyze exactly the last N commits (overrides time range)
     --max-commits N   Cap total commits analyzed (default: 2000)
+    --max-files N     Compute function-level churn for at most N in-scope
+                      Python files (default: no limit); `files_capped` in
+                      the output says when the cap applied
     --no-function     Skip function-level churn (file-level only, faster)
     --no-branches     Skip the unmerged remote branch listing
-    --key-type SPEC   Map tracker-key prefixes to commit types, e.g.
-                      B=fix,F=feature (repeatable)
+    --sweep-files N   A commit touching more than N files is a sweep, left
+                      out of co_change_count_excluding_sweeps (default: 10)
+    --key-type SPEC   Map tracker-key prefixes, or single keys, to commit
+                      types, e.g. B=fix,F=feature or T4-12=fix (repeatable;
+                      a key entry overrides its prefix's)
 """
 
 import ast
@@ -41,6 +47,10 @@ from scan_common import (  # noqa: E402
 # out. Plain substring matching was wrong in both directions on a validation
 # project:
 # "prefixes" counted as a fix, "policies" as a chore (it contains "ci").
+# "document" and "version" are not keywords: in a project whose data model
+# has documents or versions they are domain nouns, and every feature that
+# mentioned them was filed as docs or chore. "Document X" as the leading verb
+# is still docs (_LEADING_VERBS).
 CLASSIFICATION_RULES: list[tuple[str, list[str]]] = [
     (
         "fix",
@@ -77,7 +87,7 @@ CLASSIFICATION_RULES: list[tuple[str, list[str]]] = [
             "spelling",
             "changelog",
             "documentation",
-            "document(?:s|ed)?",
+            "docstrings?",
         ],
     ),
     (
@@ -120,7 +130,6 @@ CLASSIFICATION_RULES: list[tuple[str, list[str]]] = [
             "config",
             "lint",
             "format",
-            "version",
             "release",
             "merge",
             "revert(?:s|ed)?",
@@ -184,7 +193,8 @@ _TYPE_WORDS: dict[str, str] = {
     "pkg": "chore",
 }
 
-_CONVENTIONAL_RE = re.compile(r"^\s*([A-Za-z]+)(?:\([^)]*\))?!?:\s")
+# The scope may be left unclosed (`feat(api: ...`): the type is still stated.
+_CONVENTIONAL_RE = re.compile(r"^\s*([A-Za-z]+)(?:\([^)]*\)?)?!?:\s")
 _LEADING_TAGS_RE = re.compile(r"^\s*((?:\[[^\[\]\n]+\]\s*)+)")
 _TAG_RE = re.compile(r"\[([^\[\]]+)\]")
 # Tracker keys: `ABC-123` (Jira style) or a single capital followed by digits,
@@ -192,6 +202,93 @@ _TAG_RE = re.compile(r"\[([^\[\]]+)\]")
 _TRACKER_KEY_RE = re.compile(
     r"(?<![\w-])([A-Z][A-Z0-9]*-\d+(?:-\d+)*|[A-Z]\d+(?:-\d+)*)(?![\w-])"
 )
+
+# Words that settle a subject's type wherever they appear, ahead of its leading
+# verb: "Add docstrings to the parser" is docs, "Fix the flake8 warnings" and
+# "Add a mypy job" are tooling chores, "Add tests for X" is test work. On a
+# validation project the keyword list counted lint sweeps as bug fixes.
+_STRONG_SIGNALS: list[tuple[str, re.Pattern[str]]] = [
+    (
+        "docs",
+        re.compile(
+            r"\b(?:docstrings?|readme|changelog|typos?|spelling|misspell\w*)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "chore",
+        re.compile(
+            r"\b(?:flake8|pylint|isort|ruff|mypy|pre-commit|linters?|lint(?:s|ing)?"
+            r"|formatting|reformat(?:s|ted|ting)?)\b"
+            r"|\bblack\b.*\bformat|\bformat\w*\b.*\bblack\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "test",
+        re.compile(
+            r"^(?:add|adds|added|adding|improve[sd]?|extend(?:s|ed)?|increase[sd]?)"
+            r"\s+(?:\S+\s+){0,2}?(?:unit\s*)?(?:tests?|test\s+cases?|coverage)\b",
+            re.IGNORECASE,
+        ),
+    ),
+]
+
+# A subject without a stated type usually opens with an imperative verb, and
+# that verb says more than any keyword later in the line: "Add a reconnect
+# option for socket failures" is a feature, not a fix. A feature verb still yields to an
+# explicit fix word ("Add a guard to fix the crash").
+_VERBS_BY_TYPE = {
+    "feature": (
+        "add adds added adding implement implements implemented introduce "
+        "introduces introduced enable enables enabled allow allows allowed "
+        "expose exposes exposed provide provides provided create creates created"
+    ),
+    "fix": (
+        "fix fixes fixed fixing resolve resolves resolved repair repairs "
+        "repaired correct corrects corrected prevent prevents prevented"
+    ),
+    "refactor": (
+        "refactor refactors refactored rename renames renamed move moves moved "
+        "extract extracts extracted simplify simplifies simplified split splits "
+        "inline inlines inlined restructure restructured reorganize reorganized "
+        "reorganise reorganised clean cleans cleaned cleanup deduplicate "
+        "deduplicated tidy"
+    ),
+    "docs": "document documents documented",
+    "chore": "bump bumps bumped upgrade upgrades upgraded release merge revert",
+}
+_LEADING_VERBS: dict[str, str] = {
+    verb: category
+    for category, verbs in _VERBS_BY_TYPE.items()
+    for verb in verbs.split()
+}
+_EXPLICIT_FIX_RE = re.compile(
+    r"\b(?:fix(?:es|ed|ing)?|bugs?|bugfix(?:es)?|hotfix(?:es)?|crash(?:es|ed|ing)?"
+    r"|regressions?|segfaults?|leak(?:s|ed|ing)?)\b",
+    re.IGNORECASE,
+)
+# Words that name a defect, as opposed to the verb "fix" alone ("Fixed all
+# flake8 errors" is a lint sweep; "Fix crash in the lint command" is a fix).
+_BUG_WORDS_RE = re.compile(
+    r"\b(?:bugs?|bugfix(?:es)?|hotfix(?:es)?|crash(?:es|ed|ing)?|regressions?"
+    r"|segfaults?|leak(?:s|ed|ing)?|deadlocks?|hang(?:s|ing)?)\b",
+    re.IGNORECASE,
+)
+# An area prefix that is not a Conventional Commits type: `cli: add x`.
+_AREA_PREFIX_RE = re.compile(r"^\s*[\w./-]+:\s+")
+
+
+def _leading_verb_type(subject: str) -> str | None:
+    """The type the subject's opening verb names, or None."""
+    words = re.findall(r"[A-Za-z][\w-]*", subject[:80])
+    if not words:
+        return None
+    category = _LEADING_VERBS.get(words[0].lower())
+    if category == "feature" and _EXPLICIT_FIX_RE.search(subject):
+        return "fix"
+    return category
+
 
 # Precedence when one commit carries several typed signals of equal rank.
 _TYPE_PRIORITY = {t: i for i, t in enumerate(COMMIT_TYPES)}
@@ -218,7 +315,12 @@ def tracker_key_prefix(key: str) -> str:
 
 
 def parse_key_types(spec: str) -> dict[str, str]:
-    """Parse `B=fix,F=feature` into {prefix: type}. Raises ValueError."""
+    """Parse `B=fix,F=feature,T4-12=fix` into {prefix or key: type}.
+
+    An entry names either a whole prefix (`B`) or one tracker key (`T4-12`).
+    A key entry overrides its prefix's entry, so a prefix that mixes fixes and
+    features can be mapped key by key. Raises ValueError.
+    """
     result: dict[str, str] = {}
     for item in spec.split(","):
         item = item.strip()
@@ -227,13 +329,53 @@ def parse_key_types(spec: str) -> dict[str, str]:
         prefix, sep, ctype = item.partition("=")
         prefix, ctype = prefix.strip(), ctype.strip().lower()
         ctype = _TYPE_WORDS.get(ctype, ctype)
-        if not sep or not re.fullmatch(r"[A-Z]+", prefix) or ctype not in COMMIT_TYPES:
+        names_key = re.fullmatch(r"[A-Z]+", prefix) or _TRACKER_KEY_RE.fullmatch(prefix)
+        if not sep or not names_key or ctype not in COMMIT_TYPES:
             raise ValueError(
-                f"bad --key-type entry {item!r}: expected PREFIX=TYPE with an "
-                f"uppercase prefix and TYPE one of {', '.join(COMMIT_TYPES)}"
+                f"bad --key-type entry {item!r}: expected PREFIX=TYPE or KEY=TYPE "
+                "with an uppercase prefix (B) or a tracker key (T4-12), and TYPE "
+                f"one of {', '.join(COMMIT_TYPES)}"
             )
         result[prefix] = ctype
     return result
+
+
+def _key_type(key: str, key_types: dict[str, str]) -> str:
+    """The mapped type of one key: its own entry first, then its prefix's."""
+    return key_types.get(key) or key_types.get(tracker_key_prefix(key), "")
+
+
+def inherit_key_majority(commits: list[dict], min_votes: int = 2) -> int:
+    """Give an `unknown` commit the majority type of its key's other commits.
+
+    A tracker key carried by several commits is one piece of work: in a
+    hardening series where half the commits were tagged as fixes, the rest
+    stayed `unknown`. The inherited type needs at least `min_votes` classified
+    commits and a strict majority among them; the source is `key-majority`.
+    Returns how many commits were reclassified.
+    """
+    votes: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for commit in commits:
+        if commit["type"] == "unknown":
+            continue
+        for key in commit.get("keys", []):
+            votes[key][commit["type"]] += 1
+    changed = 0
+    for commit in commits:
+        if commit["type"] != "unknown":
+            continue
+        for key in commit.get("keys", []):
+            tally = votes.get(key)
+            if not tally:
+                continue
+            total = sum(tally.values())
+            best = min(tally, key=lambda t: (-tally[t], _TYPE_PRIORITY.get(t, 99)))
+            if total >= min_votes and tally[best] * 2 > total:
+                commit["type"] = best
+                commit["type_source"] = "key-majority"
+                changed += 1
+                break
+    return changed
 
 
 def _best_type(types: Iterable[str]) -> str | None:
@@ -249,10 +391,11 @@ def classify_commit_detail(
 
     Signals, strongest first: a Conventional Commits type (`fix(cli): ...`), a
     leading bracketed tag that names a type (`[fix][cli] ...`), a tracker key
-    whose prefix is mapped by `key_types` (`... (K7)` with `K=fix`), and last
-    a word-boundary keyword match. Returns
+    mapped by `key_types` (`... (K7)` with `K=fix`, or the whole key `K7=fix`),
+    a strong word (`docstrings`, `flake8`, "add tests"), the subject's leading
+    verb, and last a word-boundary keyword match. Returns
     {"type", "source", "tags", "keys"}; source is one of conventional / tag /
-    key / keyword / None.
+    key / strong / verb / keyword / None.
     """
     tags: list[str] = []
     tag_match = _LEADING_TAGS_RE.match(message)
@@ -271,10 +414,25 @@ def classify_commit_detail(
         detail.update(type=tag_type, source="tag")
         return detail
     if key_types:
-        key_type = _best_type(key_types.get(tracker_key_prefix(k), "") for k in keys)
+        key_type = _best_type(_key_type(k, key_types) for k in keys)
         if key_type:
             detail.update(type=key_type, source="key")
             return detail
+    # The rest reads the subject without its leading tags or area prefix.
+    rest = message[tag_match.end() :] if tag_match else message
+    rest = _AREA_PREFIX_RE.sub("", rest, count=1)
+    bug_words = _BUG_WORDS_RE.search(rest) is not None
+    for category, pattern in _STRONG_SIGNALS:
+        # "Fix crash when a docstring is missing" is still a fix.
+        if bug_words and category != "test":
+            continue
+        if pattern.search(rest):
+            detail.update(type=category, source="strong")
+            return detail
+    verb_type = _leading_verb_type(rest)
+    if verb_type:
+        detail.update(type=verb_type, source="verb")
+        return detail
     for category, pattern in _KEYWORD_RES:
         if pattern.search(message):
             detail.update(type=category, source="keyword")
@@ -339,7 +497,15 @@ def _is_git_repo(path: Path) -> bool:
 
 
 def _check_script_timeout() -> bool:
-    """Return True if the script has exceeded its timeout."""
+    """Return True if the script has exceeded its timeout.
+
+    The clock starts in `analyze()`. Called as a library, before or without
+    `analyze()`, there is no budget to exceed: comparing against an unset
+    start of 0.0 made every check report a timeout, so `find_unmerged_branches`
+    returned no branches at all.
+    """
+    if not _SCRIPT_START:
+        return False
     return (time.monotonic() - _SCRIPT_START) > _SCRIPT_TIMEOUT
 
 
@@ -364,6 +530,28 @@ def _parse_commit_header(payload: str) -> tuple[str, str, str, str, str] | None:
     return parts[0], parts[1], parts[1], parts[2], parts[3]
 
 
+_BRACE_RENAME_RE = re.compile(r"^(.*)\{(.*) => (.*)\}(.*)$")
+
+
+def split_rename(path: str) -> tuple[str | None, str]:
+    """`src/{a.py => b.py}` -> ("src/a.py", "src/b.py"); a plain path -> (None, path).
+
+    `git log --numstat` writes a detected rename in this compact form. It was
+    recorded verbatim, as a file named "src/{a.py => b.py}", so a renamed file's
+    history was split across three names.
+    """
+    if " => " not in path:
+        return None, path
+    brace = _BRACE_RENAME_RE.match(path)
+    if brace:
+        head, old, new, tail = brace.groups()
+        old_path = re.sub("/{2,}", "/", head + old + tail)
+        new_path = re.sub("/{2,}", "/", head + new + tail)
+        return old_path, new_path
+    old_path, _, new_path = path.partition(" => ")
+    return old_path, new_path
+
+
 def parse_git_log(
     lines: Iterable[str],
     max_commits: int,
@@ -385,6 +573,10 @@ def parse_git_log(
     file_changes: dict[str, dict] = {}
     current_commit: dict | None = None
     commit_count = 0
+    # The log runs newest first, so by the time a rename `old => new` is read,
+    # every later commit has already been credited to `new` (or to whatever
+    # `new` became). `alias` sends the older commits of `old` there too.
+    alias: dict[str, str] = {}
 
     for line in lines:
         line = line.rstrip("\n")
@@ -409,19 +601,27 @@ def parse_git_log(
                 "type": detail["type"],
                 "type_source": detail["source"],
                 "keys": detail["keys"],
+                # Paths as they were at this commit (what `git show` needs).
                 "files": [],
+                # The same files under their newest name, following renames.
+                "canonical_files": [],
                 "stats": [],
             }
         elif line.strip() and current_commit is not None:
             parts = line.split("\t", 2)
             if len(parts) == 3:
-                added_str, removed_str, filepath = parts
+                added_str, removed_str, raw_path = parts
                 try:
                     added = int(added_str) if added_str != "-" else 0
                     removed = int(removed_str) if removed_str != "-" else 0
                 except ValueError:
                     continue
+                old_path, filepath = split_rename(raw_path)
+                canonical = alias.get(filepath, filepath)
+                if old_path is not None and old_path != filepath:
+                    alias[old_path] = canonical
                 current_commit["files"].append(filepath)
+                current_commit["canonical_files"].append(canonical)
                 current_commit["stats"].append(
                     {
                         "file": filepath,
@@ -429,16 +629,21 @@ def parse_git_log(
                         "removed": removed,
                     }
                 )
-                if filepath not in file_changes:
-                    file_changes[filepath] = {
+                if canonical not in file_changes:
+                    file_changes[canonical] = {
                         "commits": 0,
                         "lines_added": 0,
                         "lines_removed": 0,
                         "authors": set(),
                         "first_date": date_str,
                         "last_date": date_str,
+                        "renamed_from": set(),
                     }
-                fc = file_changes[filepath]
+                fc = file_changes[canonical]
+                if old_path is not None and old_path != filepath:
+                    fc["renamed_from"].add(old_path)
+                if filepath != canonical:
+                    fc["renamed_from"].add(filepath)
                 fc["commits"] += 1
                 fc["lines_added"] += added
                 fc["lines_removed"] += removed
@@ -453,6 +658,7 @@ def parse_git_log(
         commits.append(current_commit)
 
     # Build file_stats list.
+    head_files = _files_at_head(project_root) if project_root is not None else None
     file_stats: list[dict] = []
     for filepath, fc in file_changes.items():
         if project_root is not None:
@@ -475,12 +681,32 @@ def parse_git_log(
                 # Committer dates: the same clock the window was selected on.
                 "first_commit_in_range": fc["first_date"],
                 "last_modified": fc["last_date"],
+                # False for a file deleted since (None: not checked). Renamed
+                # files are listed under their newest name.
+                "exists_at_head": (
+                    None if head_files is None else filepath in head_files
+                ),
+                "renamed_from": sorted(fc["renamed_from"]),
             }
         )
 
     # Sort by commits descending.
     file_stats.sort(key=lambda x: x["commits"], reverse=True)
     return commits, file_stats
+
+
+def _files_at_head(project_root: Path) -> set[str] | None:
+    """Repo-relative paths tracked at HEAD, or None if git cannot say."""
+    try:
+        result = _run_git(
+            ["-c", "core.quotepath=off", "ls-tree", "-r", "--name-only", "HEAD"],
+            git_toplevel(project_root),
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    return set(result.stdout.splitlines())
 
 
 def _get_file_line_count(filepath: Path) -> int:
@@ -897,8 +1123,12 @@ def compute_function_churn_level2(
     project_root: Path,
     max_files: int = 0,
     attributor: CommitAttributor | None = None,
+    stats: dict | None = None,
 ) -> list[dict]:
     """Level 2: map each commit's hunks onto the functions of THAT commit.
+
+    `stats`, when given, receives `files_total` (in-scope Python files at
+    HEAD) and `files_analyzed` (after the `max_files` cap).
 
     The old implementation mapped every historical hunk onto function
     boundaries parsed from HEAD. On a file that more than doubled in the
@@ -910,7 +1140,9 @@ def compute_function_churn_level2(
     if attributor is None:
         attributor = CommitAttributor(git_root)
     try:
-        return _function_churn(commits, scan_root, git_root, max_files, attributor)
+        return _function_churn(
+            commits, scan_root, git_root, max_files, attributor, stats
+        )
     finally:
         if owned:
             attributor.close()
@@ -922,6 +1154,7 @@ def _function_churn(
     git_root: Path,
     max_files: int,
     attributor: CommitAttributor,
+    stats: dict | None = None,
 ) -> list[dict]:
     # The in-scope Python files that exist at HEAD, keyed by repo path.
     if scan_root.is_file():
@@ -950,8 +1183,12 @@ def _function_churn(
             continue
         allowed.append(pf.relative_to(git_root).as_posix())
 
+    if stats is not None:
+        stats["files_total"] = len(allowed)
     if max_files > 0 and len(allowed) > max_files:
         allowed = allowed[:max_files]
+    if stats is not None:
+        stats["files_analyzed"] = len(allowed)
     allowed_set = set(allowed)
     if not allowed_set:
         return []
@@ -1102,41 +1339,239 @@ def get_commit_details(
     return results
 
 
+# A commit touching more files than this is a sweep (a reformat, a rename, a
+# lint pass, a version bump): it makes every pair of its files "co-change"
+# without saying anything about coupling.
+SWEEP_FILES = 10
+
+
+# Commit types whose subject promises no behaviour change.
+_NON_BEHAVIOURAL_TYPES = ("docs", "chore")
+_MAX_BEHAVIOUR_COMMITS = 200
+_MAX_BEHAVIOUR_FILES = 20
+
+
+def _strip_docstrings(tree: ast.AST) -> None:
+    """Drop the docstring statement of the module and of every def/class."""
+    for node in ast.walk(tree):
+        if isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                node.body = body[1:] or [ast.Pass()]
+
+
+class _BlankConstants(ast.NodeTransformer):
+    def visit_Constant(self, node: ast.Constant) -> ast.Constant:
+        return ast.Constant(value=type(node.value).__name__)
+
+
+def code_fingerprint(source: str | None, blank_constants: bool = False) -> str | None:
+    """The AST of `source` without docstrings, comments or layout.
+
+    Two versions with the same fingerprint behave the same: the change was
+    to comments, docstrings, formatting or line wrapping. None when the
+    source does not parse; "" for an absent file. With `blank_constants`,
+    literal values are replaced by their type, so a change of a version string
+    or a message compares equal.
+    """
+    if source is None:
+        return ""
+    try:
+        tree = ast.parse(source.removeprefix("\ufeff"))
+    except (SyntaxError, ValueError):
+        return None
+    _strip_docstrings(tree)
+    if all(isinstance(stmt, ast.Pass) for stmt in tree.body):
+        return ""
+    if blank_constants:
+        tree = _BlankConstants().visit(tree)
+    # Reordering a block of imports (isort) is layout too.
+    parts: list[str] = []
+    run: list[str] = []
+    for stmt in tree.body:
+        dumped = ast.dump(stmt, include_attributes=False)
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            run.append(dumped)
+            continue
+        parts.extend(sorted(run))
+        run = []
+        parts.append(dumped)
+    parts.extend(sorted(run))
+    return "\n".join(parts)
+
+
+def find_behavioural_non_code_commits(
+    commits: list[dict],
+    git_root: Path,
+    allowed_prefix: str = "",
+) -> dict:
+    """docs/chore commits whose Python changes alter the code, not just its text.
+
+    A `docs:` commit on a validation project added `str()`/`int()` coercions
+    and was counted as documentation, so it never reached fix-completeness or
+    fix-propagation review. Each in-scope `.py` file the commit touched is
+    compared before and after with docstrings, comments and layout stripped.
+    """
+    candidates = [
+        c
+        for c in commits
+        if c["type"] in _NON_BEHAVIOURAL_TYPES
+        and any(f.endswith(".py") and f.startswith(allowed_prefix) for f in c["files"])
+    ]
+    checked = candidates[:_MAX_BEHAVIOUR_COMMITS]
+    result: dict = {
+        "types_checked": list(_NON_BEHAVIOURAL_TYPES),
+        "candidates": len(candidates),
+        "commits_checked": 0,
+        "commits_not_checked": len(candidates) - len(checked),
+        "flagged": [],
+        # Only literal values changed (a version string, a message, a number).
+        "constants_only": [],
+        "undetermined": [],
+    }
+    if not checked:
+        return result
+    parents = _parents(git_root, [c["hash"] for c in checked])
+    reader = BlobFunctionIndex(git_root)
+    try:
+        for commit in checked:
+            if _check_script_timeout() or reader.broken:
+                result["commits_not_checked"] += 1
+                continue
+            sha = commit["hash"]
+            commit_parents = parents.get(sha)
+            if commit_parents is None or len(commit_parents) > 1:
+                # A merge's diff is the merged branch's work; unknown parents
+                # mean the check could not run.
+                result["commits_not_checked"] += 1
+                continue
+            parent = commit_parents[0] if commit_parents else None
+            changed: list[str] = []
+            literal: list[str] = []
+            unparsed: list[str] = []
+            paths = [
+                f
+                for f in commit["files"]
+                if f.endswith(".py") and f.startswith(allowed_prefix)
+            ][:_MAX_BEHAVIOUR_FILES]
+            for path in paths:
+                after = reader._read_blob(f"{sha}:{path}")
+                before = reader._read_blob(f"{parent}:{path}") if parent else None
+                old_fp, new_fp = code_fingerprint(before), code_fingerprint(after)
+                if old_fp is None or new_fp is None:
+                    unparsed.append(path)
+                elif old_fp != new_fp:
+                    if code_fingerprint(before, True) == code_fingerprint(after, True):
+                        literal.append(path)
+                    else:
+                        changed.append(path)
+            result["commits_checked"] += 1
+            entry = {
+                "commit": sha,
+                "commit_short": sha[:7],
+                "message": commit["message"],
+                "type": commit["type"],
+                "date": commit["date"],
+            }
+            if changed:
+                result["flagged"].append({**entry, "files_changing_code": changed})
+            elif literal:
+                result["constants_only"].append({**entry, "files": literal})
+            elif unparsed:
+                result["undetermined"].append({**entry, "files_unparseable": unparsed})
+    finally:
+        reader.close()
+    return result
+
+
+def _parents(git_root: Path, shas: list[str]) -> dict[str, list[str]]:
+    """{sha: [parent shas]} for the given commits (missing on failure)."""
+    found: dict[str, list[str]] = {}
+    for start in range(0, len(shas), 200):
+        batch = shas[start : start + 200]
+        try:
+            result = _run_git(
+                ["show", "-s", "--no-walk=unsorted", "--format=%H %P", *batch],
+                git_root,
+            )
+        except subprocess.TimeoutExpired:
+            continue
+        if result.returncode != 0:
+            continue
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if parts:
+                found[parts[0]] = parts[1:]
+    return found
+
+
 def compute_co_change_clusters(
     commits: list[dict],
     min_co_changes: int = 3,
     max_pairs: int = 30,
+    sweep_files: int = SWEEP_FILES,
+    head_files: set[str] | None = None,
 ) -> list[dict]:
-    """Detect file pairs that frequently change together."""
+    """Detect file pairs that frequently change together.
+
+    Files are counted under their newest name (renames followed).
+    `co_change_count` counts every commit; `co_change_count_excluding_sweeps`
+    leaves out commits touching more than `sweep_files` files, and pairs are
+    ranked by it. On a validation project the top pair lost close to half of
+    its count once sweeps were set aside.
+    """
     # Count per-file commits.
     file_commit_counts: dict[str, int] = defaultdict(int)
-    # Count co-occurrences.
+    # Count co-occurrences, with and without sweep commits.
     co_changes: dict[tuple[str, str], int] = defaultdict(int)
+    co_changes_focused: dict[tuple[str, str], int] = defaultdict(int)
 
     for commit in commits:
-        files = sorted(set(commit["files"]))
+        files = sorted(set(commit.get("canonical_files") or commit["files"]))
+        sweep = len(files) > sweep_files
         for f in files:
             file_commit_counts[f] += 1
         for i in range(len(files)):
             for j in range(i + 1, len(files)):
                 pair = (files[i], files[j])
                 co_changes[pair] += 1
+                if not sweep:
+                    co_changes_focused[pair] += 1
 
     # Filter and sort.
     results: list[dict] = []
     for (file_a, file_b), count in co_changes.items():
         if count >= min_co_changes:
-            results.append(
-                {
-                    "file_a": file_a,
-                    "file_b": file_b,
-                    "co_change_count": count,
-                    "total_commits_a": file_commit_counts[file_a],
-                    "total_commits_b": file_commit_counts[file_b],
-                }
-            )
+            entry = {
+                "file_a": file_a,
+                "file_b": file_b,
+                "co_change_count": count,
+                "co_change_count_excluding_sweeps": co_changes_focused[
+                    (file_a, file_b)
+                ],
+                "total_commits_a": file_commit_counts[file_a],
+                "total_commits_b": file_commit_counts[file_b],
+            }
+            if head_files is not None:
+                entry["exists_at_head_a"] = file_a in head_files
+                entry["exists_at_head_b"] = file_b in head_files
+            results.append(entry)
 
-    results.sort(key=lambda x: x["co_change_count"], reverse=True)
+    results.sort(
+        key=lambda x: (
+            -x["co_change_count_excluding_sweeps"],
+            -x["co_change_count"],
+            x["file_a"],
+            x["file_b"],
+        )
+    )
     return results[:max_pairs]
 
 
@@ -1274,6 +1709,12 @@ def find_unmerged_branches(
             behind, ahead = (int(x) for x in counts.stdout.split()[:2])
             if ahead == 0:
                 continue
+            # `=` marks a branch commit whose patch is already in base (a
+            # cherry-pick or a rebased copy), `+` one whose patch is not.
+            marks = _run_git(
+                ["rev-list", "--cherry-mark", "--right-only", f"{base}...{name}"],
+                git_root,
+            )
             log = _run_git(
                 [
                     "log",
@@ -1296,6 +1737,13 @@ def find_unmerged_branches(
             )
         except (subprocess.TimeoutExpired, ValueError):
             continue
+        in_base: set[str] | None = None
+        if marks.returncode == 0:
+            in_base = {
+                line[1:].strip()
+                for line in marks.stdout.splitlines()
+                if line.startswith("=")
+            }
         commits = []
         for entry in log.stdout.splitlines():
             sha, cdate, subject = (entry.split("\x00") + ["", ""])[:3]
@@ -1307,6 +1755,9 @@ def find_unmerged_branches(
                     "message": subject,
                     "type": detail["type"],
                     "keys": detail["keys"],
+                    # True: the same patch is already in base, so this commit
+                    # is not unmerged work. None: the check failed.
+                    "patch_in_base": None if in_base is None else sha in in_base,
                 }
             )
         changed = (
@@ -1315,10 +1766,22 @@ def find_unmerged_branches(
         branches.append(
             {
                 "branch": name,
+                # Raw commit count (`rev-list base..branch`). A branch rebased
+                # or cherry-picked onto base still counts every copy here;
+                # `ahead_patch_unique` is the work base does not have.
                 "ahead": ahead,
+                "ahead_patch_unique": (
+                    None if in_base is None else max(ahead - len(in_base), 0)
+                ),
+                "ahead_patch_in_base": None if in_base is None else len(in_base),
                 "behind": behind,
                 "last_commit_date": date,
                 "fix_commits_shown": sum(1 for c in commits if c["type"] == "fix"),
+                "fix_commits_shown_unique": sum(
+                    1
+                    for c in commits
+                    if c["type"] == "fix" and c["patch_in_base"] is not True
+                ),
                 "commits": commits,
                 "commits_truncated": ahead > len(commits),
                 "files_in_scope_changed": len(changed),
@@ -1335,10 +1798,48 @@ def find_unmerged_branches(
         "note": (
             "Commits on remote branches that are not in the base branch, as "
             "of the last fetch (this script never fetches). Treat them as "
-            "prior art: a finding may already be fixed, or attempted, there."
+            "prior art: a finding may already be fixed, or attempted, there. "
+            "A commit with patch_in_base true is a copy of a commit base "
+            "already has (cherry-pick or rebase), so it is not unmerged work; "
+            "`ahead_patch_unique` counts the rest."
         ),
         "branches": branches,
     }
+
+
+# Author and committer dates further apart than this mark a commit that was
+# rebased, cherry-picked or amended after it was written.
+_DATE_DIVERGENCE = timedelta(hours=1)
+_DATE_DIVERGENCE_SHARE = 0.2
+_DATE_DIVERGENCE_MIN = 5
+
+
+def count_date_divergence(commits: list[dict]) -> int:
+    """How many commits have author and committer dates over an hour apart."""
+    count = 0
+    for commit in commits:
+        try:
+            authored = datetime.fromisoformat(commit["date"])
+            committed = datetime.fromisoformat(commit["committer_date"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if abs(committed - authored) > _DATE_DIVERGENCE:
+            count += 1
+    return count
+
+
+def last_commit_date(git_root: Path, rel_scope: str) -> str | None:
+    """Committer date of the newest commit touching the scope, or None."""
+    args = ["log", "-1", "--format=%cI"]
+    if rel_scope != ".":
+        args += ["--", rel_scope]
+    try:
+        result = _run_git(args, git_root)
+    except subprocess.TimeoutExpired:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
 
 
 def parse_args(argv: list[str]) -> dict:
@@ -1353,6 +1854,7 @@ def parse_args(argv: list[str]) -> dict:
         "max_files": 0,
         "no_function": False,
         "no_branches": False,
+        "sweep_files": SWEEP_FILES,
         "key_types": {},
         "unknown_args": [],
     }
@@ -1402,6 +1904,16 @@ def parse_args(argv: list[str]) -> dict:
             except ValueError:
                 print(
                     f"Error: --max-files requires an integer, got '{argv[i + 1]}'",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            i += 2
+        elif arg == "--sweep-files" and i + 1 < len(argv):
+            try:
+                args["sweep_files"] = int(argv[i + 1])
+            except ValueError:
+                print(
+                    f"Error: --sweep-files requires an integer, got '{argv[i + 1]}'",
                     file=sys.stderr,
                 )
                 sys.exit(2)
@@ -1465,6 +1977,9 @@ def analyze(argv: list[str] | None = None) -> dict:
     # Parse git log.
     git_args = [
         "log",
+        # Detect renames whatever diff.renames says, so a renamed file keeps
+        # its history (see split_rename).
+        "-M",
         "--numstat",
         f"--format={LOG_FORMAT}",
     ]
@@ -1489,6 +2004,9 @@ def analyze(argv: list[str] | None = None) -> dict:
             key_types,
         )
 
+    # An unknown commit inherits its tracker key's majority type.
+    inherit_key_majority(commits)
+
     # If using --last, derive time range from actual commits.
     commit_cap_applied = len(commits) >= max_commits
     if last_n is not None and commits:
@@ -1504,6 +2022,8 @@ def analyze(argv: list[str] | None = None) -> dict:
     else:
         days = args["days"]
 
+    divergent = count_date_divergence(commits)
+
     # Classify commits.
     commits_by_type: dict[str, int] = defaultdict(int)
     classified_by: dict[str, int] = defaultdict(int)
@@ -1515,6 +2035,9 @@ def analyze(argv: list[str] | None = None) -> dict:
 
     git_root = git_toplevel(project_root)
     attributor = CommitAttributor(git_root)
+    # --max-files caps the files function churn is computed for; null counts
+    # mean function churn did not run.
+    file_stats: dict = {"files_total": None, "files_analyzed": None}
     try:
         # Function-level churn.
         function_churn: list[dict] = []
@@ -1531,6 +2054,7 @@ def analyze(argv: list[str] | None = None) -> dict:
                 project_root,
                 max_files=args["max_files"],
                 attributor=attributor,
+                stats=file_stats,
             )
             if _check_script_timeout():
                 function_churn_note = (
@@ -1567,7 +2091,23 @@ def analyze(argv: list[str] | None = None) -> dict:
     attribution_meta = attributor.meta()
 
     # Co-change clusters.
-    co_change_clusters = compute_co_change_clusters(commits)
+    head_files = _files_at_head(project_root)
+    sweep_files = args["sweep_files"]
+    co_change_clusters = compute_co_change_clusters(
+        commits, sweep_files=sweep_files, head_files=head_files
+    )
+    sweep_commits = sum(
+        1
+        for c in commits
+        if len(set(c.get("canonical_files") or c["files"])) > sweep_files
+    )
+
+    scope_prefix = _relative_scope(scan_root, git_root)
+    if scope_prefix == ".":
+        scope_prefix = ""
+    elif not scan_root.is_file():
+        scope_prefix = scope_prefix.rstrip("/") + "/"
+    behavioural = find_behavioural_non_code_commits(commits, git_root, scope_prefix)
 
     if args["no_branches"]:
         unmerged = {
@@ -1583,9 +2123,19 @@ def analyze(argv: list[str] | None = None) -> dict:
         )
 
     # Build result.
+    files_capped = (
+        file_stats["files_total"] is not None
+        and file_stats["files_analyzed"] < file_stats["files_total"]
+    )
     result: dict = {
         "project_root": str(project_root),
         "scan_root": str(scan_root),
+        # The envelope's file fields describe function churn, the only part
+        # --max-files caps. File churn and commit lists always cover the
+        # whole window.
+        "files_total": file_stats["files_total"],
+        "files_analyzed": file_stats["files_analyzed"],
+        "files_capped": files_capped,
         "time_range": {
             "start": since,
             "end": until,
@@ -1606,6 +2156,9 @@ def analyze(argv: list[str] | None = None) -> dict:
             "files_changed": len(file_churn),
             "functions_changed": len(function_churn),
             "authors": len(authors),
+            # Commits whose author and committer dates are over an hour apart
+            # (rebased, cherry-picked or amended later).
+            "author_committer_date_divergent": divergent,
         },
         "tracker_keys": summarize_tracker_keys(commits),
         "file_churn": file_churn,
@@ -1614,7 +2167,14 @@ def analyze(argv: list[str] | None = None) -> dict:
         "recent_fixes": recent_fixes,
         "recent_features": recent_features,
         "recent_refactors": recent_refactors,
+        "behavioural_non_code_commits": behavioural,
         "co_change_clusters": co_change_clusters,
+        "co_change_meta": {
+            "sweep_files_threshold": sweep_files,
+            "sweep_commits": sweep_commits,
+            "ranked_by": "co_change_count_excluding_sweeps",
+            "renames_followed": True,
+        },
         "unmerged_branches": unmerged,
         "notes": [],
     }
@@ -1629,6 +2189,43 @@ def analyze(argv: list[str] | None = None) -> dict:
             f"{attribution_meta['files_unattributed']} file change(s) could not "
             "be mapped to functions (timeout, parse cap, or a file version that "
             "does not parse). Function counts are lower bounds."
+        )
+    if not commits:
+        last = last_commit_date(project_root, rel_scope)
+        result["time_range"]["empty"] = True
+        result["time_range"]["last_commit_in_scope"] = last
+        scope_name = rel_scope if rel_scope != "." else "the project"
+        result["notes"].append(
+            f"EMPTY WINDOW: 0 commits touch {scope_name} between {since} and "
+            f"{until}. "
+            + (
+                f"The last commit to it is dated {last}; re-run with --since "
+                "an earlier date (or --days N, or --last N) before drawing any "
+                "temporal conclusion. Every count below is zero because the "
+                "window is empty, not because the code is stable."
+                if last
+                else "There is no commit touching it at all."
+            )
+        )
+    if (
+        divergent >= _DATE_DIVERGENCE_MIN
+        and divergent / len(commits) >= _DATE_DIVERGENCE_SHARE
+    ):
+        result["notes"].append(
+            f"{divergent} of {len(commits)} commits have author and committer "
+            "dates more than an hour apart: the history was rebased, "
+            "cherry-picked or landed in batches. The window and all in-window "
+            "dates use the committer date, so do not read velocity, bursts or "
+            "the order of a feature and its follow-up fixes from these dates; "
+            "the author date (`date`) is closer to when the work was written."
+        )
+    if behavioural["flagged"]:
+        result["notes"].append(
+            f"{len(behavioural['flagged'])} docs/chore commit(s) change Python "
+            "code, not only comments, docstrings or layout (see "
+            "behavioural_non_code_commits.flagged). Review them as you would "
+            "a fix or a feature: they are missing from recent_fixes and "
+            "recent_features."
         )
     unknown = commits_by_type.get("unknown", 0)
     if commits and unknown / len(commits) > 0.15:
@@ -1654,6 +2251,14 @@ def analyze(argv: list[str] | None = None) -> dict:
             + ". The analysis below ran with default values for whatever those "
             "flags were meant to set -- re-run with the correct flag before "
             "trusting any temporal claim."
+        )
+
+    if files_capped:
+        result["notes"].append(
+            f"FILES CAPPED: function churn covers {file_stats['files_analyzed']} "
+            f"of {file_stats['files_total']} in-scope Python files "
+            "(--max-files). Functions in the remaining files are missing from "
+            "`function_churn`, not unchanged."
         )
 
     if commit_cap_applied:

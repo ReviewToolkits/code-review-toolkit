@@ -112,6 +112,6 @@ AUDIT-RESULT: FIX=n CONSIDER=n POLICY=n SCANNERS=n/m -- <STATE>
 - **Report the denominator with every zero.** "0 findings" and "0 findings across 44 files with 2
   scanners blocked" are different claims, and only one of them is an audit.
 - **`status` on every FIX.** Reproduced and merely-confirmed findings must be distinguishable; see
-  `docs/reproduction-convention.md`.
+  `<plugin_root>/docs/reproduction-convention.md`.
 - The sign-off line is parsed by other tools. Do not reformat it, do not add fields before the
   terminal state, and keep it on line 1.

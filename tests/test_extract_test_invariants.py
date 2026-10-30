@@ -1,7 +1,8 @@
 """Tests for extract_test_invariants.py — test invariant extraction and propagation."""
 
 import unittest
-from helpers import import_script, TempProject
+
+from helpers import TempProject, import_script
 
 mod = import_script("extract_test_invariants")
 
@@ -143,6 +144,52 @@ def test_just_exercise():
         self.assertEqual(len(assertions), 0)
 
 
+class TestHttpErrorStatusAssertions(unittest.TestCase):
+    """Asserting a 4xx/5xx response status is an error-condition invariant."""
+
+    def _types(self, body: str) -> list[str]:
+        import ast
+        tree = ast.parse(body)
+        func = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
+        return [a["invariant_type"] for a in mod.extract_assertions(func)]
+
+    def test_status_code_comparisons(self):
+        for check in (
+            "assert r.status_code == 400",
+            "assert 404 == r.status_code",
+            "assert r.status_code in (400, 422)",
+            "assert r.status_code >= 400",
+            "assert r.status_code == HTTPStatus.CONFLICT",
+            "assert r.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE",
+            "assert r.status == 503",
+            "self.assertEqual(r.status_code, 403)",
+            "self.assertIn(r.status_code, {401, 403})",
+        ):
+            with self.subTest(check=check):
+                body = f"def test_x(self, r):\n    {check}\n"
+                self.assertIn("error_condition", self._types(body))
+
+    def test_success_statuses_are_not_errors(self):
+        for check in (
+            "assert r.status_code == 200",
+            "assert r.status_code in (200, 201)",
+            "assert r.status_code < 400",
+            "assert r.status_code != 500",
+            "self.assertEqual(r.status_code, 204)",
+            "assert r.json()['count'] == 404",
+        ):
+            with self.subTest(check=check):
+                body = f"def test_x(self, r):\n    {check}\n"
+                self.assertNotIn("error_condition", self._types(body))
+
+    def test_detail_names_the_status(self):
+        import ast
+        tree = ast.parse("def test_x(r):\n    assert r.status_code == 409\n")
+        func = tree.body[0]
+        (assertion,) = mod.extract_assertions(func)
+        self.assertEqual(assertion["detail"], "HTTP 409")
+
+
 class TestSimilarFunctions(unittest.TestCase):
     """Test similar function discovery."""
 
@@ -233,6 +280,97 @@ class TestSimilarFunctionPrecision(unittest.TestCase):
             "ensure_token": _fn("ensure_token", "pkg/tokens.py"),
         }
         self.assertEqual(self._similar("ensure_key", funcs), ["ensure_token"])
+
+
+class TestSimilarFunctionNoise(unittest.TestCase):
+    """Abstract declarations and bare-verb prefixes are not siblings."""
+
+    def _similar(self, tested: str, funcs: dict[str, dict]) -> list[str]:
+        table = {name: [info] for name, info in funcs.items()}
+        return [
+            s["function"]
+            for s in mod.find_similar_functions(tested, funcs[tested], table)
+        ]
+
+    def test_bare_verb_is_not_a_prefix_sibling(self):
+        funcs = {
+            "Converter._verify_spec_version": _fn(
+                "Converter._verify_spec_version", "pkg/conv.py", 1, True
+            ),
+            "Node._verify": _fn("Node._verify", "pkg/node.py", 0, True),
+            "Converter._verify_spec_layout": {**_fn(
+                "Converter._verify_spec_layout", "pkg/conv.py", 1, True
+            ), "line": 20},
+        }
+        self.assertEqual(
+            self._similar("Converter._verify_spec_version", funcs),
+            ["Converter._verify_spec_layout"],
+        )
+
+    def test_one_shared_word_needs_more_than_the_word(self):
+        funcs = {
+            "Loader._parse_header": _fn("Loader._parse_header", "pkg/a.py", 1, True),
+            # Same shape (method, one parameter): kept.
+            "Loader._parse_footer": {
+                **_fn("Loader._parse_footer", "pkg/a.py", 1, True), "line": 20
+            },
+            # A module function with three more parameters, nothing else shared.
+            "_parse_options": _fn("_parse_options", "pkg/b.py", 4, False),
+            # Shares a second word: kept despite the different shape.
+            "_parse_header_line": _fn("_parse_header_line", "pkg/c.py", 4, False),
+        }
+        self.assertEqual(
+            sorted(self._similar("Loader._parse_header", funcs)),
+            ["Loader._parse_footer", "_parse_header_line"],
+        )
+
+    def test_abstract_declarations_are_skipped(self):
+        funcs = {
+            "DiskStore.close": _fn("DiskStore.close", "pkg/disk.py", 0, True),
+            "BaseStore.close": {**_fn("BaseStore.close", "pkg/base.py", 0, True),
+                                "is_abstract": True},
+            "NetStore.close": _fn("NetStore.close", "pkg/net.py", 0, True),
+        }
+        self.assertEqual(self._similar("DiskStore.close", funcs), ["NetStore.close"])
+
+    def test_abstract_bodies_detected(self):
+        with TempProject({
+            "pkg/base.py": (
+                "import abc\n"
+                "from typing import Protocol, overload\n"
+                "\n"
+                "class Base(abc.ABC):\n"
+                "    @abc.abstractmethod\n"
+                "    def run(self):\n"
+                "        \"\"\"Run.\"\"\"\n"
+                "    def stop(self):\n"
+                "        raise NotImplementedError('subclass')\n"
+                "    def reset(self):\n"
+                "        ...\n"
+                "    def close(self):\n"
+                "        pass\n"
+                "\n"
+                "class Backend(Protocol):\n"
+                "    def search(self, q): pass\n"
+                "\n"
+                "class Real:\n"
+                "    def close(self):\n"
+                "        pass\n"
+                "    def flush(self):\n"
+                "        raise NotImplementedError if self else None\n"
+            ),
+        }) as root:
+            funcs = mod.extract_source_functions([root / "pkg/base.py"], root)
+        abstract = {
+            name: locs[0]["is_abstract"] for name, locs in funcs.items()
+        }
+        self.assertEqual(abstract, {
+            "Base.run": True, "Base.stop": True, "Base.reset": True,
+            # `pass` in an ABC or Protocol is a declaration...
+            "Base.close": True, "Backend.search": True,
+            # ...but in a concrete class it is a real (no-op) implementation.
+            "Real.close": False, "Real.flush": False,
+        })
 
 
 class TestSelectTests(unittest.TestCase):
@@ -417,6 +555,39 @@ class TestDiscoverTestsOutsideScope(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["test_discovery"]["method"], "scan_root")
         self.assertEqual(result["warnings"], [])
+
+
+_OUTCOME_FILES = {
+    "app/__init__.py": "",
+    "app/test_outcome.py": "class Outcome:\n    __test__ = False\n    OK = 1\n",
+    "app/core.py": "def parse(text):\n    return text\n",
+    "tests/test_core.py": (
+        "from app.core import parse\n"
+        "\n"
+        "def test_parse_empty():\n"
+        "    assert parse('') == ''\n"
+    ),
+}
+
+
+class TestSourceModuleNamedLikeATest(unittest.TestCase):
+    """A package's own `test_*.py` module with no tests does not stop discovery."""
+
+
+    def test_falls_back_to_project_tests(self):
+        with TempProject(_OUTCOME_FILES) as root:
+            result = mod.analyze(str(root / "app"))
+        self.assertEqual(result["test_discovery"]["method"], "conventional_dir")
+        self.assertEqual(result["summary"]["total_test_functions"], 1)
+        self.assertEqual(result["summary"]["test_files"], 1)
+        self.assertTrue(any("test_outcome.py" in w for w in result["warnings"]))
+
+    def test_envelope_fields_present(self):
+        with TempProject(_OUTCOME_FILES) as root:
+            result = mod.analyze(str(root / "app"), max_files=2)
+        self.assertTrue(result["files_capped"])
+        self.assertEqual(result["files_analyzed"], 2)
+        self.assertEqual(result["files_total"], 3)
 
 
 def _tested(result: dict, test_name: str) -> dict | None:
@@ -666,6 +837,197 @@ class TestBugFixAttribution(unittest.TestCase):
         self.assertEqual(total, 1)
         self.assertEqual(entries[0]["test_functions"], ["test_flush_race_regression"])
         self.assertEqual(entries[0]["attribution"], "function")
+
+
+# Two ways to install a record: create validates the spec first; restore
+# copies it in from an archive and never does. Their names share nothing.
+_ENTRY_POINT_SRC = {
+    "pkg/__init__.py": "",
+    "pkg/registry.py": (
+        "class Registry:\n"
+        "    def create_record(self, key, spec):\n"
+        "        check_spec(spec)\n"
+        "        with self._record_lock(key):\n"
+        "            path = self._record_path(key)\n"
+        "            self._write_spec(path, spec)\n"
+        "\n"
+        "    def import_from_archive(self, key, blob):\n"
+        "        spec = blob['spec']\n"
+        "        with self._record_lock(key):\n"
+        "            path = self._record_path(key)\n"
+        "            self._write_spec(path, spec)\n"
+        "\n"
+        "    def describe(self, key):\n"
+        "        # Shares only the busy lock: not the same operation.\n"
+        "        with self._record_lock(key):\n"
+        "            return key\n"
+        "\n"
+        "    def _record_lock(self, key):\n        return key\n"
+        "    def _record_path(self, key):\n        return key\n"
+        "    def _write_spec(self, path, spec):\n        return path\n"
+        "    def compact_all(self):\n"
+        "        for key in []:\n"
+        "            with self._record_lock(key):\n                pass\n"
+        "    def rename(self, key):\n"
+        "        with self._record_lock(key):\n                pass\n"
+        "\n"
+        "def check_spec(spec):\n"
+        "    if not spec:\n"
+        "        raise ValueError('empty')\n"
+    ),
+    "tests/test_registry.py": (
+        "import pytest\n"
+        "from pkg.registry import Registry\n"
+        "\n"
+        "def test_create_record_rejects_empty_spec():\n"
+        "    reg = Registry()\n"
+        "    with pytest.raises(ValueError):\n"
+        "        reg.create_record('k', {})\n"
+    ),
+}
+
+
+class TestEntryPointSiblings(unittest.TestCase):
+    """Functions calling the tested path's helpers are other entry points."""
+
+    def test_sibling_entry_point_found_with_missing_guard(self):
+        with TempProject(_ENTRY_POINT_SRC) as root:
+            result = mod.analyze(str(root))
+        (inv,) = result["invariants"]
+        self.assertEqual(inv["tested_function"]["function"], "Registry.create_record")
+        siblings = {s["function"]: s for s in inv["entry_point_siblings"]}
+        self.assertIn("Registry.import_from_archive", siblings)
+        sib = siblings["Registry.import_from_archive"]
+        self.assertEqual(sib["missing_guards"], ["check_spec"])
+        self.assertEqual(
+            sorted(sib["shared_calls"]),
+            ["_record_lock", "_record_path", "_write_spec"],
+        )
+        # True negative: one common helper alone is not the same operation.
+        self.assertNotIn("Registry.describe", siblings)
+        top = result["entry_point_siblings"]
+        self.assertEqual(top[0]["function"], "Registry.import_from_archive")
+        self.assertEqual(top[0]["sibling_of"], "Registry.create_record")
+        self.assertFalse(top[0]["tested"])
+
+    def test_same_named_layers_are_one_operation(self):
+        files = dict(_ENTRY_POINT_SRC)
+        files["pkg/service.py"] = (
+            "from pkg.registry import Registry\n"
+            "\n"
+            "def create_record(key, spec):\n"
+            "    return Registry().create_record(key, spec)\n"
+        )
+        files["tests/test_registry.py"] = (
+            "import pytest\n"
+            "from pkg.service import create_record\n"
+            "\n"
+            "def test_create_record_rejects_empty_spec():\n"
+            "    with pytest.raises(ValueError):\n"
+            "        create_record('k', {})\n"
+        )
+        with TempProject(files) as root:
+            result = mod.analyze(str(root))
+        (inv,) = result["invariants"]
+        self.assertEqual(inv["tested_function"]["file"], "pkg/service.py")
+        names = [s["function"] for s in inv["entry_point_siblings"]]
+        self.assertIn("Registry.import_from_archive", names)
+        # The deeper layer of the same operation is not its own sibling.
+        self.assertNotIn("Registry.create_record", names)
+
+
+class TestFixCommitClassification(unittest.TestCase):
+    """A commit type or tag outranks fix vocabulary in the subject."""
+
+    def test_typed_non_fix_commits_are_not_fixes(self):
+        for subject in (
+            "chore: fix a typo (#12)",
+            "ci: fix the docs build (#34)",
+            "test: cover the parser error paths (#56)",
+            "docs: fix a typo",
+            "style(lint): fix line lengths",
+            "refactor!: fix naming",
+            "[test] Raise the timeout of the slow worker tests",
+            "[bench] Use a larger sample",
+            "[docs][api] Fix the error table",
+        ):
+            with self.subTest(subject=subject):
+                self.assertFalse(mod.is_fix_commit(subject))
+
+    def test_fix_commits(self):
+        for subject in (
+            "fix: keep the trailing newline",
+            "fix(io): flush before close",
+            "Fix: strip whitespace around values",
+            "[fix][cli] Reject an empty --output path",
+            "[core][fix] Close the handle on error",
+            "hotfix: restore the default",
+            # No type at all: fall back to the vocabulary.
+            "Close the race between flush and read",
+            "[core] Avoid a deadlock on close",
+            # A malformed scope still names the type.
+            "fix(io: escape the path",
+        ):
+            with self.subTest(subject=subject):
+                self.assertTrue(mod.is_fix_commit(subject))
+
+    def test_untyped_subject_without_vocabulary(self):
+        self.assertFalse(mod.is_fix_commit("feat(cli: add a quiet flag"))
+        self.assertFalse(mod.is_fix_commit("Add a prefix option"))
+
+
+class TestTestOnlyFixesRankLast(unittest.TestCase):
+    """A fix commit that changes only tests or benchmarks ranks below the rest."""
+
+    def test_product_fix_selected_before_test_only_fix(self):
+        tests = [
+            _t("test_slack", "tests/test_timing.py"),
+            _t("test_regression", "tests/test_store.py"),
+        ]
+        fixes = [
+            {   # Newest: a test-only commit.
+                "test_file": "tests/test_timing.py", "fix_commit": "a",
+                "fix_message": "fix: give the timing test room",
+                "test_functions": ["test_slack"], "attribution": "function",
+                "touches_source": False,
+            },
+            {
+                "test_file": "tests/test_store.py", "fix_commit": "b",
+                "fix_message": "fix: reject a truncated header",
+                "test_functions": ["test_regression"], "attribution": "function",
+                "touches_source": True,
+            },
+        ]
+        selected = mod.select_tests(tests, fixes, max_tests=1)
+        self.assertEqual(selected[0]["function"], "test_regression")
+
+    def test_git_entry_records_touches_source(self):
+        with TempProject({
+            "pkg/core.py": "X = 1\n",
+            "tests/test_core.py": "def test_a():\n    assert True\n",
+            "benchmarks/run.py": "N = 1\n",
+        }) as root:
+            _git(root, "init", "-q", "-b", "main")
+            _git(root, "add", "-A")
+            _git(root, "commit", "-q", "-m", "Add core")
+            (root / "tests/test_core.py").write_text(
+                "def test_a():\n    assert 1\n", encoding="utf-8"
+            )
+            (root / "benchmarks/run.py").write_text("N = 2\n", encoding="utf-8")
+            _git(root, "commit", "-q", "-am", "Fix the slow timeout in the bench")
+            (root / "tests/test_core.py").write_text(
+                "def test_a():\n    assert 2\n", encoding="utf-8"
+            )
+            (root / "pkg/core.py").write_text("X = 2\n", encoding="utf-8")
+            _git(root, "commit", "-q", "-am", "Fix the core crash")
+            _git(root, "commit", "-q", "--allow-empty", "-m", "chore: fix a typo")
+            entries, total = mod._get_bug_fix_tests([root / "tests/test_core.py"], root)
+        self.assertEqual(total, 2)
+        by_msg = {e["fix_message"]: e["touches_source"] for e in entries}
+        self.assertEqual(
+            by_msg,
+            {"Fix the core crash": True, "Fix the slow timeout in the bench": False},
+        )
 
 
 if __name__ == "__main__":

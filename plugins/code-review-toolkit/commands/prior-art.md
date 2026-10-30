@@ -23,8 +23,8 @@ all three observed on a single corpus:
 
 ## The recipe
 
-Read [`docs/searching-trackers.md`](../../../docs/searching-trackers.md) — it is vendored into this
-repo and is the authority. The essentials, because getting them wrong returns a *silent* empty
+Read [`<plugin_root>/docs/searching-trackers.md`](../docs/searching-trackers.md) — it ships with the plugin
+and is the authority. The essentials, because getting them wrong returns a *silent* empty
 result that reads exactly like "not reported":
 
 ```bash
@@ -56,7 +56,7 @@ gh api -X GET search/issues -f q="repo:$R is:issue TERM1 TERM2" \
   GitLab "work items" (tasks, epics) may not appear in the issues endpoint; check the project's
   web UI once to see where its tracking lives.
 - **No public tracker, or a private one.** Many projects track work by **keys** in commit subjects
-  and docs (`[fix] ... (B92)`, `ABC-123`, a `ROADMAP.md` or `TODO.md` with key → status). That is
+  and docs (`[fix] ... (B12)`, `ABC-123`, a `ROADMAP.md` or `TODO.md` with key → status). That is
   prior art too, and it's local:
 
   ```bash

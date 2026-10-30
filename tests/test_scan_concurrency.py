@@ -525,6 +525,349 @@ class TestReentry(unittest.TestCase):
         self.assertEqual(of(scan(src), self.shape), [])
 
 
+class TestNestedLockContextManagers(unittest.TestCase):
+    """A @contextmanager that enters another lock context manager holds its lock."""
+
+    _NESTED = """
+    import threading
+    from contextlib import contextmanager
+
+    class Pool:
+        def __init__(self, model):
+            self._lock = threading.{kind}()
+            self.model = model
+
+        @contextmanager
+        def _guards(self, *keys):
+            with self._lock:
+                yield
+
+        @contextmanager
+        def _guard(self, key):
+            with self._guards(key):
+                yield
+
+        @contextmanager
+        def _outer_guard(self, key):
+            with self._guard(key):
+                yield
+
+        def job(self, texts):
+            with self._guard("k"):
+                return self.model.embed_many(texts)
+
+        def deep_job(self, texts):
+            with self._outer_guard("k"):
+                return self.model.embed_many(texts)
+    """
+
+    def test_nested_cm_is_a_lock_cm(self):
+        result = scan_project(
+            {"pkg/mod.py": self._NESTED.format(kind="Lock")}, blocking=["embed_many"]
+        )
+        cms = result["summary"]["lock_context_managers"]
+        self.assertEqual(set(cms), {"Pool._guards", "Pool._guard", "Pool._outer_guard"})
+        found = of(result["findings"], "blocking-call-under-lock")
+        self.assertEqual(
+            sorted(f["function"] for f in found), ["Pool.deep_job", "Pool.job"]
+        )
+        self.assertEqual(
+            result["summary"]["lock_context_managers_wrapping"]["Pool._guard"],
+            "self._guards(key)",
+        )
+        self.assertEqual(result["summary"]["possible_lock_cms_missed"], [])
+
+    def test_wrapper_and_wrapped_cm_are_one_guard(self):
+        # Most callers take the single-key wrapper; one takes the multi-key CM
+        # it wraps. Both hold the same lock, so the helper is guarded everywhere.
+        src = """
+        import threading
+        from contextlib import contextmanager
+
+        class Shelf:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self._items = {}
+
+            @contextmanager
+            def _guards(self, *keys):
+                with self._lock:
+                    yield
+
+            @contextmanager
+            def _guard(self, key):
+                with self._guards(key):
+                    yield
+
+            def _load(self, key):
+                return self._items.get(key)
+
+            def a(self, k):
+                with self._guard(k):
+                    return self._load(k)
+
+            def b(self, k):
+                with self._guard(k):
+                    return self._load(k)
+
+            def c(self, k):
+                with self._guard(k):
+                    return self._load(k)
+
+            def move(self, k1, k2):
+                with self._guards(k1, k2):
+                    return self._load(k1)
+        """
+        found = of(scan(src), "unguarded-access-to-lock-guarded-state")
+        self.assertEqual(found, [])
+
+    def test_cm_over_a_non_lock_cm_is_not_a_lock(self):
+        src = """
+        from contextlib import contextmanager
+
+        class Timer:
+            @contextmanager
+            def _timed(self, op):
+                yield
+
+            @contextmanager
+            def _scope(self, op):
+                with self._timed(op):
+                    yield
+
+            @contextmanager
+            def _opened(self, path):
+                with open(path) as fh:
+                    yield fh
+
+            def run(self, model):
+                with self._scope("x"):
+                    model.embed_many([])
+        """
+        result = scan_project({"pkg/mod.py": src}, blocking=["embed_many"])
+        self.assertEqual(result["summary"]["lock_context_managers"], [])
+        self.assertEqual(of(result["findings"], "blocking-call-under-lock"), [])
+        # Unresolved CMs with a `with` around `yield` are listed for a manual check.
+        missed = result["summary"]["possible_lock_cms_missed"]
+        self.assertEqual(len(missed), 2)
+        self.assertTrue(any(m.startswith("Timer._scope: with") for m in missed))
+
+
+class TestLockContextManagerKind(unittest.TestCase):
+    """A CM-derived lock inherits the reentrancy of the lock it wraps."""
+
+    shape = "non-reentrant-lock-reacquired"
+
+    _READING = """
+    import threading
+    from contextlib import contextmanager
+
+    class Table:
+        def __init__(self):
+            self._read_mutex = threading.{kind}()
+            self._rows = {{}}
+
+        @contextmanager
+        def _reading(self):
+            self._read_mutex.acquire()
+            try:
+                yield self._rows
+            finally:
+                self._read_mutex.release()
+
+        def get_many(self, keys):
+            with self._reading():
+                return [self.get(k) for k in keys]
+
+        def get(self, key):
+            with self._reading() as rows:
+                return rows.get(key)
+    """
+
+    def test_reader_over_rlock_is_silent(self):
+        self.assertEqual(of(scan(self._READING.format(kind="RLock")), self.shape), [])
+
+    def test_reader_over_plain_lock_is_flagged_as_non_reentrant(self):
+        result = scan_project({"pkg/mod.py": self._READING.format(kind="Lock")})
+        found = of(result["findings"], self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertIn("non-reentrant Lock", found[0]["message"])
+        self.assertEqual(
+            result["summary"]["lock_context_manager_kinds"]["Table._reading"], "Lock"
+        )
+
+    _WRITING = """
+    import threading
+    from contextlib import contextmanager
+
+    class Table:
+        def __init__(self):
+            self._write_mutex = threading.{kind}()
+            self._rows = {{}}
+
+        @contextmanager
+        def _writing_with(self, lock):
+            lock.acquire()
+            try:
+                yield self._rows
+            finally:
+                lock.release()
+
+        @contextmanager
+        def _writing(self):
+            with self._writing_with(self._write_mutex) as rows:
+                yield rows
+
+        def put_many(self, items):
+            with self._writing():
+                for k, v in items:
+                    self.put(k, v)
+
+        def put(self, key, value):
+            with self._writing() as rows:
+                rows[key] = value
+    """
+
+    def test_nested_writer_over_lock_parameter(self):
+        found = of(scan(self._WRITING.format(kind="Lock")), self.shape)
+        self.assertEqual([f["function"] for f in found], ["Table.put_many"])
+        self.assertEqual(of(scan(self._WRITING.format(kind="RLock")), self.shape), [])
+
+    def test_cm_holding_a_reentrant_and_a_plain_lock_is_not_reentrant(self):
+        src = """
+        import threading
+        from contextlib import contextmanager
+
+        class Box:
+            def __init__(self):
+                self._outer = threading.RLock()
+                self._inner = threading.Lock()
+
+            @contextmanager
+            def _both(self):
+                with self._outer, self._inner:
+                    yield
+
+            def a(self):
+                with self._both():
+                    self.b()
+
+            def b(self):
+                with self._both():
+                    pass
+        """
+        result = scan_project({"pkg/mod.py": src})
+        self.assertEqual(
+            result["summary"]["lock_context_manager_kinds"]["Box._both"], "Lock"
+        )
+        self.assertEqual(len(of(result["findings"], self.shape)), 1)
+
+    def test_cm_with_an_unresolved_item_is_not_taken_as_reentrant(self):
+        # The ExitStack may enter a non-reentrant lock the scanner cannot see.
+        src = """
+        import threading
+        from contextlib import ExitStack, contextmanager
+
+        class Box:
+            def __init__(self):
+                self._outer = threading.RLock()
+
+            @contextmanager
+            def _all(self, items):
+                with self._outer, ExitStack() as stack:
+                    for item in items:
+                        stack.enter_context(item.write_lock())
+                    yield
+        """
+        result = scan_project({"pkg/mod.py": src})
+        self.assertEqual(
+            result["summary"]["lock_context_manager_kinds"]["Box._all"], "custom"
+        )
+
+
+class TestCallResolution(unittest.TestCase):
+    """Two classes share a method name: resolve to the receiver's class, and say
+    so in the chain when only the name was used."""
+
+    def test_local_provenance_avoids_a_false_lock_cycle(self):
+        src = """
+        import threading
+
+        class Registry:
+            def __init__(self):
+                self._lock = threading.Lock()
+
+            def get_config(self, name):
+                with self._lock:
+                    return {}
+
+        class Store:
+            def __init__(self, registry=None):
+                self._state = threading.Lock()
+                self._guard = threading.Lock()
+                self._registry = registry or Registry()
+
+            def get_config(self, name):
+                with self._state:
+                    return self._bootstrap()
+
+            def _bootstrap(self):
+                registry = self._registry
+                with self._guard:
+                    return registry.get_config("x")
+        """
+        self.assertEqual(of(scan(src), "lock-order-inversion"), [])
+
+    _SHARED = """
+    import threading, time
+    from typing import Protocol
+
+    class ShelfBase(Protocol):
+        def metrics(self) -> dict: ...
+
+    class DiskShelf{base}:
+        def metrics(self):
+            time.sleep(1)
+            return {{}}
+
+    class Registry:
+        def metrics(self):
+            return {{}}
+
+    lock = threading.Lock()
+
+    def refresh({param}):
+        with lock:
+            return shelf.metrics()
+    """
+
+    def _found(self, base: str, param: str) -> list[dict]:
+        src = self._SHARED.format(base=base, param=param)
+        return of(scan(src), "blocking-call-under-lock")
+
+    def test_receiver_name_picks_the_class_and_hop_is_marked_weak(self):
+        found = self._found("", "shelf")
+        self.assertEqual(len(found), 1)
+        self.assertTrue(found[0]["chain"][0].endswith("[weak: name-only]"))
+        self.assertIn("DiskShelf.metrics", found[0]["chain"][1])
+
+    def test_ambiguous_hop_names_its_candidate_count(self):
+        src = (
+            self._SHARED.format(base="", param="shelf")
+            .replace("shelf.metrics()", "thing.metrics()")
+            .replace("def refresh(shelf)", "def refresh(thing)")
+        )
+        found = of(scan(src), "blocking-call-under-lock")
+        self.assertEqual(len(found), 1)
+        self.assertIn("[weak: name-only, 1 of 2 candidates]", found[0]["chain"][0])
+
+    def test_protocol_annotation_resolves_to_its_one_implementation(self):
+        found = self._found("(ShelfBase)", "shelf: ShelfBase")
+        self.assertEqual(len(found), 1)
+        self.assertNotIn("[weak", " ".join(found[0]["chain"]))
+        self.assertIn("DiskShelf.metrics", found[0]["chain"][1])
+
+
 class TestConditions(unittest.TestCase):
     def test_wait_without_predicate_loop(self):
         src = """
@@ -676,10 +1019,72 @@ class TestBlockingUnderLock(unittest.TestCase):
 
         def go(model):
             with lock:
-                model.encode_batch([])
+                model.embed_many([])
         """
         self.assertEqual(of(scan(src), self.shape), [])
-        found = of(scan(src, blocking=["encode_batch"]), self.shape)
+        found = of(scan(src, blocking=["embed_many"]), self.shape)
+        self.assertEqual(len(found), 1)
+
+
+class TestBlockingLowSignal(unittest.TestCase):
+    shape = "blocking-call-under-lock"
+
+    _FILE_IO = """
+    import threading
+    lock = threading.Lock()
+
+    def save(path, text):
+        with lock:
+            with open(path, "w") as fh:
+                fh.write(text)
+    """
+
+    def test_file_io_under_lock_is_summarized_not_reported(self):
+        result = scan_project({"pkg/mod.py": self._FILE_IO})
+        self.assertEqual(of(result["findings"], self.shape), [])
+        low = result["summary"]["blocking_low_signal"]
+        self.assertEqual(low["reported_as"], "summary")
+        self.assertEqual(low["sites"], 1)
+        self.assertEqual(low["by_lock"][0]["lock"], "lock")
+        self.assertEqual(low["by_lock"][0]["by_category"], {"file-io": 1})
+
+    def test_all_blocking_reports_each_one(self):
+        result = scan_project({"pkg/mod.py": self._FILE_IO}, all_blocking=True)
+        self.assertEqual(len(of(result["findings"], self.shape)), 1)
+        low = result["summary"]["blocking_low_signal"]
+        self.assertEqual((low["reported_as"], low["sites"]), ("findings", None))
+
+    def test_worst_category_wins_through_a_call(self):
+        src = """
+        import threading, json, requests
+        lock = threading.Lock()
+
+        def sync(path):
+            with open(path) as fh:
+                cfg = json.load(fh)
+            return requests.get(cfg["url"])
+
+        def refresh(path):
+            with lock:
+                return sync(path)
+        """
+        found = of(scan(src), self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertIn("network", found[0]["message"])
+
+    def test_designated_call_that_also_blocks_is_one_finding(self):
+        src = """
+        import threading, time
+        lock = threading.Lock()
+
+        def embed_many(items):
+            time.sleep(1)
+
+        def job(items):
+            with lock:
+                embed_many(items)
+        """
+        found = of(scan(src, blocking=["embed_many"]), self.shape)
         self.assertEqual(len(found), 1)
 
 
@@ -815,6 +1220,111 @@ class TestTransitiveBlockingInAsync(unittest.TestCase):
         self.assertEqual([f["confidence"] for f in found], ["low"])
 
 
+class TestSlotReleasedOnEveryExit(unittest.TestCase):
+    shape = "slot-acquired-before-the-try-that-releases-it"
+
+    def test_await_between_acquire_and_try(self):
+        src = """
+        async def handle(gate, limiter, request):
+            slot = gate.take_slot(request)
+            decision = await limiter.charge(request)
+            if not decision.allowed:
+                slot.release()
+                raise RuntimeError("limited")
+            try:
+                return await request.run()
+            finally:
+                slot.release()
+        """
+        found = of(scan(src), self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertEqual((found[0]["line"], found[0]["confidence"]), (3, "high"))
+
+    def test_try_right_after_acquire_is_silent(self):
+        src = """
+        import threading
+        sem = threading.Semaphore(4)
+
+        async def handle(gate, request):
+            slot = gate.take_slot(request)
+            if slot is None:
+                raise RuntimeError("busy")
+            try:
+                return await request.run()
+            finally:
+                slot.release()
+
+        def work(job):
+            sem.acquire()
+            try:
+                job()
+            finally:
+                sem.release()
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+    def test_release_only_in_except_exception_around_an_await(self):
+        src = """
+        async def download(gate, request, export):
+            slot, refused = gate.admit(request)
+            if refused is not None:
+                return refused
+            try:
+                path = await export(request)
+            except ValueError:
+                slot.release()
+                return None
+            except Exception:
+                slot.release()
+                raise
+            request.on_close(slot.release)
+            return path
+        """
+        found = of(scan(src), self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertIn("CancelledError", found[0]["message"])
+
+    def test_except_base_exception_is_silent(self):
+        src = """
+        async def download(gate, request, export):
+            slot = gate.admit(request)
+            try:
+                path = await export(request)
+            except BaseException:
+                slot.release()
+                raise
+            request.on_close(slot.release)
+            return path
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+    def test_call_between_acquire_and_hand_off(self):
+        src = """
+        def admit(gate, quota, request):
+            slot, refused = gate.admit(request)
+            if refused is not None:
+                return None, refused
+            limited = quota.charge(request)
+            if limited is not None:
+                slot.release()
+                return None, limited
+            return slot, None
+        """
+        found = of(scan(src), self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["confidence"], "medium")
+        self.assertIn("line 6", found[0]["message"])
+
+    def test_a_resource_never_released_here_is_not_a_slot(self):
+        src = """
+        def build(factory, log):
+            conn = factory.open()
+            conn.configure()
+            return conn
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+
 class TestSignalHandlers(unittest.TestCase):
     shape = "signal-handler-does-real-work"
 
@@ -848,6 +1358,64 @@ class TestSignalHandlers(unittest.TestCase):
             signal.signal(signal.SIGTERM, on_term)
         """
         self.assertEqual(of(scan(src), self.shape), [])
+
+
+class TestModuleState(unittest.TestCase):
+    """The re-entrancy starting point when the guard map is empty."""
+
+    def test_inventory(self):
+        files = {
+            "pkg/settings.py": """
+            import threading
+
+            class Settings:
+                def load(self):
+                    return {}
+
+            SETTINGS = Settings()
+            _registry = {}
+            DEFAULTS = {"timeout": 5}
+            _client = None
+            _lock = threading.Lock()
+
+            def register(name, fn):
+                _registry[name] = fn
+
+            def get_client():
+                global _client
+                if _client is None:
+                    _client = object()
+                return _client
+
+            def timeout():
+                return DEFAULTS["timeout"]
+
+            def shadow():
+                _registry = {}
+                _registry["x"] = 1
+            """,
+            "pkg/cli.py": """
+            from pkg.settings import SETTINGS, _registry
+
+            def run():
+                SETTINGS.load()
+                _registry.clear()
+            """,
+        }
+        result = scan_project(files)
+        state = {e["name"]: e for e in result["module_state"]}
+        self.assertEqual(
+            set(state),
+            {"pkg.settings:SETTINGS", "pkg.settings:_registry", "pkg.settings:_client"},
+        )
+        self.assertEqual(state["pkg.settings:SETTINGS"]["kind"], "instance")
+        self.assertEqual(state["pkg.settings:SETTINGS"]["functions"], ["run"])
+        self.assertEqual(state["pkg.settings:_registry"]["kind"], "container")
+        self.assertEqual(
+            state["pkg.settings:_registry"]["functions"], ["register", "run"]
+        )
+        self.assertEqual(state["pkg.settings:_client"]["kind"], "rebound")
+        self.assertEqual(result["summary"]["module_state_entries"], 3)
 
 
 class TestEnvelopeAndOptions(unittest.TestCase):

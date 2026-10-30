@@ -104,9 +104,30 @@ fixed. The divergence you see today *is* the unfixed bug.
   paths B and C still lack it."
 
 When the pattern is a mapping (error codes and the statuses or messages they map to, config keys
-and their readers, event names and their handlers), extract the producer and consumer sides with a
-short AST or grep pass and diff them: a code produced but never mapped, or mapped but never
-produced, is a concrete finding.
+and their readers, event names and their handlers), extract the producer and consumer sides and
+diff them: a code produced but never mapped, or mapped but never produced, is a concrete finding.
+
+For exceptions and error codes, run `map_exceptions.py` (see
+[Running the script](#running-the-script)) instead of writing the pass by hand:
+
+- `exceptions`: per class, `raised_at` and `caught_at`. A handler for a base class counts, with
+  `via` naming the base, so compare catch sites by what they cover, not by the names they list.
+- `raise_sites`: `escapes_function: false` with `caught_locally_at` marks a raise that a `try` in
+  the same function catches. Leave those out of what the function can emit. Propagation across
+  calls is not modelled: follow a helper's escaping raises to its callers yourself.
+- `codes`: per error code, `produced_at` (raise argument, `code=` keyword, class attribute, a
+  `{"code": ...}` result, a `.get("code", default)` fallback) and `consumed_at` (mapping key,
+  comparison, prefix/suffix/substring test). `mappings` lists the status and class maps with their
+  `keys_not_produced`. `by_module` gives each module's two sides: diff the modules that should
+  agree (each transport of one API, a server and its embedded client).
+- `leads`: `caught_never_raised`, `raised_never_caught` (only broad handlers or none),
+  `codes_produced_not_consumed` and `codes_consumed_not_produced`. Each is a lead, not a finding.
+  A code with no mapping may be meant to fall to a default status. Check what the default is, and
+  whether a client maps it the same way.
+
+Codes are matched under the keys in `code_keys` (`code`, `error_code`, `error_type`, `err_code`).
+If the project names its codes differently, add `--code-key NAME`. If the scope produces no codes,
+`codes` is empty: say so rather than reporting "no divergence".
 
 ### Phase 3: Missing Abstraction Detection
 
@@ -170,6 +191,7 @@ For each:
 ## Important Guidelines
 
 - **Behavioral divergence, not style divergence**: Leave quote styles and import ordering to the consistency-auditor. Focus on cases where the same *problem* is solved with different *approaches*.
+- **Migration drift belongs to the consistency-auditor**: when one module adopted a new convention, library or API and another still uses the old one, leave it to that agent, even when the leftover breaks behavior. Report here only divergence that is not the trace of a migration in progress. This keeps the two reports from carrying the same finding twice.
 - **Threshold of 2+**: Don't flag a pattern unless at least 2 modules do it differently. A unique approach in one module isn't divergence — it may be the only module that needs that particular solution.
 - **Respect intentional variation**: Some divergence is appropriate. CLI modules may handle errors differently than library modules. Note this rather than flagging it.
 - **Missing abstractions are gold**: The most valuable finding is not "these differ" but "here's the shared abstraction that would unify them."
@@ -181,3 +203,35 @@ For each:
 - **CONSIDER**: Divergence worth unifying for maintainability but no correctness risk
 - **POLICY**: Requires a project-level decision on which pattern to standardize on
 - **ACCEPTABLE**: Intentional variation between modules with genuinely different requirements, or where unification would increase complexity
+
+## Running the script
+
+These rules apply to every script call this agent makes.
+
+- **Timeout.** Give the Bash call `timeout: 300000` (5 min). The 120 s default kills the script on
+  large projects. If it may run longer still, use `run_in_background` and wait for the completion
+  notification rather than polling.
+- **A private output location.** Other agents run the toolkit's scripts concurrently in `parallel`
+  mode, so never write to a fixed path. Create a directory of your own and keep stdout and stderr
+  apart, in one Bash call:
+
+  ```bash
+  d=$(mktemp -d "${TMPDIR:-/tmp}/crt-pattern-consistency-checker.XXXXXX") && echo "$d" &&
+  python3 <plugin_root>/scripts/map_exceptions.py [scope] [options] > "$d/out.json" 2> "$d/out.err"; echo "exit=$?"
+  ```
+
+  Options: `--max-files N`, and `--code-key NAME` (repeatable) for a project that keys its error
+  codes by another name.
+
+  Each Bash call is a fresh shell: a `$$` suffix or a shell variable does not survive into the next
+  call. Reuse the literal path `echo` printed.
+- **Running the project's own code** (its tests, a reproducer, an import check): do it in an
+  exported copy, never in the checkout, and set `TMPDIR` to your private directory so the project's
+  own temp files land there instead of a shared `/tmp`.
+- **Forward `--max-files N`** when the caller gave one, and say so in the report whenever the
+  envelope's `files_capped` is true. List `files_unparsed` too: those files were not mapped.
+- **Check before you read.** A non-zero `exit` or an empty `out.json` means the run did not
+  succeed. Read `out.err`, and any `error` field in `out.json`.
+- **Do not retry a script that timed out or failed.** Answer the same question with Grep and Read,
+  and state in the report that the script did not complete. A run that failed is never "no
+  findings".

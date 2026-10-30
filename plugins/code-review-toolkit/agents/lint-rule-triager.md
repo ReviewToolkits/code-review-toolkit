@@ -27,12 +27,31 @@ likely-defects and strong smells; run it only when tier 1 is exhausted or the us
 | Field | What it means for your report |
 |---|---|
 | `version_matches_pin` false | Every count below is **non-comparable** with a calibrated run. Say so in the report; do not silently compare against a previous run's numbers. |
+| `project_ruff_pin` set, and `version_matches_project_pin` false | The project runs a different ruff than this run did (its lock file, pre-commit rev or requirements say which). See "Two pins" below. |
 | `rule_validation.unknown` non-empty | Codes ruff does not recognise — a stale selection. Report it. |
 | `rule_validation.removed` non-empty | Rules deleted from ruff. **A membership test would have passed for these**; they are found by reading `status`. Report and stop selecting them. |
 | `rule_validation.preview_gated` non-empty | Those rules **silently did nothing**. Their absence from the findings is not evidence of absence in the code. |
 | `stderr` non-empty | Remapped codes and no-effect selections warn here and nowhere else. Read it. |
 | `error` non-null | The run is incomplete. An incomplete lint pass reported as clean is worse than no pass. |
 | `unlinted` non-empty | ruff could not read those paths ("Failed to lint" on stderr), and it still exits 0 with no findings. A sandboxed ruff, such as the snap package, cannot read `/tmp`. `error` is set. Re-run with `--ruff-bin` pointing at a different ruff; never report those paths as clean. |
+
+**Two pins.** When the project pins a ruff (`project_ruff_pin.version`) that is not the toolkit's
+`pinned_version`, one run cannot be both comparable with the calibration and true to the project.
+Run the script twice, once per version, and report the difference:
+
+```bash
+python3 <plugin_root>/scripts/run_lint_rules.py [scope] --tier 1 --ruff-bin <the project's ruff>
+printf '#!/bin/sh\nexec uvx ruff@<pinned_version> "$@"\n' > "$d/ruff-pinned" && chmod +x "$d/ruff-pinned"
+python3 <plugin_root>/scripts/run_lint_rules.py [scope] --tier 1 --ruff-bin "$d/ruff-pinned"
+```
+
+`--ruff-bin` takes one executable path, hence the wrapper in your private directory `$d`. Hits that
+appear in only one run come from the version change, not from the code: say which version reports
+them. A finding that only the newer ruff reports is debt that comes due when
+the project upgrades ruff. It is not a defect the project's lint reports today.
+
+Each finding's `tier` is the tier of **its rule**, not the run's `--tier`. A `--tier 2` run also
+returns every tier-1 hit, tagged `1`.
 
 ## Phase 2 — Merge, do not double-report
 
@@ -51,20 +70,48 @@ Every finding carries `shape_id`.
 
 **Tier-1 precision is 50-70%, not 100%.** Treat every finding as a candidate.
 
-`has_suppression_comment` is the strongest measured dismissal signal. When it is true, the author has
-already considered this exact class and written down that they meant it. On coverage.py, 6 of 19
-tier-1 findings carried one and **every one was a deliberate idiom** — `open = open  # pylint:
-disable=redefined-builtin`, which captures the builtin at import time so later mocking cannot break
-the module. Dismiss those *with the author's stated reason*, do not re-litigate them.
+`has_suppression_comment` is the strongest measured dismissal signal **where
+`suppression_is_dismissal_signal` is true**. Then the author has already considered this exact class
+and written down that they meant it. On coverage.py, 6 of 19 tier-1 findings carried one and **every
+one was a deliberate idiom** — `open = open  # pylint: disable=redefined-builtin`, which captures the
+builtin at import time so later mocking cannot break the module. Dismiss those *with the author's
+stated reason*, do not re-litigate them.
 
-**The script has already dismissed one mechanical class.** `dismissed` holds hits moved out of
+**A suppression on a security rule (`S…`) or any `# nosec` is a claim to check, not a dismissal.**
+The calibration above was all `redefined-builtin`; it does not transfer. A `# nosec` asserts that a
+guard makes the code safe, and when the guard does not hold, the comment hides exactly the finding
+the rule exists for. For these hits `suppression_is_dismissal_signal` is false. For each one:
+
+1. Read `suppression_comment`. If it gives a reason that names a guard (a sandbox, an allow-list, an
+   escaping step, "input is trusted"), find that guard in the code and try to get around it.
+   Dismiss only when the guard holds, and cite where it is.
+2. `suppression_names_rule: false` means the comment names a *different* rule (`# nosec B301` over
+   an `eval`). It suppresses nothing that is firing here: report it as a stale suppression next to
+   the live finding.
+3. `summary.suppression_needs_verification` is how many hits need this. Say in the report how many
+   you checked.
+
+**The script has already dismissed some mechanical classes.** `dismissed` holds hits moved out of
 `findings`, each with a `dismissal_reason` that `dismissal_reasons` explains. `summary.total`
 still counts them, so it stays comparable with the calibrated totals. `summary.reported` is what is
-left to triage. Today the only reason is `fastapi-dependency-marker`: B008 on `Depends(...)`,
-`Query(...)`, `Body(...)` and the other FastAPI dependency markers, when the call resolves to a
-fastapi import in that file. That default is the framework's injection idiom, not a shared mutable
-value. On a FastAPI service it can be most of tier 1. List the count in the report's Dismissed
-section, and do not re-triage those hits.
+left to triage. Each check resolves the flagged code in the same file and dismisses only what it can
+prove:
+
+| Reason | Rule | Dismissed when |
+|---|---|---|
+| `fastapi-dependency-marker` | B008 | The default is `Depends(...)`, `Query(...)` or another FastAPI marker imported from fastapi: the framework's injection idiom. |
+| `raise-systemexit-in-except` | B904 | The raise is the builtin `SystemExit`: no traceback is printed, so a cause would never be shown. |
+| `yaml-loader-subclasses-safeloader` | S506 | The Loader is a class in the same file whose bases are all safe yaml loaders. Its own `add_constructor` handlers are not checked; read them if the file registers any. |
+| `closure-called-synchronously` | B023 | The lambda goes straight to a same-file function (or `self.` method) that only calls that parameter, and is not async or a generator. |
+| `sql-built-from-literals` | S608 | Every value in the query text is a literal or a name bound only to literals: a `",".join(["?"] * n)` placeholder list, a constant table name, a list of literal clauses. |
+
+List the counts in the report's Dismissed section, and do not re-triage those hits.
+
+**`closure_passed_as_argument: true`** on a B023 hit means the lambda is a direct argument of a call,
+but the script could not verify the callee (it is imported, a parameter, async, or it stores the
+callable). Read the function named in `callee` once. If it calls the parameter before it returns,
+every hit with that callee is a false positive. If it stores, schedules or returns the callable,
+the hit is real.
 
 **`suspect_tool_bug: true` marks a known ruff false-positive mode.** Today that means an F821 on an
 `except ... as exc` name read by a closure nested in that handler (`known_tool_issue: "ruff#6878"`).
@@ -72,6 +119,15 @@ The binding is alive until the handler exits, so the hit is false if the closure
 handler. It is a real NameError if the closure escapes (stored, returned, scheduled) and runs later.
 Decide that one question per hit. These hits are kept out of `novel_shape_candidates`. Never
 recommend removing the `as exc`.
+
+They carry `shape_id: "linter-autofix-breaks-closure-capture"`, and the real defect is that shape:
+the project's **own** `ruff check --fix` deleting `as exc` while the closure still reads it. The
+script measures that under the project's config. `project_config_autofixes: true` on a hit means
+the project's ruff would apply that fix. Report it as a FIX: the error path breaks the next time
+someone runs the autofix. Also check whether `--fix` runs automatically anywhere (pre-commit, CI, a
+`make` target). `project_autofix_check.autofixed_by_project_config` counts these hits. If
+`project_autofix_check.error` is set, the question was not answered, so do not treat it as false.
+There is no scanner finding to merge these hits with: the hit is the evidence for the shape.
 
 For everything else, the ordinary rules apply: read the code, construct a concrete failure scenario,
 and drop anything you cannot make concrete. Rules that are policy rather than defect in a given
@@ -91,7 +147,9 @@ produced it**, because it makes every future run on every project find that clas
 Known-productive candidates from the benchmark runs that are still uncatalogued:
 
 - **`PLE0704`** bare `raise` outside an exception handler — a `RuntimeError` in the error path.
-- **`S608`** SQL built by string construction.
+- **`S608`** SQL built by string construction. Placeholder lists and constant table names are
+  dismissed mechanically (`sql-built-from-literals`), so the hits that remain interpolate a value
+  from outside the file or from a parameter.
 
 Two former candidates are now catalogued, and their hits carry a `shape_id`, so merge them in
 Phase 2 instead of proposing them again: **`B905`** (`zip()` without `strict=`) →

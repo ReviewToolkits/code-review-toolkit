@@ -641,6 +641,157 @@ class TestReferencedOnlyFromTests(unittest.TestCase):
         self.assertNotIn("percentiles", test_only)
 
 
+class TestDecoratedTopLevelFunctions(unittest.TestCase):
+    """A registering decorator is how a top-level function is reached."""
+
+    FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/render.py": (
+            "from functools import singledispatch\n"
+            "@singledispatch\n"
+            "def render(value):\n"
+            "    return str(value)\n"
+            "@render.register(int)\n"
+            "@render.register(float)\n"
+            "def _render_number(value):\n"
+            "    return format(value, '.2f')\n"
+            "@staticmethod\n"
+            "def _inert_but_dead():\n"
+            "    return 1\n"
+            "def _plain_dead():\n"
+            "    return 2\n"
+        ),
+        "pkg/app.py": "from pkg.render import render\nprint(render(1.5))\n",
+    }
+
+    def test_singledispatch_overload_is_not_dead(self):
+        with TempProject(self.FILES) as root:
+            out = _run_main(root, root)
+        names = {u["name"] for u in out["unreferenced_symbols"]}
+        self.assertNotIn("_render_number", names)
+        # `render` (@singledispatch) and the overload.
+        self.assertEqual(
+            out["summary"]["functions_excluded_by_reason"], {"decorated": 2}
+        )
+
+    def test_inert_decorator_and_plain_function_are_still_reported(self):
+        with TempProject(self.FILES) as root:
+            out = _run_main(root, root)
+        names = {u["name"] for u in out["unreferenced_symbols"]}
+        self.assertIn("_plain_dead", names)
+        self.assertIn("_inert_but_dead", names)
+
+
+class TestTemplateReferences(unittest.TestCase):
+    """A Jinja template inside the scanned tree is a production reference."""
+
+    FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/run.py": (
+            "class Run:\n"
+            "    def passed(self):\n"
+            "        return True\n"
+            "    def failed(self):\n"
+            "        return False\n"
+            "    def summary(self):\n"
+            "        return ''\n"
+        ),
+        "pkg/report.py": "from pkg.run import Run\nRun().summary()\n",
+        "pkg/views/page.jinja2": (
+            "<p>failed</p>\n{% if run.passed() %}<b>ok</b>{% endif %}\n"
+        ),
+        "tests/test_run.py": (
+            "from pkg.run import Run\n"
+            "def test_run():\n"
+            "    assert Run().passed()\n"
+            "    assert not Run().failed()\n"
+        ),
+    }
+
+    def test_attribute_read_in_a_template_is_a_production_use(self):
+        with TempProject(self.FILES) as root:
+            out = _run_main(root, root / "pkg")
+        test_only = {u["name"] for u in out["referenced_only_from_tests"]}
+        self.assertNotIn("Run.passed", test_only)
+        self.assertEqual(
+            out["summary"]["template_files_scanned"], ["views/page.jinja2"]
+        )
+
+    def test_template_text_outside_blocks_is_not_a_reference(self):
+        # "failed" appears in the HTML, but not inside {{ }} or {% %}.
+        with TempProject(self.FILES) as root:
+            out = _run_main(root, root / "pkg")
+        test_only = {u["name"] for u in out["referenced_only_from_tests"]}
+        self.assertIn("Run.failed", test_only)
+
+
+class TestSharedMethodNames(unittest.TestCase):
+    """A call to `A._load()` must not keep an unrelated `B._load()` alive."""
+
+    FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/stores.py": (
+            "class Base:\n"
+            "    def fetch(self):\n"
+            "        return self._open()\n"
+            "class Primary(Base):\n"
+            "    def _open(self):\n"
+            "        return 1\n"
+            "    def query(self):\n"
+            "        return self._conn()\n"
+            "    def _conn(self):\n"
+            "        return 1\n"
+            "class Ledger:\n"
+            "    def _conn(self):\n"
+            "        return 2\n"
+            "    def _open(self):\n"
+            "        return 2\n"
+            "class Mirror(Base):\n"
+            "    def _open(self):\n"
+            "        return 3\n"
+            "    def _close(self):\n"
+            "        return 3\n"
+            "class Other:\n"
+            "    def _close(self):\n"
+            "        return 4\n"
+            "def close_all(item):\n"
+            "    return item._close()\n"
+        ),
+        "pkg/app.py": (
+            "from pkg.stores import Primary, Mirror, close_all\n"
+            "Primary().query()\nPrimary().fetch()\nclose_all(Mirror())\n"
+        ),
+        "tests/test_stores.py": (
+            "from pkg.stores import Ledger\n"
+            "def test_catalog():\n"
+            "    assert Ledger()._conn() == 2\n"
+        ),
+    }
+
+    def _run(self):
+        with TempProject(self.FILES) as root:
+            return _run_main(root, root / "pkg")
+
+    def test_self_call_in_an_unrelated_class_does_not_count(self):
+        out = self._run()
+        test_only = {u["name"] for u in out["referenced_only_from_tests"]}
+        unreferenced = {u["name"] for u in out["unreferenced_symbols"]}
+        self.assertIn("Ledger._conn", test_only)
+        self.assertNotIn("Primary._conn", test_only | unreferenced)
+        # No reference at all on Ledger's side either.
+        self.assertIn("Ledger._open", unreferenced)
+
+    def test_self_call_in_a_base_class_reaches_every_override(self):
+        unreferenced = {u["name"] for u in self._run()["unreferenced_symbols"]}
+        self.assertNotIn("Primary._open", unreferenced)
+        self.assertNotIn("Mirror._open", unreferenced)
+
+    def test_call_through_another_receiver_counts_for_every_class(self):
+        unreferenced = {u["name"] for u in self._run()["unreferenced_symbols"]}
+        self.assertNotIn("Mirror._close", unreferenced)
+        self.assertNotIn("Other._close", unreferenced)
+
+
 if __name__ == "__main__":
     unittest.main()
 

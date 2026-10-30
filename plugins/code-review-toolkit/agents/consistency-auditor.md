@@ -13,11 +13,22 @@ You think like a new team member reading the codebase for the first time: "I lea
 
 Analyze the scope provided. Default: the entire project. You may receive architecture-mapper output as additional context — use it to understand module boundaries and focus your comparison across and within modules.
 
+**Migration drift is yours, across modules too:** when part of the codebase moved to a new convention, library or API and another part did not (a client-library swap, `os.path` to `pathlib`, a new error helper), report it here, including any behavior the leftover old usage breaks. The pattern-consistency-checker leaves it to you.
+
 ## Analysis Strategy
 
 ### Phase 1: Discover Conventions
 
-Before flagging violations, you must **discover what the conventions actually are**. For each pattern category below, survey the codebase to find the majority approach:
+Before flagging violations, you must **discover what the conventions actually are**. For each pattern category below, survey the codebase to find the majority approach.
+
+Start with `survey_conventions.py` (see "Running the script"). It counts the variants of nine
+categories: `string_formatting`, `logging_message`, `logger_acquisition`, `generic_style`,
+`union_style`, `annotation_coverage`, `docstring_style`, `exits` and `output`. For each one it
+gives the `majority` and its `majority_share`, the `files_mixing_variants`, a `per_file`
+breakdown, and the `sites` of every minority variant (every site, for `exits` and `output`).
+These numbers are the "quantify divergence" evidence, so quote them instead of recounting.
+Survey the categories it doesn't cover (imports, class and testing patterns, naming) with Grep
+and Read as before. Test files are skipped unless you pass `--include-tests`.
 
 **Import Patterns:**
 - Import grouping and ordering (stdlib / external / internal)
@@ -181,3 +192,32 @@ For each:
 - **Respect project history**: Some inconsistencies reflect evolution, not sloppiness. Recommend modernizing but acknowledge that wholesale reformatting may not be worth the churn.
 - **Cap your output**: Report at most 5 high-severity, 5 medium-severity, and 10 low-severity items in the summary. Offer to provide more detail on specific categories.
 - **Be specific**: Always include file paths and line numbers. "Some files use bare except" is useless; "src/runner.py:142, src/fetcher.py:89 use bare except while 12 other exception handlers use specific types" is actionable.
+
+## Running the script
+
+These rules apply to every script call this agent makes.
+
+- **Timeout.** Give the Bash call `timeout: 300000` (5 min). The 120 s default kills the script on
+  large projects. If it may run longer still, use `run_in_background` and wait for the completion
+  notification rather than polling.
+- **A private output location.** Other agents run the toolkit's scripts concurrently in `parallel`
+  mode, so never write to a fixed path. Create a directory of your own and keep stdout and stderr
+  apart, in one Bash call:
+
+  ```bash
+  d=$(mktemp -d "${TMPDIR:-/tmp}/crt-consistency-auditor.XXXXXX") && echo "$d" &&
+  python3 <plugin_root>/scripts/survey_conventions.py [scope] [options] > "$d/out.json" 2> "$d/out.err"; echo "exit=$?"
+  ```
+
+  Each Bash call is a fresh shell: a `$$` suffix or a shell variable does not survive into the next
+  call. Reuse the literal path `echo` printed. Put your own scratch files in the same directory,
+  never in a shared fixed path.
+- **Forward `--max-files N`** when the caller gave one, and say so in the report whenever the
+  envelope's `files_capped` is true. When a category's `sites_truncated` is non-zero, say how many
+  minority sites the list left out.
+- **Check before you read.** A non-zero `exit` or an empty `out.json` means the run did not
+  succeed. Read `out.err`, and any `error` field in `out.json`. Name the files under
+  `skipped.unparseable` in the report.
+- **Do not retry a script that timed out or failed.** Answer the same question with Grep and Read,
+  and state in the report that the script did not complete. A run that failed is never "no
+  findings".

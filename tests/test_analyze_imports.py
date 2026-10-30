@@ -630,5 +630,331 @@ class TestPlainImportNames(unittest.TestCase):
         self.assertEqual(mod.resolve_edge_targets(edge, index), {"pkg/__init__.py"})
 
 
+def _cycles(files: dict[str, str], **kwargs) -> list[list[str]]:
+    with TempProject(files) as root:
+        paths = sorted(mod.discover_python_files(root))
+        analyses = [mod.analyze_file(p, root, {"pkg"}) for p in paths]
+        names = [a["file"] for a in analyses]
+        graph = mod.build_internal_graph(analyses)
+    return mod.detect_cycles(graph, all_files=names, **kwargs)
+
+
+_PARENT_INIT_CYCLE = {
+    "pkg/__init__.py": "",
+    "pkg/helpers.py": (
+        "from pkg.graph.consts import KEY\n\ndef helper():\n    return KEY\n"
+    ),
+    "pkg/graph/__init__.py": "from pkg.graph.vertex import Vertex\n",
+    "pkg/graph/consts.py": "KEY = 1\n",
+    "pkg/graph/vertex.py": "from pkg.helpers import helper\n\nclass Vertex:\n    pass\n",
+}
+
+
+class TestCycleThroughParentPackageInit(unittest.TestCase):
+    """`from pkg.graph.consts import K` runs `pkg/graph/__init__.py` first.
+
+    Verified on disk: with this layout, `import pkg.helpers` raises
+    `ImportError: cannot import name 'helper' from partially initialized
+    module 'pkg.helpers'`.
+    """
+
+    def test_cycle_through_the_parent_package_init_is_reported(self):
+        cycles = _cycles(_PARENT_INIT_CYCLE)
+        self.assertIn(
+            ["pkg/graph/__init__.py", "pkg/graph/vertex.py", "pkg/helpers.py"], cycles
+        )
+
+    def test_it_is_an_import_time_cycle(self):
+        self.assertTrue(_cycles(_PARENT_INIT_CYCLE, include_lazy=False))
+
+    def test_own_parent_package_adds_no_edge(self):
+        # A module inside pkg.graph importing pkg.graph.consts: pkg/graph/__init__.py
+        # is already running (or done) by the time node.py runs.
+        files = {
+            "pkg/__init__.py": "",
+            "pkg/graph/__init__.py": "from pkg.graph.vertex import Vertex\n",
+            "pkg/graph/consts.py": "KEY = 1\n",
+            "pkg/graph/vertex.py": "from pkg.graph.consts import KEY\n\nclass Vertex:\n    pass\n",
+        }
+        self.assertEqual(_cycles(files), [])
+
+    def test_top_level_facade_still_adds_no_edge(self):
+        files = {
+            "pkg/__init__.py": "from pkg.a import A\n",
+            "pkg/a.py": "from pkg.sub.b import B\nA = B\n",
+            "pkg/sub/__init__.py": "",
+            "pkg/sub/b.py": "B = 1\n",
+        }
+        self.assertEqual(_cycles(files), [])
+
+    def test_lazy_import_keeps_the_implicit_edge_lazy(self):
+        files = dict(_PARENT_INIT_CYCLE)
+        files["pkg/helpers.py"] = (
+            "def helper():\n    from pkg.graph.consts import KEY\n    return KEY\n"
+        )
+        self.assertTrue(_cycles(files))
+        self.assertEqual(_cycles(files, include_lazy=False), [])
+
+
+_PLUGIN_FACTORY = {
+    "pkg/__init__.py": "",
+    "pkg/plugins/__init__.py": "",
+    "pkg/plugins/factory.py": (
+        "import importlib\n\n"
+        "def build(kind):\n"
+        "    return importlib.import_module(f'pkg.plugins.{kind}').Plugin()\n"
+        "\n"
+        "def default_options():\n"
+        "    return {}\n"
+    ),
+    "pkg/plugins/alpha.py": (
+        "class Plugin:\n"
+        "    def options(self):\n"
+        "        from pkg.plugins.factory import default_options\n"
+        "        return default_options()\n"
+    ),
+    "pkg/plugins/beta.py": "class Plugin:\n    pass\n",
+}
+
+
+class TestDynamicImportExpansion(unittest.TestCase):
+    """A computed import name with a literal prefix can reach every module
+    under that prefix; a cycle through it is invisible to the static graph."""
+
+    def _run(self, files):
+        with TempProject(files) as root:
+            return mod.analyze(str(root))
+
+    def test_prefix_is_expanded_into_targets(self):
+        out = self._run(_PLUGIN_FACTORY)
+        (site,) = out["dynamic_import_sites"]
+        self.assertEqual(
+            site["expanded_targets"],
+            ["pkg/plugins/alpha.py", "pkg/plugins/beta.py"],
+        )
+
+    def test_cycle_through_the_factory_is_a_dynamic_cycle(self):
+        out = self._run(_PLUGIN_FACTORY)
+        self.assertEqual(out["cycles"], [])
+        (cycle,) = out["dynamic_cycles"]
+        self.assertEqual(
+            cycle["cycle"], ["pkg/plugins/alpha.py", "pkg/plugins/factory.py"]
+        )
+        self.assertEqual(
+            cycle["via_dynamic_import"],
+            [{"from": "pkg/plugins/factory.py", "to": "pkg/plugins/alpha.py"}],
+        )
+        self.assertFalse(cycle["import_time"])
+
+    def test_no_back_edge_means_no_dynamic_cycle(self):
+        files = dict(_PLUGIN_FACTORY)
+        files["pkg/plugins/alpha.py"] = "class Plugin:\n    pass\n"
+        self.assertEqual(self._run(files)["dynamic_cycles"], [])
+
+    def test_relative_prefix_is_resolved_against_the_importer(self):
+        files = dict(_PLUGIN_FACTORY)
+        files["pkg/plugins/factory.py"] = files["pkg/plugins/factory.py"].replace(
+            "f'pkg.plugins.{kind}'", "f'.{kind}', __package__"
+        )
+        (site,) = self._run(files)["dynamic_import_sites"]
+        self.assertIn("pkg/plugins/alpha.py", site["expanded_targets"])
+
+    def test_site_without_a_prefix_expands_to_nothing(self):
+        files = dict(_PLUGIN_FACTORY)
+        files["pkg/plugins/factory.py"] = (
+            "import importlib\ndef build(name):\n"
+            "    return importlib.import_module(name)\n"
+        )
+        out = self._run(files)
+        self.assertEqual(out["dynamic_import_sites"][0]["expanded_targets"], [])
+        self.assertEqual(out["dynamic_cycles"], [])
+
+
+def _effects(src: str) -> list[dict]:
+    import ast as _ast
+
+    return mod.import_time_side_effects(_ast.parse(src))
+
+
+class TestImportTimeSideEffects(unittest.TestCase):
+    """Process-wide operations a module performs on import."""
+
+    def test_root_logger_setup_through_a_called_helper(self):
+        src = (
+            "import logging\n"
+            "def _setup():\n"
+            "    root = logging.getLogger()\n"
+            "    root.handlers = []\n"
+            "    root.addHandler(logging.StreamHandler())\n"
+            "    return root\n"
+            "_LOG = _setup()\n"
+        )
+        effects = _effects(src)
+        self.assertEqual(
+            [(e["line"], e["category"], e["via"], e["call_line"]) for e in effects],
+            [(4, "logging", ["_setup"], 7), (5, "logging", ["_setup"], 7)],
+        )
+
+    def test_direct_module_level_operations(self):
+        src = (
+            "import os, sys, warnings\n"
+            "from logging import basicConfig\n"
+            "basicConfig(level=10)\n"
+            "os.environ['MODE'] = 'x'\n"
+            "os.environ.setdefault('A', '1')\n"
+            "sys.path.insert(0, '.')\n"
+            "warnings.simplefilter('ignore')\n"
+            "with open('state.txt', 'w') as fh:\n"
+            "    pass\n"
+        )
+        self.assertEqual(
+            [(e["line"], e["category"]) for e in _effects(src)],
+            [
+                (3, "logging"),
+                (4, "environment"),
+                (5, "environment"),
+                (6, "sys"),
+                (7, "process_global"),
+                (8, "filesystem"),
+            ],
+        )
+
+    def test_transitive_chain_records_the_whole_path(self):
+        src = (
+            "import os\n"
+            "def _inner():\n    os.makedirs('cache', exist_ok=True)\n"
+            "def _outer():\n    _inner()\n"
+            "class Config:\n    DIR = _outer()\n"
+        )
+        (effect,) = _effects(src)
+        self.assertEqual(effect["via"], ["_outer", "_inner"])
+        self.assertEqual(effect["call_line"], 7)
+
+    def test_uncalled_function_main_guard_and_reads_are_not_effects(self):
+        src = (
+            "import logging, os, sys\n"
+            "log = logging.getLogger(__name__)\n"
+            "log.setLevel(logging.DEBUG)\n"
+            "MODE = os.environ.get('MODE')\n"
+            "def configure():\n    logging.basicConfig()\n"
+            "def read():\n    return open('data.txt').read()\n"
+            "if __name__ == '__main__':\n"
+            "    configure()\n    sys.path.insert(0, '.')\n"
+        )
+        self.assertEqual(_effects(src), [])
+
+    def test_reported_by_analyze(self):
+        files = {
+            "pkg/__init__.py": "",
+            "pkg/log.py": "import logging\nlogging.basicConfig()\n",
+        }
+        with TempProject(files) as root:
+            out = mod.analyze(str(root))
+        self.assertEqual(
+            out["import_time_side_effects"],
+            [
+                {
+                    "file": "pkg/log.py",
+                    "line": 2,
+                    "category": "logging",
+                    "operation": "logging.basicConfig",
+                }
+            ],
+        )
+
+
+_DEP_FILES = {
+    "pkg/__init__.py": "",
+    "pkg/app.py": (
+        "import logging\n"
+        "import yaml\n"
+        "import toolz\n"
+        "from zope.interface import Interface\n"
+        "try:\n    import ujson\nexcept ImportError:\n    ujson = None\n"
+        "log = logging.getLogger('pkg.app')\n"
+        "EXTENSIONS = ['fancy_ext.Extension']\n"
+        "SERVER = 'pkg.app:app'\n"
+        "CONFIG = 'pkg.yaml'\n"
+        "DATA = 'yaml.dump'\n"
+    ),
+}
+
+
+class TestStringImportsAndDependencyCheck(unittest.TestCase):
+    """Modules loaded by name, and imports vs declared dependencies."""
+
+    PYPROJECT = (
+        "[project]\n"
+        'name = "demo-app"\n'
+        "dependencies = [\n"
+        '  "PyYAML>=6",\n'
+        '  "fancy-ext==1.0",\n'
+        '  "zope.interface",\n'
+        '  "unused-lib<2",\n'
+        "]\n"
+        "[project.optional-dependencies]\n"
+        'speed = ["ujson"]\n'
+    )
+
+    def _run(self, files, pyproject=None):
+        with TempProject(files) as root:
+            if pyproject is not None:
+                (root / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+            return mod.analyze(str(root))
+
+    def test_string_imports(self):
+        out = self._run(_DEP_FILES, self.PYPROJECT)
+        self.assertEqual(
+            [(e["string"], e["category"]) for e in out["string_imports"]],
+            [("fancy_ext.Extension", "external"), ("pkg.app:app", "internal")],
+        )
+
+    def test_imported_but_not_declared(self):
+        check = self._run(_DEP_FILES, self.PYPROJECT)["dependency_check"]
+        self.assertEqual(check["sources"], ["pyproject.toml"])
+        self.assertEqual(
+            check["imported_not_declared"],
+            [
+                {
+                    "top_level": "toolz",
+                    "files": ["pkg/app.py"],
+                    "conditional_only": False,
+                }
+            ],
+        )
+
+    def test_declared_but_not_imported_counts_string_loads(self):
+        check = self._run(_DEP_FILES, self.PYPROJECT)["dependency_check"]
+        self.assertEqual(
+            check["declared_not_imported"], [{"name": "unused-lib", "group": "runtime"}]
+        )
+
+    def test_conditional_import_is_flagged(self):
+        pyproject = self.PYPROJECT.replace('speed = ["ujson"]', "")
+        check = self._run(_DEP_FILES, pyproject)["dependency_check"]
+        flags = {
+            e["top_level"]: e["conditional_only"]
+            for e in check["imported_not_declared"]
+        }
+        self.assertEqual(flags, {"toolz": False, "ujson": True})
+
+    def test_setup_py_install_requires_is_read_without_running_it(self):
+        files = dict(_DEP_FILES)
+        files["setup.py"] = (
+            "from setuptools import setup\n"
+            "REQS = ['PyYAML', 'toolz', 'zope.interface', 'fancy-ext']\n"
+            "raise SystemExit('setup.py must not be executed')\n"
+            "setup(name='demo', install_requires=REQS, extras_require={'x': ['ujson']})\n"
+        )
+        check = self._run(files)["dependency_check"]
+        self.assertEqual(check["sources"], ["setup.py"])
+        self.assertEqual(check["imported_not_declared"], [])
+
+    def test_no_declaration_is_unmeasured_not_clean(self):
+        out = self._run({"pkg/__init__.py": "", "pkg/a.py": "import toolz\n"})
+        self.assertIsNone(out["dependency_check"])
+        self.assertIn("no dependency declaration", out["dependency_check_reason"])
+
+
 if __name__ == "__main__":
     unittest.main()

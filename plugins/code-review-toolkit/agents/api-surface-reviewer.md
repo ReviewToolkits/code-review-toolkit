@@ -21,6 +21,17 @@ In Python, the "public API" is:
 3. CLI commands and their arguments
 4. Configuration file format and options
 5. Any classes, functions, or constants documented as user-facing
+6. **Declarative surfaces**, which are the primary surface of a spec- or config-driven tool:
+   - spec/schema keys the user writes (YAML/JSON/TOML documents the tool reads)
+   - config-file keys and environment variables
+   - expression or template forms (`${var}`, `${{ code }}`, `{{ jinja }}`) and the context
+     variables they can see
+   - output formats, report fields, and **exit codes**
+     (`grep -rnE "sys\.exit|SystemExit|\.Exit\(|ctx\.exit" [scope]` lists the exit sites)
+
+   Judge these with the same questions as Python names: does one concept have one spelling, can
+   a user who learned one key predict the next, and does every documented key or code exist and
+   behave as documented?
 
 ## Analysis Dimensions
 
@@ -104,6 +115,108 @@ each transport in-process (e.g. the SDK over a test client and over the embedded
 prints the differences. Transport divergence is where API defects concentrate, because each
 transport is tested on its own and nobody compares them.
 
+Start from this harness rather than writing one from scratch. Fill in the three marked parts,
+save it in your private directory, and run it against an exported copy of the project:
+
+```python
+"""Run each case through every transport and print where the outcomes diverge."""
+import pathlib
+import sys
+import tempfile
+
+EXPORT = "/path/to/export"  # an exported copy, never the checkout
+sys.path.insert(0, EXPORT)
+import mypkg  # FILL IN: the package under review
+assert mypkg.__file__.startswith(EXPORT), mypkg.__file__
+
+# Per-call noise that would make every case "differ". Extend with --ignore-keys a,b.
+IGNORE_KEYS = {"request_id", "trace_id", "timestamp", "took_ms"}
+
+
+def make_transports(tmp: pathlib.Path) -> dict:
+    """FILL IN: one client per transport, each over its own fresh state."""
+    from fastapi.testclient import TestClient  # e.g. an HTTP app plus its SDK
+
+    app = mypkg.create_app(state_dir=tmp / "remote")
+    return {
+        "remote": mypkg.Client(transport=TestClient(app)),
+        "local": mypkg.EmbeddedClient(state_dir=tmp / "local"),
+    }
+
+
+# FILL IN: (label, method, args, kwargs). Run in order on each transport, so a case can
+# depend on the ones before it. The error cases are where transports diverge most.
+CASES = [
+    ("create", "create_item", ("a",), {}),
+    ("create again", "create_item", ("a",), {}),
+    ("get missing", "get_item", ("nope",), {}),
+    ("bad limit", "list_items", (), {"limit": -1}),
+    ("empty name", "create_item", ("",), {}),
+]
+
+
+def shape(value):
+    if hasattr(value, "model_dump"):
+        value = value.model_dump()
+    elif hasattr(value, "__dict__") and not isinstance(value, type):
+        value = vars(value)
+    if isinstance(value, dict):
+        return tuple(sorted(k for k in value if k not in IGNORE_KEYS))
+    if isinstance(value, (list, tuple)):
+        return ("seq", len(value), shape(value[0]) if value else None)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return type(value).__name__
+
+
+def outcome(fn, args, kwargs):
+    """Normalise one call: the exception (class, code) or the return (type, shape)."""
+    try:
+        value = fn(*args, **kwargs)
+    except Exception as exc:  # the exception is the outcome being compared
+        code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+        return ("raises", type(exc).__name__, code)
+    return ("returns", type(value).__name__, shape(value))
+
+
+def main(argv):
+    if "--ignore-keys" in argv:
+        IGNORE_KEYS.update(argv[argv.index("--ignore-keys") + 1].split(","))
+    with tempfile.TemporaryDirectory() as tmp:
+        transports = make_transports(pathlib.Path(tmp))
+        names = list(transports)
+        print("   case".ljust(24) + "".join(n.ljust(44) for n in names))
+        diverged = 0
+        for label, method, args, kwargs in CASES:
+            got = {n: outcome(getattr(c, method), args, kwargs) for n, c in transports.items()}
+            differs = len({repr(v) for v in got.values()}) > 1
+            diverged += differs
+            row = "".join(repr(got[n])[:42].ljust(44) for n in names)
+            print(("!! " if differs else "   ") + label[:20].ljust(21) + row)
+        print(f"{diverged}/{len(CASES)} cases diverge")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
+```
+
+Each `!!` row is a candidate. Decide which transport is right from the documented contract
+(OpenAPI schema, SDK docstrings, README), not from the majority. Two transports that agree can
+both be wrong.
+
+**For a CLI or a config-driven tool**, the "transports" are the channels a setting arrives
+through: the CLI flag, the config-file key, the environment variable and the default. For each
+setting, tabulate its spelling, type, default and precedence in every channel, and diff them:
+
+| Setting | Flag | Config key | Env var | Default (flag / config schema / code) | Documented precedence |
+|---|---|---|---|---|---|
+
+Typical divergences: a flag whose config key is spelled differently or is missing, a default
+that differs between the flag declaration and the config schema, a setting read from the config
+file but not from the flag that claims to override it, an env var the docs name but the code
+never reads, and a precedence that differs from the docs. Confirm each row by running the CLI
+twice in an export, once with the flag and once with the config key.
+
 ### 6c. REST/OpenAPI surface (if applicable)
 
 For an HTTP API, compare the documented contract (OpenAPI schema, docs) with behavior:
@@ -114,6 +227,22 @@ For an HTTP API, compare the documented contract (OpenAPI schema, docs) with beh
   user-facing defect.)
 - Response-model changes that only break **generated clients** (a field becoming optional, an enum
   gaining a value): a breaking-change category of its own.
+
+### 6d. A client contract that lives in another package
+
+Sometimes the client is a separate distribution outside the scope and the repository: an SDK, a
+generated client, or a CLI wrapper. Its interface is still part of what users experience:
+
+- Record the version that is installed (`python -m pip show <dist>` in the project's
+  environment) next to the project's pin (`pyproject.toml`, `setup.py`, requirements, lockfile).
+  A pin range that admits client versions whose methods the server lacks, or the reverse, is a
+  finding against **this** project's pin.
+- Treat the installed client's public interface as the contract. Drive it through §6b against
+  this project's server or local implementation. Report operations the client exposes that the
+  server doesn't serve, and server operations the client can't reach.
+- Don't file findings against the other package's code. Report the defect where this project
+  can fix it (its pin, its server, its docs). If the bug really is in the client, add it as an
+  upstream note.
 
 ### 7. Breaking Change Classification
 
@@ -139,6 +268,9 @@ Tag each recommendation with `[breaking]`, `[breaks-generated-clients]`, `[addit
 - Public classes: N
 - Public functions/methods: N
 - CLI commands: N (if applicable)
+- Spec keys / config keys / env vars: N / N / N (if applicable)
+- Expression or template forms: N (if applicable)
+- Exit codes: N distinct, N documented (if applicable)
 - Estimated patterns to learn: N
 
 ## Naming Consistency

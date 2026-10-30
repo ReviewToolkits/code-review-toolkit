@@ -16,7 +16,9 @@ Usage:
 """
 
 import ast
+import configparser
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -535,7 +537,342 @@ def analyze_file(
             )
 
     result["dynamic_import_sites"] = dynamic_sites
+    result["import_time_side_effects"] = import_time_side_effects(tree)
+    result["string_import_candidates"] = _string_import_candidates(tree)
     return result
+
+
+# A string that names a module, optionally with an attribute: "pkg.mod.Class",
+# "pkg.mod:app". Frameworks load these by name (Jinja extensions, uvicorn
+# apps, Django settings, entry points), so the import never appears in `ast`.
+_DOTTED_STRING = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+(?::[A-Za-z_][\w.]*)?"
+)
+
+
+def _string_import_candidates(tree: ast.AST) -> list[dict]:
+    """Dotted string constants that may name a module (filtered later against
+    the project's modules and declared dependencies). Logger names are skipped:
+    `getLogger("pkg.mod")` names a logger, it imports nothing."""
+    logger_args = {
+        id(arg)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and _dotted_name(node.func).rsplit(".", 1)[-1] == "getLogger"
+        for arg in [*node.args, *(k.value for k in node.keywords)]
+    }
+    found = [
+        {"line": node.lineno, "string": node.value}
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in logger_args
+        and _DOTTED_STRING.fullmatch(node.value)
+    ]
+    return sorted(found, key=lambda c: c["line"])
+
+
+# --- import-time side effects ------------------------------------------------
+#
+# A module-level statement runs when the module is imported, so a library that
+# calls `logging.basicConfig()` -- or a helper that does -- at import time
+# rewrites its host's logging the moment anyone imports it. These are the
+# process-wide operations worth knowing about; each maps to a category.
+_SIDE_EFFECT_CALLS: dict[str, str] = {
+    **dict.fromkeys(
+        (
+            "logging.basicConfig",
+            "logging.disable",
+            "logging.captureWarnings",
+            "logging.setLoggerClass",
+            "logging.setLogRecordFactory",
+            "logging.config.dictConfig",
+            "logging.config.fileConfig",
+        ),
+        "logging",
+    ),
+    **dict.fromkeys(
+        (
+            "os.putenv",
+            "os.unsetenv",
+            "os.environ.update",
+            "os.environ.setdefault",
+            "os.environ.pop",
+            "os.environ.popitem",
+            "os.environ.clear",
+            "os.environ.__setitem__",
+            "os.environ.__delitem__",
+        ),
+        "environment",
+    ),
+    **dict.fromkeys(
+        (
+            "open",
+            "os.makedirs",
+            "os.mkdir",
+            "os.remove",
+            "os.unlink",
+            "os.rename",
+            "os.replace",
+            "os.rmdir",
+            "os.removedirs",
+            "os.symlink",
+            "os.chmod",
+            "shutil.copy",
+            "shutil.copy2",
+            "shutil.copyfile",
+            "shutil.copytree",
+            "shutil.move",
+            "shutil.rmtree",
+            "tempfile.mkdtemp",
+            "tempfile.mkstemp",
+            "logging.FileHandler",
+            "logging.handlers.RotatingFileHandler",
+            "logging.handlers.TimedRotatingFileHandler",
+        ),
+        "filesystem",
+    ),
+    **dict.fromkeys(
+        (
+            "sys.path.insert",
+            "sys.path.append",
+            "sys.path.extend",
+            "sys.setrecursionlimit",
+            "sys.settrace",
+            "sys.setprofile",
+            "sys.setswitchinterval",
+        ),
+        "sys",
+    ),
+    **dict.fromkeys(
+        (
+            "os.chdir",
+            "os.umask",
+            "signal.signal",
+            "warnings.filterwarnings",
+            "warnings.simplefilter",
+            "socket.setdefaulttimeout",
+            "locale.setlocale",
+            "faulthandler.enable",
+            "asyncio.set_event_loop_policy",
+            "multiprocessing.set_start_method",
+        ),
+        "process_global",
+    ),
+}
+# Assigning to (or into) one of these replaces process-wide state.
+_SIDE_EFFECT_TARGETS: dict[str, str] = {
+    "os.environ": "environment",
+    "sys.path": "sys",
+    "sys.modules": "sys",
+    "sys.excepthook": "sys",
+    "sys.stdout": "sys",
+    "sys.stderr": "sys",
+    "sys.stdin": "sys",
+    "threading.excepthook": "process_global",
+}
+# pathlib methods that write to disk.
+_FS_METHODS = frozenset({"mkdir", "write_text", "write_bytes", "touch"})
+# Mutations of a logger object; flagged only on the ROOT logger.
+_LOGGER_MUTATORS = frozenset(
+    {"addHandler", "removeHandler", "setLevel", "addFilter", "removeFilter"}
+)
+_LIST_MUTATORS = frozenset({"append", "extend", "insert", "remove", "clear", "pop"})
+
+
+def _import_aliases(tree: ast.Module) -> dict[str, str]:
+    """Local name -> dotted origin for module-level imports (`environ` ->
+    `os.environ`, `lg` -> `logging`)."""
+    aliases: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname:
+                    aliases[alias.asname] = alias.name
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            for alias in node.names:
+                aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+    return aliases
+
+
+def _is_main_guard(node: ast.If) -> bool:
+    test = node.test
+    return (
+        isinstance(test, ast.Compare)
+        and isinstance(test.left, ast.Name)
+        and test.left.id == "__name__"
+    )
+
+
+def _is_type_checking_guard(node: ast.If) -> bool:
+    test = node.test
+    return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+        isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+    )
+
+
+def _executed_nodes(stmts: list[ast.stmt]):
+    """Every node *stmts* execute when run, without entering nested function or
+    lambda bodies, `if __name__ == "__main__":` or `if TYPE_CHECKING:`."""
+    stack: list[ast.AST] = list(reversed(stmts))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # Decorators and defaults run at definition time; the body does not.
+            children: list[ast.AST] = [*node.decorator_list, node.args]
+        elif isinstance(node, ast.Lambda):
+            children = [node.args]
+        elif isinstance(node, ast.If) and (
+            _is_main_guard(node) or _is_type_checking_guard(node)
+        ):
+            children = list(node.orelse)
+        else:
+            children = list(ast.iter_child_nodes(node))
+        stack.extend(reversed(children))
+
+
+def import_time_side_effects(tree: ast.Module) -> list[dict]:
+    """Process-wide operations a module performs when it is imported.
+
+    Covers module-level (and class-body) code, plus the bodies of module-level
+    functions that code calls -- transitively, within the same file -- since
+    `_LOG = _setup_logging()` runs `_setup_logging` on import. Each entry has
+    the `line` of the operation, its `category` (logging, environment,
+    filesystem, sys, process_global), the `operation`, and, when it happens
+    inside a called function, `via` (the call chain) and `call_line` (the
+    module-level call that triggers it).
+    """
+    aliases = _import_aliases(tree)
+    functions = {
+        n.name: n
+        for n in tree.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    def canon(node: ast.AST) -> str:
+        name = _dotted_name(node)
+        head, _, rest = name.partition(".")
+        if head in aliases:
+            return f"{aliases[head]}.{rest}" if rest else aliases[head]
+        return name
+
+    def is_root_logger(node: ast.AST, roots: set[str]) -> bool:
+        if isinstance(node, ast.Name) and node.id in roots:
+            return True
+        if isinstance(node, ast.Attribute) and canon(node) == "logging.root":
+            return True
+        if isinstance(node, ast.Call) and canon(node.func) == "logging.getLogger":
+            if not node.args and not node.keywords:
+                return True
+            arg = node.args[0] if node.args else node.keywords[0].value
+            return isinstance(arg, ast.Constant) and arg.value in (None, "")
+        return False
+
+    def effect(node: ast.AST, roots: set[str]) -> tuple[str, str] | None:
+        if isinstance(node, ast.Call):
+            name = canon(node.func)
+            if name in _SIDE_EFFECT_CALLS:
+                if name == "open" and not _opens_for_writing(node):
+                    return None
+                return _SIDE_EFFECT_CALLS[name], name
+            func = node.func
+            if isinstance(func, ast.Attribute):
+                if func.attr in _LOGGER_MUTATORS and is_root_logger(func.value, roots):
+                    return "logging", f"root logger .{func.attr}()"
+                if (
+                    func.attr in _LIST_MUTATORS
+                    and isinstance(func.value, ast.Attribute)
+                    and func.value.attr == "handlers"
+                    and is_root_logger(func.value.value, roots)
+                ):
+                    return "logging", f"root logger .handlers.{func.attr}()"
+                if func.attr in _FS_METHODS:
+                    return "filesystem", f".{func.attr}()"
+            return None
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)) and node.value:
+            targets = [node.target]
+        elif isinstance(node, ast.Delete):
+            targets = list(node.targets)
+        for target in targets:
+            base = target.value if isinstance(target, ast.Subscript) else target
+            name = canon(base)
+            if name in _SIDE_EFFECT_TARGETS:
+                return _SIDE_EFFECT_TARGETS[name], f"{name} assignment"
+            if (
+                isinstance(base, ast.Attribute)
+                and base.attr in ("handlers", "level", "propagate")
+                and is_root_logger(base.value, roots)
+            ):
+                return "logging", f"root logger .{base.attr} assignment"
+        return None
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    queue: list[tuple[list[ast.stmt], list[str], int | None]] = [(tree.body, [], None)]
+    while queue:
+        body, via, call_line = queue.pop(0)
+        nodes = list(_executed_nodes(body))
+        roots = {
+            t.id
+            for n in nodes
+            if isinstance(n, ast.Assign) and is_root_logger(n.value, set())
+            for t in n.targets
+            if isinstance(t, ast.Name)
+        }
+        for node in nodes:
+            found = effect(node, roots)
+            if found:
+                entry = {
+                    "line": node.lineno,
+                    "category": found[0],
+                    "operation": found[1],
+                }
+                if via:
+                    entry["via"] = via
+                    entry["call_line"] = call_line
+                out.append(entry)
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in functions
+                and node.func.id not in seen
+            ):
+                seen.add(node.func.id)
+                queue.append(
+                    (
+                        functions[node.func.id].body,
+                        [*via, node.func.id],
+                        call_line if via else node.lineno,
+                    )
+                )
+    out.sort(key=lambda e: (e.get("call_line") or e["line"], e["line"]))
+    return out
+
+
+def _dotted_name(node: ast.AST) -> str:
+    """`a.b.c` for a Name/Attribute chain, else ''."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        inner = _dotted_name(node.value)
+        return f"{inner}.{node.attr}" if inner else ""
+    return ""
+
+
+def _opens_for_writing(call: ast.Call) -> bool:
+    mode = call.args[1] if len(call.args) > 1 else None
+    for kw in call.keywords:
+        if kw.arg == "mode":
+            mode = kw.value
+    return (
+        isinstance(mode, ast.Constant)
+        and isinstance(mode.value, str)
+        and any(c in mode.value for c in "wax+")
+    )
 
 
 def _scope_map(tree: ast.AST) -> dict[int, tuple[str, str | None]]:
@@ -735,6 +1072,84 @@ def compute_metrics(graph: dict[str, list[dict]], all_files: list[str]) -> dict:
     }
 
 
+def implicit_package_inits(
+    target: str, importer: str, module_to_file: dict[str, str]
+) -> set[str]:
+    """Package ``__init__.py`` files an import of *target* runs on the way.
+
+    ``from a.b.c import X`` executes ``a/__init__.py`` and ``a/b/__init__.py``
+    before ``a/b/c.py``, so a cycle can close THROUGH a parent package: ``helpers``
+    imports ``pkg.graph.consts``, ``pkg/graph/__init__.py`` imports ``vertex``,
+    and ``vertex`` imports ``helpers``. Recording only the edge to
+    ``pkg.graph.consts``
+    hid exactly that cycle, which fails as ``ImportError`` when ``utils`` is
+    imported first.
+
+    Packages that enclose the importer itself are left out: they were imported
+    (at least partially) before the importer started running, so the import
+    cannot execute them again. Adding them would turn every
+    ``from pkg import x`` inside ``pkg`` into a phantom cycle through the
+    facade -- the false positive ``resolve_edge_targets`` exists to prevent.
+    """
+    importer_module = module_name_for(importer)
+    own = importer_module.split(".")
+    own_packages = {".".join(own[:i]) for i in range(1, len(own))}
+    if importer.endswith("__init__.py"):
+        own_packages.add(importer_module)
+    parts = target.split(".")
+    out: set[str] = set()
+    for i in range(1, len(parts) + 1):
+        package = ".".join(parts[:i])
+        path = module_to_file.get(package)
+        if path and path.endswith("__init__.py") and package not in own_packages:
+            out.add(path)
+    return out
+
+
+def file_adjacency(
+    graph: dict[str, list[dict]],
+    all_files: list[str] | None = None,
+    *,
+    include_type_checking: bool = False,
+    include_lazy: bool = True,
+) -> dict[str, set[str]]:
+    """``file -> files it depends on``, with edges resolved to concrete files.
+
+    Includes the implicit edge from an import of ``a.b.c`` to each parent
+    package ``__init__.py`` it executes (see ``implicit_package_inits``).
+    """
+    adj: dict[str, list[dict]] = {}
+    for source, edges in graph.items():
+        adj[source] = [
+            e
+            for e in edges
+            if (include_type_checking or not e.get("type_checking_only"))
+            and (include_lazy or not e.get("lazy"))
+        ]
+    # Index EVERY file, not only those that have imports of their own. A leaf
+    # module (coverage/env.py, fan-out 0) is absent from the graph keys, so
+    # indexing from them alone leaves `coverage.env` unresolvable -- and the
+    # bare-package fallback then attributes `from coverage import env` to the
+    # package __init__, manufacturing a cycle through the facade.
+    module_to_file = {
+        module_name_for(f): f for f in (all_files if all_files is not None else adj)
+    }
+    out: dict[str, set[str]] = {}
+    for f, edges in adj.items():
+        resolved: set[str] = set()
+        for edge in edges:
+            # No prefix fallback: an unresolvable target is not a file-level
+            # edge. A prefix match fabricated edges to the enclosing package's
+            # __init__, and with them phantom cycles.
+            resolved |= resolve_edge_targets(edge, module_to_file)
+            resolved |= implicit_package_inits(
+                edge.get("target") or "", f, module_to_file
+            )
+        resolved.discard(f)
+        out[f] = resolved
+    return out
+
+
 def detect_cycles(
     graph: dict[str, list[dict]],
     include_type_checking: bool = False,
@@ -753,49 +1168,21 @@ def detect_cycles(
 
     ``include_lazy=False`` also drops function-level imports that do not run at
     import time, leaving the cycles that can fail a plain ``import``.
+
+    An import of ``a.b.c`` also depends on the parent package ``a/b/__init__.py``
+    (when the importer lives outside ``a.b``): importing it runs that file.
     """
-    # Build a simplified adjacency list: file -> set of live edges.
-    adj: dict[str, list[dict]] = {}
-    for source, edges in graph.items():
-        adj[source] = [
-            e
-            for e in edges
-            if (include_type_checking or not e.get("type_checking_only"))
-            and (include_lazy or not e.get("lazy"))
-        ]
+    file_adj = file_adjacency(
+        graph,
+        all_files,
+        include_type_checking=include_type_checking,
+        include_lazy=include_lazy,
+    )
+    return _cycles_in(file_adj)
 
-    # Collect all known file-stem identifiers so we can map dotted targets
-    # back to concrete files.
-    # Index EVERY file, not only those that have imports of their own. A leaf
-    # module (coverage/env.py, fan-out 0) is absent from the graph keys, so
-    # indexing from them alone leaves `coverage.env` unresolvable -- and the
-    # bare-package fallback then attributes `from coverage import env` to the
-    # package __init__, manufacturing a cycle through the facade. This is the
-    # same root cause as the prefix fallback removed earlier: the index was
-    # incomplete, not the matching rule.
-    file_to_module: dict[str, str] = {}
-    module_to_file: dict[str, str] = {}
-    for f in all_files if all_files is not None else list(adj):
-        mod = module_name_for(f)
-        file_to_module[f] = mod
-        module_to_file[mod] = f
 
-    # Resolve adjacency to file-level.
-    file_adj: dict[str, set[str]] = {}
-    for f, edges in adj.items():
-        resolved: set[str] = set()
-        for edge in edges:
-            resolved |= resolve_edge_targets(edge, module_to_file)
-            # No prefix fallback. `module_to_file` only covers files that have
-            # imports of their own, so a target naming an import-free module
-            # (mypkg.utils) is absent from it; a prefix match then resolved it to
-            # the enclosing package's __init__, fabricating an edge and with it a
-            # phantom cycle. An unresolvable target is simply not a file-level
-            # edge -- `from . import X` yields the exact target `mypkg`, so real
-            # package-level cycles still resolve.
-        resolved.discard(f)  # ignore self-imports
-        file_adj[f] = resolved
-
+def _cycles_in(file_adj: dict[str, set[str]]) -> list[list[str]]:
+    """Cycles found by a DFS over a file-level adjacency map."""
     # Standard cycle detection with DFS.
     WHITE, GRAY, BLACK = 0, 1, 2
     color: dict[str, int] = {f: WHITE for f in file_adj}
@@ -804,7 +1191,7 @@ def detect_cycles(
 
     def dfs(u: str) -> None:
         color[u] = GRAY
-        for v in file_adj.get(u, set()):
+        for v in sorted(file_adj.get(u, ())):
             if v not in color:
                 color[v] = WHITE
             if color[v] == GRAY:
@@ -829,19 +1216,447 @@ def detect_cycles(
                 dfs(v)
         color[u] = BLACK
 
-    for f in file_adj:
+    for f in sorted(file_adj):
         if color.get(f, WHITE) == WHITE:
             dfs(f)
 
     return cycles
 
 
-def main() -> None:
-    target_arg, max_files = parse_common_args(sys.argv[1:], __doc__)
-    target = Path(target_arg).resolve()
+# --- declared vs imported dependencies ---------------------------------------
 
-    project_root = find_project_root(target)
-    scan_root = target if target.is_dir() else project_root
+# Import names whose distribution name is not derivable by normalisation
+# (`yaml` -> `pyyaml` and `dotenv` -> `python-dotenv` are derived; these are not).
+_IMPORT_TO_DIST: dict[str, tuple[str, ...]] = {
+    "PIL": ("pillow",),
+    "bs4": ("beautifulsoup4",),
+    "sklearn": ("scikit_learn",),
+    "skimage": ("scikit_image",),
+    "cv2": ("opencv_python", "opencv_python_headless", "opencv_contrib_python"),
+    "attr": ("attrs",),
+    "Crypto": ("pycryptodome", "pycrypto"),
+    "Cryptodome": ("pycryptodomex",),
+    "git": ("gitpython",),
+    "MySQLdb": ("mysqlclient",),
+    "dns": ("dnspython",),
+    "fitz": ("pymupdf",),
+    "pkg_resources": ("setuptools",),
+    "win32api": ("pywin32",),
+    "win32con": ("pywin32",),
+    "_cffi_backend": ("cffi",),
+}
+_REQUIREMENT_NAME = re.compile(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
+
+
+def _norm_dist(name: str) -> str:
+    """PEP 503-style normalisation, with `_` as the separator."""
+    return re.sub(r"[-_.]+", "_", name).lower()
+
+
+def _requirement_name(spec: object) -> str | None:
+    if not isinstance(spec, str) or spec.lstrip().startswith(("-", "#")):
+        return None
+    match = _REQUIREMENT_NAME.match(spec)
+    return match.group(1) if match else None
+
+
+def declared_dependencies(
+    project_root: Path,
+) -> tuple[list[dict], list[str], list[str]]:
+    """``(declared, sources, notes)`` from the project's packaging metadata:
+    pyproject.toml, setup.cfg, a literal ``setup()`` call and requirements files.
+
+    Each declared entry is ``{"name", "group"}``. ``group`` is ``runtime``,
+    ``build``, ``optional:<extra>``, ``group:<name>`` (dependency groups, poetry/uv/pdm
+    dev groups) or ``file:<requirements file>``.
+    """
+    declared: list[dict] = []
+    sources: list[str] = []
+    notes: list[str] = []
+    project_name = None
+
+    def add(names, group: str) -> None:
+        for spec in names or ():
+            name = _requirement_name(spec)
+            if name:
+                declared.append({"name": name, "group": group})
+
+    pyproject = project_root / "pyproject.toml"
+    if pyproject.is_file():
+        try:
+            import tomllib
+        except ImportError:  # Python 3.10
+            tomllib = None  # type: ignore[assignment]
+            notes.append("pyproject.toml not read: tomllib needs Python 3.11+")
+        if tomllib is not None:
+            try:
+                data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                data = {}
+                notes.append(f"pyproject.toml not read: {exc}")
+            project = data.get("project", {})
+            project_name = project.get("name")
+            add(project.get("dependencies"), "runtime")
+            add(data.get("build-system", {}).get("requires"), "build")
+            for extra, names in (project.get("optional-dependencies") or {}).items():
+                add(names, f"optional:{extra}")
+            for group, names in (data.get("dependency-groups") or {}).items():
+                add([n for n in names if isinstance(n, str)], f"group:{group}")
+            tool = data.get("tool", {})
+            poetry = tool.get("poetry", {})
+            project_name = project_name or poetry.get("name")
+            add([k for k in poetry.get("dependencies", {}) if k != "python"], "runtime")
+            add(list(poetry.get("dev-dependencies", {})), "group:dev")
+            for group, body in (poetry.get("group") or {}).items():
+                add(list((body or {}).get("dependencies", {})), f"group:{group}")
+            add(tool.get("uv", {}).get("dev-dependencies"), "group:dev")
+            for group, names in (
+                tool.get("pdm", {}).get("dev-dependencies") or {}
+            ).items():
+                add(names, f"group:{group}")
+            if declared:
+                sources.append("pyproject.toml")
+
+    setup_cfg = project_root / "setup.cfg"
+    if setup_cfg.is_file():
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            parser.read(setup_cfg, encoding="utf-8")
+        except (configparser.Error, UnicodeDecodeError) as exc:
+            notes.append(f"setup.cfg not read: {exc}")
+        else:
+            before = len(declared)
+            if parser.has_option("options", "install_requires"):
+                add(parser.get("options", "install_requires").splitlines(), "runtime")
+            if parser.has_section("options.extras_require"):
+                for extra, value in parser.items("options.extras_require"):
+                    add(value.splitlines(), f"optional:{extra}")
+            if len(declared) > before:
+                sources.append("setup.cfg")
+
+    setup_py = project_root / "setup.py"
+    if setup_py.is_file():
+        before = len(declared)
+        for names, group in _setup_py_requirements(setup_py):
+            if group == "name":
+                project_name = project_name or names[0]
+                continue
+            add(names, group)
+        if len(declared) > before:
+            sources.append("setup.py")
+
+    has_runtime = any(d["group"] == "runtime" for d in declared)
+    requirement_files = sorted(project_root.glob("requirements*.txt")) + sorted(
+        (project_root / "requirements").glob("*.txt")
+    )
+    for path in requirement_files:
+        rel = str(path.relative_to(project_root))
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        group = (
+            "runtime"
+            if rel == "requirements.txt" and not has_runtime
+            else f"file:{rel}"
+        )
+        before = len(declared)
+        add(lines, group)
+        if len(declared) > before:
+            sources.append(rel)
+
+    if project_name:
+        own = _norm_dist(project_name)
+        declared = [d for d in declared if _norm_dist(d["name"]) != own]
+    return declared, sources, notes
+
+
+def _setup_py_requirements(path: Path) -> list[tuple[list[str], str]]:
+    """Literal ``install_requires`` / ``extras_require`` (and ``name``, as group
+    ``"name"``) of a ``setup()`` call, read with ``ast`` -- setup.py is never
+    executed. A module-level name bound to a literal list or dict is followed
+    once."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError, ValueError):
+        return []
+    bound = {
+        t.id: node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        for t in node.targets
+        if isinstance(t, ast.Name)
+    }
+
+    def literal(node: ast.expr | None) -> object:
+        if isinstance(node, ast.Name):
+            node = bound.get(node.id)
+        try:
+            return ast.literal_eval(node) if node is not None else None
+        except (ValueError, TypeError, SyntaxError, RecursionError):
+            return None
+
+    out: list[tuple[list[str], str]] = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call) and _dotted_name(node.func).endswith("setup")
+        ):
+            continue
+        for kw in node.keywords:
+            value = literal(kw.value)
+            if kw.arg == "name" and isinstance(value, str):
+                out.append(([value], "name"))
+            elif kw.arg == "install_requires" and isinstance(value, (list, tuple)):
+                out.append(([v for v in value if isinstance(v, str)], "runtime"))
+            elif kw.arg == "extras_require" and isinstance(value, dict):
+                for extra, names in value.items():
+                    if isinstance(names, (list, tuple)):
+                        out.append(
+                            (
+                                [v for v in names if isinstance(v, str)],
+                                f"optional:{extra}",
+                            )
+                        )
+    return out
+
+
+def _dists_for_import(
+    top: str, declared: set[str], *, exact_only: bool = False
+) -> set[str]:
+    """Declared (normalised) distributions that may provide import name *top*."""
+    n = _norm_dist(top)
+    exact = {d for d in (n, f"python_{n}", f"py{n}", f"{n}_python") if d in declared}
+    exact |= {d for d in _IMPORT_TO_DIST.get(top, ()) if d in declared}
+    if exact or exact_only:
+        return exact
+    # `zope` from `zope.interface`, `psycopg2` from `psycopg2-binary`.
+    return {d for d in declared if d.startswith(f"{n}_")}
+
+
+def dependency_check(
+    file_analyses: list[dict],
+    string_imports: list[dict],
+    project_root: Path,
+    scan_root: Path,
+) -> dict | None:
+    """Compare what the code imports with what the project declares.
+
+    Returns None when the project declares no dependencies anywhere this can
+    read, so "nothing undeclared" is never reported for an unmeasured project.
+    """
+    declared, sources, notes = declared_dependencies(project_root)
+    if not sources:
+        return None
+    names = {_norm_dist(d["name"]) for d in declared}
+    runtime = {_norm_dist(d["name"]): d for d in declared if d["group"] == "runtime"}
+
+    files_by_top: dict[str, set[str]] = {}
+    unconditional: set[str] = set()
+    for fa in file_analyses:
+        if Path(fa["file"]).name == "setup.py":
+            continue  # build-time imports, declared (if anywhere) in build-system
+        for imp in fa["imports"]:
+            top = imp["top_level"]
+            if imp["category"] != "external" or not top or imp["type_checking_only"]:
+                continue
+            files_by_top.setdefault(top, set()).add(fa["file"])
+            if not imp["conditional"]:
+                unconditional.add(top)
+
+    used: set[str] = set()
+    missing: list[dict] = []
+    for top in sorted(files_by_top):
+        dists = _dists_for_import(top, names)
+        used |= dists
+        if not dists:
+            missing.append(
+                {
+                    "top_level": top,
+                    "files": sorted(files_by_top[top]),
+                    # Only imported inside try/except ImportError: an optional
+                    # dependency, which need not be declared.
+                    "conditional_only": top not in unconditional,
+                }
+            )
+    for item in string_imports:
+        if item["category"] == "external":
+            used |= _dists_for_import(item["module"].split(".")[0], names)
+
+    unused = [
+        {"name": d["name"], "group": "runtime"}
+        for key, d in sorted(runtime.items())
+        if key not in used
+    ]
+    if scan_root != project_root:
+        notes.append(
+            "scope is narrower than the project, so a runtime dependency used "
+            "only outside it is listed in declared_not_imported"
+        )
+    notes.append(
+        "an import name that does not derive from its distribution name "
+        "appears in both lists (e.g. import `foo` from distribution `bar-foo`)"
+    )
+    notes.append(
+        "a runtime dependency loaded only by a framework or CLI (a server, a "
+        "plugin entry point) is never imported; declared_not_imported lists "
+        "candidates to check, not removals"
+    )
+    return {
+        "sources": sources,
+        "declared_count": len(declared),
+        "imported_not_declared": missing,
+        "declared_not_imported": unused,
+        "notes": notes,
+    }
+
+
+def string_imports(
+    file_analyses: list[dict],
+    all_files: list[str],
+    project_packages: set[str],
+    project_root: Path,
+) -> list[dict]:
+    """String constants that name a project module or a declared dependency.
+
+    Internal strings must resolve to a scanned module below the top package
+    (longest dotted prefix); external ones must name a declared distribution
+    the code never imports. Arbitrary dotted text ("config.yaml", "a.b") is
+    not reported.
+    """
+    modules = {module_name_for(f): f for f in all_files}
+    declared, _, _ = declared_dependencies(project_root)
+    declared_names = {_norm_dist(d["name"]) for d in declared}
+    imported = {
+        imp["top_level"]
+        for fa in file_analyses
+        for imp in fa["imports"]
+        if imp["category"] == "external" and imp["top_level"]
+    }
+    out: list[dict] = []
+    for fa in file_analyses:
+        for cand in fa.get("string_import_candidates", []):
+            module = cand["string"].split(":", 1)[0]
+            top = module.split(".")[0]
+            entry = {"file": fa["file"], "line": cand["line"], "string": cand["string"]}
+            if top in project_packages:
+                parts = module.split(".")
+                # At least `pkg.mod`: a bare package plus one unknown component
+                # is usually a file name ("pkg.yaml", "pkg.conf").
+                for i in range(len(parts), 1, -1):
+                    path = modules.get(".".join(parts[:i]))
+                    if path:
+                        out.append(
+                            {
+                                **entry,
+                                "module": ".".join(parts[:i]),
+                                "category": "internal",
+                                "resolved_file": path,
+                            }
+                        )
+                        break
+            elif (
+                top not in imported
+                and not _is_stdlib(top)
+                and _dists_for_import(top, declared_names, exact_only=True)
+            ):
+                # Only packages the code never imports: a string naming one it
+                # does import adds nothing, and is usually a file name.
+                out.append({**entry, "module": module, "category": "external"})
+    return out
+
+
+def _prefix_module(site: dict, project_root: Path) -> str | None:
+    """The dotted prefix a computed dynamic import name starts with, resolved
+    against the importing file when it is relative (`f".{name}"`)."""
+    prefix = site.get("prefix")
+    if not prefix:
+        return None
+    if not prefix.startswith("."):
+        return prefix
+    level = len(prefix) - len(prefix.lstrip("."))
+    base = _resolve_relative_import(
+        project_root / site["file"], project_root, level, None
+    )
+    rest = prefix.lstrip(".")
+    return f"{base}.{rest}" if base else None
+
+
+def expand_dynamic_sites(
+    sites: list[dict], all_files: list[str], project_root: Path
+) -> dict[str, list[dict]]:
+    """Possible edges for computed-name dynamic imports with a literal prefix.
+
+    ``importlib.import_module(f"pkg.plugins.{kind}")`` can load any module
+    directly under ``pkg.plugins``. Those modules are recorded on the site as
+    ``expanded_targets`` and returned as edges (``possible: true``), so a cycle
+    that closes only through the factory -- factory -> plugin -> factory -- can
+    be reported. Only direct children of the prefix are expanded; an allowlist
+    in the code may narrow the real set further, which is why they are
+    "possible".
+    """
+    modules = {module_name_for(f): f for f in all_files}
+    extra: dict[str, list[dict]] = {}
+    for site in sites:
+        prefix = _prefix_module(site, project_root)
+        targets: list[str] = []
+        if prefix:
+            for module, path in sorted(modules.items()):
+                rest = module[len(prefix) :] if module.startswith(prefix) else ""
+                if rest and "." not in rest and path != site["file"]:
+                    targets.append(path)
+                    extra.setdefault(site["file"], []).append(
+                        {
+                            "target": module,
+                            "names": [{"name": module, "alias": None}],
+                            "line": site["line"],
+                            "type_checking_only": False,
+                            "conditional": False,
+                            "scope": site.get("scope", "module"),
+                            "lazy": site.get("lazy", False),
+                            "dynamic": True,
+                            "form": "dynamic",
+                            "possible": True,
+                        }
+                    )
+        site["expanded_targets"] = targets
+    return extra
+
+
+def dynamic_cycles(
+    graph: dict[str, list[dict]],
+    extra: dict[str, list[dict]],
+    all_files: list[str],
+) -> list[dict]:
+    """Cycles that close only through an expanded dynamic-import edge."""
+    if not extra:
+        return []
+    merged = {k: list(v) for k, v in graph.items()}
+    for source, edges in extra.items():
+        merged.setdefault(source, []).extend(edges)
+    static = file_adjacency(graph, all_files)
+    eager = file_adjacency(merged, all_files, include_lazy=False)
+    out: list[dict] = []
+    for cycle in _cycles_in(file_adjacency(merged, all_files)):
+        pairs = list(zip(cycle, cycle[1:] + cycle[:1]))
+        via = [{"from": a, "to": b} for a, b in pairs if b not in static.get(a, set())]
+        if via:
+            out.append(
+                {
+                    "cycle": cycle,
+                    "via_dynamic_import": via,
+                    # Every step also runs at import time (no lazy edge).
+                    "import_time": all(b in eager.get(a, set()) for a, b in pairs),
+                }
+            )
+    return out
+
+
+def analyze(target: str, *, max_files: int = 0) -> dict:
+    """Import graph, metrics and cycles for *target* (see the module docstring)."""
+    target_path = Path(target).resolve()
+
+    project_root = find_project_root(target_path)
+    scan_root = target_path if target_path.is_dir() else project_root
     project_packages = identify_project_packages(project_root, scan_root)
 
     all_files = sorted(discover_python_files(scan_root))
@@ -863,6 +1678,21 @@ def main() -> None:
         for fa in file_analyses
         for site in fa.get("dynamic_import_sites", [])
     ]
+    loaded_by_name = string_imports(
+        file_analyses, all_file_paths, project_packages, project_root
+    )
+    dependencies = dependency_check(
+        file_analyses, loaded_by_name, project_root, scan_root
+    )
+    side_effects = [
+        {"file": fa["file"], **effect}
+        for fa in file_analyses
+        for effect in fa.get("import_time_side_effects", [])
+    ]
+    possible_edges = expand_dynamic_sites(
+        dynamic_import_sites, all_file_paths, project_root
+    )
+    cycles_via_dynamic = dynamic_cycles(internal_graph, possible_edges, all_file_paths)
 
     # Collect external dependencies.
     external: dict[str, list[str]] = {}
@@ -899,6 +1729,7 @@ def main() -> None:
 
     # Prune intermediate fields from file analyses to reduce memory.
     for fa in file_analyses:
+        fa.pop("string_import_candidates", None)
         for imp in fa["imports"]:
             imp.pop("resolved_module", None)
 
@@ -967,10 +1798,36 @@ def main() -> None:
         # `dynamic: true`; these are not edges, so modules reached only this
         # way show fan-in 0.
         "dynamic_import_sites": dynamic_import_sites,
+        # Cycles that close only through a computed-name dynamic import whose
+        # literal prefix was expanded to the modules under it
+        # (`dynamic_import_sites[].expanded_targets`). Possible, not certain:
+        # the code may only ever load some of those modules.
+        "dynamic_cycles": cycles_via_dynamic,
+        # Process-wide operations a module performs when it is imported
+        # (root-logger setup, environment writes, files, sys.path, signal and
+        # warning filters), directly or through a module-level function the
+        # module calls on import (`via`, `call_line`).
+        "import_time_side_effects": side_effects,
+        # Modules named in string constants that a framework loads by name
+        # ("pkg.ext.Extension", "pkg.app:app"). Not graph edges.
+        "string_imports": loaded_by_name,
+        # Imports vs the dependencies declared in pyproject.toml / setup.cfg /
+        # requirements*.txt. None when no declaration could be read.
+        "dependency_check": dependencies,
+        "dependency_check_reason": (
+            None
+            if dependencies is not None
+            else "no dependency declaration found (pyproject.toml, setup.cfg, "
+            "requirements*.txt, setup.py)"
+        ),
         "re_exports": re_exports,
     }
+    return output
 
-    json.dump(output, sys.stdout, indent=2)
+
+def main() -> None:
+    target_arg, max_files = parse_common_args(sys.argv[1:], __doc__)
+    json.dump(analyze(target_arg, max_files=max_files), sys.stdout, indent=2)
     sys.stdout.write("\n")
 
 
