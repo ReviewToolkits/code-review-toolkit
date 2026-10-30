@@ -191,6 +191,7 @@ For each:
 ## Important Guidelines
 
 - **Behavioral divergence, not style divergence**: Leave quote styles and import ordering to the consistency-auditor. Focus on cases where the same *problem* is solved with different *approaches*.
+- **Migration drift belongs to the consistency-auditor**: when one module adopted a new convention, library or API and another still uses the old one, leave it to that agent, even when the leftover breaks behavior. Report here only divergence that is not the trace of a migration in progress. This keeps the two reports from carrying the same finding twice.
 - **Threshold of 2+**: Don't flag a pattern unless at least 2 modules do it differently. A unique approach in one module isn't divergence — it may be the only module that needs that particular solution.
 - **Respect intentional variation**: Some divergence is appropriate. CLI modules may handle errors differently than library modules. Note this rather than flagging it.
 - **Missing abstractions are gold**: The most valuable finding is not "these differ" but "here's the shared abstraction that would unify them."

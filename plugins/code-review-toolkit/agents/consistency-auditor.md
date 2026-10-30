@@ -13,6 +13,8 @@ You think like a new team member reading the codebase for the first time: "I lea
 
 Analyze the scope provided. Default: the entire project. You may receive architecture-mapper output as additional context — use it to understand module boundaries and focus your comparison across and within modules.
 
+**Migration drift is yours, across modules too:** when part of the codebase moved to a new convention, library or API and another part did not (a client-library swap, `os.path` to `pathlib`, a new error helper), report it here, including any behavior the leftover old usage breaks. The pattern-consistency-checker leaves it to you.
+
 ## Analysis Strategy
 
 ### Phase 1: Discover Conventions
