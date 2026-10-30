@@ -118,6 +118,47 @@ class TestAnyDetection(unittest.TestCase):
         self.assertEqual(len(result["any_usages"]), 0)
 
 
+class TestAnyUsageSchema(unittest.TestCase):
+    """Every `any_usages[]` entry shares `kind`, `file` and `line`."""
+
+    def _usages(self, source: str) -> list[dict]:
+        with TempProject({"mod.py": source}) as root:
+            return mod.analyze_file(root / "mod.py", root)["any_usages"]
+
+    def test_function_method_and_attribute_share_keys(self):
+        usages = self._usages(
+            "from typing import Any\n"
+            "\n"
+            "def f(x: Any) -> None:\n"
+            "    pass\n"
+            "\n"
+            "class C:\n"
+            "    attr: Any\n"
+            "\n"
+            "    def m(self) -> Any:\n"
+            "        pass\n"
+        )
+        by_kind = {u["kind"]: u for u in usages if u["kind"] != "function"}
+        functions = [u for u in usages if u["kind"] == "function"]
+        self.assertEqual(
+            sorted((u["file"], u["line"]) for u in functions),
+            [("mod.py", 3), ("mod.py", 9)],
+        )
+        attr = by_kind["class_attribute"]
+        # The attribute's own line, not the class line.
+        self.assertEqual((attr["file"], attr["line"]), ("mod.py", 7))
+        self.assertEqual(attr["attribute"], "attr")
+        # The legacy `location` key is kept for existing consumers.
+        self.assertTrue(all("location" in u for u in usages))
+
+    def test_return_only_any_has_empty_details(self):
+        (usage,) = self._usages(
+            "from typing import Any\n\ndef g() -> Any:\n    pass\n"
+        )
+        self.assertEqual(usage["details"], [])
+        self.assertTrue(usage["in_return"])
+
+
 class TestContainerTypeDetection(unittest.TestCase):
     """Test detection of dataclass, TypedDict, NamedTuple, etc."""
 

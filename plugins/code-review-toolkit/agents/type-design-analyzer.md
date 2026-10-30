@@ -27,7 +27,9 @@ Parse the JSON output. This gives you precise annotation coverage statistics, An
 
 Key fields:
 - `summary`: coverage percentages (`annotation_coverage_all`, `annotation_coverage_public`), counts of functions/classes/Any usages/type ignores, container type breakdown
-- `any_usages`: locations and details of every Any usage
+- `any_usages`: every Any usage. All entries carry `kind`, `file`, `line` (and the legacy `location` = `"file:line"`).
+  `kind: "function"` entries add `function`, `details` (the parameters whose annotation contains Any; empty when Any is only in the return) and `in_return`;
+  `kind: "class_attribute"` entries add `class`, `attribute`, `annotation` (their `location` is the class line, `line` the attribute's)
 - `container_inventory`: categorized data containers (dataclass, TypedDict, NamedTuple, Protocol, Enum)
 - `unannotated_public_functions`: priority annotation targets (up to 50), each `{file, name, line}`; `unannotated_public_functions_total` is the uncapped count
 - `files[]`: per-file details including per-function annotation status and class attribute analysis

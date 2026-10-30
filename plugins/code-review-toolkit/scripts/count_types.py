@@ -107,6 +107,25 @@ def _check_frozen_dataclass(class_node: ast.ClassDef) -> bool:
     return False
 
 
+def _function_any_usage(rel: str, func_info: dict) -> dict:
+    """One `any_usages[]` entry for a function or method.
+
+    Every entry, whatever its `kind`, carries `file` and `line`; `location` is
+    the same pair as one `file:line` string. `details` lists the parameters
+    whose annotation contains Any and is empty when Any is in the return
+    annotation only (then `in_return` is true).
+    """
+    return {
+        "kind": "function",
+        "file": rel,
+        "line": func_info["line"],
+        "location": f"{rel}:{func_info['line']}",
+        "function": func_info["name"],
+        "details": func_info["any_in_params"],
+        "in_return": func_info["any_in_return"],
+    }
+
+
 def analyze_file(filepath: Path, project_root: Path) -> dict:
     """Analyze type annotations in a file."""
     rel = str(filepath.relative_to(project_root))
@@ -197,6 +216,7 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
             if isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name):
                 annotated_attrs.append({
                     "name": child.target.id,
+                    "line": child.lineno,
                     "annotation": _annotation_to_str(child.annotation),
                     "has_any": _contains_any(child.annotation),
                 })
@@ -232,12 +252,7 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
             result["functions"].append(func_info)
             # Track Any usage.
             if func_info["any_in_params"] or func_info["any_in_return"]:
-                result["any_usages"].append({
-                    "location": f"{rel}:{node.lineno}",
-                    "function": func_info["name"],
-                    "details": func_info["any_in_params"],
-                    "in_return": func_info["any_in_return"],
-                })
+                result["any_usages"].append(_function_any_usage(rel, func_info))
         elif isinstance(node, ast.ClassDef):
             cls_info = _analyze_class(node)
             result["classes"].append(cls_info)
@@ -245,6 +260,11 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
             for attr in cls_info["annotated_attributes"]:
                 if attr["has_any"]:
                     result["any_usages"].append({
+                        "kind": "class_attribute",
+                        "file": rel,
+                        "line": attr["line"],
+                        # `location` keeps the class line it always had, so
+                        # diff_findings keys built on it stay stable.
                         "location": f"{rel}:{node.lineno}",
                         "class": cls_info["name"],
                         "attribute": attr["name"],
@@ -253,12 +273,7 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
             # Track methods' Any usage.
             for method in cls_info["methods"]:
                 if method["any_in_params"] or method["any_in_return"]:
-                    result["any_usages"].append({
-                        "location": f"{rel}:{method['line']}",
-                        "function": method["name"],
-                        "details": method["any_in_params"],
-                        "in_return": method["any_in_return"],
-                    })
+                    result["any_usages"].append(_function_any_usage(rel, method))
 
     # Find untyped container usage (bare list, dict, set in annotations).
     _BARE_CONTAINER_RE = re.compile(
