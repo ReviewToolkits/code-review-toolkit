@@ -25,50 +25,240 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scan_common import (  # noqa: E402
     discover_python_files,
     find_project_root,
+    parse_common_args,
 )
 
 
 # Comprehensive stdlib module list (Python 3.10+).  Used to distinguish
 # stdlib imports from third-party imports when we cannot rely on
 # importlib.metadata or sys.stdlib_module_names being available.
-_STDLIB_TOP_LEVEL = frozenset({
-    "__future__", "_thread", "abc", "aifc", "argparse", "array", "ast",
-    "asynchat", "asyncio", "asyncore", "atexit", "audioop", "base64",
-    "bdb", "binascii", "binhex", "bisect", "builtins", "bz2", "calendar",
-    "cgi", "cgitb", "chunk", "cmath", "cmd", "code", "codecs", "codeop",
-    "collections", "colorsys", "compileall", "concurrent", "configparser",
-    "contextlib", "contextvars", "copy", "copyreg", "cProfile", "crypt",
-    "csv", "ctypes", "curses", "dataclasses", "datetime", "dbm", "decimal",
-    "difflib", "dis", "distutils", "doctest", "email", "encodings",
-    "enum", "errno", "faulthandler", "fcntl", "filecmp", "fileinput",
-    "fnmatch", "fractions", "ftplib", "functools", "gc", "getopt",
-    "getpass", "gettext", "glob", "graphlib", "grp", "gzip", "hashlib",
-    "heapq", "hmac", "html", "http", "idlelib", "imaplib", "imghdr",
-    "imp", "importlib", "inspect", "io", "ipaddress", "itertools", "json",
-    "keyword", "lib2to3", "linecache", "locale", "logging", "lzma",
-    "mailbox", "mailcap", "marshal", "math", "mimetypes", "mmap",
-    "modulefinder", "multiprocessing", "netrc", "nis", "nntplib",
-    "numbers", "operator", "optparse", "os", "ossaudiodev", "pathlib",
-    "pdb", "pickle", "pickletools", "pipes", "pkgutil", "platform",
-    "plistlib", "poplib", "posix", "posixpath", "pprint", "profile",
-    "pstats", "pty", "pwd", "py_compile", "pyclbr", "pydoc", "queue",
-    "quopri", "random", "re", "readline", "reprlib", "resource",
-    "rlcompleter", "runpy", "sched", "secrets", "select", "selectors",
-    "shelve", "shlex", "shutil", "signal", "site", "smtpd", "smtplib",
-    "sndhdr", "socket", "socketserver", "spwd", "sqlite3", "sre_compile",
-    "sre_constants", "sre_parse", "ssl", "stat", "statistics", "string",
-    "stringprep", "struct", "subprocess", "sunau", "symtable", "sys",
-    "sysconfig", "syslog", "tabnanny", "tarfile", "telnetlib", "tempfile",
-    "termios", "test", "textwrap", "threading", "time", "timeit",
-    "tkinter", "token", "tokenize", "tomllib", "trace", "traceback",
-    "tracemalloc", "tty", "turtle", "turtledemo", "types", "typing",
-    "unicodedata", "unittest", "urllib", "uu", "uuid", "venv", "warnings",
-    "wave", "weakref", "webbrowser", "winreg", "winsound", "wsgiref",
-    "xdrlib", "xml", "xmlrpc", "zipapp", "zipfile", "zipimport", "zlib",
-    "zoneinfo", "_ast", "_collections_abc", "_compat_pickle", "_compression",
-    "_markupbase", "_osx_support", "_pydecimal", "_pyio", "_sitebuiltins",
-    "_strptime", "_threading_local", "_weakrefset", "antigravity", "this",
-})
+_STDLIB_TOP_LEVEL = frozenset(
+    {
+        "__future__",
+        "_thread",
+        "abc",
+        "aifc",
+        "argparse",
+        "array",
+        "ast",
+        "asynchat",
+        "asyncio",
+        "asyncore",
+        "atexit",
+        "audioop",
+        "base64",
+        "bdb",
+        "binascii",
+        "binhex",
+        "bisect",
+        "builtins",
+        "bz2",
+        "calendar",
+        "cgi",
+        "cgitb",
+        "chunk",
+        "cmath",
+        "cmd",
+        "code",
+        "codecs",
+        "codeop",
+        "collections",
+        "colorsys",
+        "compileall",
+        "concurrent",
+        "configparser",
+        "contextlib",
+        "contextvars",
+        "copy",
+        "copyreg",
+        "cProfile",
+        "crypt",
+        "csv",
+        "ctypes",
+        "curses",
+        "dataclasses",
+        "datetime",
+        "dbm",
+        "decimal",
+        "difflib",
+        "dis",
+        "distutils",
+        "doctest",
+        "email",
+        "encodings",
+        "enum",
+        "errno",
+        "faulthandler",
+        "fcntl",
+        "filecmp",
+        "fileinput",
+        "fnmatch",
+        "fractions",
+        "ftplib",
+        "functools",
+        "gc",
+        "getopt",
+        "getpass",
+        "gettext",
+        "glob",
+        "graphlib",
+        "grp",
+        "gzip",
+        "hashlib",
+        "heapq",
+        "hmac",
+        "html",
+        "http",
+        "idlelib",
+        "imaplib",
+        "imghdr",
+        "imp",
+        "importlib",
+        "inspect",
+        "io",
+        "ipaddress",
+        "itertools",
+        "json",
+        "keyword",
+        "lib2to3",
+        "linecache",
+        "locale",
+        "logging",
+        "lzma",
+        "mailbox",
+        "mailcap",
+        "marshal",
+        "math",
+        "mimetypes",
+        "mmap",
+        "modulefinder",
+        "multiprocessing",
+        "netrc",
+        "nis",
+        "nntplib",
+        "numbers",
+        "operator",
+        "optparse",
+        "os",
+        "ossaudiodev",
+        "pathlib",
+        "pdb",
+        "pickle",
+        "pickletools",
+        "pipes",
+        "pkgutil",
+        "platform",
+        "plistlib",
+        "poplib",
+        "posix",
+        "posixpath",
+        "pprint",
+        "profile",
+        "pstats",
+        "pty",
+        "pwd",
+        "py_compile",
+        "pyclbr",
+        "pydoc",
+        "queue",
+        "quopri",
+        "random",
+        "re",
+        "readline",
+        "reprlib",
+        "resource",
+        "rlcompleter",
+        "runpy",
+        "sched",
+        "secrets",
+        "select",
+        "selectors",
+        "shelve",
+        "shlex",
+        "shutil",
+        "signal",
+        "site",
+        "smtpd",
+        "smtplib",
+        "sndhdr",
+        "socket",
+        "socketserver",
+        "spwd",
+        "sqlite3",
+        "sre_compile",
+        "sre_constants",
+        "sre_parse",
+        "ssl",
+        "stat",
+        "statistics",
+        "string",
+        "stringprep",
+        "struct",
+        "subprocess",
+        "sunau",
+        "symtable",
+        "sys",
+        "sysconfig",
+        "syslog",
+        "tabnanny",
+        "tarfile",
+        "telnetlib",
+        "tempfile",
+        "termios",
+        "test",
+        "textwrap",
+        "threading",
+        "time",
+        "timeit",
+        "tkinter",
+        "token",
+        "tokenize",
+        "tomllib",
+        "trace",
+        "traceback",
+        "tracemalloc",
+        "tty",
+        "turtle",
+        "turtledemo",
+        "types",
+        "typing",
+        "unicodedata",
+        "unittest",
+        "urllib",
+        "uu",
+        "uuid",
+        "venv",
+        "warnings",
+        "wave",
+        "weakref",
+        "webbrowser",
+        "winreg",
+        "winsound",
+        "wsgiref",
+        "xdrlib",
+        "xml",
+        "xmlrpc",
+        "zipapp",
+        "zipfile",
+        "zipimport",
+        "zlib",
+        "zoneinfo",
+        "_ast",
+        "_collections_abc",
+        "_compat_pickle",
+        "_compression",
+        "_markupbase",
+        "_osx_support",
+        "_pydecimal",
+        "_pyio",
+        "_sitebuiltins",
+        "_strptime",
+        "_threading_local",
+        "_weakrefset",
+        "antigravity",
+        "this",
+    }
+)
 
 
 def _is_stdlib(top_level_name: str) -> bool:
@@ -176,9 +366,7 @@ def analyze_file(
                 if isinstance(handler.type, ast.Name):
                     names = [handler.type.id]
                 elif isinstance(handler.type, ast.Tuple):
-                    names = [
-                        e.id for e in handler.type.elts if isinstance(e, ast.Name)
-                    ]
+                    names = [e.id for e in handler.type.elts if isinstance(e, ast.Name)]
                 if any(n in ("ImportError", "ModuleNotFoundError") for n in names):
                     start = node.body[0].lineno if node.body else node.lineno
                     end = node.end_lineno or node.lineno
@@ -202,28 +390,111 @@ def analyze_file(
                     if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
                 ]
 
+    scopes = _scope_map(tree)
+    import_time_calls = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and scopes.get(id(node), ("module", None))[0] != "function"
+    }
+
+    def _timing(node: ast.AST) -> dict:
+        """`scope` of an import and whether it is `lazy` (deferred to a call).
+
+        An import inside a function runs when the function is called, not when
+        the module is imported -- unless the module itself calls that function
+        at import time (`_STATE = _init()`, where `_init` holds a "lazy"
+        `from pkg.config import settings`). Such an edge can close an import
+        cycle that fails a plain `import` while looking function-level.
+        """
+        scope, top_fn = scopes.get(id(node), ("module", None))
+        lazy = scope == "function" and top_fn not in import_time_calls
+        return {"scope": scope, "lazy": lazy}
+
     # Extract imports.
+    dynamic_sites: list[dict] = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
+        if isinstance(node, ast.Call):
+            dynamic = _dynamic_import(node)
+            if dynamic is None:
+                continue
+            call_name, arg = dynamic
+            literal = (
+                arg.value
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+                else None
+            )
+            if not literal:
+                dynamic_sites.append(
+                    {
+                        "line": node.lineno,
+                        "call": call_name,
+                        "expression": ast.unparse(arg) if arg is not None else None,
+                        "prefix": _constant_prefix(arg),
+                        **_timing(node),
+                    }
+                )
+                continue
+            level = len(literal) - len(literal.lstrip("."))
+            module_str = literal.lstrip(".")
+            resolved = (
+                _resolve_relative_import(
+                    filepath, project_root, level, module_str or None
+                )
+                if level
+                else None
+            )
+            top = (
+                (resolved or module_str).split(".")[0]
+                if (resolved or module_str)
+                else None
+            )
+            result["imports"].append(
+                {
+                    "module": module_str,
+                    "names": [{"name": literal, "alias": None}],
+                    "alias": None,
+                    "top_level": top,
+                    "category": "internal"
+                    if level
+                    else _classify(top, project_packages),
+                    "line": node.lineno,
+                    "is_relative": bool(level),
+                    "relative_level": level,
+                    "resolved_module": resolved,
+                    "type_checking_only": _in_type_checking(node.lineno),
+                    "conditional": _is_conditional(node.lineno),
+                    "dynamic": True,
+                    "form": "dynamic",
+                    **_timing(node),
+                }
+            )
+        elif isinstance(node, ast.Import):
             for alias in node.names:
                 top = alias.name.split(".")[0]
                 category = _classify(top, project_packages)
-                result["imports"].append({
-                    "module": alias.name,
-                    "names": None,
-                    "alias": alias.asname,
-                    "top_level": top,
-                    "category": category,
-                    "line": node.lineno,
-                    "is_relative": False,
-                    "relative_level": 0,
-                    "type_checking_only": _in_type_checking(node.lineno),
-                    "conditional": _is_conditional(node.lineno),
-                })
+                result["imports"].append(
+                    {
+                        "module": alias.name,
+                        # `import a.b` binds the module itself: listing it keeps
+                        # `names` a list for every entry (it used to be null).
+                        "names": [{"name": alias.name, "alias": alias.asname}],
+                        "alias": alias.asname,
+                        "top_level": top,
+                        "category": category,
+                        "line": node.lineno,
+                        "is_relative": False,
+                        "relative_level": 0,
+                        "type_checking_only": _in_type_checking(node.lineno),
+                        "conditional": _is_conditional(node.lineno),
+                        "dynamic": False,
+                        "form": "import",
+                        **_timing(node),
+                    }
+                )
         elif isinstance(node, ast.ImportFrom):
-            names_imported = [
-                {"name": a.name, "alias": a.asname} for a in node.names
-            ]
+            names_imported = [{"name": a.name, "alias": a.asname} for a in node.names]
             level = node.level or 0
             module_str = node.module or ""
             is_relative = level > 0
@@ -238,24 +509,95 @@ def analyze_file(
                 top = module_str.split(".")[0] if module_str else None
                 category = _classify(top, project_packages)
 
-            result["imports"].append({
-                "module": module_str,
-                "names": names_imported,
-                "alias": None,
-                "top_level": top,
-                "category": category,
-                "line": node.lineno,
-                "is_relative": is_relative,
-                "relative_level": level,
-                "resolved_module": (
-                    _resolve_relative_import(filepath, project_root, level, node.module)
-                    if is_relative else None
-                ),
-                "type_checking_only": _in_type_checking(node.lineno),
-                "conditional": _is_conditional(node.lineno),
-            })
+            result["imports"].append(
+                {
+                    "module": module_str,
+                    "names": names_imported,
+                    "alias": None,
+                    "top_level": top,
+                    "category": category,
+                    "line": node.lineno,
+                    "is_relative": is_relative,
+                    "relative_level": level,
+                    "resolved_module": (
+                        _resolve_relative_import(
+                            filepath, project_root, level, node.module
+                        )
+                        if is_relative
+                        else None
+                    ),
+                    "type_checking_only": _in_type_checking(node.lineno),
+                    "conditional": _is_conditional(node.lineno),
+                    "dynamic": False,
+                    "form": "from",
+                    **_timing(node),
+                }
+            )
 
+    result["dynamic_import_sites"] = dynamic_sites
     return result
+
+
+def _scope_map(tree: ast.AST) -> dict[int, tuple[str, str | None]]:
+    """Map ``id(node)`` to ``(scope, enclosing module-level function)``.
+
+    *scope* is ``module``, ``class`` (a class body runs at import time) or
+    ``function``. The function name is the OUTERMOST module-level ``def``
+    enclosing the node, so a module-level call to it can be recognized.
+    """
+    out: dict[int, tuple[str, str | None]] = {}
+
+    def visit(node: ast.AST, scope: str, top_fn: str | None) -> None:
+        for child in ast.iter_child_nodes(node):
+            out[id(child)] = (scope, top_fn)
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                name = getattr(child, "name", None) if scope == "module" else top_fn
+                visit(child, "function", name)
+            elif isinstance(child, ast.ClassDef):
+                visit(child, "function" if scope == "function" else "class", top_fn)
+            else:
+                visit(child, scope, top_fn)
+
+    visit(tree, "module", None)
+    return out
+
+
+def _dynamic_import(node: ast.Call) -> tuple[str, ast.expr | None] | None:
+    """``(call name, module argument)`` for ``importlib.import_module(...)`` or
+    ``__import__(...)``, else None."""
+    func = node.func
+    if isinstance(func, ast.Name) and func.id in ("__import__", "import_module"):
+        name = func.id
+    elif isinstance(func, ast.Attribute) and func.attr == "import_module":
+        name = (
+            f"{func.value.id}.import_module"
+            if isinstance(func.value, ast.Name)
+            else "import_module"
+        )
+    else:
+        return None
+    arg = node.args[0] if node.args else None
+    if arg is None:
+        for kw in node.keywords:
+            if kw.arg == "name":
+                arg = kw.value
+    return name, arg
+
+
+def _constant_prefix(arg: ast.expr | None) -> str | None:
+    """The literal leading part of a computed module name (`f"pkg.{x}"` -> `pkg.`)."""
+    if isinstance(arg, ast.JoinedStr) and arg.values:
+        first = arg.values[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            return first.value
+    if (
+        isinstance(arg, ast.BinOp)
+        and isinstance(arg.op, ast.Add)
+        and isinstance(arg.left, ast.Constant)
+        and isinstance(arg.left.value, str)
+    ):
+        return arg.left.value
+    return None
 
 
 def identify_project_packages(root: Path, scan_root: Path | None = None) -> set[str]:
@@ -301,13 +643,19 @@ def build_internal_graph(
             if imp["category"] != "internal":
                 continue
             target_module = imp.get("resolved_module") or imp["module"]
-            edges.append({
-                "target": target_module,
-                "names": imp.get("names"),
-                "line": imp["line"],
-                "type_checking_only": imp["type_checking_only"],
-                "conditional": imp["conditional"],
-            })
+            edges.append(
+                {
+                    "target": target_module,
+                    "names": imp.get("names"),
+                    "line": imp["line"],
+                    "type_checking_only": imp["type_checking_only"],
+                    "conditional": imp["conditional"],
+                    "scope": imp.get("scope", "module"),
+                    "lazy": imp.get("lazy", False),
+                    "dynamic": imp.get("dynamic", False),
+                    "form": imp.get("form", "from"),
+                }
+            )
         if edges:
             graph[source] = edges
     return graph
@@ -326,7 +674,13 @@ def resolve_edge_targets(edge: dict, index: dict[str, str]) -> set[str]:
     so the dependency is on the package and is order-sensitive.
     """
     target = edge.get("target") or ""
-    names = [n.get("name") for n in (edge.get("names") or []) if n.get("name")]
+    # Only `from X import name` can bind a submodule; for `import a.b` and a
+    # dynamic import, `names` just repeats the module itself.
+    names = (
+        [n.get("name") for n in (edge.get("names") or []) if n.get("name")]
+        if edge.get("form", "from") == "from"
+        else []
+    )
     submodules = {
         index[f"{target}.{name}"] for name in names if f"{target}.{name}" in index
     }
@@ -385,6 +739,7 @@ def detect_cycles(
     graph: dict[str, list[dict]],
     include_type_checking: bool = False,
     all_files: list[str] | None = None,
+    include_lazy: bool = True,
 ) -> list[list[str]]:
     """Detect circular dependencies using DFS.
 
@@ -395,6 +750,9 @@ def detect_cycles(
     through such edges is not an import cycle -- avoiding it is precisely why
     the guard is there. Those edges are excluded by default; the flag keeps the
     type-time graph available for callers that want it.
+
+    ``include_lazy=False`` also drops function-level imports that do not run at
+    import time, leaving the cycles that can fail a plain ``import``.
     """
     # Build a simplified adjacency list: file -> set of live edges.
     adj: dict[str, list[dict]] = {}
@@ -402,7 +760,8 @@ def detect_cycles(
         adj[source] = [
             e
             for e in edges
-            if include_type_checking or not e.get("type_checking_only")
+            if (include_type_checking or not e.get("type_checking_only"))
+            and (include_lazy or not e.get("lazy"))
         ]
 
     # Collect all known file-stem identifiers so we can map dotted targets
@@ -478,21 +837,8 @@ def detect_cycles(
 
 
 def main() -> None:
-    max_files = 0  # 0 = no limit
-    positional: list[str] = []
-    argv = sys.argv[1:]
-    i = 0
-    while i < len(argv):
-        if argv[i] == "--max-files" and i + 1 < len(argv):
-            max_files = int(argv[i + 1])
-            i += 2
-        elif argv[i].startswith("--"):
-            i += 1
-        else:
-            positional.append(argv[i])
-            i += 1
-    target = Path(positional[0]) if positional else Path(".")
-    target = target.resolve()
+    target_arg, max_files = parse_common_args(sys.argv[1:], __doc__)
+    target = Path(target_arg).resolve()
 
     project_root = find_project_root(target)
     scan_root = target if target.is_dir() else project_root
@@ -503,33 +849,38 @@ def main() -> None:
     if max_files > 0 and files_total > max_files:
         all_files = all_files[:max_files]
 
-    file_analyses = [
-        analyze_file(f, project_root, project_packages)
-        for f in all_files
-    ]
+    file_analyses = [analyze_file(f, project_root, project_packages) for f in all_files]
 
     all_file_paths = [fa["file"] for fa in file_analyses]
     internal_graph = build_internal_graph(file_analyses)
     metrics = compute_metrics(internal_graph, all_file_paths)
     cycles = detect_cycles(internal_graph, all_files=all_file_paths)
+    import_time_cycles = detect_cycles(
+        internal_graph, all_files=all_file_paths, include_lazy=False
+    )
+    dynamic_import_sites = [
+        {"file": fa["file"], **site}
+        for fa in file_analyses
+        for site in fa.get("dynamic_import_sites", [])
+    ]
 
     # Collect external dependencies.
     external: dict[str, list[str]] = {}
     for fa in file_analyses:
         for imp in fa["imports"]:
             if imp["category"] == "external" and imp["top_level"]:
-                external.setdefault(
-                    imp["top_level"], []
-                ).append(fa["file"])
+                external.setdefault(imp["top_level"], []).append(fa["file"])
 
     # Collect re-exports.
     re_exports: list[dict] = []
     for fa in file_analyses:
         if fa["is_init"] and fa["all_declaration"] is not None:
-            re_exports.append({
-                "file": fa["file"],
-                "all": fa["all_declaration"],
-            })
+            re_exports.append(
+                {
+                    "file": fa["file"],
+                    "all": fa["all_declaration"],
+                }
+            )
         elif fa["is_init"]:
             # __init__.py without __all__ — list what it imports.
             init_imports = [
@@ -538,11 +889,13 @@ def main() -> None:
                 if imp["category"] == "internal"
             ]
             if init_imports:
-                re_exports.append({
-                    "file": fa["file"],
-                    "all": None,
-                    "re_imported_modules": init_imports,
-                })
+                re_exports.append(
+                    {
+                        "file": fa["file"],
+                        "all": None,
+                        "re_imported_modules": init_imports,
+                    }
+                )
 
     # Prune intermediate fields from file analyses to reduce memory.
     for fa in file_analyses:
@@ -601,11 +954,19 @@ def main() -> None:
         "files": file_analyses,
         "internal_graph": internal_graph,
         "external_dependencies": {
-            k: sorted(set(v))
-            for k, v in sorted(external.items())
+            k: sorted(set(v)) for k, v in sorted(external.items())
         },
         "metrics": metrics,
         "cycles": cycles,
+        # The subset of `cycles` whose every edge runs at import time (no
+        # TYPE_CHECKING-only or lazy function-level edge): these can fail a
+        # plain `import`; the rest only bite when the lazy import executes.
+        "import_time_cycles": import_time_cycles,
+        # importlib.import_module / __import__ calls whose module name is
+        # computed. Literal ones are ordinary `imports` entries with
+        # `dynamic: true`; these are not edges, so modules reached only this
+        # way show fan-in 0.
+        "dynamic_import_sites": dynamic_import_sites,
         "re_exports": re_exports,
     }
 

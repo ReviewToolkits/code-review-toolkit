@@ -1257,13 +1257,478 @@ def _handler_swallows(handler: ast.ExceptHandler) -> bool:
     return True
 
 
+# --- except-exception-too-broad grading -----------------------------------
+#
+# The size of the try body says little about whether a broad catch hides a
+# defect. What matters is what the handler does with the failure. Measured on
+# a web-service codebase (77 findings, ~95% dismissed when graded by body
+# size): the dismissed ones returned an error envelope, carried the exception
+# on as data, released a resource, or parsed a value with a designed default.
+# The confirmed ones turned a failure into a value a caller reads as a real
+# answer (an empty dict, a `False`) or silently skipped a persistence step.
+
+# A failed call with one of these verbs loses data or state -- swallowing it
+# makes the loss look like success.
+_DURABILITY_VERBS = (
+    "flush",
+    "fsync",
+    "sync",
+    "commit",
+    "save",
+    "persist",
+    "write",
+    "writelines",
+    "dump",
+    "checkpoint",
+    "put",
+    "send",
+    "sendall",
+    "replace",
+    "rename",
+    "store",
+)
+
+# Releasing or discarding something: a best-effort cleanup whose failure the
+# caller has no use for.
+_CLEANUP_VERBS = (
+    "close",
+    "aclose",
+    "quit",
+    "shutdown",
+    "release",
+    "disconnect",
+    "terminate",
+    "kill",
+    "unlink",
+    "remove",
+    "rmtree",
+    "rmdir",
+    "cancel",
+    "discard",
+    "stop",
+    "cleanup",
+    "clear",
+    "dispose",
+    "detach",
+    "unregister",
+)
+
+# Parsing/decoding a value: the realistic failures are the expected
+# ValueError/TypeError, and the fallback is the designed default.
+_PARSE_CALLS = frozenset(
+    {
+        "loads",
+        "load",
+        "literal_eval",
+        "int",
+        "float",
+        "complex",
+        "Decimal",
+        "Fraction",
+        "fromisoformat",
+        "strptime",
+        "b64decode",
+        "urlsafe_b64decode",
+        "unhexlify",
+        "fromhex",
+        "decode",
+        "unpack",
+        "unpack_from",
+        "sniff",
+        "has_header",
+        "urlparse",
+        "urlsplit",
+        "ip_address",
+        "ip_network",
+        "UUID",
+    }
+)
+
+# Side-effect-free helpers that may accompany a parse without changing what it is.
+_PURE_CALLS = frozenset(
+    {
+        "str",
+        "repr",
+        "len",
+        "isinstance",
+        "issubclass",
+        "bool",
+        "min",
+        "max",
+        "abs",
+        "round",
+        "sorted",
+        "list",
+        "dict",
+        "tuple",
+        "set",
+        "frozenset",
+        "getattr",
+        "hasattr",
+        "callable",
+        "strip",
+        "lstrip",
+        "rstrip",
+        "lower",
+        "upper",
+        "split",
+        "rsplit",
+        "startswith",
+        "endswith",
+        "isdigit",
+        "isnumeric",
+        "get",
+        "encode",
+        "format",
+    }
+)
+
+# A returned call whose name says it builds an error result.
+_ERROR_RESULT_HINTS = ("error", "fail", "reject", "abort", "problem")
+
+_EMPTY_CONTAINER_CALLS = frozenset({"dict", "list", "set", "tuple", "frozenset", "str"})
+
+
+def _call_tail(node: ast.Call) -> str:
+    """The final name segment of what *node* calls (`a.b.c()` -> 'c')."""
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return ""
+
+
+def _verb_match(tail: str, verbs: tuple[str, ...]) -> bool:
+    """True if *tail* is one of *verbs* or starts with `<verb>_` (`write_text`)."""
+    stem = tail.lstrip("_").lower()
+    return any(stem == v or stem.startswith(v + "_") for v in verbs)
+
+
+def _logger_level(node: ast.Call) -> str | None:
+    """'loud'/'quiet' for a call on a logger (`log.warning`), else None.
+
+    Requires a logger-looking receiver: a bare `error(...)` is far more often a
+    response builder (`return error(500, ...)`) than a log call.
+    """
+    func = node.func
+    if not isinstance(func, ast.Attribute):
+        return None
+    if func.attr in _LOUD_LOG_METHODS:
+        level = "loud"
+    elif func.attr in _QUIET_LOG_METHODS:
+        level = "quiet"
+    else:
+        return None
+    receiver = func.value
+    if isinstance(receiver, ast.Call):
+        return level if _call_tail(receiver) == "getLogger" else None
+    name = _dotted_name(receiver).split(".")[-1].lower()
+    if "log" in name or name == "warnings":
+        return level
+    return None
+
+
+def _is_error_result(expr: ast.AST | None) -> bool:
+    """True if *expr* visibly reports failure to whoever receives it."""
+    if expr is None:
+        return False
+    if isinstance(expr, ast.Dict):
+        for key, value in zip(expr.keys, expr.values):
+            if not isinstance(key, ast.Constant):
+                continue
+            if (
+                key.value == "ok"
+                and isinstance(value, ast.Constant)
+                and value.value is False
+            ):
+                return True
+            if key.value in ("error", "errors"):
+                return True
+        return False
+    if isinstance(expr, ast.Call):
+        tail = _call_tail(expr).lower()
+        if any(hint in tail for hint in _ERROR_RESULT_HINTS):
+            return True
+        for kw in expr.keywords:
+            if (
+                kw.arg in ("status_code", "status")
+                and isinstance(kw.value, ast.Constant)
+                and isinstance(kw.value.value, int)
+                and kw.value.value >= 400
+            ):
+                return True
+        return False
+    if isinstance(expr, (ast.Tuple, ast.List)):
+        return any(_is_error_result(e) for e in expr.elts) or any(
+            isinstance(e, ast.Constant) and e.value in ("error", "failed", "failure")
+            for e in expr.elts
+        )
+    return False
+
+
+def _handler_fallback(handler: ast.ExceptHandler) -> tuple[str, ast.AST | None]:
+    """What the handler hands on in place of the result.
+
+    Returns ``(kind, node)``: ``("return", value)``, ``("assign", stmt)``, or
+    ``("none", None)`` when it only passes/logs (a skipped side effect).
+    """
+    for stmt in handler.body:
+        if isinstance(stmt, ast.Return):
+            if stmt.value is None:
+                return "none", None
+            return "return", stmt.value
+        if isinstance(stmt, (ast.Assign, ast.AnnAssign)) and stmt.value is not None:
+            return "assign", stmt
+    return "none", None
+
+
+def _carries_exception(handler: ast.ExceptHandler) -> bool:
+    """True if the bound exception leaves the handler as data.
+
+    `return archive_error(exc, ...)`, `self.last_error = exc`,
+    `reported_exc = exc`: the failure is recorded, not swallowed.
+    """
+    if not handler.name:
+        return False
+    for node in ast.walk(handler):
+        if isinstance(node, ast.Return) and node.value is not None:
+            if handler.name in _names_used(node.value):
+                return True
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            uses = handler.name in _names_used(node.value)
+            if uses and (
+                any(isinstance(t, (ast.Attribute, ast.Subscript)) for t in targets)
+                or (isinstance(node.value, ast.Name) and node.value.id == handler.name)
+            ):
+                return True
+    return False
+
+
+def _is_in_domain_value(expr: ast.AST) -> bool:
+    """A constant or an empty container: a value a real result could also be."""
+    if isinstance(expr, ast.Constant):
+        return True
+    if isinstance(expr, (ast.List, ast.Tuple, ast.Set)) and not expr.elts:
+        return True
+    if isinstance(expr, ast.Dict) and not expr.keys:
+        return True
+    return (
+        isinstance(expr, ast.Call)
+        and not expr.args
+        and not expr.keywords
+        and _call_tail(expr) in _EMPTY_CONTAINER_CALLS
+    )
+
+
+def _same_constant(a: ast.AST, b: ast.AST) -> bool:
+    return (
+        isinstance(a, ast.Constant)
+        and isinstance(b, ast.Constant)
+        and type(a.value) is type(b.value)
+        and a.value == b.value
+    )
+
+
+def _established_return(
+    value: ast.AST, fn: ast.AST | None, handler: ast.ExceptHandler
+) -> int | None:
+    """Line of another `return <same constant>` in the function, if any.
+
+    When the function already returns this value on a non-exceptional path
+    (`if store is None: return False`), the fallback is its established
+    "did not happen" signal, which callers already have to handle.
+    """
+    if fn is None:
+        return None
+    inside = {id(n) for n in ast.walk(handler)}
+    for node in _walk_same_scope(fn):
+        if (
+            isinstance(node, ast.Return)
+            and id(node) not in inside
+            and node.value is not None
+            and _same_constant(node.value, value)
+        ):
+            return node.lineno
+    return None
+
+
+def _none_checked_after(
+    stmt: ast.stmt, following: list[ast.stmt], cls: ast.ClassDef | None
+) -> bool:
+    """True if a `<target> = None` fallback is tested with `is None` right after.
+
+    For `self.attr = None` the test may live anywhere in the class (a property
+    that probes when the cached value is None).
+    """
+    targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+    if len(targets) != 1:
+        return False
+    target = _dotted_name(targets[0])
+    if not target:
+        return False
+    if target.startswith("self.") and cls is not None:
+        scope: list[ast.AST] = [cls]
+    else:
+        scope = list(following[:2])
+    for root in scope:
+        for node in ast.walk(root):
+            if (
+                isinstance(node, ast.Compare)
+                and len(node.ops) == 1
+                and isinstance(node.ops[0], (ast.Is, ast.IsNot))
+                and _dotted_name(node.left) == target
+                and isinstance(node.comparators[0], ast.Constant)
+                and node.comparators[0].value is None
+            ):
+                return True
+    return False
+
+
+def _tries_in_context(tree: ast.AST):
+    """Yield ``(try, following_statements, enclosing_function, enclosing_class)``."""
+
+    def visit(node: ast.AST, fn: ast.AST | None, cls: ast.ClassDef | None):
+        for _field, value in ast.iter_fields(node):
+            children = value if isinstance(value, list) else [value]
+            for index, child in enumerate(children):
+                if not isinstance(child, ast.AST):
+                    continue
+                if isinstance(child, ast.Try):
+                    following = children[index + 1 :] if isinstance(value, list) else []
+                    yield child, following, fn, cls
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    yield from visit(child, child, cls)
+                elif isinstance(child, ast.ClassDef):
+                    yield from visit(child, None, child)
+                else:
+                    yield from visit(child, fn, cls)
+
+    yield from visit(tree, None, None)
+
+
+_DOWNGRADE = {"high": "medium", "medium": "low", "low": "low"}
+
+_BROAD_DETAIL = {
+    "durable": (
+        "a failed `{call}()` is swallowed: the persistence step is skipped and "
+        "the caller proceeds as if it succeeded"
+    ),
+    "cleanup": (
+        "best-effort release/cleanup -- narrow the except if a specific failure "
+        "is expected, but nothing is lost by ignoring it"
+    ),
+    "parse": (
+        "a parse with a designed default -- the realistic failures are the "
+        "expected ValueError/TypeError; narrowing the except is hygiene"
+    ),
+    "boundary": (
+        "large try body: may be a genuine boundary (plugin loader, CLI top "
+        "level, call into user code) -- check for a rationale"
+    ),
+    "skipped": (
+        "the guarded operation's side effect is silently skipped -- check "
+        "whether anything later relies on it having happened"
+    ),
+    "established": (
+        "the fallback matches the function's own no-result return at line "
+        "{line} -- fine if callers treat it as 'did not happen', a defect if "
+        "they read it as an answer"
+    ),
+    "checked-none": (
+        "the None fallback is tested with `is None` afterwards -- a checked "
+        "sentinel, but every unrelated failure takes that path too"
+    ),
+    "in-domain": (
+        "the failure becomes a value a real result could also be (empty, False, "
+        "0, None) -- the caller cannot tell 'failed' from 'nothing there'"
+    ),
+    "named-default": (
+        "the failure is replaced by a named default -- check that the default "
+        "is safe for every failure, not just the expected one"
+    ),
+}
+
+
+def _grade_broad_handler(
+    try_node: ast.Try,
+    handler: ast.ExceptHandler,
+    following: list[ast.stmt],
+    fn: ast.AST | None,
+    cls: ast.ClassDef | None,
+) -> tuple[str, str]:
+    """Grade a swallowing broad handler by what it does with the failure.
+
+    Returns ``(confidence, detail)``, or ``("suppressed", reason)`` when the
+    failure demonstrably reaches someone.
+    """
+    if fn is not None and getattr(fn, "name", "") == "__del__":
+        return "suppressed", "finalizer"  # a raising __del__ is its own shape
+    kind, fallback = _handler_fallback(handler)
+    value = fallback.value if kind == "assign" else fallback  # type: ignore[union-attr]
+    if _is_error_result(value) or any(
+        isinstance(n, ast.Return) and _is_error_result(n.value)
+        for n in ast.walk(handler)
+    ):
+        return "suppressed", "returns-error-result"
+    if _carries_exception(handler):
+        return "suppressed", "exception-carried-as-value"
+
+    tails = [
+        _call_tail(n)
+        for stmt in try_node.body
+        for n in ast.walk(stmt)
+        if isinstance(n, ast.Call)
+    ]
+    durable = [t for t in tails if _verb_match(t, _DURABILITY_VERBS)]
+    impure = [t for t in tails if t not in _PURE_CALLS]
+    cleanup = [t for t in impure if _verb_match(t, _CLEANUP_VERBS)]
+    parse_only = bool(impure) and all(t in _PARSE_CALLS for t in impure)
+    narrow = len(try_node.body) <= 2
+    loud = any(
+        isinstance(n, ast.Call) and _logger_level(n) == "loud"
+        for n in ast.walk(handler)
+    )
+
+    if durable:
+        conf = "high" if narrow else "medium"
+        why = _BROAD_DETAIL["durable"].format(call=durable[0])
+    elif kind == "none" and cleanup and len(cleanup) * 2 >= len(impure):
+        conf, why = "low", _BROAD_DETAIL["cleanup"]
+    elif parse_only:
+        conf, why = "low", _BROAD_DETAIL["parse"]
+    elif not narrow:
+        conf, why = "low", _BROAD_DETAIL["boundary"]
+    elif kind == "none":
+        conf, why = "medium", _BROAD_DETAIL["skipped"]
+    else:
+        established = (
+            _established_return(value, fn, handler) if kind == "return" else None
+        )
+        if established is not None:
+            conf = "medium"
+            why = _BROAD_DETAIL["established"].format(line=established)
+        elif (
+            kind == "assign"
+            and isinstance(value, ast.Constant)
+            and value.value is None
+            and _none_checked_after(fallback, following, cls)  # type: ignore[arg-type]
+        ):
+            conf, why = "medium", _BROAD_DETAIL["checked-none"]
+        elif _is_in_domain_value(value):
+            conf, why = "high", _BROAD_DETAIL["in-domain"]
+        else:
+            conf, why = "medium", _BROAD_DETAIL["named-default"]
+    if loud:
+        conf = _DOWNGRADE[conf]
+        why += "; the handler logs at warning or above, so the failure is visible"
+    return conf, why
+
+
 def _check_except_exception_too_broad(tree: ast.AST) -> list[dict]:
     out: list[dict] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Try):
-            continue
-        # A narrow try body is the signal: the author guarded one operation.
-        narrow = len(node.body) <= 2
+    for node, following, fn, cls in _tries_in_context(tree):
         for handler in node.handlers:
             if not isinstance(handler.type, ast.Name):
                 continue
@@ -1271,42 +1736,19 @@ def _check_except_exception_too_broad(tree: ast.AST) -> list[dict]:
                 continue
             if not _handler_swallows(handler):
                 continue
-            # A loud log makes the failure visible -- not silent, so not FIX.
-            loud = any(
-                isinstance(n, ast.Call)
-                and (_call_name(n).split(".")[-1] if _call_name(n) else "")
-                in _LOUD_LOG_METHODS
-                for n in ast.walk(handler)
+            conf, why = _grade_broad_handler(node, handler, following, fn, cls)
+            finding = _finding(
+                "except-exception-too-broad",
+                "CONSIDER" if conf in ("low", "suppressed") else "FIX",
+                conf,
+                handler,
+                f"`except {handler.type.id}:` swallows every failure of the "
+                f"guarded operation, not just the expected one",
+                why,
             )
-            if narrow and not loud:
-                conf = "high"
-                why = (
-                    f"the try body is {len(node.body)} statement(s) -- one narrow "
-                    f"operation guarded by a catch-all"
-                )
-            elif narrow:
-                conf, why = (
-                    "medium",
-                    "narrow try body, but the handler logs loudly -- confirm the "
-                    "broad catch is deliberate containment",
-                )
-            else:
-                conf, why = (
-                    "low",
-                    "large try body: may be a genuine boundary (plugin loader, CLI "
-                    "top level, call into user code) -- check for a rationale",
-                )
-            out.append(
-                _finding(
-                    "except-exception-too-broad",
-                    "FIX",
-                    conf,
-                    handler,
-                    f"`except {handler.type.id}:` swallows every failure of the "
-                    f"guarded operation, not just the expected one",
-                    why,
-                )
-            )
+            if conf == "suppressed":
+                finding["suppressed"] = why
+            out.append(finding)
     return out
 
 
@@ -1530,6 +1972,39 @@ def _flag_assignments(fn: ast.AST) -> dict[str, list[tuple[int, ast.AST]]]:
     return found
 
 
+# Flags whose TRUE state means "free to proceed": clearing one at entry is the
+# busy state, so an early exit that skips setting it back blocks later calls.
+_PERMISSION_FLAG_WORDS = (
+    "enabled",
+    "idle",
+    "available",
+    "allow",
+    "can_",
+    "accepting",
+)
+
+
+def _flag_polarity_confidence(name: str, entry: object, final: object) -> str | None:
+    """Grade a set/reset pair by which state an early exit leaves behind.
+
+    The shape is a BUSY marker (`busy = True` ... `busy = False`): an early exit
+    leaves the guard blocking. The inverse, `done = False` ... `done = True`, is a
+    COMPLETION marker -- leaving it at the entry value on an error path makes
+    the next call retry, which is the safe state. Returns None for a
+    completion marker.
+    """
+    if bool(entry) and not bool(final):
+        return "high"
+    if not bool(entry) and bool(final):
+        attr = name.rsplit(".", 1)[-1].lower()
+        if any(word in attr for word in _PERMISSION_FLAG_WORDS):
+            return "medium"
+        return None
+    # Two truthy or two falsy values (`state = "running"` ... `"idle"`): the
+    # polarity cannot be read from the constants.
+    return "medium"
+
+
 def _check_flag_not_reset_on_early_exit(tree: ast.AST) -> list[dict]:
     """A guard flag set at entry but reset only on the success path.
 
@@ -1565,6 +2040,13 @@ def _check_flag_not_reset_on_early_exit(tree: ast.AST) -> list[dict]:
             values = {a[1].value.value for a in (assigns[0], assigns[-1])}  # type: ignore[attr-defined]
             if len(values) < 2:
                 continue
+            confidence = _flag_polarity_confidence(
+                name,
+                assigns[0][1].value.value,  # type: ignore[attr-defined]
+                assigns[-1][1].value.value,  # type: ignore[attr-defined]
+            )
+            if confidence is None:
+                continue
             # An exit between them skips the reset.
             exits = [
                 n
@@ -1578,7 +2060,7 @@ def _check_flag_not_reset_on_early_exit(tree: ast.AST) -> list[dict]:
                 _finding(
                     "flag-not-reset-on-early-exit",
                     "FIX",
-                    "high",
+                    confidence,
                     set_node,
                     f"`{name}` is set at line {set_line} but reset only at line "
                     f"{reset_line}; {len(exits)} earlier exit(s) skip the reset",
@@ -2055,6 +2537,15 @@ def _check_duplicated_guard(tree: ast.AST) -> list[dict]:
                 continue
             # Only guards -- a test whose body just raises or returns.
             if not any(isinstance(n, (ast.Raise, ast.Return)) for n in stmt.body):
+                continue
+            # A test that calls something other than a pure helper (`len`,
+            # `isinstance`) is a POLL whose answer changes over time --
+            # `if self._cancelled(job): return` repeated between the steps of a
+            # long job -- not a comparison copied with a stale operand.
+            if any(
+                isinstance(n, ast.Call) and _call_tail(n) not in _PURE_CALLS
+                for n in ast.walk(stmt.test)
+            ):
                 continue
             if key in seen:
                 first = seen[key]
@@ -3594,6 +4085,15 @@ def analyze_file(
     return findings
 
 
+def _directory_bucket(rel_file: str) -> str:
+    """The directory a finding's file lives in (`pkg/stores/db.py` -> `pkg/stores`).
+
+    Root-level files bucket as ``.``.
+    """
+    parent = Path(rel_file).parent.as_posix()
+    return parent if parent not in ("", "/") else "."
+
+
 def analyze(
     target: str,
     *,
@@ -3636,18 +4136,35 @@ def analyze(
     # Deterministic ordering -- see explore's --runs cross-run deduplication.
     findings.sort(key=lambda f: (f["file"], f["line"], f["shape"]))
 
+    # A candidate a differential settles (an error envelope returned, the
+    # exception carried on as data) is not reported, but it is COUNTED and
+    # listed, so a suppression is visible rather than looking like a clean scan.
+    suppressed = [
+        {k: f[k] for k in ("file", "line", "shape")} | {"reason": f["suppressed"]}
+        for f in findings
+        if "suppressed" in f
+    ]
+    findings = [f for f in findings if "suppressed" not in f]
+    suppressed_counts: dict[str, dict[str, int]] = {}
+    for entry in suppressed:
+        reasons = suppressed_counts.setdefault(entry["shape"], {})
+        reasons[entry["reason"]] = reasons.get(entry["reason"], 0) + 1
+
     by_shape: dict[str, int] = {}
     by_severity: dict[str, int] = {}
     by_confidence: dict[str, int] = {}
     by_directory: dict[str, int] = {}
+    by_top_directory: dict[str, int] = {}
     for finding in findings:
         by_shape[finding["shape"]] = by_shape.get(finding["shape"], 0) + 1
         by_severity[finding["severity"]] = by_severity.get(finding["severity"], 0) + 1
         by_confidence[finding["confidence"]] = (
             by_confidence.get(finding["confidence"], 0) + 1
         )
-        top = finding["file"].split("/")[0] if "/" in finding["file"] else "."
-        by_directory[top] = by_directory.get(top, 0) + 1
+        directory = _directory_bucket(finding["file"])
+        by_directory[directory] = by_directory.get(directory, 0) + 1
+        top = directory.lstrip("/").split("/")[0] or "."
+        by_top_directory[top] = by_top_directory.get(top, 0) + 1
 
     result = build_envelope(project_root, scan_root, files_total, len(files))
     result["summary"] = {
@@ -3657,13 +4174,22 @@ def analyze(
         "by_confidence": dict(sorted(by_confidence.items())),
         # Sorted by count: a single directory dominating usually means generated
         # content, not a real defect cluster. Triage the directory, not each hit.
+        # Keyed by each file's own directory (`pkg/stores`, `pkg/routes`), so
+        # a single-package scope still breaks down; `by_top_directory` keeps the
+        # first-component roll-up, where a generated tree spread over many
+        # subdirectories still shows as one bucket.
         "by_directory": dict(
             sorted(by_directory.items(), key=lambda kv: (-kv[1], kv[0]))
         ),
+        "by_top_directory": dict(
+            sorted(by_top_directory.items(), key=lambda kv: (-kv[1], kv[0]))
+        ),
+        "suppressed_by_differential": dict(sorted(suppressed_counts.items())),
         "checks_run": sorted(checks or (set(_CHECKS) | set(_PROJECT_CHECKS))),
         "excluded_patterns": sorted(exclude or []),
     }
     result["findings"] = findings
+    result["suppressed"] = suppressed
     return result
 
 

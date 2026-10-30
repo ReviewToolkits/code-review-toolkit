@@ -13,8 +13,18 @@ class TestIsStdlib(unittest.TestCase):
     """Test stdlib detection."""
 
     def test_common_stdlib_modules(self):
-        for name in ("os", "sys", "json", "pathlib", "ast", "unittest",
-                      "collections", "typing", "functools", "itertools"):
+        for name in (
+            "os",
+            "sys",
+            "json",
+            "pathlib",
+            "ast",
+            "unittest",
+            "collections",
+            "typing",
+            "functools",
+            "itertools",
+        ):
             with self.subTest(name=name):
                 self.assertTrue(mod._is_stdlib(name))
 
@@ -66,27 +76,29 @@ class TestAnalyzeFile(unittest.TestCase):
     """Test single-file analysis."""
 
     def test_basic_imports(self):
-        with TempProject({
-            "pkg/__init__.py": "",
-            "pkg/core.py": (
-                "import os\n"
-                "import json\n"
-                "from pathlib import Path\n"
-                "import requests\n"
-                "from . import utils\n"
-            ),
-            "pkg/utils.py": "",
-        }) as root:
-            result = mod.analyze_file(
-                root / "pkg/core.py", root, {"pkg"}
-            )
+        with TempProject(
+            {
+                "pkg/__init__.py": "",
+                "pkg/core.py": (
+                    "import os\n"
+                    "import json\n"
+                    "from pathlib import Path\n"
+                    "import requests\n"
+                    "from . import utils\n"
+                ),
+                "pkg/utils.py": "",
+            }
+        ) as root:
+            result = mod.analyze_file(root / "pkg/core.py", root, {"pkg"})
             self.assertIsNone(result["parse_error"])
             imports = result["imports"]
             self.assertEqual(len(imports), 5)
 
             # Check categories.
-            categories = {i["module"] or i.get("resolved_module", ""): i["category"]
-                          for i in imports}
+            categories = {
+                i["module"] or i.get("resolved_module", ""): i["category"]
+                for i in imports
+            }
             self.assertEqual(categories["os"], "stdlib")
             self.assertEqual(categories["json"], "stdlib")
             self.assertEqual(categories["pathlib"], "stdlib")
@@ -98,21 +110,21 @@ class TestAnalyzeFile(unittest.TestCase):
             self.assertEqual(relative_imports[0]["category"], "internal")
 
     def test_type_checking_detection(self):
-        with TempProject({
-            "pkg/__init__.py": "",
-            "pkg/core.py": (
-                "from __future__ import annotations\n"
-                "from typing import TYPE_CHECKING\n"
-                "\n"
-                "if TYPE_CHECKING:\n"
-                "    from pkg.models import SomeType\n"
-                "\n"
-                "import os\n"
-            ),
-        }) as root:
-            result = mod.analyze_file(
-                root / "pkg/core.py", root, {"pkg"}
-            )
+        with TempProject(
+            {
+                "pkg/__init__.py": "",
+                "pkg/core.py": (
+                    "from __future__ import annotations\n"
+                    "from typing import TYPE_CHECKING\n"
+                    "\n"
+                    "if TYPE_CHECKING:\n"
+                    "    from pkg.models import SomeType\n"
+                    "\n"
+                    "import os\n"
+                ),
+            }
+        ) as root:
+            result = mod.analyze_file(root / "pkg/core.py", root, {"pkg"})
             imports = result["imports"]
             tc_imports = [i for i in imports if i["type_checking_only"]]
             non_tc = [i for i in imports if not i["type_checking_only"]]
@@ -126,36 +138,38 @@ class TestAnalyzeFile(unittest.TestCase):
             self.assertIn("os", non_tc_modules)
 
     def test_conditional_import_detection(self):
-        with TempProject({
-            "pkg/__init__.py": "",
-            "pkg/core.py": (
-                "try:\n"
-                "    import rapidjson as json_mod\n"
-                "except ImportError:\n"
-                "    import json as json_mod\n"
-            ),
-        }) as root:
-            result = mod.analyze_file(
-                root / "pkg/core.py", root, {"pkg"}
-            )
+        with TempProject(
+            {
+                "pkg/__init__.py": "",
+                "pkg/core.py": (
+                    "try:\n"
+                    "    import rapidjson as json_mod\n"
+                    "except ImportError:\n"
+                    "    import json as json_mod\n"
+                ),
+            }
+        ) as root:
+            result = mod.analyze_file(root / "pkg/core.py", root, {"pkg"})
             conditional = [i for i in result["imports"] if i["conditional"]]
             # The "try" branch import should be conditional.
             self.assertTrue(len(conditional) >= 1)
 
     def test_all_declaration(self):
-        with TempProject({
-            "pkg/__init__.py": '__all__ = ["foo", "Bar"]\n',
-        }) as root:
-            result = mod.analyze_file(
-                root / "pkg/__init__.py", root, {"pkg"}
-            )
+        with TempProject(
+            {
+                "pkg/__init__.py": '__all__ = ["foo", "Bar"]\n',
+            }
+        ) as root:
+            result = mod.analyze_file(root / "pkg/__init__.py", root, {"pkg"})
             self.assertEqual(result["all_declaration"], ["foo", "Bar"])
             self.assertTrue(result["is_init"])
 
     def test_syntax_error_handled(self):
-        with TempProject({
-            "bad.py": "def broken(\n",
-        }) as root:
+        with TempProject(
+            {
+                "bad.py": "def broken(\n",
+            }
+        ) as root:
             result = mod.analyze_file(root / "bad.py", root, set())
             self.assertIsNotNone(result["parse_error"])
             self.assertEqual(result["imports"], [])
@@ -166,8 +180,12 @@ class TestDetectCycles(unittest.TestCase):
 
     def test_direct_cycle(self):
         graph = {
-            "a.py": [{"target": "b", "type_checking_only": False, "conditional": False}],
-            "b.py": [{"target": "a", "type_checking_only": False, "conditional": False}],
+            "a.py": [
+                {"target": "b", "type_checking_only": False, "conditional": False}
+            ],
+            "b.py": [
+                {"target": "a", "type_checking_only": False, "conditional": False}
+            ],
         }
         cycles = mod.detect_cycles(graph)
         self.assertEqual(len(cycles), 1)
@@ -177,17 +195,27 @@ class TestDetectCycles(unittest.TestCase):
 
     def test_no_cycles(self):
         graph = {
-            "a.py": [{"target": "b", "type_checking_only": False, "conditional": False}],
-            "b.py": [{"target": "c", "type_checking_only": False, "conditional": False}],
+            "a.py": [
+                {"target": "b", "type_checking_only": False, "conditional": False}
+            ],
+            "b.py": [
+                {"target": "c", "type_checking_only": False, "conditional": False}
+            ],
         }
         cycles = mod.detect_cycles(graph)
         self.assertEqual(len(cycles), 0)
 
     def test_indirect_cycle(self):
         graph = {
-            "a.py": [{"target": "b", "type_checking_only": False, "conditional": False}],
-            "b.py": [{"target": "c", "type_checking_only": False, "conditional": False}],
-            "c.py": [{"target": "a", "type_checking_only": False, "conditional": False}],
+            "a.py": [
+                {"target": "b", "type_checking_only": False, "conditional": False}
+            ],
+            "b.py": [
+                {"target": "c", "type_checking_only": False, "conditional": False}
+            ],
+            "c.py": [
+                {"target": "a", "type_checking_only": False, "conditional": False}
+            ],
         }
         cycles = mod.detect_cycles(graph)
         self.assertGreaterEqual(len(cycles), 1)
@@ -204,29 +232,35 @@ class TestIdentifyProjectPackages(unittest.TestCase):
     """Test project package discovery."""
 
     def test_finds_packages_with_init(self):
-        with TempProject({
-            "mypkg/__init__.py": "",
-            "mypkg/core.py": "",
-            "other/__init__.py": "",
-        }) as root:
+        with TempProject(
+            {
+                "mypkg/__init__.py": "",
+                "mypkg/core.py": "",
+                "other/__init__.py": "",
+            }
+        ) as root:
             packages = mod.identify_project_packages(root)
             self.assertIn("mypkg", packages)
             self.assertIn("other", packages)
 
     def test_ignores_test_dirs(self):
-        with TempProject({
-            "mypkg/__init__.py": "",
-            "tests/__init__.py": "",
-        }) as root:
+        with TempProject(
+            {
+                "mypkg/__init__.py": "",
+                "tests/__init__.py": "",
+            }
+        ) as root:
             packages = mod.identify_project_packages(root)
             self.assertIn("mypkg", packages)
             self.assertNotIn("tests", packages)
 
     def test_src_layout(self):
-        with TempProject({
-            "src/mypkg/__init__.py": "",
-            "src/mypkg/core.py": "",
-        }) as root:
+        with TempProject(
+            {
+                "src/mypkg/__init__.py": "",
+                "src/mypkg/core.py": "",
+            }
+        ) as root:
             packages = mod.identify_project_packages(root)
             self.assertIn("mypkg", packages)
 
@@ -235,34 +269,30 @@ class TestEndToEnd(unittest.TestCase):
     """Integration test: full pipeline on a small project."""
 
     def test_small_project(self):
-        with TempProject({
-            "mypkg/__init__.py": "from .core import main\n",
-            "mypkg/core.py": (
-                "import os\n"
-                "from .utils import helper\n"
-                "\n"
-                "def main():\n"
-                "    return helper(os.getcwd())\n"
-            ),
-            "mypkg/utils.py": (
-                "def helper(path):\n"
-                "    return str(path)\n"
-            ),
-            "tests/test_core.py": (
-                "import unittest\n"
-                "from mypkg.core import main\n"
-                "\n"
-                "class TestCore(unittest.TestCase):\n"
-                "    def test_main(self):\n"
-                "        self.assertIsNotNone(main())\n"
-            ),
-        }) as root:
+        with TempProject(
+            {
+                "mypkg/__init__.py": "from .core import main\n",
+                "mypkg/core.py": (
+                    "import os\n"
+                    "from .utils import helper\n"
+                    "\n"
+                    "def main():\n"
+                    "    return helper(os.getcwd())\n"
+                ),
+                "mypkg/utils.py": ("def helper(path):\n    return str(path)\n"),
+                "tests/test_core.py": (
+                    "import unittest\n"
+                    "from mypkg.core import main\n"
+                    "\n"
+                    "class TestCore(unittest.TestCase):\n"
+                    "    def test_main(self):\n"
+                    "        self.assertIsNotNone(main())\n"
+                ),
+            }
+        ) as root:
             files = sorted(mod.discover_python_files(root))
             project_packages = mod.identify_project_packages(root)
-            analyses = [
-                mod.analyze_file(f, root, project_packages)
-                for f in files
-            ]
+            analyses = [mod.analyze_file(f, root, project_packages) for f in files]
 
             self.assertEqual(len(analyses), 4)
 
@@ -272,7 +302,7 @@ class TestEndToEnd(unittest.TestCase):
             targets = {e["target"] for e in core_edges}
             self.assertTrue(
                 any("utils" in t for t in targets),
-                f"Expected utils dependency, got {targets}"
+                f"Expected utils dependency, got {targets}",
             )
 
             # No cycles in this project.
@@ -284,19 +314,20 @@ class TestMaxFiles(unittest.TestCase):
     """Test --max-files caps file processing."""
 
     def test_max_files_caps_output(self):
-        files = {
-            f"pkg/mod{i}.py": f"x{i} = {i}\n" for i in range(10)
-        }
+        files = {f"pkg/mod{i}.py": f"x{i} = {i}\n" for i in range(10)}
         files["pkg/__init__.py"] = ""
         with TempProject(files) as root:
             import io
             import sys
+
             old_stdout = sys.stdout
             sys.stdout = io.StringIO()
             old_argv = sys.argv
             sys.argv = [
-                "analyze_imports.py", str(root),
-                "--max-files", "3",
+                "analyze_imports.py",
+                str(root),
+                "--max-files",
+                "3",
             ]
             try:
                 mod.main()
@@ -313,7 +344,9 @@ def _graph(root):
     """Build the internal import graph for a temp project."""
     files = sorted(mod.discover_python_files(root))
     packages = mod.identify_project_packages(root)
-    return mod.build_internal_graph([mod.analyze_file(f, root, packages) for f in files])
+    return mod.build_internal_graph(
+        [mod.analyze_file(f, root, packages) for f in files]
+    )
 
 
 class TestRelativeImportResolution(unittest.TestCase):
@@ -444,9 +477,7 @@ class TestSubmoduleVsBoundName(unittest.TestCase):
 
     def test_submodule_import_resolves_to_the_submodule(self):
         edge = {"target": "pkg", "names": [{"name": "env"}]}
-        self.assertEqual(
-            mod.resolve_edge_targets(edge, self.INDEX), {"pkg/env.py"}
-        )
+        self.assertEqual(mod.resolve_edge_targets(edge, self.INDEX), {"pkg/env.py"})
 
     def test_bound_name_import_resolves_to_the_package(self):
         # `Coverage` is bound in __init__.py, so this edge IS on the package
@@ -479,6 +510,125 @@ class TestSubmoduleVsBoundName(unittest.TestCase):
         self.assertEqual(mod.detect_cycles(graph, all_files=all_files), [])
 
 
+def _imports(files: dict[str, str], target: str) -> dict:
+    with TempProject(files) as root:
+        return mod.analyze_file(root / target, root, {"pkg"})
+
+
+class TestImportScopeAndLaziness(unittest.TestCase):
+    """A function-level import does not run at import time -- unless the module
+    calls that function at import time."""
+
+    def test_module_class_and_function_scopes(self):
+        src = (
+            "import os\n"
+            "class C:\n    import json\n"
+            "def f():\n    import pkg.b\n    return pkg.b\n"
+        )
+        result = _imports({"pkg/__init__.py": "", "pkg/a.py": src}, "pkg/a.py")
+        by_module = {i["module"]: i for i in result["imports"]}
+        self.assertEqual(
+            (by_module["os"]["scope"], by_module["os"]["lazy"]), ("module", False)
+        )
+        self.assertEqual(
+            (by_module["json"]["scope"], by_module["json"]["lazy"]), ("class", False)
+        )
+        self.assertEqual(
+            (by_module["pkg.b"]["scope"], by_module["pkg.b"]["lazy"]),
+            ("function", True),
+        )
+
+    def test_function_called_at_import_time_is_not_lazy(self):
+        src = (
+            "def _init():\n    from pkg.config import settings\n    return settings\n"
+            "_SINGLETON = _init()\n"
+        )
+        result = _imports({"pkg/__init__.py": "", "pkg/log.py": src}, "pkg/log.py")
+        (imp,) = result["imports"]
+        self.assertEqual((imp["scope"], imp["lazy"]), ("function", False))
+
+    def test_import_time_cycles_exclude_lazy_edges(self):
+        files = {
+            "pkg/__init__.py": "",
+            "pkg/a.py": "from pkg import b\n",
+            "pkg/b.py": "def f():\n    from pkg import a\n    return a\n",
+        }
+        with TempProject(files) as root:
+            paths = sorted(mod.discover_python_files(root))
+            analyses = [mod.analyze_file(p, root, {"pkg"}) for p in paths]
+            names = [a["file"] for a in analyses]
+            graph = mod.build_internal_graph(analyses)
+        self.assertEqual(len(mod.detect_cycles(graph, all_files=names)), 1)
+        self.assertEqual(
+            mod.detect_cycles(graph, all_files=names, include_lazy=False), []
+        )
+
+
+class TestDynamicImports(unittest.TestCase):
+    def test_literal_import_module_and_dunder_import_are_edges(self):
+        src = (
+            "import importlib\n"
+            "def load():\n"
+            "    a = importlib.import_module('pkg.plugins.alpha')\n"
+            "    b = __import__('pkg.plugins.beta')\n"
+            "    return a, b\n"
+        )
+        result = _imports({"pkg/__init__.py": "", "pkg/f.py": src}, "pkg/f.py")
+        dynamic = {i["module"]: i for i in result["imports"] if i["dynamic"]}
+        self.assertEqual(set(dynamic), {"pkg.plugins.alpha", "pkg.plugins.beta"})
+        alpha = dynamic["pkg.plugins.alpha"]
+        self.assertEqual(alpha["category"], "internal")
+        self.assertTrue(alpha["lazy"])
+        self.assertEqual(result["dynamic_import_sites"], [])
+
+    def test_from_importlib_import_module_is_recognized(self):
+        src = "from importlib import import_module\nm = import_module('json')\n"
+        result = _imports({"pkg/__init__.py": "", "pkg/f.py": src}, "pkg/f.py")
+        self.assertIn("json", [i["module"] for i in result["imports"] if i["dynamic"]])
+
+    def test_computed_name_is_reported_as_a_site(self):
+        src = (
+            "import importlib\n"
+            "def load(kind):\n"
+            "    return importlib.import_module(f'pkg.plugins.{kind}')\n"
+        )
+        result = _imports({"pkg/__init__.py": "", "pkg/f.py": src}, "pkg/f.py")
+        (site,) = result["dynamic_import_sites"]
+        self.assertEqual(site["prefix"], "pkg.plugins.")
+        self.assertEqual(site["call"], "importlib.import_module")
+        self.assertEqual(site["line"], 3)
+        self.assertFalse(any(i["dynamic"] for i in result["imports"]))
+
+    def test_non_literal_argument_is_a_site_never_an_edge(self):
+        src = "def f(loader, spec):\n    return loader.import_module(spec)\n"
+        result = _imports({"pkg/__init__.py": "", "pkg/f.py": src}, "pkg/f.py")
+        self.assertEqual(result["imports"], [])
+        self.assertEqual(len(result["dynamic_import_sites"]), 1)
+
+
+class TestPlainImportNames(unittest.TestCase):
+    def test_plain_import_names_is_a_list(self):
+        # `names` used to be null for `import a.b`, which crashed consumers
+        # that iterate it.
+        src = "import pkg.sub\nimport pkg.sub as s\n"
+        result = _imports(
+            {"pkg/__init__.py": "", "pkg/sub.py": "", "pkg/a.py": src}, "pkg/a.py"
+        )
+        self.assertEqual(
+            [i["names"] for i in result["imports"]],
+            [
+                [{"name": "pkg.sub", "alias": None}],
+                [{"name": "pkg.sub", "alias": "s"}],
+            ],
+        )
+
+    def test_plain_import_names_do_not_resolve_as_submodules(self):
+        # `import pkg` stays an edge to pkg/__init__.py even when a submodule
+        # pkg/pkg.py exists.
+        index = {"pkg": "pkg/__init__.py", "pkg.pkg": "pkg/pkg.py"}
+        edge = {"target": "pkg", "names": [{"name": "pkg"}], "form": "import"}
+        self.assertEqual(mod.resolve_edge_targets(edge, index), {"pkg/__init__.py"})
+
+
 if __name__ == "__main__":
     unittest.main()
-

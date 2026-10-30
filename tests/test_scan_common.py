@@ -1,5 +1,11 @@
 """Tests for scan_common.py -- the shared utilities module."""
 
+import ast
+import contextlib
+import io
+import os
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -140,6 +146,67 @@ class TestParseCommonArgs(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             mod.parse_common_args(["--max-files", "abc"])
         self.assertEqual(ctx.exception.code, 2)
+
+    def test_help_prints_usage_and_exits_zero(self):
+        # Before: `--help` was ignored as an unknown flag and a full
+        # scan of the cwd ran; `-h` became the target path.
+        for flag in ("--help", "-h"):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as ctx:
+                mod.parse_common_args(
+                    ["src/", flag], "Do a thing.\n\nUsage: x [path]\n"
+                )
+            self.assertEqual(ctx.exception.code, 0)
+            self.assertEqual(out.getvalue(), "Do a thing.\n\nUsage: x [path]\n")
+
+    def test_no_help_flag_returns_normally(self):
+        self.assertIsNone(mod.exit_on_help(["src/", "--max-files", "3"]))
+
+
+_SCRIPTS_DIR = (
+    Path(__file__).resolve().parent.parent
+    / "plugins"
+    / "code-review-toolkit"
+    / "scripts"
+)
+
+
+class TestEveryScriptHonorsHelp(unittest.TestCase):
+    """`--help`/`-h` prints usage and exits 0 WITHOUT scanning, for every script.
+
+    Run from a directory holding a Python project, so a script that ignores the
+    flag scans it and prints a JSON envelope instead of usage.
+    """
+
+    def test_every_script(self):
+        scripts = sorted(
+            p for p in _SCRIPTS_DIR.glob("*.py") if p.name != "scan_common.py"
+        )
+        self.assertGreater(len(scripts), 10)
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        with TempProject({"pkg/mod.py": "def f(x=[]):\n    return x\n"}) as root:
+            for script in scripts:
+                for flag in ("--help", "-h"):
+                    with self.subTest(script=script.name, flag=flag):
+                        proc = subprocess.run(
+                            [sys.executable, str(script), flag],
+                            cwd=root,
+                            env=env,
+                            capture_output=True,
+                            text=True,
+                            timeout=60,
+                            check=False,
+                        )
+                        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                        # argparse usage, or the script's own docstring.
+                        doc = ast.get_docstring(ast.parse(script.read_text())) or ""
+                        first = proc.stdout.splitlines()[0] if proc.stdout else ""
+                        self.assertTrue(
+                            first.startswith("usage:") or first == doc.splitlines()[0],
+                            proc.stdout[:300],
+                        )
+                        self.assertIn("usage", proc.stdout.lower())
+                        self.assertNotIn('"project_root"', proc.stdout)
 
 
 class TestResolveTarget(unittest.TestCase):

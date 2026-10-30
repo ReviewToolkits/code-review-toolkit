@@ -35,7 +35,9 @@ class TestMarkerDetection(unittest.TestCase):
     def test_workaround(self):
         items = self._scan("# WORKAROUND: upstream bug\n")
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["category"], "HACK")  # HACK and WORKAROUND share category
+        self.assertEqual(
+            items[0]["category"], "HACK"
+        )  # HACK and WORKAROUND share category
 
     def test_xxx(self):
         items = self._scan("# XXX: needs review\n")
@@ -58,22 +60,14 @@ class TestMarkerDetection(unittest.TestCase):
         self.assertEqual(items[0]["category"], "PRAGMA_NO_COVER")
 
     def test_case_insensitive(self):
-        items = self._scan(
-            "# todo: lowercase\n"
-            "# Todo: mixed case\n"
-            "# TODO: uppercase\n"
-        )
+        items = self._scan("# todo: lowercase\n# Todo: mixed case\n# TODO: uppercase\n")
         self.assertEqual(len(items), 3)
         for item in items:
             self.assertEqual(item["category"], "TODO")
 
     def test_skip_decorator(self):
         items = self._scan(
-            "import unittest\n"
-            "\n"
-            "@unittest.skip('broken')\n"
-            "def test_foo():\n"
-            "    pass\n"
+            "import unittest\n\n@unittest.skip('broken')\ndef test_foo():\n    pass\n"
         )
         skip_items = [i for i in items if i["category"] == "SKIP"]
         self.assertEqual(len(skip_items), 1)
@@ -102,21 +96,14 @@ class TestMarkerDetection(unittest.TestCase):
 
     def test_context_captured(self):
         items = self._scan(
-            "def process():\n"
-            "    # TODO: optimize this loop\n"
-            "    for x in range(100):\n"
+            "def process():\n    # TODO: optimize this loop\n    for x in range(100):\n"
         )
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["context_before"], "def process():")
         self.assertEqual(items[0]["context_after"], "for x in range(100):")
 
     def test_line_numbers_correct(self):
-        items = self._scan(
-            "line1 = 1\n"
-            "line2 = 2\n"
-            "# TODO: on line 3\n"
-            "line4 = 4\n"
-        )
+        items = self._scan("line1 = 1\nline2 = 2\n# TODO: on line 3\nline4 = 4\n")
         self.assertEqual(items[0]["line"], 3)
 
 
@@ -154,21 +141,15 @@ class TestEndToEnd(unittest.TestCase):
     """Integration test: scan a small project without git."""
 
     def test_project_scan(self):
-        with TempProject({
-            "pkg/core.py": (
-                "# TODO: refactor this\n"
-                "def main():\n"
-                "    pass  # FIXME: implement\n"
-            ),
-            "pkg/utils.py": (
-                "def helper():\n"
-                "    return 42\n"
-            ),
-            "tests/test_core.py": (
-                "import unittest\n"
-                "# TODO: add more tests\n"
-            ),
-        }) as root:
+        with TempProject(
+            {
+                "pkg/core.py": (
+                    "# TODO: refactor this\ndef main():\n    pass  # FIXME: implement\n"
+                ),
+                "pkg/utils.py": ("def helper():\n    return 42\n"),
+                "tests/test_core.py": ("import unittest\n# TODO: add more tests\n"),
+            }
+        ) as root:
             files = mod.discover_python_files(root)
             all_items = []
             for f in files:
@@ -188,19 +169,21 @@ class TestMaxFiles(unittest.TestCase):
 
     def test_max_files_caps_output(self):
         files = {
-            f"pkg/mod{i}.py": f"# TODO: fix mod{i}\nx{i} = {i}\n"
-            for i in range(10)
+            f"pkg/mod{i}.py": f"# TODO: fix mod{i}\nx{i} = {i}\n" for i in range(10)
         }
         files["pkg/__init__.py"] = ""
         with TempProject(files) as root:
             import io
             import sys
+
             old_stdout = sys.stdout
             sys.stdout = io.StringIO()
             old_argv = sys.argv
             sys.argv = [
-                "collect_debt.py", str(root),
-                "--max-files", "3",
+                "collect_debt.py",
+                str(root),
+                "--max-files",
+                "3",
             ]
             try:
                 mod.main()
@@ -211,6 +194,90 @@ class TestMaxFiles(unittest.TestCase):
             self.assertEqual(output["files_analyzed"], 3)
             self.assertTrue(output["files_capped"])
             self.assertGreater(output["files_total"], 3)
+
+
+def _run_main(argv: list[str]) -> dict:
+    import contextlib
+    import io
+    import sys
+
+    out = io.StringIO()
+    old_argv = sys.argv
+    sys.argv = ["collect_debt.py", *argv]
+    try:
+        with contextlib.redirect_stdout(out):
+            mod.main()
+    finally:
+        sys.argv = old_argv
+    return json.loads(out.getvalue())
+
+
+_KEYED_PROJECT = {
+    "pkg/__init__.py": '"""Package docstring citing ABC-7."""\n',
+    "pkg/store.py": (
+        "def flush():\n"
+        "    # Deferred until ABC-12 lands; see roadmap.\n"
+        "    return None\n"
+        "x = 'ABC-99 in a string is not a citation'\n"
+    ),
+    "pkg/cache.py": "# ABC-3: done, kept as a pointer\nCACHE = {}\n",
+    "ROADMAP.md": (
+        "| key | item | target |\n|---|---|---|\n"
+        "| ABC-12 | deferred flush | v1.2 |\n"
+        "| ~~ABC-5~~ | shipped thing | v1.0 |\n"
+        "| ABC-20 | planned work | v1.3 |\n"
+    ),
+    "CHANGELOG.md": "## 1.0\n- ABC-3 fixed the cache\n",
+}
+
+
+class TestTrackerKeys(unittest.TestCase):
+    """Debt tracked by tracker key, not by TODO marker, was invisible."""
+
+    def test_keys_from_comments_docstrings_and_docs(self):
+        with TempProject(_KEYED_PROJECT) as root:
+            out = _run_main([str(root), "--key-regex", r"\bABC-\d+\b"])
+        tk = out["tracker_keys"]
+        keys = {k["key"]: k for k in tk["keys"]}
+        self.assertEqual(set(keys), {"ABC-3", "ABC-5", "ABC-7", "ABC-12", "ABC-20"})
+        # Only comments and docstrings count as code citations.
+        self.assertNotIn("ABC-99", keys)
+        self.assertEqual(keys["ABC-12"]["code_refs"][0]["line"], 2)
+        self.assertEqual(keys["ABC-7"]["code_ref_count"], 1)
+        self.assertTrue(keys["ABC-3"]["in_changelog"])
+        self.assertTrue(keys["ABC-5"]["struck_through"])
+        self.assertIn("v1.2", keys["ABC-12"]["doc_refs"][0]["text"])
+        # Cited in code with no resolution signal: open debt.
+        self.assertEqual(tk["open_in_code"], ["ABC-7", "ABC-12"])
+        self.assertEqual(tk["open_in_planning_docs"], ["ABC-12", "ABC-20"])
+        # No .git in the temp project: commits were not searched, and say so.
+        self.assertFalse(tk["git_log_searched"])
+        self.assertIsNone(keys["ABC-12"]["commits"])
+
+    def test_keys_are_sorted_naturally(self):
+        files = {"m.py": "# ABC-10\n# ABC-9\n# ABC-100\n"}
+        with TempProject(files) as root:
+            out = _run_main([str(root), "--key-regex=ABC-\\d+"])
+        self.assertEqual(
+            [k["key"] for k in out["tracker_keys"]["keys"]],
+            ["ABC-9", "ABC-10", "ABC-100"],
+        )
+
+    def test_not_requested_is_null_with_a_reason(self):
+        with TempProject(_KEYED_PROJECT) as root:
+            out = _run_main([str(root)])
+        self.assertIsNone(out["tracker_keys"])
+        self.assertIn("--key-regex", out["tracker_keys_reason"])
+
+    def test_regex_value_is_not_taken_as_the_target(self):
+        with TempProject(_KEYED_PROJECT) as root:
+            out = _run_main([str(root), "--key-regex", "ABC-1"])
+        self.assertEqual(out["scan_root"], str(root.resolve()))
+
+    def test_invalid_regex_is_a_json_error(self):
+        with TempProject({"m.py": ""}) as root, self.assertRaises(SystemExit) as ctx:
+            _run_main([str(root), "--key-regex", "("])
+        self.assertEqual(ctx.exception.code, 2)
 
 
 if __name__ == "__main__":

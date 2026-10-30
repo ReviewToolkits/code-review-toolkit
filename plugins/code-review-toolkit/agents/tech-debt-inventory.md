@@ -30,6 +30,26 @@ Key fields:
 - `summary.by_age`: counts per age bucket (fresh/growing/stale/ancient/unknown)
 - `summary.top_files`: files with the most debt markers
 
+**Tracker keys.** Many projects track deferred work by key (`ABC-12`, `PROJ-7`, `R2-4`) in an issue
+tracker or a ROADMAP, and cite the key in code instead of writing TODO; a low marker count then
+says nothing about the debt. Before running the script, look at the CHANGELOG, ROADMAP and recent
+commit subjects for a key scheme. If there is one, pass it:
+
+```bash
+python <plugin_root>/scripts/collect_debt.py [scope] --key-regex '\b(?:ABC|PROJ)-\d+\b'
+```
+
+`tracker_keys` then lists every key cited in comments, docstrings and docs (project root plus
+`docs/`/`doc/`), each with `code_refs`, `doc_refs` (the line text, which in a roadmap row usually
+names the target version), `in_changelog`, `in_planning_doc`, `struck_through` (`~~KEY~~`) and
+`commits` (from one local `git log` pass; `null` when git was not searched). Two derived lists:
+- `open_in_code`: cited in code with no resolution signal — keyed open debt
+- `open_in_planning_docs`: in a roadmap/todo/backlog/plan file, not struck through, in no changelog
+
+These are heuristics: a commit that mentions a key may have started rather than finished it.
+Without `--key-regex`, `tracker_keys` is `null` and `tracker_keys_reason` says why — report that
+the key inventory was not run, not that there is no keyed debt.
+
 ## External Tool Integration
 
 If external tool output is available (from `run_external_tools.py`), incorporate deprecated-pattern findings from ruff.

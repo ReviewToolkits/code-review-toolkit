@@ -24,16 +24,25 @@ Useful options:
 - `--exclude PAT[,PAT...]` — drop paths containing a substring (see *Phase 2* — do this deliberately)
 - `--max-files N` — cap the scan
 
-The output envelope carries `summary.by_shape`, `summary.by_severity`, `summary.by_confidence`, and
-`summary.by_directory`, plus a `findings` list. Each finding has `shape`, `severity`, `confidence`,
-`file`, `line`, `message`, and `detail`.
+The output envelope carries `summary.by_shape`, `summary.by_severity`, `summary.by_confidence`,
+`summary.by_directory`, `summary.by_top_directory` and `summary.suppressed_by_differential`, plus a
+`findings` list and a `suppressed` list. Each finding has `shape`, `severity`, `confidence`, `file`,
+`line`, `message`, and `detail`.
+
+`suppressed` lists candidates (`file`, `line`, `shape`, `reason`) that a differential settles and
+that are therefore not in `findings`. Today that is `except-exception-too-broad` handlers that
+return an error result (`{"ok": False, ...}`, `return error(500, ...)`), carry the exception on as
+data (`self.last_error = exc`), or sit in `__del__`. Give the counts in your report's
+*Suppressed* section; spot-check one or two if a count looks surprising.
 
 ## Phase 2 — Read `by_directory` FIRST
 
-Before triaging anything, look at `summary.by_directory`. **If one directory dominates the counts,
-that is almost always generated content, not a defect cluster.** Observed in practice: report
-artifacts, golden/fixture files, vendored trees, and generated stress-test scripts routinely produce
-90%+ of raw findings.
+Before triaging anything, look at `summary.by_directory` (each file's own directory, e.g.
+`pkg/stores`, `pkg/routes`) and `summary.by_top_directory` (the first path component). **If one
+directory dominates the counts, that is almost always generated content, not a defect cluster.**
+Observed in practice: report artifacts, golden/fixture files, vendored trees, and generated
+stress-test scripts routinely produce 90%+ of raw findings. A generated tree spread over many
+subdirectories shows up in `by_top_directory`, not in `by_directory`.
 
 Triage the *directory*, not each hit:
 1. Check whether the dominant directory is hand-written source at all.
@@ -104,6 +113,13 @@ Then report, explicitly:
   discriminator: does control flow continue as if nothing happened (bug), or is the exception
   captured/re-raised/reported so the caller can act (acceptable)? The scanner already downgrades the
   capture pattern to `medium` — verify which one you have.
+- **`except-exception-too-broad` is graded by what the handler does with the failure**, not by the
+  size of the try body. `high`: the failure becomes a value a real result could also be (`{}`,
+  `False`, `0`, `None`) or a persistence call (`flush`, `write`, `commit`) is swallowed silently.
+  `medium`: the fallback is the function's own established no-result return, a `None` checked with
+  `is None` right after, a named default, or a skipped side effect. `low`: best-effort cleanup, a
+  parse with a designed default, a large boundary body, or a handler that logs at warning+. The
+  question to answer for each: does the caller read the fallback as an answer?
 - **`eq-without-hash` only matters if instances actually reach a set or dict key.** Check for that
   before calling it a defect.
 - **`class-level-mutable-attribute` is fine for genuine constants.** ALL_CAPS names are already

@@ -276,6 +276,9 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
 
 
 def main() -> None:
+    from scan_common import exit_on_help
+
+    exit_on_help(sys.argv[1:], __doc__)
     max_files = 0  # 0 = no limit
     positional: list[str] = []
     argv = sys.argv[1:]

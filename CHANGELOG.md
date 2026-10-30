@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — scan_common, pitfall precision, imports, debt (#57)
+
+- **`--help`/`-h` prints usage and exits 0 in every script**, instead of silently running a full
+  scan of the current directory (12 of 16 scripts did); a test runs every script with both flags.
+- **`except-exception-too-broad` is graded by what the handler does with the failure**, not by the
+  size of the `try` body. Handlers that re-raise, report loudly, or return a sentinel the caller
+  checks move to `suppressed` (listed, with `summary.suppressed_by_differential`); on a real
+  service the high-confidence findings went 47 → 5 while the confirmed true positives stayed.
+- `flag-not-reset-on-early-exit` skips completion markers and `duplicated-guard-wrong-operand`
+  skips poll calls (both false positives on a real project).
+- `summary.by_directory` buckets by each file's own directory; `by_top_directory` keeps the old
+  roll-up.
+
+### Enhanced
+
+- **`analyze_imports.py`** marks each import's `scope` and `lazy` flag, detects
+  `importlib.import_module`/`__import__` sites, reports `import_time_cycles` separately, and never
+  leaves `names` null.
+- **`collect_debt.py --key-regex`** inventories tracker keys cited in code and planning docs, with a
+  resolution signal per key.
+
 ### Fixed — history attribution (#53)
 
 - `analyze_history.py` classifies commits by bracketed tags, Conventional Commits types and
