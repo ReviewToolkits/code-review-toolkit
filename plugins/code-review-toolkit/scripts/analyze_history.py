@@ -1533,6 +1533,41 @@ def find_unmerged_branches(
     }
 
 
+# Author and committer dates further apart than this mark a commit that was
+# rebased, cherry-picked or amended after it was written.
+_DATE_DIVERGENCE = timedelta(hours=1)
+_DATE_DIVERGENCE_SHARE = 0.2
+_DATE_DIVERGENCE_MIN = 5
+
+
+def count_date_divergence(commits: list[dict]) -> int:
+    """How many commits have author and committer dates over an hour apart."""
+    count = 0
+    for commit in commits:
+        try:
+            authored = datetime.fromisoformat(commit["date"])
+            committed = datetime.fromisoformat(commit["committer_date"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if abs(committed - authored) > _DATE_DIVERGENCE:
+            count += 1
+    return count
+
+
+def last_commit_date(git_root: Path, rel_scope: str) -> str | None:
+    """Committer date of the newest commit touching the scope, or None."""
+    args = ["log", "-1", "--format=%cI"]
+    if rel_scope != ".":
+        args += ["--", rel_scope]
+    try:
+        result = _run_git(args, git_root)
+    except subprocess.TimeoutExpired:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
 def parse_args(argv: list[str]) -> dict:
     """Parse command-line arguments."""
     args: dict = {
@@ -1699,6 +1734,8 @@ def analyze(argv: list[str] | None = None) -> dict:
     else:
         days = args["days"]
 
+    divergent = count_date_divergence(commits)
+
     # Classify commits.
     commits_by_type: dict[str, int] = defaultdict(int)
     classified_by: dict[str, int] = defaultdict(int)
@@ -1801,6 +1838,9 @@ def analyze(argv: list[str] | None = None) -> dict:
             "files_changed": len(file_churn),
             "functions_changed": len(function_churn),
             "authors": len(authors),
+            # Commits whose author and committer dates are over an hour apart
+            # (rebased, cherry-picked or amended later).
+            "author_committer_date_divergent": divergent,
         },
         "tracker_keys": summarize_tracker_keys(commits),
         "file_churn": file_churn,
@@ -1824,6 +1864,35 @@ def analyze(argv: list[str] | None = None) -> dict:
             f"{attribution_meta['files_unattributed']} file change(s) could not "
             "be mapped to functions (timeout, parse cap, or a file version that "
             "does not parse). Function counts are lower bounds."
+        )
+    if not commits:
+        last = last_commit_date(project_root, rel_scope)
+        result["time_range"]["empty"] = True
+        result["time_range"]["last_commit_in_scope"] = last
+        scope_name = rel_scope if rel_scope != "." else "the project"
+        result["notes"].append(
+            f"EMPTY WINDOW: 0 commits touch {scope_name} between {since} and "
+            f"{until}. "
+            + (
+                f"The last commit to it is dated {last}; re-run with --since "
+                "an earlier date (or --days N, or --last N) before drawing any "
+                "temporal conclusion. Every count below is zero because the "
+                "window is empty, not because the code is stable."
+                if last
+                else "There is no commit touching it at all."
+            )
+        )
+    if (
+        divergent >= _DATE_DIVERGENCE_MIN
+        and divergent / len(commits) >= _DATE_DIVERGENCE_SHARE
+    ):
+        result["notes"].append(
+            f"{divergent} of {len(commits)} commits have author and committer "
+            "dates more than an hour apart: the history was rebased, "
+            "cherry-picked or landed in batches. The window and all in-window "
+            "dates use the committer date, so do not read velocity, bursts or "
+            "the order of a feature and its follow-up fixes from these dates; "
+            "the author date (`date`) is closer to when the work was written."
         )
     unknown = commits_by_type.get("unknown", 0)
     if commits and unknown / len(commits) > 0.15:

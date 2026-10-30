@@ -979,6 +979,53 @@ class TestTaggedAndKeyedClassification(unittest.TestCase):
         )
 
 
+class TestWindowWarnings(unittest.TestCase):
+    """An empty window and rebased dates are said out loud."""
+
+    def _commits(self, n, rebased):
+        commits = []
+        for i in range(n):
+            commit = {
+                "files": {"a.py": f"x = {i}\n"},
+                "message": f"Change a {i}",
+                "date": f"2025-01-{i + 1:02d}T12:00:00+00:00",
+            }
+            if i < rebased:
+                commit["committer_date"] = "2025-01-20T12:00:00+00:00"
+            commits.append(commit)
+        return commits
+
+    def test_empty_window_is_flagged_with_the_last_commit_date(self):
+        with GitTempProject(self._commits(2, 0)) as root:
+            result = mod.analyze(
+                [str(root), "--since", "2025-06-01", "--until", "2025-07-01"]
+            )
+        self.assertEqual(result["summary"]["total_commits"], 0)
+        self.assertTrue(result["time_range"]["empty"])
+        self.assertTrue(
+            result["time_range"]["last_commit_in_scope"].startswith("2025-01-02")
+        )
+        self.assertTrue(any(n.startswith("EMPTY WINDOW") for n in result["notes"]))
+
+    def test_non_empty_window_has_no_empty_note(self):
+        with GitTempProject(self._commits(2, 0)) as root:
+            result = mod.analyze([str(root), *_WINDOW, "--no-function"])
+        self.assertNotIn("empty", result["time_range"])
+        self.assertFalse(any("EMPTY WINDOW" in n for n in result["notes"]))
+
+    def test_rebased_history_is_flagged(self):
+        with GitTempProject(self._commits(8, 5)) as root:
+            result = mod.analyze([str(root), *_WINDOW, "--no-function"])
+        self.assertEqual(result["summary"]["author_committer_date_divergent"], 5)
+        self.assertTrue(any("author and committer" in n for n in result["notes"]))
+
+    def test_a_few_rebased_commits_are_counted_but_not_flagged(self):
+        with GitTempProject(self._commits(8, 1)) as root:
+            result = mod.analyze([str(root), *_WINDOW, "--no-function"])
+        self.assertEqual(result["summary"]["author_committer_date_divergent"], 1)
+        self.assertFalse(any("author and committer" in n for n in result["notes"]))
+
+
 class TestCommitterDateWindow(unittest.TestCase):
     """The window selects on the committer date, so the reported
     first/last dates must be committer dates too."""
