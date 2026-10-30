@@ -148,9 +148,31 @@ def find_mypy_config(project_root: Path) -> str | None:
     return None
 
 
-def parse_output(stdout: str) -> tuple[list[dict], dict]:
-    """Parse mypy's text output into findings plus its own summary line."""
+# Notes that introduce the error AFTER them rather than explaining the one before.
+_CONTEXT_NOTE = re.compile(
+    r"^(In module imported here|In function |In member |In class |At top level)"
+)
+
+
+def parse_output(
+    stdout: str, standalone_notes: list[dict] | None = None
+) -> tuple[list[dict], dict]:
+    """Parse mypy's text output into findings plus its own summary line.
+
+    A ``note:`` line is part of the error it follows, not a finding of its own:
+    the Superclass/Subclass signatures under an ``override`` error and the
+    candidate list under ``call-overload`` are what make those errors
+    triageable. Each finding carries its notes in ``notes``. A note with an
+    error code of its own (``annotation-unchecked``) stands alone, as does one
+    with no error before it; those are appended to *standalone_notes* when a
+    list is given. Context notes ("In module imported here:") precede the error
+    they introduce and are attached to that one.
+    """
     findings: list[dict] = []
+    # The finding a following code-less note belongs to; None after anything
+    # that breaks the chain (a summary line, an unparseable line, a coded note).
+    current: dict | None = None
+    pending_context: list[dict] = []
     stats: dict[str, int | None] = {
         "errors": None,
         "files_with_errors": None,
@@ -163,6 +185,7 @@ def parse_output(stdout: str) -> tuple[list[dict], dict]:
             stats.update(
                 errors=0, files_with_errors=0, files_checked=int(clean["checked"])
             )
+            current = None
             continue
         summary = _SUMMARY.search(line)
         if summary:
@@ -171,28 +194,46 @@ def parse_output(stdout: str) -> tuple[list[dict], dict]:
                 files_with_errors=int(summary["files"]),
                 files_checked=int(summary["checked"]),
             )
+            current = None
             continue
         m = _LINE.match(line)
-        if not m or m["severity"] == "note":
+        if not m:
+            current = None
             continue
         code = m["code"] or ""
-        findings.append(
-            {
-                "file": m["file"],
-                "line": int(m["line"]),
-                "column": int(m["col"]) if m["col"] else 0,
-                "severity": m["severity"],
-                "code": code,
-                "message": m["message"],
-                "kind": (
-                    "defect"
-                    if code in _DEFECT_CODES
-                    else "missing-annotation"
-                    if code in _ANNOTATION_CODES
-                    else "other"
-                ),
-            }
-        )
+        if m["severity"] == "note":
+            note = {"file": m["file"], "line": int(m["line"]), "message": m["message"]}
+            if code:
+                note["code"] = code
+            if _CONTEXT_NOTE.match(m["message"].strip()) and not code:
+                pending_context.append(note)
+            elif current is not None and not code:
+                current["notes"].append(note)
+            else:
+                if standalone_notes is not None:
+                    standalone_notes.append(note)
+                current = None
+            continue
+        current = {
+            "file": m["file"],
+            "line": int(m["line"]),
+            "column": int(m["col"]) if m["col"] else 0,
+            "severity": m["severity"],
+            "code": code,
+            "message": m["message"],
+            "kind": (
+                "defect"
+                if code in _DEFECT_CODES
+                else "missing-annotation"
+                if code in _ANNOTATION_CODES
+                else "other"
+            ),
+            "notes": pending_context,
+        }
+        findings.append(current)
+        pending_context = []
+    if standalone_notes is not None:
+        standalone_notes.extend(pending_context)
     return findings, stats
 
 
@@ -342,7 +383,8 @@ def _analyze_with_cache(
     stdout, stderr, returncode = _run_mypy(
         mypy_bin, targets, config, cap_flags, os.path.join(cache_root, "baseline")
     )
-    findings, stats = parse_output(stdout)
+    standalone_notes: list[dict] = []
+    findings, stats = parse_output(stdout, standalone_notes)
 
     # A checker that analyzed nothing is a FAILED run, not a clean one. This is
     # the single most important line in the script: pyrefly reports `0 errors`
@@ -426,6 +468,9 @@ def _analyze_with_cache(
         },
         "findings": findings,
         "phantom_import_findings": phantom_imports,
+        # Notes that belong to no error: `annotation-unchecked` (an annotated
+        # variable inside an untyped function body mypy skips), reveal_type.
+        "standalone_notes": standalone_notes,
     }
 
 

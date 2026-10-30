@@ -140,6 +140,65 @@ class TestParseOutput(unittest.TestCase):
         )
         self.assertEqual(findings, [])
 
+    def test_override_notes_stay_with_their_error(self):
+        """#63: the Superclass/Subclass signatures are what make an `override`
+        error triageable; they used to be dropped."""
+        out = (
+            'a.py:5: error: Signature of "f" incompatible with supertype "A"  '
+            "[override]\n"
+            "a.py:5: note:      Superclass:\n"
+            "a.py:5: note:          def f(self, x: int) -> int\n"
+            "a.py:5: note:      Subclass:\n"
+            "a.py:5: note:          def f(self) -> int\n"
+            'a.py:9: error: Name "y" is not defined  [name-defined]\n'
+            "Found 2 errors in 1 file (checked 1 source file)\n"
+        )
+        findings, stats = mod.parse_output(out)
+        self.assertEqual(len(findings), stats["errors"])
+        self.assertEqual(
+            [n["message"] for n in findings[0]["notes"]],
+            [
+                "     Superclass:",
+                "         def f(self, x: int) -> int",
+                "     Subclass:",
+                "         def f(self) -> int",
+            ],
+        )
+        self.assertEqual(findings[1]["notes"], [])
+
+    def test_a_note_pointing_elsewhere_still_belongs_to_its_error(self):
+        findings, _ = mod.parse_output(
+            'a.py:3: error: Unexpected keyword argument "z" for "f"  [call-arg]\n'
+            'b.py:10: note: "f" defined here\n'
+        )
+        self.assertEqual(findings[0]["notes"][0]["file"], "b.py")
+        self.assertEqual(findings[0]["notes"][0]["line"], 10)
+
+    def test_a_coded_note_stands_alone(self):
+        """`annotation-unchecked` notes carry their own code and follow whatever
+        error came before them in the output; they are not that error's."""
+        standalone: list[dict] = []
+        findings, _ = mod.parse_output(
+            "a.py:3: error: bad  [arg-type]\n"
+            "a.py:40: note: By default the bodies of untyped functions are not "
+            "checked, consider using --check-untyped-defs  [annotation-unchecked]\n"
+            "a.py:41: note: a stray note after a coded note\n",
+            standalone,
+        )
+        self.assertEqual(findings[0]["notes"], [])
+        self.assertEqual(
+            [n.get("code") for n in standalone], ["annotation-unchecked", None]
+        )
+
+    def test_context_note_attaches_to_the_error_it_introduces(self):
+        findings, _ = mod.parse_output(
+            "a.py:1: error: first  [misc]\n"
+            "b.py:1: note: In module imported here:\n"
+            "c.py:4: error: second  [misc]\n"
+        )
+        self.assertEqual(findings[0]["notes"], [])
+        self.assertEqual(findings[1]["notes"][0]["message"], "In module imported here:")
+
     def test_defect_and_annotation_codes_are_distinguished(self):
         findings, _ = mod.parse_output(
             "a.py:1: error: bad [arg-type]\n"
