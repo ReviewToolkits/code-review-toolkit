@@ -640,6 +640,94 @@ class TestGitIntegration(unittest.TestCase):
             self.assertGreater(churn_map["a.py"]["churn_rate"], 0)
 
 
+class TestRenamesSweepsAndDeletions(unittest.TestCase):
+    """Co-change follows renames, discounts sweeps, and flags deleted files."""
+
+    def test_split_rename_forms(self):
+        self.assertEqual(
+            mod.split_rename("src/{a.py => b.py}"), ("src/a.py", "src/b.py")
+        )
+        self.assertEqual(
+            mod.split_rename("{src => lib}/a.py"), ("src/a.py", "lib/a.py")
+        )
+        self.assertEqual(
+            mod.split_rename("src/{ => sub}/a.py"), ("src/a.py", "src/sub/a.py")
+        )
+        self.assertEqual(mod.split_rename("old.py => new.py"), ("old.py", "new.py"))
+        self.assertEqual(mod.split_rename("plain.py"), (None, "plain.py"))
+
+    def test_history_of_a_renamed_file_is_credited_to_its_new_name(self):
+        lines = [
+            "COMMIT:" + "c" * 40 + "|2025-01-03T00:00:00+00:00|A|edit new",
+            "1\t1\tpkg/new.py",
+            "COMMIT:" + "b" * 40 + "|2025-01-02T00:00:00+00:00|A|rename",
+            "0\t0\tpkg/{old.py => new.py}",
+            "COMMIT:" + "a" * 40 + "|2025-01-01T00:00:00+00:00|A|edit old",
+            "2\t0\tpkg/old.py",
+        ]
+        commits, stats = mod.parse_git_log(lines, 100)
+        self.assertEqual([s["file"] for s in stats], ["pkg/new.py"])
+        self.assertEqual(stats[0]["commits"], 3)
+        self.assertEqual(stats[0]["renamed_from"], ["pkg/old.py"])
+        # `files` keeps the path at each commit; `canonical_files` follows.
+        self.assertEqual(commits[2]["files"], ["pkg/old.py"])
+        self.assertEqual(commits[2]["canonical_files"], ["pkg/new.py"])
+
+    def test_sweep_commits_are_discounted(self):
+        sweep = [f"f{i}.py" for i in range(12)]
+        commits = [{"files": ["a.py", "b.py"]} for _ in range(3)]
+        commits += [{"files": ["a.py", "c.py"] + sweep} for _ in range(4)]
+        clusters = mod.compute_co_change_clusters(commits, sweep_files=10)
+        by_pair = {(c["file_a"], c["file_b"]): c for c in clusters}
+        ab, ac = by_pair[("a.py", "b.py")], by_pair[("a.py", "c.py")]
+        self.assertEqual(
+            (ab["co_change_count"], ab["co_change_count_excluding_sweeps"]), (3, 3)
+        )
+        self.assertEqual(
+            (ac["co_change_count"], ac["co_change_count_excluding_sweeps"]), (4, 0)
+        )
+        # Ranked by the focused count: the real pair comes first.
+        self.assertEqual(
+            (clusters[0]["file_a"], clusters[0]["file_b"]), ("a.py", "b.py")
+        )
+
+    def test_deleted_files_are_flagged(self):
+        with GitTempProject(
+            [
+                {"files": {"a.py": "x = 1\n", "gone.py": "y = 1\n"}, "message": "Add"},
+                {"files": {"a.py": "x = 2\n", "gone.py": "y = 2\n"}, "message": "Edit"},
+            ]
+        ) as root:
+            _git(root, "rm", "-q", "gone.py")
+            _git(root, "commit", "-qm", "Drop gone")
+            result = mod.analyze([str(root), "--since", "2000-01-01", "--no-function"])
+        by_file = {f["file"]: f for f in result["file_churn"]}
+        self.assertTrue(by_file["a.py"]["exists_at_head"])
+        self.assertFalse(by_file["gone.py"]["exists_at_head"])
+        self.assertEqual(result["co_change_meta"]["sweep_files_threshold"], 10)
+
+    def test_renamed_file_in_a_real_repo(self):
+        with GitTempProject(
+            [
+                {"files": {"old.py": "x = 1\n"}, "message": "Add"},
+                {"files": {"old.py": "x = 2\n"}, "message": "Edit"},
+            ]
+        ) as root:
+            _git(root, "mv", "old.py", "new.py")
+            _git(root, "commit", "-qm", "Rename")
+            result = mod.analyze([str(root), "--since", "2000-01-01", "--no-function"])
+        files = {
+            f["file"]: f for f in result["file_churn"] if f["file"].endswith(".py")
+        }
+        self.assertEqual(sorted(files), ["new.py"])
+        self.assertEqual(files["new.py"]["commits"], 3)
+        self.assertEqual(files["new.py"]["renamed_from"], ["old.py"])
+
+    def test_sweep_files_flag(self):
+        self.assertEqual(mod.parse_args([])["sweep_files"], 10)
+        self.assertEqual(mod.parse_args(["--sweep-files", "5"])["sweep_files"], 5)
+
+
 class TestParseGitLogStreaming(unittest.TestCase):
     """Test that parse_git_log works with a list of lines (iterable)."""
 

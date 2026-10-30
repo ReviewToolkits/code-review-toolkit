@@ -18,6 +18,8 @@ Options:
                       the output says when the cap applied
     --no-function     Skip function-level churn (file-level only, faster)
     --no-branches     Skip the unmerged remote branch listing
+    --sweep-files N   A commit touching more than N files is a sweep, left
+                      out of co_change_count_excluding_sweeps (default: 10)
     --key-type SPEC   Map tracker-key prefixes, or single keys, to commit
                       types, e.g. B=fix,F=feature or T4-12=fix (repeatable;
                       a key entry overrides its prefix's)
@@ -528,6 +530,28 @@ def _parse_commit_header(payload: str) -> tuple[str, str, str, str, str] | None:
     return parts[0], parts[1], parts[1], parts[2], parts[3]
 
 
+_BRACE_RENAME_RE = re.compile(r"^(.*)\{(.*) => (.*)\}(.*)$")
+
+
+def split_rename(path: str) -> tuple[str | None, str]:
+    """`src/{a.py => b.py}` -> ("src/a.py", "src/b.py"); a plain path -> (None, path).
+
+    `git log --numstat` writes a detected rename in this compact form. It was
+    recorded verbatim, as a file named "src/{a.py => b.py}", so a renamed file's
+    history was split across three names.
+    """
+    if " => " not in path:
+        return None, path
+    brace = _BRACE_RENAME_RE.match(path)
+    if brace:
+        head, old, new, tail = brace.groups()
+        old_path = re.sub("/{2,}", "/", head + old + tail)
+        new_path = re.sub("/{2,}", "/", head + new + tail)
+        return old_path, new_path
+    old_path, _, new_path = path.partition(" => ")
+    return old_path, new_path
+
+
 def parse_git_log(
     lines: Iterable[str],
     max_commits: int,
@@ -549,6 +573,10 @@ def parse_git_log(
     file_changes: dict[str, dict] = {}
     current_commit: dict | None = None
     commit_count = 0
+    # The log runs newest first, so by the time a rename `old => new` is read,
+    # every later commit has already been credited to `new` (or to whatever
+    # `new` became). `alias` sends the older commits of `old` there too.
+    alias: dict[str, str] = {}
 
     for line in lines:
         line = line.rstrip("\n")
@@ -573,19 +601,27 @@ def parse_git_log(
                 "type": detail["type"],
                 "type_source": detail["source"],
                 "keys": detail["keys"],
+                # Paths as they were at this commit (what `git show` needs).
                 "files": [],
+                # The same files under their newest name, following renames.
+                "canonical_files": [],
                 "stats": [],
             }
         elif line.strip() and current_commit is not None:
             parts = line.split("\t", 2)
             if len(parts) == 3:
-                added_str, removed_str, filepath = parts
+                added_str, removed_str, raw_path = parts
                 try:
                     added = int(added_str) if added_str != "-" else 0
                     removed = int(removed_str) if removed_str != "-" else 0
                 except ValueError:
                     continue
+                old_path, filepath = split_rename(raw_path)
+                canonical = alias.get(filepath, filepath)
+                if old_path is not None and old_path != filepath:
+                    alias[old_path] = canonical
                 current_commit["files"].append(filepath)
+                current_commit["canonical_files"].append(canonical)
                 current_commit["stats"].append(
                     {
                         "file": filepath,
@@ -593,16 +629,21 @@ def parse_git_log(
                         "removed": removed,
                     }
                 )
-                if filepath not in file_changes:
-                    file_changes[filepath] = {
+                if canonical not in file_changes:
+                    file_changes[canonical] = {
                         "commits": 0,
                         "lines_added": 0,
                         "lines_removed": 0,
                         "authors": set(),
                         "first_date": date_str,
                         "last_date": date_str,
+                        "renamed_from": set(),
                     }
-                fc = file_changes[filepath]
+                fc = file_changes[canonical]
+                if old_path is not None and old_path != filepath:
+                    fc["renamed_from"].add(old_path)
+                if filepath != canonical:
+                    fc["renamed_from"].add(filepath)
                 fc["commits"] += 1
                 fc["lines_added"] += added
                 fc["lines_removed"] += removed
@@ -617,6 +658,7 @@ def parse_git_log(
         commits.append(current_commit)
 
     # Build file_stats list.
+    head_files = _files_at_head(project_root) if project_root is not None else None
     file_stats: list[dict] = []
     for filepath, fc in file_changes.items():
         if project_root is not None:
@@ -639,12 +681,32 @@ def parse_git_log(
                 # Committer dates: the same clock the window was selected on.
                 "first_commit_in_range": fc["first_date"],
                 "last_modified": fc["last_date"],
+                # False for a file deleted since (None: not checked). Renamed
+                # files are listed under their newest name.
+                "exists_at_head": (
+                    None if head_files is None else filepath in head_files
+                ),
+                "renamed_from": sorted(fc["renamed_from"]),
             }
         )
 
     # Sort by commits descending.
     file_stats.sort(key=lambda x: x["commits"], reverse=True)
     return commits, file_stats
+
+
+def _files_at_head(project_root: Path) -> set[str] | None:
+    """Repo-relative paths tracked at HEAD, or None if git cannot say."""
+    try:
+        result = _run_git(
+            ["-c", "core.quotepath=off", "ls-tree", "-r", "--name-only", "HEAD"],
+            git_toplevel(project_root),
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    return set(result.stdout.splitlines())
 
 
 def _get_file_line_count(filepath: Path) -> int:
@@ -1277,41 +1339,72 @@ def get_commit_details(
     return results
 
 
+# A commit touching more files than this is a sweep (a reformat, a rename, a
+# lint pass, a version bump): it makes every pair of its files "co-change"
+# without saying anything about coupling.
+SWEEP_FILES = 10
+
+
 def compute_co_change_clusters(
     commits: list[dict],
     min_co_changes: int = 3,
     max_pairs: int = 30,
+    sweep_files: int = SWEEP_FILES,
+    head_files: set[str] | None = None,
 ) -> list[dict]:
-    """Detect file pairs that frequently change together."""
+    """Detect file pairs that frequently change together.
+
+    Files are counted under their newest name (renames followed).
+    `co_change_count` counts every commit; `co_change_count_excluding_sweeps`
+    leaves out commits touching more than `sweep_files` files, and pairs are
+    ranked by it. On a validation project the top pair lost close to half of
+    its count once sweeps were set aside.
+    """
     # Count per-file commits.
     file_commit_counts: dict[str, int] = defaultdict(int)
-    # Count co-occurrences.
+    # Count co-occurrences, with and without sweep commits.
     co_changes: dict[tuple[str, str], int] = defaultdict(int)
+    co_changes_focused: dict[tuple[str, str], int] = defaultdict(int)
 
     for commit in commits:
-        files = sorted(set(commit["files"]))
+        files = sorted(set(commit.get("canonical_files") or commit["files"]))
+        sweep = len(files) > sweep_files
         for f in files:
             file_commit_counts[f] += 1
         for i in range(len(files)):
             for j in range(i + 1, len(files)):
                 pair = (files[i], files[j])
                 co_changes[pair] += 1
+                if not sweep:
+                    co_changes_focused[pair] += 1
 
     # Filter and sort.
     results: list[dict] = []
     for (file_a, file_b), count in co_changes.items():
         if count >= min_co_changes:
-            results.append(
-                {
-                    "file_a": file_a,
-                    "file_b": file_b,
-                    "co_change_count": count,
-                    "total_commits_a": file_commit_counts[file_a],
-                    "total_commits_b": file_commit_counts[file_b],
-                }
-            )
+            entry = {
+                "file_a": file_a,
+                "file_b": file_b,
+                "co_change_count": count,
+                "co_change_count_excluding_sweeps": co_changes_focused[
+                    (file_a, file_b)
+                ],
+                "total_commits_a": file_commit_counts[file_a],
+                "total_commits_b": file_commit_counts[file_b],
+            }
+            if head_files is not None:
+                entry["exists_at_head_a"] = file_a in head_files
+                entry["exists_at_head_b"] = file_b in head_files
+            results.append(entry)
 
-    results.sort(key=lambda x: x["co_change_count"], reverse=True)
+    results.sort(
+        key=lambda x: (
+            -x["co_change_count_excluding_sweeps"],
+            -x["co_change_count"],
+            x["file_a"],
+            x["file_b"],
+        )
+    )
     return results[:max_pairs]
 
 
@@ -1594,6 +1687,7 @@ def parse_args(argv: list[str]) -> dict:
         "max_files": 0,
         "no_function": False,
         "no_branches": False,
+        "sweep_files": SWEEP_FILES,
         "key_types": {},
         "unknown_args": [],
     }
@@ -1643,6 +1737,16 @@ def parse_args(argv: list[str]) -> dict:
             except ValueError:
                 print(
                     f"Error: --max-files requires an integer, got '{argv[i + 1]}'",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            i += 2
+        elif arg == "--sweep-files" and i + 1 < len(argv):
+            try:
+                args["sweep_files"] = int(argv[i + 1])
+            except ValueError:
+                print(
+                    f"Error: --sweep-files requires an integer, got '{argv[i + 1]}'",
                     file=sys.stderr,
                 )
                 sys.exit(2)
@@ -1706,6 +1810,9 @@ def analyze(argv: list[str] | None = None) -> dict:
     # Parse git log.
     git_args = [
         "log",
+        # Detect renames whatever diff.renames says, so a renamed file keeps
+        # its history (see split_rename).
+        "-M",
         "--numstat",
         f"--format={LOG_FORMAT}",
     ]
@@ -1817,7 +1924,16 @@ def analyze(argv: list[str] | None = None) -> dict:
     attribution_meta = attributor.meta()
 
     # Co-change clusters.
-    co_change_clusters = compute_co_change_clusters(commits)
+    head_files = _files_at_head(project_root)
+    sweep_files = args["sweep_files"]
+    co_change_clusters = compute_co_change_clusters(
+        commits, sweep_files=sweep_files, head_files=head_files
+    )
+    sweep_commits = sum(
+        1
+        for c in commits
+        if len(set(c.get("canonical_files") or c["files"])) > sweep_files
+    )
 
     if args["no_branches"]:
         unmerged = {
@@ -1878,6 +1994,12 @@ def analyze(argv: list[str] | None = None) -> dict:
         "recent_features": recent_features,
         "recent_refactors": recent_refactors,
         "co_change_clusters": co_change_clusters,
+        "co_change_meta": {
+            "sweep_files_threshold": sweep_files,
+            "sweep_commits": sweep_commits,
+            "ranked_by": "co_change_count_excluding_sweeps",
+            "renames_followed": True,
+        },
         "unmerged_branches": unmerged,
         "notes": [],
     }
