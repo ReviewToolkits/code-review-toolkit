@@ -626,7 +626,7 @@ class TestParseArgs(unittest.TestCase):
         self.assertIsNone(args.skip)
         self.assertEqual(args.max_findings, 200)
         self.assertFalse(args.mypy_strict)
-        self.assertEqual(args.vulture_min_confidence, 80)
+        self.assertEqual(args.vulture_min_confidence, 60)
         self.assertFalse(args.ignore_config)
 
     def test_tools_flag(self):
@@ -650,8 +650,8 @@ class TestParseArgs(unittest.TestCase):
         self.assertTrue(args.mypy_strict)
 
     def test_vulture_min_confidence(self):
-        args = mod.parse_args(["--vulture-min-confidence", "60"])
-        self.assertEqual(args.vulture_min_confidence, 60)
+        args = mod.parse_args(["--vulture-min-confidence", "80"])
+        self.assertEqual(args.vulture_min_confidence, 80)
 
     def test_ignore_config(self):
         args = mod.parse_args(["--ignore-config"])
@@ -802,6 +802,279 @@ class TestRunToolSafely(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# The reviewed project is left untouched
+# ---------------------------------------------------------------------------
+
+
+class TestNoCacheInReviewedProject(unittest.TestCase):
+    """Neither ruff nor mypy may leave a cache directory in the project."""
+
+    def test_ruff_runs_without_a_cache(self):
+        with TempProject({"m.py": "x = 1\n"}) as root:
+            with patch.object(mod.subprocess, "run") as run:
+                run.return_value = MagicMock(stdout="[]", stderr="")
+                mod.run_ruff(mod.parse_args([str(root)]), root, root)
+            for call in run.call_args_list:
+                self.assertIn("--no-cache", call.args[0])
+
+    def test_mypy_cache_is_private_and_removed(self):
+        seen: dict = {}
+
+        def fake_run(cmd, **kwargs):
+            cache = Path(cmd[cmd.index("--cache-dir") + 1])
+            seen["cache"] = cache
+            seen["existed_during_run"] = cache.is_dir()
+            (cache / "3.14").mkdir()  # mypy populates it
+            return MagicMock(stdout="", stderr="")
+
+        with TempProject({"m.py": "x = 1\n"}) as root:
+            with patch.object(mod.subprocess, "run", side_effect=fake_run):
+                mod.run_mypy(mod.parse_args([str(root)]), root, root)
+            self.assertTrue(seen["existed_during_run"])
+            self.assertFalse(seen["cache"].is_relative_to(root))
+            self.assertFalse(seen["cache"].exists(), "cache left behind")
+            self.assertFalse((root / ".mypy_cache").exists())
+
+    def test_mypy_cache_is_removed_even_when_mypy_times_out(self):
+        seen: dict = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cache"] = Path(cmd[cmd.index("--cache-dir") + 1])
+            raise subprocess.TimeoutExpired(cmd, 300)
+
+        with (
+            TempProject({"m.py": "x = 1\n"}) as root,
+            patch.object(mod.subprocess, "run", side_effect=fake_run),
+        ):
+            result = mod.run_tool_safely("mypy", mod.parse_args([str(root)]), root, root)
+        self.assertIn("timed out", result["error"])
+        self.assertFalse(seen["cache"].exists())
+
+
+# ---------------------------------------------------------------------------
+# Known ruff false positive: except-binding read from a closure (#22)
+# ---------------------------------------------------------------------------
+
+EXCEPT_CLOSURE_SOURCE = """\
+def retry(fn):
+    return fn(None)
+
+def f(job):
+    try:
+        job()
+    except Exception as exc:
+        retry(lambda c: str(exc))
+
+def g(job):
+    try:
+        job()
+    except Exception as exc:
+        def report():
+            return f"failed: {exc}"
+        report()
+
+def h():
+    return undefined_name
+
+def k(job):
+    try:
+        job()
+    except Exception as exc:
+        pass
+
+def m(job):
+    try:
+        job()
+    except Exception as exc:
+        pass
+    return lambda: exc
+"""
+
+
+def _ruff_hit(root, code, line, name):
+    message = {
+        "F821": f"Undefined name `{name}`",
+        "F841": f"Local variable `{name}` is assigned to but never used",
+    }[code]
+    return {
+        "code": code,
+        "filename": str(root / "m.py"),
+        "location": {"row": line, "column": 1},
+        "message": message,
+        "fix": {"applicability": "unsafe"} if code == "F841" else None,
+    }
+
+
+class TestExceptClosureFalsePositive(unittest.TestCase):
+    """ruff 0.16.0 flags `exc` read by a closure inside its own handler."""
+
+    def _run(self, hits):
+        with TempProject({"m.py": EXCEPT_CLOSURE_SOURCE}) as root:
+            hits = [_ruff_hit(root, *h) for h in hits]
+            with patch.object(mod.subprocess, "run") as run:
+                run.return_value = MagicMock(stdout=json.dumps(hits), stderr="")
+                out = mod.run_ruff(
+                    mod.parse_args([str(root), "--ruff-rules", "F"]), root, root
+                )
+        return {(f["rule"], f["line"]): f for f in out["findings"]}, out
+
+    def test_closure_reads_are_labelled_not_bug_risk(self):
+        by_site, out = self._run([("F821", 8, "exc"), ("F821", 15, "exc")])
+        for site in (("F821", 8), ("F821", 15)):
+            with self.subTest(site=site):
+                hit = by_site[site]
+                self.assertEqual(hit["category"], "suspected-tool-false-positive")
+                self.assertTrue(hit["suspect_tool_bug"])
+                self.assertEqual(hit["known_tool_issue"], "ruff#6878")
+                self.assertIn("escapes", hit["tool_bug_note"])
+        self.assertEqual(out["suspected_tool_false_positives"], 2)
+
+    def test_matching_f841_autofix_is_flagged_unsafe(self):
+        by_site, _ = self._run([("F841", 7, "exc"), ("F841", 13, "exc")])
+        for site in (("F841", 7), ("F841", 13)):
+            with self.subTest(site=site):
+                hit = by_site[site]
+                self.assertTrue(hit["autofix_unsafe"])
+                self.assertEqual(hit["category"], "suspected-tool-false-positive")
+                self.assertIn("NameError", hit["tool_bug_note"])
+
+    def test_genuine_undefined_name_stays_bug_risk(self):
+        by_site, out = self._run([("F821", 19, "undefined_name")])
+        self.assertEqual(by_site[("F821", 19)]["category"], "bug-risk")
+        self.assertNotIn("suspect_tool_bug", by_site[("F821", 19)])
+        self.assertEqual(out["suspected_tool_false_positives"], 0)
+
+    def test_closure_escaping_the_handler_stays_bug_risk(self):
+        # `return lambda: exc` AFTER the handler: exc is deleted by then, so
+        # this F821 is a real NameError.
+        by_site, _ = self._run([("F821", 32, "exc")])
+        self.assertEqual(by_site[("F821", 32)]["category"], "bug-risk")
+
+    def test_genuinely_unused_binding_keeps_its_autofix(self):
+        by_site, _ = self._run([("F841", 24, "exc")])
+        hit = by_site[("F841", 24)]
+        self.assertEqual(hit["category"], "dead-code")
+        self.assertNotIn("autofix_unsafe", hit)
+
+
+# ---------------------------------------------------------------------------
+# Toolkit-selected second ruff pass for the category feeds (#38/#66)
+# ---------------------------------------------------------------------------
+
+FEED_SOURCE = """\
+from fastapi import Depends
+
+def route(db=Depends(get_db), items=[]):
+    if items:
+        return True
+    else:
+        return False
+
+x = "%s" % db
+"""
+
+
+def _hit(root, code, line, column, message="m"):
+    return {
+        "code": code,
+        "filename": str(root / "app.py"),
+        "location": {"row": line, "column": column},
+        "message": message,
+        "fix": None,
+    }
+
+
+class TestToolkitRuffPass(unittest.TestCase):
+    """A narrow project selection must not leave the agents' feeds empty."""
+
+    PYPROJECT = '[project]\nname = "x"\n\n[tool.ruff.lint]\nselect = ["B006"]\n'
+
+    def _run(self, argv=(), pyproject=PYPROJECT, toolkit_error=None):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            toolkit = "--select" in cmd and "UP" in cmd[cmd.index("--select") + 1]
+            if toolkit and toolkit_error:
+                raise toolkit_error
+            hits = [_hit(root, "B006", 3, 37)]  # the project's own rule
+            if toolkit:
+                hits += [
+                    _hit(root, "B008", 3, 14),  # FastAPI marker: dismissed
+                    _hit(root, "SIM103", 4, 5),
+                    _hit(root, "UP031", 9, 5),
+                ]
+            return MagicMock(stdout=json.dumps(hits), stderr="")
+
+        with TempProject({"app.py": FEED_SOURCE}) as root:
+            (root / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+            with patch.object(mod.subprocess, "run", side_effect=fake_run):
+                out = mod.run_ruff(mod.parse_args([str(root), *argv]), root, root)
+        return out, calls
+
+    def test_feeds_are_filled_and_labelled_as_the_toolkits(self):
+        out, _ = self._run()
+        by_rule = {f["rule"]: f for f in out["findings"]}
+        self.assertEqual(by_rule["B006"]["selection"], "project")
+        self.assertEqual(by_rule["SIM103"]["selection"], "toolkit")
+        self.assertEqual(by_rule["SIM103"]["category"], "simplification")
+        self.assertEqual(by_rule["UP031"]["category"], "deprecated")
+        meta = out["toolkit_pass"]
+        self.assertTrue(meta["ran"])
+        self.assertIn("UP", meta["selection"]["deprecated"])
+        self.assertIn("NOT the project's", meta["note"])
+        self.assertEqual(meta["by_category"], {"deprecated": 1, "simplification": 1})
+        # The project's own numbers still describe the project's pass only.
+        self.assertEqual(out["total_findings"], 1)
+        self.assertEqual(out["rules_applied"], ["B006"])
+
+    def test_project_hits_are_not_reported_twice(self):
+        out, _ = self._run()
+        self.assertEqual(sum(f["rule"] == "B006" for f in out["findings"]), 1)
+        self.assertEqual(out["toolkit_pass"]["duplicates_of_project_findings"], 1)
+
+    def test_fastapi_markers_are_counted_not_fed(self):
+        out, _ = self._run()
+        self.assertNotIn("B008", {f["rule"] for f in out["findings"]})
+        self.assertEqual(
+            out["toolkit_pass"]["dismissed"], {"fastapi-dependency-marker": 1}
+        )
+
+    def test_toolkit_command_keeps_the_project_config_and_no_cache(self):
+        _, calls = self._run()
+        toolkit_cmd = calls[1]
+        self.assertIn("--no-cache", toolkit_cmd)
+        self.assertNotIn("--isolated", toolkit_cmd)
+        # target-version comes from the project's config.
+        self.assertNotIn("--target-version", toolkit_cmd)
+
+    def test_without_a_ruff_config_the_target_version_is_pinned(self):
+        _, calls = self._run(
+            pyproject='[project]\nname = "x"\nrequires-python = ">=3.11"\n'
+        )
+        toolkit_cmd = calls[1]
+        index = toolkit_cmd.index("--target-version")
+        self.assertEqual(toolkit_cmd[index + 1], "py311")
+
+    def test_explicit_rules_or_the_flag_skip_the_pass(self):
+        for argv, reason in (
+            (["--ruff-rules", "F"], "explicit --ruff-rules selection"),
+            (["--no-toolkit-ruff-pass"], "--no-toolkit-ruff-pass"),
+        ):
+            with self.subTest(argv=argv):
+                out, calls = self._run(argv)
+                self.assertEqual(len(calls), 1)
+                self.assertFalse(out["toolkit_pass"]["ran"])
+                self.assertEqual(out["toolkit_pass"]["skipped_reason"], reason)
+
+    def test_a_failed_toolkit_pass_keeps_the_project_findings(self):
+        out, _ = self._run(toolkit_error=subprocess.TimeoutExpired("ruff", 120))
+        self.assertEqual([f["rule"] for f in out["findings"]], ["B006"])
+        self.assertFalse(out["toolkit_pass"]["ran"])
+        self.assertIn("failed", out["toolkit_pass"]["error"])
+
+
+# ---------------------------------------------------------------------------
 # Integration: full pipeline with mocked tools
 # ---------------------------------------------------------------------------
 
@@ -861,6 +1134,121 @@ class TestBuildSkippedReport(unittest.TestCase):
         self.assertEqual(reasons["mypy"], "not installed")
         self.assertEqual(reasons["vulture"], "excluded by user")
         self.assertEqual(reasons["coverage"], "not installed")
+
+
+FAKE_RUFF = """\
+#!{python}
+import sys
+
+if {fail}:
+    # What a sandboxed (snap) ruff prints for a path it cannot see.
+    sys.stderr.write(
+        "warning: Failed to lint " + sys.argv[-1] + ": No such file or directory"
+        " (os error 2)\\n"
+    )
+sys.stdout.write("[]")
+"""
+
+
+class TestUnlintedPaths(unittest.TestCase):
+    """ruff exits 0 with no findings for a path it could not read."""
+
+    def _run(self, *, fail):
+        import sys
+        import tempfile
+
+        with (
+            tempfile.TemporaryDirectory() as bindir,
+            TempProject({"m.py": "x = 1\n"}) as root,
+        ):
+            ruff = Path(bindir) / "ruff"
+            ruff.write_text(
+                FAKE_RUFF.format(python=sys.executable, fail=fail), encoding="utf-8"
+            )
+            os.chmod(ruff, 0o755)
+            path = bindir + os.pathsep + os.environ.get("PATH", "")
+            with patch.dict(os.environ, {"PATH": path}):
+                return mod.run_ruff(mod.parse_args([str(root)]), root, root)
+
+    def test_failed_to_lint_is_an_error_not_a_clean_result(self):
+        out = self._run(fail=True)
+        self.assertIn("could not read", out["error"])
+        self.assertEqual(len(out["unlinted"]), 1)
+        self.assertIn("could not read", out["toolkit_pass"]["error"])
+        self.assertEqual(len(out["toolkit_pass"]["unlinted"]), 1)
+
+    def test_a_clean_run_has_no_error(self):
+        out = self._run(fail=False)
+        self.assertNotIn("error", out)
+        self.assertEqual(out["unlinted"], [])
+        self.assertNotIn("error", out["toolkit_pass"])
+
+
+VULTURE_OUTPUT = """\
+pkg/a.py:3: unused import 'os' (90% confidence)
+pkg/a.py:10: unused method '_open_writer' (60% confidence)
+pkg/a.py:20: unused function 'helper' (60% confidence)
+pkg/a.py:30: unused variable 'exc_tb' (100% confidence)
+"""
+
+
+class TestVultureConfidence(unittest.TestCase):
+    """Unused methods are scored 60% by vulture: the default must keep them."""
+
+    def _run(self, argv=()):
+        with (
+            TempProject({"pkg/a.py": "x = 1\n"}) as root,
+            patch.object(mod.subprocess, "run") as run,
+        ):
+            run.return_value = MagicMock(stdout=VULTURE_OUTPUT, stderr="")
+            out = mod.run_vulture(mod.parse_args([str(root), *argv]), root, root)
+        return out, run.call_args.args[0]
+
+    def test_default_threshold_keeps_unused_methods(self):
+        _, cmd = self._run()
+        self.assertIn("--min-confidence=60", cmd)
+
+    def test_confidence_is_reported_per_hit_and_bucketed(self):
+        out, _ = self._run()
+        self.assertEqual(
+            {f["name"]: f["confidence"] for f in out["findings"]},
+            {"os": 90, "_open_writer": 60, "helper": 60, "exc_tb": 100},
+        )
+        self.assertEqual(out["by_confidence"], {"100": 1, "90": 1, "60": 2})
+        self.assertEqual(
+            out["by_type"],
+            {
+                "unused-function": 1,
+                "unused-import": 1,
+                "unused-method": 1,
+                "unused-variable": 1,
+            },
+        )
+
+    def test_capping_is_reported_and_buckets_count_every_hit(self):
+        out, _ = self._run(["--max-findings", "2"])
+        self.assertEqual(len(out["findings"]), 2)
+        self.assertEqual(out["total_findings"], 4)
+        self.assertTrue(out["findings_capped"])
+        self.assertEqual(sum(out["by_confidence"].values()), 4)
+
+    def test_mypy_capping_is_reported(self):
+        lines = "\n".join(f"a.py:{i}: error: Bad [misc]" for i in range(5))
+        with (
+            TempProject({"a.py": "x = 1\n"}) as root,
+            patch.object(mod.subprocess, "run") as run,
+        ):
+            run.return_value = MagicMock(stdout=lines, stderr="")
+            out = mod.run_mypy(
+                mod.parse_args([str(root), "--max-findings", "2"]), root, root
+            )
+        self.assertEqual(len(out["findings"]), 2)
+        self.assertEqual(out["total_findings"], 5)
+        self.assertTrue(out["findings_capped"])
+
+    def test_an_explicit_threshold_is_still_honoured(self):
+        _, cmd = self._run(["--vulture-min-confidence", "80"])
+        self.assertIn("--min-confidence=80", cmd)
 
 
 class TestEarlyStopParsing(unittest.TestCase):

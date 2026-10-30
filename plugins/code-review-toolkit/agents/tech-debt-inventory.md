@@ -36,6 +36,8 @@ If external tool output is available (from `run_external_tools.py`), incorporate
 
 ### Ruff Deprecated-Pattern Findings
 
+Each ruff finding carries `selection`. `project` (or `ruff-default` / `explicit`) marks the project's own ruff pass. `toolkit` marks the second pass described in `ruff.toolkit_pass`, which fills this feed even when the project's config selects none of these rules. A `toolkit` hit is a rule the project did not opt into: judge it on its own merits, never as a breach of the project's conventions.
+
 Filter the ruff output for `category: "deprecated"` findings:
 
 - **`UP` rules**: Outdated syntax for the project's minimum Python version — old-style string formatting, deprecated typing imports, unnecessary encoding arguments, legacy super() calls, etc.

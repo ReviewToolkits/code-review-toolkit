@@ -52,14 +52,15 @@ Filter the ruff output for `category: "dead-code"` findings:
 
 **Auto-fixable findings** (significance: "reduced"): ruff can auto-fix `F401` and some `F841` findings. Include these but classify as CONSIDER rather than FIX unless our script also flags them with high confidence (in which case classify as FIX — the double detection increases confidence).
 
-**Never recommend the F841 autofix on an `except ... as NAME` binding without reading the handler.** If NAME is used inside a lambda or nested def in that handler, the linter is wrong (it doesn't see the closure use; ruff reports a matching F821 there), and the autofix deletes `as NAME`, turning the error path into a `NameError`. Report these as false positives, and as a hazard if the project runs `--fix` anywhere (shape `linter-autofix-breaks-closure-capture`). The same caution applies to any "unused" name whose only use is in a closure.
+**Never recommend the F841 autofix on an `except ... as NAME` binding without reading the handler.** If NAME is used inside a lambda or nested def in that handler, the linter is wrong (it doesn't see the closure use; ruff reports a matching F821 there), and the autofix deletes `as NAME`, turning the error path into a `NameError`. `run_external_tools.py` marks the ones it recognizes with `autofix_unsafe: true` and `category: "suspected-tool-false-positive"` (not `dead-code`); never recommend a fix so marked. Report these as false positives, and as a hazard if the project runs `--fix` anywhere (shape `linter-autofix-breaks-closure-capture`). The same caution applies to any "unused" name whose only use is in a closure.
 
 ### Vulture Findings
 
 Filter vulture output for all findings:
 - Merge vulture's unused functions/variables with the script's output
 - Vulture catches unused code inside function bodies that our script misses (unused local variables, unreachable code after returns)
-- Vulture uses confidence percentages — map 90%+ to high confidence, 80-89% to medium confidence
+- Vulture uses confidence percentages, and every finding carries its own `confidence`. `vulture.by_confidence` and `vulture.by_type` bucket them. Map 90%+ to high confidence and 80-89% to medium.
+- **60% is where unused functions, methods, classes and attributes live.** Vulture scores them no higher, because it cannot see dynamic dispatch. The script runs at `--min-confidence 60` so they appear; at 80 every one was dropped. Treat a 60% hit as a candidate, not a finding: Grep for the name (including `getattr` strings, framework registration, and tests) before you classify it.
 
 **Deduplication**: When vulture and our script flag the same symbol, merge and note both sources. When they disagree (one flags, the other doesn't), investigate the discrepancy and use your judgment.
 

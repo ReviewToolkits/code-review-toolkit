@@ -54,6 +54,18 @@ class TestRuleToShape(unittest.TestCase):
             with self.subTest(code=code):
                 self.assertIn(shape, known)
 
+    def test_catalogued_zip_and_datetime_shapes_are_mapped(self):
+        # Unmapped, these were harvested as novel shapes although the catalog
+        # already had them (the B019 failure, repeated).
+        expected = {
+            "B905": "zip-truncates-on-length-mismatch",
+            "DTZ005": "naive-datetime-in-a-persisted-artifact",
+            "DTZ006": "naive-datetime-in-a-persisted-artifact",
+        }
+        for code, shape in expected.items():
+            with self.subTest(code=code):
+                self.assertEqual(mod.RULE_TO_SHAPE.get(code), shape)
+
 
 class TestSuppressionDetection(unittest.TestCase):
     """`has_suppression_comment` is the measured dismissal signal."""
@@ -92,7 +104,7 @@ class TestNormalize(unittest.TestCase):
         from pathlib import Path
 
         out = mod.normalize(
-            {"code": "B905", "filename": None, "location": None, "message": "m"},
+            {"code": "S608", "filename": None, "location": None, "message": "m"},
             Path("/p"),
             tier=1,
             cache={},
@@ -100,11 +112,266 @@ class TestNormalize(unittest.TestCase):
         self.assertIsNone(out["shape_id"])
 
 
+class TestRuffInvocation(unittest.TestCase):
+    """The ruff command line: what the reviewed project is exposed to."""
+
+    def _cmd(self):
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+
+        with patch.object(mod.subprocess, "run") as run:
+            run.return_value = MagicMock(stdout="[]", stderr="")
+            mod._run_ruff("ruff", ["F821"], Path("/p"), preview=False)
+        return run.call_args.args[0]
+
+    def test_ruff_never_writes_a_cache_into_the_project(self):
+        # Without --no-cache ruff leaves `.ruff_cache/` in the reviewed checkout.
+        self.assertIn("--no-cache", self._cmd())
+
+    def test_selection_is_still_isolated_and_explicit(self):
+        cmd = self._cmd()
+        self.assertIn("--isolated", cmd)
+        self.assertIn("--select", cmd)
+        self.assertNotIn("--extend-select", cmd)
+
+
+def _fake_hit(root, relpath, line, needle, code="B008"):
+    """A ruff JSON finding at the first *needle* on *line* (1-based columns)."""
+    path = root / relpath
+    text = path.read_text(encoding="utf-8").splitlines()[line - 1]
+    return {
+        "code": code,
+        "filename": str(path),
+        "location": {"row": line, "column": text.index(needle) + 1},
+        "message": f"hit on `{needle}`",
+    }
+
+
+def _analyze_with_fake_ruff(root, hits):
+    from unittest.mock import patch
+
+    with (
+        patch.object(mod, "ruff_version", return_value=mod.PINNED_RUFF_VERSION),
+        patch.object(
+            mod,
+            "validate_rules",
+            return_value={"ok": [], "unknown": [], "removed": [], "preview_gated": []},
+        ),
+        patch.object(mod, "_run_ruff", return_value=(hits, "", None)),
+    ):
+        return mod.analyze(str(root))
+
+
+class TestFastapiMarkerDismissal(unittest.TestCase):
+    """B008 on a FastAPI dependency marker is the framework's idiom (#26)."""
+
+    ROUTES = (
+        "from fastapi import Depends, Query as Q\n"
+        "import fastapi\n"
+        "\n"
+        "def route(db=Depends(get_db), q: str = Q(None)):\n"
+        "    pass\n"
+        "\n"
+        "def other(x=fastapi.Security(scheme)):\n"
+        "    pass\n"
+        "\n"
+        "def café(n=Depends(get_n)):\n"
+        "    pass\n"
+        "\n"
+        "def real(items=make_list()):\n"
+        "    pass\n"
+    )
+
+    def test_markers_are_dismissed_with_a_reason_and_counted(self):
+        from helpers import TempProject
+
+        with TempProject({"routes.py": self.ROUTES}) as root:
+            hits = [
+                _fake_hit(root, "routes.py", 4, "Depends("),
+                _fake_hit(root, "routes.py", 4, "Q("),
+                _fake_hit(root, "routes.py", 7, "fastapi.Security("),
+                # Non-ASCII before the call: ruff counts characters, ast bytes.
+                _fake_hit(root, "routes.py", 10, "Depends("),
+            ]
+            result = _analyze_with_fake_ruff(root, hits)
+        self.assertEqual(result["findings"], [])
+        self.assertEqual(len(result["dismissed"]), 4)
+        for hit in result["dismissed"]:
+            self.assertEqual(hit["dismissal_reason"], "fastapi-dependency-marker")
+        summary = result["summary"]
+        self.assertEqual(summary["total"], 4)
+        self.assertEqual(summary["reported"], 0)
+        self.assertEqual(summary["dismissed"], 4)
+        self.assertEqual(
+            summary["dismissed_by_reason"], {"fastapi-dependency-marker": 4}
+        )
+        # A dismissed hit is not a shape overlap to merge.
+        self.assertEqual(summary["overlaps_a_shape"], 0)
+        self.assertIn("fastapi-dependency-marker", result["dismissal_reasons"])
+
+    def test_a_real_call_default_in_a_fastapi_file_is_still_reported(self):
+        from helpers import TempProject
+
+        with TempProject({"routes.py": self.ROUTES}) as root:
+            result = _analyze_with_fake_ruff(
+                root, [_fake_hit(root, "routes.py", 13, "make_list(")]
+            )
+        self.assertEqual(len(result["findings"]), 1)
+        self.assertEqual(result["dismissed"], [])
+
+    def test_a_marker_name_not_imported_from_fastapi_is_still_reported(self):
+        from helpers import TempProject
+
+        source = (
+            "from fastapi import APIRouter\n"
+            "from mylib import Query\n"
+            "\n"
+            "class Depends:\n"
+            "    pass\n"
+            "\n"
+            "def f(a=Depends(), b=Query()):\n"
+            "    pass\n"
+        )
+        with TempProject({"m.py": source}) as root:
+            result = _analyze_with_fake_ruff(
+                root,
+                [
+                    _fake_hit(root, "m.py", 7, "Depends("),
+                    _fake_hit(root, "m.py", 7, "Query("),
+                ],
+            )
+        self.assertEqual(len(result["findings"]), 2)
+        self.assertEqual(result["summary"]["dismissed"], 0)
+
+    def test_other_codes_on_a_marker_line_are_not_dismissed(self):
+        from helpers import TempProject
+
+        with TempProject({"routes.py": self.ROUTES}) as root:
+            result = _analyze_with_fake_ruff(
+                root, [_fake_hit(root, "routes.py", 4, "Depends(", code="B006")]
+            )
+        self.assertEqual(len(result["findings"]), 1)
+
+
+class TestExceptClosureFlag(unittest.TestCase):
+    """F821 on an except binding read by a closure in its handler (ruff#6878)."""
+
+    SOURCE = (
+        "def f(job, retry):\n"
+        "    try:\n"
+        "        job()\n"
+        "    except Exception as exc:\n"
+        "        retry(lambda c: str(exc))\n"
+        "    return missing\n"
+    )
+
+    def test_closure_read_is_flagged_but_kept_for_triage(self):
+        from helpers import TempProject
+
+        with TempProject({"m.py": self.SOURCE}) as root:
+            result = _analyze_with_fake_ruff(
+                root,
+                [
+                    _fake_hit(root, "m.py", 5, "exc", code="F821"),
+                    _fake_hit(root, "m.py", 6, "missing", code="F821"),
+                ],
+            )
+        by_line = {f["line"]: f for f in result["findings"]}
+        # Flagged, not dismissed: an escaping closure makes the same F821 real.
+        self.assertEqual(len(result["findings"]), 2)
+        self.assertTrue(by_line[5]["suspect_tool_bug"])
+        self.assertEqual(by_line[5]["known_tool_issue"], "ruff#6878")
+        self.assertNotIn("suspect_tool_bug", by_line[6])
+        self.assertEqual(result["summary"]["suspect_tool_bug"], 1)
+        # The genuine F821 keeps F821 a novel-shape candidate ...
+        self.assertEqual(result["summary"]["novel_shape_candidates"], ["F821"])
+
+    def test_a_known_tool_bug_alone_is_not_a_novel_shape(self):
+        from helpers import TempProject
+
+        with TempProject({"m.py": self.SOURCE}) as root:
+            result = _analyze_with_fake_ruff(
+                root, [_fake_hit(root, "m.py", 5, "exc", code="F821")]
+            )
+        self.assertEqual(result["summary"]["novel_shape_candidates"], [])
+
+
 class TestMissingRuff(unittest.TestCase):
     def test_absent_binary_is_an_error_not_an_empty_result(self):
         result = mod.analyze(".", ruff_bin="definitely-not-a-real-ruff-binary")
         self.assertIn("error", result)
         self.assertEqual(result["findings"], [])
+
+
+FAKE_RUFF = """\
+#!{python}
+import sys
+
+args = sys.argv[1:]
+if args[:1] == ["--version"]:
+    print("ruff 0.16.0")
+elif args[:1] == ["rule"]:
+    print("[]")
+else:
+    if {fail}:
+        # What a sandboxed (snap) ruff prints for a path it cannot see.
+        sys.stderr.write(
+            "warning: Failed to lint " + args[-1] + ": No such file or directory"
+            " (os error 2)\\n"
+        )
+    sys.stdout.write("[]")
+"""
+
+
+def write_fake_ruff(directory, *, fail):
+    """An executable `ruff` in *directory*; *fail* makes it skip every path."""
+    import os
+    import sys
+    from pathlib import Path
+
+    path = Path(directory) / "ruff"
+    path.write_text(
+        FAKE_RUFF.format(python=sys.executable, fail=fail), encoding="utf-8"
+    )
+    os.chmod(path, 0o755)
+    return path
+
+
+class TestUnlintedPaths(unittest.TestCase):
+    """ruff exits 0 with no findings for a path it could not read."""
+
+    def _analyze(self, *, fail):
+        import tempfile
+
+        from helpers import TempProject
+
+        with (
+            tempfile.TemporaryDirectory() as bindir,
+            TempProject({"m.py": "x = 1\n"}) as root,
+        ):
+            ruff = write_fake_ruff(bindir, fail=fail)
+            return mod.analyze(str(root), ruff_bin=str(ruff)), root
+
+    def test_failed_to_lint_is_an_error_not_a_clean_result(self):
+        result, root = self._analyze(fail=True)
+        self.assertIn("could not read", result["error"])
+        self.assertEqual(result["unlinted"][0]["path"], str(root.resolve()))
+        self.assertIn("No such file", result["unlinted"][0]["reason"])
+
+    def test_a_clean_run_has_no_error(self):
+        result, _ = self._analyze(fail=False)
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["unlinted"], [])
+
+    def test_parses_coloured_and_plain_warnings(self):
+        stderr = (
+            "\x1b[33mwarning\x1b[0m: Failed to lint /a/b.py: Permission denied\n"
+            "warning: Selection `X` has no effect\n"
+        )
+        self.assertEqual(
+            mod.unlinted_paths(stderr),
+            [{"path": "/a/b.py", "reason": "Permission denied"}],
+        )
 
 
 if __name__ == "__main__":

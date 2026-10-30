@@ -22,12 +22,20 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from run_lint_rules import (  # noqa: E402
+    detect_target_version,
+    dismissal_reason,
+    except_closure_annotation,
+    unlinted_error,
+    unlinted_paths,
+)
 from scan_common import (  # noqa: E402
     find_project_root,
 )
@@ -46,12 +54,24 @@ _RUFF_DEAD_CODE_RULES = frozenset({"F401", "F811", "F841"})
 _RUFF_CATEGORY_BY_PREFIX: dict[str, str] = {
     "F": "bug-risk",
     "B": "bug-risk",
+    "BLE": "bug-risk",
     "SIM": "simplification",
     "S": "security",
     "RET": "simplification",
     "PIE": "dead-code",
     "UP": "deprecated",
     "PERF": "performance",
+}
+
+# The toolkit's selection for the per-agent category feeds, run as a second,
+# labelled pass (see run_ruff_toolkit_pass). Keyed by the feed it fills; each
+# code's category still comes from _RUFF_CATEGORY_BY_PREFIX.
+_TOOLKIT_FEED_SELECTION: dict[str, tuple[str, ...]] = {
+    "bug-risk": ("B", "BLE001"),
+    "security": ("S",),
+    "simplification": ("SIM", "RET"),
+    "performance": ("PERF",),
+    "deprecated": ("UP",),
 }
 
 
@@ -334,6 +354,35 @@ def normalize_ruff_finding(finding: dict, project_root: Path) -> dict:
     }
 
 
+def _flag_known_tool_bugs(
+    finding: dict,
+    filename: str | None,
+    closures: dict,
+) -> dict:
+    """Re-label a hit that matches a known ruff false-positive mode.
+
+    The case handled is an ``except ... as exc`` binding read from a closure
+    nested in that handler: ruff 0.16.0 reports the read as F821 and the
+    binding as F841. Unlabelled, the F821 hits were shown as ``bug-risk``,
+    and the F841 hits offered a "safe" autofix (dropping ``as exc``) that
+    breaks the closure with a NameError. They get their own category so they
+    leave the bug-risk and dead-code feeds, and F841 is marked
+    ``autofix_unsafe`` so no agent recommends the fix.
+    """
+    annotation = except_closure_annotation(
+        finding["rule"],
+        finding["message"],
+        finding["line"],
+        Path(filename) if filename else None,
+        closures,
+    )
+    if annotation:
+        finding.update(annotation)
+        finding["category"] = "suspected-tool-false-positive"
+        finding["significance"] = "reduced"
+    return finding
+
+
 def _extract_rules_applied(findings: list[dict]) -> list[str]:
     """Extract the set of unique rule codes from ruff findings."""
     return sorted({f.get("code", "") for f in findings if f.get("code")})
@@ -343,7 +392,8 @@ def run_ruff(
     args: argparse.Namespace, project_root: Path, scan_root: Path,
 ) -> dict:
     """Run ruff and return normalized findings."""
-    cmd = ["ruff", "check", "--output-format=json"]
+    # --no-cache: ruff otherwise writes `.ruff_cache/` into the reviewed project.
+    cmd = ["ruff", "check", "--output-format=json", "--no-cache"]
 
     if args.ignore_config or not has_project_config("ruff", project_root):
         # DEFECT-GRADE selection is `run_lint_rules.py`'s job, not this script's.
@@ -355,7 +405,8 @@ def run_ruff(
         # the three benchmark corpora while missing a quarter of the tier-1
         # defects (it excluded PL, RUF, DTZ and ASYNC entirely). Shipping it
         # alongside run_lint_rules.py's tiers would put two contradictory ruff
-        # configurations in one toolkit.
+        # configurations in one toolkit. (The agents' category feeds are filled
+        # separately, by the labelled run_ruff_toolkit_pass below.)
         if args.ruff_rules:
             cmd.extend(["--select", args.ruff_rules])
             config_source = "explicit"
@@ -368,25 +419,174 @@ def run_ruff(
 
     cmd.append(str(scan_root))
 
-    result = subprocess.run(
-        cmd, capture_output=True, text=True,
-        timeout=_TOOL_TIMEOUTS["ruff"],
-    )
+    findings, stderr = _run_ruff_json(cmd)
+    unlinted = unlinted_paths(stderr)
 
-    findings = json.loads(result.stdout) if result.stdout else []
-
+    closures: dict = {}
     normalized = [
-        normalize_ruff_finding(f, project_root)
+        _flag_known_tool_bugs(
+            normalize_ruff_finding(f, project_root), f.get("filename"), closures
+        )
         for f in findings[:args.max_findings]
     ]
+    for finding in normalized:
+        finding["selection"] = config_source
 
-    return {
+    toolkit_findings, toolkit_pass = run_ruff_toolkit_pass(
+        args, project_root, scan_root, normalized, closures,
+    )
+
+    output = {
         "config_source": config_source,
         "rules_applied": _extract_rules_applied(findings),
         "total_findings": len(findings),
         "findings_capped": len(findings) > args.max_findings,
-        "findings": normalized,
+        # Hits re-labelled `suspected-tool-false-positive`; see each one's
+        # `tool_bug_note`.
+        "suspected_tool_false_positives": sum(
+            1 for f in normalized + toolkit_findings if f.get("suspect_tool_bug")
+        ),
+        # The second, toolkit-selected pass. Its findings are appended to
+        # `findings` with `selection: "toolkit"`; `total_findings` and
+        # `rules_applied` above describe the project's own pass only.
+        "toolkit_pass": toolkit_pass,
+        # Paths ruff could not read ("Failed to lint" on stderr, exit 0).
+        "unlinted": unlinted,
+        "findings": normalized + toolkit_findings,
     }
+    if unlinted:
+        # Never a clean result: those files were not linted at all.
+        output["error"] = unlinted_error(unlinted)
+    return output
+
+
+def _run_ruff_json(cmd: list[str]) -> tuple[list[dict], str]:
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=_TOOL_TIMEOUTS["ruff"],
+    )
+    findings = json.loads(result.stdout) if result.stdout else []
+    return findings, result.stderr or ""
+
+
+def run_ruff_toolkit_pass(
+    args: argparse.Namespace,
+    project_root: Path,
+    scan_root: Path,
+    project_findings: list[dict],
+    closures: dict,
+) -> tuple[list[dict], dict]:
+    """Run the toolkit's feed selection; return (new findings, pass metadata).
+
+    The project pass answers "what does the project's own config say?". When
+    that config is narrow -- say, only E/F/W/I -- every category feed
+    the agents read (bug-risk, security, simplification, performance,
+    deprecated) comes back empty, and each agent had to re-run ruff by hand.
+    This pass fills those feeds with a fixed selection, labelled as the
+    toolkit's, and drops any hit the project pass already reported.
+
+    It is a FEED for the review agents, not a defect pass: the tiered
+    defect-grade selection stays in run_lint_rules.py.
+    """
+    selection = {cat: list(codes) for cat, codes in _TOOLKIT_FEED_SELECTION.items()}
+    meta: dict = {
+        "ran": False,
+        "selection": selection,
+        "note": (
+            "The toolkit's own selection, NOT the project's ruff config. A hit "
+            "here may be a rule the project chose not to enable: treat it as "
+            "POLICY unless it is a defect on its own merits."
+        ),
+    }
+    if args.no_toolkit_ruff_pass:
+        meta["skipped_reason"] = "--no-toolkit-ruff-pass"
+        return [], meta
+    if args.ruff_rules:
+        meta["skipped_reason"] = "explicit --ruff-rules selection"
+        return [], meta
+
+    codes = sorted({c for group in selection.values() for c in group})
+    cmd = [
+        "ruff",
+        "check",
+        "--output-format=json",
+        "--no-cache",
+        "--select",
+        ",".join(codes),
+    ]
+    if has_project_config("ruff", project_root) and not args.ignore_config:
+        # The project's config still supplies target-version, excludes and
+        # per-file-ignores; only the rule selection is the toolkit's.
+        if args.ruff_config:
+            cmd.extend(["--config", args.ruff_config])
+    else:
+        # Without a config ruff assumes its oldest target, which makes UP
+        # report "deprecated" syntax the project could not have used.
+        cmd.extend(["--target-version", detect_target_version(project_root)])
+    cmd.append(str(scan_root))
+
+    try:
+        raw, stderr = _run_ruff_json(cmd)
+    except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
+        meta["error"] = f"toolkit ruff pass failed: {exc}"
+        return [], meta
+    meta["ran"] = True
+    meta["unlinted"] = unlinted_paths(stderr)
+    if meta["unlinted"]:
+        meta["error"] = unlinted_error(meta["unlinted"])
+
+    seen = {(f["rule"], f["file"], f["line"], f["column"]) for f in project_findings}
+    added: list[dict] = []
+    duplicates = 0
+    dismissed: dict[str, int] = {}
+    trees: dict = {}
+    lines: dict = {}
+    for item in raw:
+        finding = normalize_ruff_finding(item, project_root)
+        if (
+            finding["rule"],
+            finding["file"],
+            finding["line"],
+            finding["column"],
+        ) in seen:
+            duplicates += 1
+            continue
+        filename = item.get("filename")
+        path = Path(filename) if filename else None
+        reason = dismissal_reason(
+            {
+                "code": finding["rule"],
+                "line": finding["line"],
+                "column": finding["column"],
+            },
+            path,
+            trees,
+            lines,
+        )
+        if reason:
+            dismissed[reason] = dismissed.get(reason, 0) + 1
+            continue
+        finding["selection"] = "toolkit"
+        added.append(_flag_known_tool_bugs(finding, filename, closures))
+
+    by_category: dict[str, int] = {}
+    for finding in added:
+        by_category[finding["category"]] = by_category.get(finding["category"], 0) + 1
+    meta.update(
+        {
+            "rules_applied": _extract_rules_applied(raw),
+            "total_findings": len(added),
+            "findings_capped": len(added) > args.max_findings,
+            "duplicates_of_project_findings": duplicates,
+            # Mechanical dismissals, by reason (see run_lint_rules.DISMISSAL_REASONS):
+            # counted, not silently dropped.
+            "dismissed": dismissed,
+            "by_category": dict(sorted(by_category.items())),
+        }
+    )
+    return added[: args.max_findings], meta
 
 
 # ---------------------------------------------------------------------------
@@ -462,16 +662,25 @@ def run_mypy(
     else:
         config_source = "project"
 
+    # mypy's default cache is `.mypy_cache/` in the working directory, which is
+    # usually the reviewed project. Give it a private cache and remove it
+    # afterwards, so the review leaves nothing behind. A real directory rather
+    # than `/dev/null`: the run stays an ordinary incremental run.
+    cache_dir = tempfile.mkdtemp(prefix="crt-mypy-cache-")
+    cmd.extend(["--cache-dir", cache_dir])
     cmd.append(str(scan_root))
 
-    result = subprocess.run(
-        cmd, capture_output=True, text=True,
-        timeout=_TOOL_TIMEOUTS["mypy"],
-    )
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=_TOOL_TIMEOUTS["mypy"],
+        )
+    finally:
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
-    findings = parse_mypy_output(
-        result.stdout, max_findings=args.max_findings,
-    )
+    # Parse everything, then cap: stopping the parse at max_findings made
+    # `total_findings` equal the cap and `findings_capped` never true.
+    findings = parse_mypy_output(result.stdout)
 
     normalized = [
         normalize_mypy_finding(f, project_root)
@@ -538,16 +747,31 @@ def run_vulture(
         timeout=_TOOL_TIMEOUTS["vulture"],
     )
 
-    findings = parse_vulture_output(
-        result.stdout, project_root,
-        max_findings=args.max_findings,
-    )
+    # Parse everything, then cap: stopping the parse at max_findings made
+    # `total_findings` equal the cap and `findings_capped` never true.
+    findings = parse_vulture_output(result.stdout, project_root)
     normalized = findings[:args.max_findings]
+
+    by_confidence: dict[str, int] = {}
+    by_type: dict[str, int] = {}
+    for finding in findings:
+        key = str(finding["confidence"])
+        by_confidence[key] = by_confidence.get(key, 0) + 1
+        by_type[finding["type"]] = by_type.get(finding["type"], 0) + 1
 
     return {
         "min_confidence": min_confidence,
         "total_findings": len(findings),
         "findings_capped": len(findings) > args.max_findings,
+        # Each finding keeps its own `confidence`. Vulture scores unused
+        # functions, methods, classes and attributes at 60% -- it cannot see
+        # dynamic dispatch -- so these buckets say how much of the output is
+        # that verify-first tier, and how much is 90-100% (imports,
+        # unreachable code, unused arguments).
+        "by_confidence": dict(
+            sorted(by_confidence.items(), key=lambda kv: -int(kv[0]))
+        ),
+        "by_type": dict(sorted(by_type.items())),
         "findings": normalized,
     }
 
@@ -954,6 +1178,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--ruff-rules", default=None,
         help="Override rule selection (comma-separated, e.g. 'F,B,SIM')",
     )
+    parser.add_argument(
+        "--no-toolkit-ruff-pass", action="store_true", default=False,
+        help=(
+            "Skip the second, toolkit-selected ruff pass that fills the "
+            "bug-risk/security/simplification/performance/deprecated feeds"
+        ),
+    )
 
     # Mypy options.
     parser.add_argument(
@@ -963,8 +1194,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # Vulture options.
     parser.add_argument(
-        "--vulture-min-confidence", type=int, default=80,
-        help="Minimum confidence threshold (default: 80)",
+        # 60, not 80: vulture caps unused functions, methods, classes and
+        # attributes at 60%, so at 80 every one of them is dropped: a review
+        # then saw only `__exit__`-style parameters, and every real dead
+        # method had to come from a manual re-run at 60.
+        "--vulture-min-confidence", type=int, default=60,
+        help=(
+            "Minimum confidence threshold (default: 60, which keeps unused "
+            "functions and methods; each finding reports its confidence)"
+        ),
     )
 
     # Coverage options.

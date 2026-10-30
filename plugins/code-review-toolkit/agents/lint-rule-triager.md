@@ -32,6 +32,7 @@ likely-defects and strong smells; run it only when tier 1 is exhausted or the us
 | `rule_validation.preview_gated` non-empty | Those rules **silently did nothing**. Their absence from the findings is not evidence of absence in the code. |
 | `stderr` non-empty | Remapped codes and no-effect selections warn here and nowhere else. Read it. |
 | `error` non-null | The run is incomplete. An incomplete lint pass reported as clean is worse than no pass. |
+| `unlinted` non-empty | ruff could not read those paths ("Failed to lint" on stderr), and it still exits 0 with no findings. A sandboxed ruff, such as the snap package, cannot read `/tmp`. `error` is set. Re-run with `--ruff-bin` pointing at a different ruff; never report those paths as clean. |
 
 ## Phase 2 — Merge, do not double-report
 
@@ -56,6 +57,22 @@ tier-1 findings carried one and **every one was a deliberate idiom** — `open =
 disable=redefined-builtin`, which captures the builtin at import time so later mocking cannot break
 the module. Dismiss those *with the author's stated reason*, do not re-litigate them.
 
+**The script has already dismissed one mechanical class.** `dismissed` holds hits moved out of
+`findings`, each with a `dismissal_reason` that `dismissal_reasons` explains. `summary.total`
+still counts them, so it stays comparable with the calibrated totals. `summary.reported` is what is
+left to triage. Today the only reason is `fastapi-dependency-marker`: B008 on `Depends(...)`,
+`Query(...)`, `Body(...)` and the other FastAPI dependency markers, when the call resolves to a
+fastapi import in that file. That default is the framework's injection idiom, not a shared mutable
+value. On a FastAPI service it can be most of tier 1. List the count in the report's Dismissed
+section, and do not re-triage those hits.
+
+**`suspect_tool_bug: true` marks a known ruff false-positive mode.** Today that means an F821 on an
+`except ... as exc` name read by a closure nested in that handler (`known_tool_issue: "ruff#6878"`).
+The binding is alive until the handler exits, so the hit is false if the closure runs inside the
+handler. It is a real NameError if the closure escapes (stored, returned, scheduled) and runs later.
+Decide that one question per hit. These hits are kept out of `novel_shape_candidates`. Never
+recommend removing the `as exc`.
+
 For everything else, the ordinary rules apply: read the code, construct a concrete failure scenario,
 and drop anything you cannot make concrete. Rules that are policy rather than defect in a given
 project — `S101` (assert) in a test suite, `S603`/`S607` in a build script — are ACCEPTABLE, and
@@ -71,14 +88,17 @@ For each one where you confirm a true positive, write a candidate catalog entry 
 `caught_as`, `differential` — and propose it. **A new shape is worth more than the finding that
 produced it**, because it makes every future run on every project find that class.
 
-Known-productive candidates from the benchmark runs, none of them yet catalogued:
+Known-productive candidates from the benchmark runs that are still uncatalogued:
 
-- **`B905`** `zip()` without `strict=` — silently truncates to the shorter iterable. 16 instances
-  across all three corpora. The single strongest candidate.
-- **`DTZ005`/`DTZ006`** naive `datetime.now()`/`fromtimestamp()` — silently wrong across DST and
-  time zones.
 - **`PLE0704`** bare `raise` outside an exception handler — a `RuntimeError` in the error path.
 - **`S608`** SQL built by string construction.
+
+Two former candidates are now catalogued, and their hits carry a `shape_id`, so merge them in
+Phase 2 instead of proposing them again: **`B905`** (`zip()` without `strict=`) →
+`zip-truncates-on-length-mismatch`, and **`DTZ005`/`DTZ006`** (naive `datetime.now()` /
+`fromtimestamp()`) → `naive-datetime-in-a-persisted-artifact`. The shapes are narrower than the
+rules: apply each shape's `differential`. A naive timestamp that never leaves the process is not
+that shape.
 
 ## Phase 5 — Report
 

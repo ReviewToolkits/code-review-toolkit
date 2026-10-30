@@ -47,6 +47,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
 import subprocess
@@ -55,12 +56,48 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scan_common import emit, find_project_root, relative_to_root  # noqa: E402
+from scan_common import (  # noqa: E402
+    emit,
+    find_project_root,
+    parse_source,
+    relative_to_root,
+)
 
 # A ruff bump is a calibration event. Bump this WITH a fixture-corpus re-run.
 PINNED_RUFF_VERSION = "0.16.0"
 
 _RUFF_TIMEOUT = 300
+
+# ruff reports a file it could not read on stderr only -- "warning: Failed to
+# lint <path>: <reason>" -- and still exits 0 with an empty result. A
+# confined ruff (the snap package cannot see /tmp) therefore prints "All
+# checks passed!" for a tree it never read. That must be an error.
+_FAILED_TO_LINT = re.compile(r"Failed to lint (?P<path>.+?): (?P<reason>.+)$")
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def unlinted_paths(stderr: str) -> list[dict]:
+    """Every ``Failed to lint`` warning on ruff's stderr, as {path, reason}."""
+    found = []
+    for line in _ANSI.sub("", stderr or "").splitlines():
+        match = _FAILED_TO_LINT.search(line)
+        if match:
+            found.append(
+                {"path": match.group("path"), "reason": match.group("reason").strip()}
+            )
+    return found
+
+
+def unlinted_error(unlinted: list[dict]) -> str | None:
+    """The error message for a run that skipped files, or None."""
+    if not unlinted:
+        return None
+    return (
+        f"ruff could not read {len(unlinted)} path(s) (see `unlinted`); the "
+        "result is incomplete, not clean. A sandboxed ruff (e.g. the snap "
+        "package) cannot read some directories: pass a different binary."
+    )
+
 
 # ---------------------------------------------------------------------------
 # The tiers. These were measured once and then lost; they live here now so a
@@ -145,12 +182,225 @@ RULE_TO_SHAPE = {
     "RUF009": "class-level-mutable-attribute",
     "RUF012": "class-level-mutable-attribute",
     "PLW1508": "unvalidated-numeric-from-environment",
+    # Catalogued while the agent prompt still listed them as novel; unmapped,
+    # they were harvested as "new shapes" again -- the B019 failure repeated.
+    # The shapes are narrower than the rules (DTZ fires on every naive `now()`,
+    # the shape needs a persisted artifact): the shape's `differential` decides.
+    "B905": "zip-truncates-on-length-mismatch",
+    "DTZ005": "naive-datetime-in-a-persisted-artifact",
+    "DTZ006": "naive-datetime-in-a-persisted-artifact",
 }
 
 _SUPPRESSION = re.compile(
     r"#\s*(noqa|type:\s*ignore|pylint:\s*disable|ruff:\s*noqa|nosec|pragma)",
     re.IGNORECASE,
 )
+
+# FastAPI's dependency-injection markers. `def route(db=Depends(get_db))` is the
+# framework's documented idiom: the call builds an immutable marker object that
+# FastAPI reads at startup, so B008's "evaluated once at definition time" is the
+# intended behaviour, not a defect. On a FastAPI service these markers can be
+# most of tier 1 -- every one false, and every one counted as an overlap with
+# the `mutable-default-argument` shape.
+FASTAPI_DEPENDENCY_MARKERS = frozenset(
+    {"Depends", "Query", "Body", "File", "Form", "Header", "Path", "Security", "Cookie"}
+)
+
+# Why a hit was moved from `findings` to `dismissed`. Every dismissal is
+# counted and kept, never silently dropped.
+DISMISSAL_REASONS = {
+    "fastapi-dependency-marker": (
+        "B008 on a FastAPI dependency marker (Depends/Query/Body/...) imported from "
+        "fastapi: the default is the framework's injection idiom, not a shared "
+        "mutable value."
+    ),
+}
+
+
+def _fastapi_bindings(tree: ast.Module) -> tuple[dict[str, str], set[str]]:
+    """Names this module binds from fastapi.
+
+    Returns ``(markers, modules)``: *markers* maps a local name to the
+    dependency marker it was imported as (``from fastapi import Depends as D``
+    gives ``{"D": "Depends"}``); *modules* holds local names bound to fastapi
+    itself or one of its submodules (``import fastapi``, ``from fastapi import
+    params``), through which ``fastapi.Depends(...)`` is reached.
+    """
+    markers: dict[str, str] = {}
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            if node.module != "fastapi" and not node.module.startswith("fastapi."):
+                continue
+            for alias in node.names:
+                local = alias.asname or alias.name
+                if alias.name in FASTAPI_DEPENDENCY_MARKERS:
+                    markers[local] = alias.name
+                else:
+                    modules.add(local)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "fastapi" or alias.name.startswith("fastapi."):
+                    modules.add(alias.asname or alias.name.split(".")[0])
+    return markers, modules
+
+
+def _is_fastapi_marker_call(call: ast.Call, markers: dict, modules: set) -> bool:
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id in markers
+    if isinstance(func, ast.Attribute) and func.attr in FASTAPI_DEPENDENCY_MARKERS:
+        root = func.value
+        while isinstance(root, ast.Attribute):
+            root = root.value
+        return isinstance(root, ast.Name) and root.id in modules
+    return False
+
+
+def _default_calls(tree: ast.Module) -> dict[tuple[int, int], ast.Call]:
+    """Every call that is a parameter default, keyed by ``(line, byte column)``."""
+    calls: dict[tuple[int, int], ast.Call] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            for default in (*node.args.defaults, *node.args.kw_defaults):
+                if isinstance(default, ast.Call):
+                    calls[(default.lineno, default.col_offset)] = default
+    return calls
+
+
+def dismissal_reason(
+    finding: dict, path: Path | None, trees: dict, cache: dict
+) -> str | None:
+    """The DISMISSAL_REASONS key that dismisses *finding*, or None.
+
+    B008 is dismissed only when the flagged call resolves to a fastapi import
+    in that same file: a local ``Depends`` class, or a ``Query()`` from
+    another library, is still reported.
+    """
+    if finding["code"] != "B008" or path is None:
+        return None
+    if path not in trees:
+        tree = parse_source(path)
+        trees[path] = (
+            (tree, _default_calls(tree), *_fastapi_bindings(tree)) if tree else None
+        )
+    entry = trees[path]
+    if entry is None:
+        return None
+    _, calls, markers, modules = entry
+    if not markers and not modules:
+        return None
+    # ruff's column is 1-based characters; ast's col_offset is 0-based UTF-8 bytes.
+    text = _source_line(path, finding["line"], cache)
+    byte_col = len(text[: max(finding["column"] - 1, 0)].encode("utf-8"))
+    call = calls.get((finding["line"], byte_col))
+    if call is not None and _is_fastapi_marker_call(call, markers, modules):
+        return "fastapi-dependency-marker"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# A known ruff false positive: the `except ... as NAME` binding read from a
+# closure nested inside that same handler. Shared with run_external_tools.py.
+# ---------------------------------------------------------------------------
+
+EXCEPT_CLOSURE_ISSUE = "ruff#6878"
+
+_NAME_IN_MESSAGE = re.compile(r"`([^`]+)`")
+
+
+def except_closure_bindings(tree: ast.Module) -> list[tuple[str, int, int, set[int]]]:
+    """Every ``except ... as NAME`` whose NAME is read inside a nested closure.
+
+    Returns ``(name, first_line, last_header_line, closure_read_lines)`` per
+    handler. The header span covers a multi-line ``except (A,\\n B) as NAME:``,
+    where ruff places F841 on the line of NAME rather than of ``except``.
+
+    Python keeps the binding alive until the handler exits, so a lambda or
+    nested def that runs *inside* the handler sees it. ruff 0.16.0 reports
+    those reads as F821 (undefined name) and the binding as F841 (unused) --
+    and F841's autofix removes ``as NAME``, which turns working code into a
+    NameError.
+    """
+    found: list[tuple[str, int, int, set[int]]] = []
+    for handler in ast.walk(tree):
+        if not isinstance(handler, ast.ExceptHandler) or not handler.name:
+            continue
+        name = handler.name
+        reads: set[int] = set()
+        for stmt in handler.body:
+            for node in ast.walk(stmt):
+                if not isinstance(
+                    node, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef)
+                ):
+                    continue
+                body = [node.body] if isinstance(node, ast.Lambda) else node.body
+                for part in body:
+                    for inner in ast.walk(part):
+                        if (
+                            isinstance(inner, ast.Name)
+                            and inner.id == name
+                            and isinstance(inner.ctx, ast.Load)
+                        ):
+                            reads.add(inner.lineno)
+        if reads:
+            header_end = handler.body[0].lineno if handler.body else handler.lineno
+            found.append((name, handler.lineno, header_end, reads))
+    return found
+
+
+def except_closure_match(code: str, message: str, line: int, bindings: list) -> dict:
+    """Annotation for an F821/F841 hit that is the except-closure false positive.
+
+    Empty when the hit is anything else -- an F821 on a genuinely undefined
+    name, or an F841 on a binding nothing reads, is left alone.
+    """
+    if code not in ("F821", "F841"):
+        return {}
+    named = _NAME_IN_MESSAGE.search(message or "")
+    if not named:
+        return {}
+    name = named.group(1)
+    for bound, first, header_end, reads in bindings:
+        if bound != name:
+            continue
+        if code == "F821" and line in reads:
+            return {
+                "suspect_tool_bug": True,
+                "known_tool_issue": EXCEPT_CLOSURE_ISSUE,
+                "tool_bug_note": (
+                    f"`{name}` is the `except ... as {name}` binding, read from a "
+                    "closure nested in that handler. Python keeps it bound until "
+                    "the handler exits, so this is a false positive when the "
+                    "closure runs inside the handler. It is a real NameError only "
+                    "if the closure escapes (stored, returned, scheduled) and runs "
+                    "after the handler ends."
+                ),
+            }
+        if code == "F841" and first <= line <= header_end:
+            return {
+                "suspect_tool_bug": True,
+                "known_tool_issue": EXCEPT_CLOSURE_ISSUE,
+                "autofix_unsafe": True,
+                "tool_bug_note": (
+                    f"`{name}` IS used, by a closure at line {min(reads)}. ruff's "
+                    f"fix removes `as {name}` and makes that closure raise "
+                    "NameError: do not apply or recommend it."
+                ),
+            }
+    return {}
+
+
+def except_closure_annotation(
+    code: str, message: str, line: int, path: Path | None, bindings_cache: dict
+) -> dict:
+    """``except_closure_match`` for a hit in *path*, parsing each file once."""
+    if code not in ("F821", "F841") or path is None:
+        return {}
+    if path not in bindings_cache:
+        tree = parse_source(path)
+        bindings_cache[path] = except_closure_bindings(tree) if tree else []
+    return except_closure_match(code, message, line, bindings_cache[path])
 
 
 def _tier_codes(tier: int) -> list[str]:
@@ -295,6 +545,9 @@ def _run_ruff(
         # --isolated so results are comparable across projects: a project's own
         # ruff config would otherwise silently change the selection.
         "--isolated",
+        # --no-cache: ruff otherwise writes `.ruff_cache/` into the project it
+        # lints. A review must leave the reviewed checkout exactly as it found it.
+        "--no-cache",
         "--select",
         ",".join(codes),
     ]
@@ -349,7 +602,27 @@ def analyze(
         ruff_bin, runnable, scan_root, preview=False, target_version=target_version
     )
     cache: dict[Path, list[str]] = {}
-    findings = [normalize(f, project_root, tier, cache) for f in raw[:max_findings]]
+    trees: dict = {}
+    findings: list[dict] = []
+    # Hits with a known, mechanical dismissal: kept and counted, never dropped.
+    dismissed: list[dict] = []
+    closures: dict = {}
+    for raw_finding in raw[:max_findings]:
+        finding = normalize(raw_finding, project_root, tier, cache)
+        filename = raw_finding.get("filename")
+        path = Path(filename) if filename else None
+        # Flagged, not dismissed: the same F821 is a real NameError when the
+        # closure escapes the handler, and only the agent can tell.
+        finding.update(
+            except_closure_annotation(
+                finding["code"], finding["message"], finding["line"], path, closures
+            )
+        )
+        reason = dismissal_reason(finding, path, trees, cache)
+        if reason:
+            dismissed.append({**finding, "dismissal_reason": reason})
+        else:
+            findings.append(finding)
 
     preview_findings: list[dict] = []
     preview_stderr = ""
@@ -366,12 +639,21 @@ def analyze(
             for f in praw[:max_findings]
         ]
 
+    # by_code counts every hit ruff returned, dismissed ones included, so it
+    # stays comparable with the calibrated totals.
     by_code: dict[str, int] = {}
-    for f in findings + preview_findings:
+    for f in findings + dismissed + preview_findings:
         by_code[f["code"]] = by_code.get(f["code"], 0) + 1
+    dismissed_by_reason: dict[str, int] = {}
+    for f in dismissed:
+        reason = f["dismissal_reason"]
+        dismissed_by_reason[reason] = dismissed_by_reason.get(reason, 0) + 1
 
     merged = [f for f in findings if f["shape_id"]]
     suppressed = [f for f in findings if f["has_suppression_comment"]]
+
+    unlinted = unlinted_paths(stderr) + unlinted_paths(preview_stderr)
+    error = error or unlinted_error(unlinted)
 
     return {
         "project_root": str(project_root),
@@ -388,22 +670,43 @@ def analyze(
         # Remapped and preview-gated codes warn on stderr and nowhere else.
         "stderr": (stderr + preview_stderr).strip(),
         "error": error,
+        # Paths ruff reported it could not read ("Failed to lint"). Non-empty
+        # means `error` is set: their absence of findings is not a clean result.
+        "unlinted": unlinted,
         "summary": {
-            "total": len(findings) + len(preview_findings),
+            # Every hit ruff returned, dismissed ones included (the calibrated
+            # number); `reported` is what is left in `findings` to triage.
+            "total": len(findings) + len(dismissed) + len(preview_findings),
+            "reported": len(findings) + len(preview_findings),
+            "dismissed": len(dismissed),
+            "dismissed_by_reason": dismissed_by_reason,
             "preview": len(preview_findings),
             "by_code": dict(sorted(by_code.items(), key=lambda kv: -kv[1])),
-            # Findings that overlap a catalogued shape: merge, do not re-report.
+            # Reported findings that overlap a catalogued shape: merge, do not
+            # re-report. Dismissed hits are not counted here.
             "overlaps_a_shape": len(merged),
             # ~30 selected rules have no shape at all. A confirmed true positive
             # from one of those is a NEW CATALOG ENTRY -- the highest-value
             # output of this script, more than the findings themselves.
+            # A known tool false positive is not evidence of a new shape.
             "novel_shape_candidates": sorted(
-                {f["code"] for f in findings if not f["shape_id"]}
+                {
+                    f["code"]
+                    for f in findings
+                    if not f["shape_id"] and not f.get("suspect_tool_bug")
+                }
             ),
             "has_suppression_comment": len(suppressed),
+            # Hits matching a known ruff false-positive mode (see each hit's
+            # `known_tool_issue` and `tool_bug_note`). Flagged, not dismissed.
+            "suspect_tool_bug": sum(1 for f in findings if f.get("suspect_tool_bug")),
         },
         "findings_capped": len(raw) > max_findings,
         "findings": findings + preview_findings,
+        # Hits dismissed by a mechanical rule, each with its `dismissal_reason`
+        # (explained in `dismissal_reasons`). Not triaged, but not hidden.
+        "dismissed": dismissed,
+        "dismissal_reasons": {k: DISMISSAL_REASONS[k] for k in dismissed_by_reason},
     }
 
 
