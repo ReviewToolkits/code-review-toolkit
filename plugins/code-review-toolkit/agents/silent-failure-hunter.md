@@ -222,6 +222,34 @@ undeletable files, `/dev/full` as a log or output path for "disk full".
 State in the report that the pass ran and how many handlers and `finally` blocks it covered. A
 report with no Step 3b section is incomplete.
 
+### Step 3c: False success (no exception involved)
+
+Some of the worst silent failures contain no `try` at all: the code finishes normally and reports
+success for work it did not do, or checked the wrong thing. The survey cannot list these. Look for
+them in the code that produces a verdict, a count, a report or an exit status:
+
+- **Discarded parse remainders.** A parser that consumes a prefix and drops the rest: `re.match`
+  where `fullmatch` was meant, the first regex match of several, `raw_decode()` ignoring the end
+  index, `split()[0]`. Ask: does extra input raise, or vanish?
+- **Unvalidated config read with an empty default.** `cfg.get("section", {})` turns a misspelled
+  key into "no settings" with no warning. Unknown keys are accepted silently too. The survey's
+  `get-empty-default` implicit sites list the candidates.
+- **An `if`/`elif` chain with no `else`.** An unrecognized value (a new option, a typo in a spec)
+  falls through and does nothing. Ask what the missing `else` should do: raise, or warn.
+- **Truthiness as a verdict.** `if result:` or `return bool(check())` where the check can return a
+  non-empty error object, a list, a status code or the string `"False"`. A pass/fail flag should be
+  a `bool`, compared as one.
+- **A lenient template `Undefined`.** Jinja2's default `Undefined` renders a missing or renamed
+  attribute as an empty string, so a report loses sections with no error. Render the templates
+  once with `StrictUndefined` over the real object types to find them.
+- **Zero work counted as success.** Zero tests collected or zero items processed reported as
+  "passed"; a lazy generator whose consumption is left to caller code, so its errors never surface
+  (or it never runs); planned items that never reach the tally. Ask: is every planned item counted,
+  and does "nothing ran" fail?
+
+Report these with the same severity scale. A false success in a verdict (a test runner, a
+validator, a health check) is usually CRITICAL.
+
 ### Step 4: Assess Impact
 
 For each finding, consider:
