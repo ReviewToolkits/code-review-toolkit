@@ -151,6 +151,8 @@ Per finding it reports:
 
 A null `introduced_by` or `pickaxe` comes with a reason. Report it as unknown. Never substitute HEAD or the last commit you happened to look at: an empty pickaxe used to fall back to HEAD silently in hand-written helpers. When `introduced_by` and `blame` disagree, read both commits. A `pattern` is whitespace-sensitive and matches a single line, so after a reformatting sweep prefer `introduced_by`.
 
+**Live since** is not always the introducing commit. When the defect depends on how a dependency behaves (a library default, a parser's leniency, an HTTP client's redirect or timeout policy), check the dependency constraints too. Run `git log -L '/<dependency>/,+1:pyproject.toml'` (or the lockfile, `setup.cfg`, `requirements*.txt`) and look at the constraint at each release tag. Say "live since" from the release where both the code and a dependency version that triggers it were in place. A pin widened later can make old code defective.
+
 ## Capability 6: Co-Change Coupling Analysis
 
 Using git-history-context's co-change data + architecture-mapper's import graph:
