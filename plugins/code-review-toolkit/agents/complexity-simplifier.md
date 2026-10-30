@@ -33,6 +33,16 @@ Key fields:
 - `history_crossing` and, per hotspot, `fix_commits_2y`, `fix_density`, `risk_rank` and `verdict`: fix commits in the last two years whose hunks fell inside that function *in that commit's own version of the file*, matched by full path and qualified name. `active-risk` (≥ 2 fixes) outranks the complexity score; `recent-churn` (at least half of the function's current lines added in the last 90 days: `recent_commits`, `lines_added_recent`, `lines_changed_recent`, `recent_share`) means the code is young, so a low fix count says nothing yet: never deprioritize it; `settled` (complex, rarely fixed, not recently rewritten) says deprioritize; `quiet` on recently written code means "untested by time", not "safe"; `unknown` (with `verdict_reason`) means some fixes to the file could not be attributed and could change the verdict. A function renamed or moved within the window loses its earlier fixes. `history_crossing.fix_commits_seen` counts fixes to the **hotspots' files only** (`fix_commits_seen_scope`). Never report it as the project's fix count
 - `history_crossing.top_fixed_functions`: the source functions with the most fix commits across the whole scan root, whatever their score (`is_hotspot` says whether they also made the hotspot list). On a structurally simple codebase the fix-dense functions score below 5. Report the top ones in their own short table even when they are not hotspots, because that is where the defects have been. Pass `--key-type B=fix` (same meaning as in `analyze_history.py`) when the project marks bug-fix commits only with a tracker key
 
+- `clones`: groups of near-duplicate statement windows, within and across functions and files (test files skipped). Each group has `kind` (`exact`: identical apart from layout; `renamed`: identical up to local names), `statements`, `nodes`, `lines`, `copies` and `locations` (`file`, `function`, `line_start`, `line_end`). Called names, attributes and literals must match, so two blocks that call different helpers are not a group. `--no-clones` skips the pass
+
+### Using `clones`
+
+Duplicated code is where a fix lands in one copy and not the other. For each group:
+
+1. Read every copy side by side. Did they drift? Look for a guard, a cleanup step, an error code or a lock present in one copy only. Drift is a correctness lead, not a style note: report it as FIX when one copy lacks a step the other has for a reason that applies to both, and hand it to the run's bug-finding agents.
+2. Only when the copies are still identical, judge extraction as a simplification. A sequence repeated inside one function (a stop or cleanup sequence written out at each exit) usually wants one helper. Copies across modules may be intentional; see "Intentional near-duplication" below.
+3. A group inside a hotspot raises that hotspot's priority. Say so in its entry.
+
 ## External Tool Integration
 
 If external tool output is available (from `run_external_tools.py`), use ruff's simplification findings as concrete targets for your analysis.

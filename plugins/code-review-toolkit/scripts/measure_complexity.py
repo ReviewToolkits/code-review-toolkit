@@ -11,8 +11,18 @@ Outputs a JSON structure with per-function metrics:
 - return_count (number of return statements)
 - cognitive_complexity (weighted complexity score)
 
+It also reports `clones`: groups of near-identical statement windows
+(normalized-AST hashing), within and across functions and files.
+
 Usage:
-    python measure_complexity.py [path]
+    python measure_complexity.py [path] [--max-files N] [--key-type SPEC]
+                                 [--no-clones]
+
+Options:
+    --max-files N     Analyze at most N files
+    --key-type SPEC   Tracker-key prefixes (or single keys) that mark a commit's
+                      type, as in analyze_history.py (e.g. B=fix)
+    --no-clones       Skip near-duplicate block detection
 """
 
 import ast
@@ -993,6 +1003,281 @@ def top_fixed_functions(
     }
 
 
+# --- Near-duplicate blocks -------------------------------------------------
+#
+# Two copies of one step that later drift apart are a strong bug signal that
+# per-function metrics cannot show: on a validation project a long literal
+# was AST-identical in two functions and a stop sequence was written out at
+# each exit of one job runner. A window of consecutive statements is hashed on
+# its normalized AST: layout, comments and docstrings ignored, and names BOUND
+# inside the window (locals, parameters, loop and `as` targets) renamed by
+# order of appearance. Free names (functions called, modules, globals),
+# attribute names and literals are kept, so two blocks that call different
+# functions or use different constants do not match.
+
+CLONE_MIN_NODES = 40
+CLONE_MIN_LINES = 6
+MAX_CLONE_GROUPS = 30
+_NAME_MARK = "\x01"
+_SKIP_FIELDS = frozenset({"ctx", "type_comment", "kind"})
+
+
+class _StmtInfo:
+    __slots__ = ("bound", "end", "nodes", "start", "tokens")
+
+    def __init__(self, stmt: ast.stmt) -> None:
+        tokens: list[str] = []
+        bound: set[str] = set()
+        nodes = 0
+        todo: list[object] = [stmt]
+        while todo:
+            item = todo.pop()
+            if isinstance(item, str):
+                tokens.append(item)
+                continue
+            if not isinstance(item, ast.AST):
+                tokens.append(repr(item))
+                continue
+            nodes += 1
+            tokens.append(type(item).__name__)
+            if isinstance(item, ast.Name):
+                if not isinstance(item.ctx, ast.Load):
+                    bound.add(item.id)
+                tokens.append(_NAME_MARK + item.id)
+                continue
+            if isinstance(item, ast.arg):
+                bound.add(item.arg)
+                tokens.append(_NAME_MARK + item.arg)
+                continue
+            if isinstance(item, ast.ExceptHandler) and item.name:
+                bound.add(item.name)
+            pending: list[object] = []
+            for field, value in ast.iter_fields(item):
+                if field in _SKIP_FIELDS:
+                    continue
+                if isinstance(item, ast.ExceptHandler) and field == "name" and value:
+                    pending.append(_NAME_MARK + value)
+                    continue
+                if isinstance(value, list):
+                    pending.append("[")
+                    pending.extend(value)
+                    pending.append("]")
+                else:
+                    pending.append(value)
+            todo.extend(reversed(pending))
+        self.tokens = tokens
+        self.bound = bound
+        self.nodes = nodes
+        self.start = def_start_line(stmt)
+        self.end = getattr(stmt, "end_lineno", None) or stmt.lineno
+
+
+def _window_key(stmts: list[_StmtInfo], exact: bool = False) -> tuple:
+    bound: set[str] = set()
+    for info in stmts:
+        bound |= info.bound
+    mapping: dict[str, str] = {}
+    out: list[str] = []
+    for info in stmts:
+        for token in info.tokens:
+            if token.startswith(_NAME_MARK) and not exact:
+                name = token[1:]
+                if name in bound:
+                    token = mapping.setdefault(name, f"{_NAME_MARK}v{len(mapping)}")
+            out.append(token)
+        out.append(";")
+    return tuple(out)
+
+
+def _is_docstring(stmt: ast.stmt) -> bool:
+    return (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Constant)
+        and isinstance(stmt.value.value, str)
+    )
+
+
+def _statement_runs(tree: ast.AST) -> list[list[ast.stmt]]:
+    """Runs of consecutive plain statements in every block of the file.
+
+    A def, a class or an import ends a run (each def's body is its own
+    block), and docstrings are left out.
+    """
+    runs: list[list[ast.stmt]] = []
+    for node in ast.walk(tree):
+        for _field, value in ast.iter_fields(node):
+            if not (
+                isinstance(value, list) and value and isinstance(value[0], ast.stmt)
+            ):
+                continue
+            run: list[ast.stmt] = []
+            for stmt in value:
+                if isinstance(
+                    stmt,
+                    (
+                        ast.FunctionDef,
+                        ast.AsyncFunctionDef,
+                        ast.ClassDef,
+                        ast.Import,
+                        ast.ImportFrom,
+                    ),
+                ) or _is_docstring(stmt):
+                    if run:
+                        runs.append(run)
+                    run = []
+                    continue
+                run.append(stmt)
+            if run:
+                runs.append(run)
+    return runs
+
+
+def _enclosing_function(spans: list[tuple[str, int, int]], line: int) -> str | None:
+    best: tuple[str, int, int] | None = None
+    for qual, start, end in spans:
+        if start <= line <= end and (best is None or start >= best[1]):
+            best = (qual, start, end)
+    return best[0] if best else None
+
+
+def find_clones(
+    files: list[tuple[str, ast.AST]],
+    min_nodes: int = CLONE_MIN_NODES,
+    min_lines: int = CLONE_MIN_LINES,
+    max_groups: int = MAX_CLONE_GROUPS,
+) -> dict:
+    """Groups of near-identical statement windows, across files and functions.
+
+    `files` is [(relative path, parsed module)]. Each window is the shortest
+    run of consecutive statements, from each starting statement, holding at
+    least `min_nodes` AST nodes; matching windows are then grown statement by
+    statement while every copy still matches. A group is reported when each
+    copy spans at least `min_lines` lines and it is not wholly inside a larger
+    reported group.
+    """
+    runs: list[tuple[str, list[_StmtInfo]]] = []
+    spans_by_file: dict[str, list[tuple[str, int, int]]] = {}
+    for rel, tree in files:
+        spans_by_file[rel] = [
+            (
+                qual,
+                def_start_line(node),
+                getattr(node, "end_lineno", None) or node.lineno,
+            )
+            for qual, node, _ in iter_qualified_defs(tree)
+        ]
+        for run in _statement_runs(tree):
+            runs.append((rel, [_StmtInfo(stmt) for stmt in run]))
+
+    # Minimal windows, keyed by their normalized AST.
+    by_key: dict[tuple, list[tuple[int, int, int]]] = {}
+    for run_id, (_rel, infos) in enumerate(runs):
+        for i in range(len(infos)):
+            total, j = 0, i
+            while j < len(infos) and total < min_nodes:
+                total += infos[j].nodes
+                j += 1
+            if total < min_nodes:
+                break
+            by_key.setdefault(_window_key(infos[i:j]), []).append((run_id, i, j))
+
+    groups: list[dict] = []
+    for occurrences in by_key.values():
+        # Drop copies overlapping an earlier copy in the same run.
+        kept: list[list[int]] = []
+        for run_id, i, j in occurrences:
+            if any(r == run_id and i < kj and ki < j for r, ki, kj in kept):
+                continue
+            kept.append([run_id, i, j])
+        if len(kept) < 2:
+            continue
+        # Grow every copy while all of them still match.
+        while True:
+            grown = []
+            for run_id, i, j in kept:
+                infos = runs[run_id][1]
+                if j >= len(infos):
+                    break
+                grown.append((run_id, i, j + 1))
+            if len(grown) != len(kept):
+                break
+            overlap = any(
+                a[0] == b[0] and a[1] < b[2] and b[1] < a[2]
+                for n, a in enumerate(grown)
+                for b in grown[n + 1 :]
+            )
+            keys = {_window_key(runs[r][1][i:j]) for r, i, j in grown}
+            if overlap or len(keys) != 1:
+                break
+            kept = [list(g) for g in grown]
+        locations = []
+        for run_id, i, j in kept:
+            rel, infos = runs[run_id]
+            start, end = infos[i].start, infos[j - 1].end
+            locations.append(
+                {
+                    "file": rel,
+                    "function": _enclosing_function(spans_by_file[rel], start),
+                    "line_start": start,
+                    "line_end": end,
+                }
+            )
+        if (
+            min(loc["line_end"] - loc["line_start"] + 1 for loc in locations)
+            < min_lines
+        ):
+            continue
+        first_run, first_i, first_j = kept[0]
+        sample = runs[first_run][1][first_i:first_j]
+        exact = {_window_key(runs[r][1][i:j], exact=True) for r, i, j in kept}
+        groups.append(
+            {
+                "kind": "exact" if len(exact) == 1 else "renamed",
+                "statements": first_j - first_i,
+                "nodes": sum(info.nodes for info in sample),
+                "lines": max(
+                    loc["line_end"] - loc["line_start"] + 1 for loc in locations
+                ),
+                "copies": len(locations),
+                "locations": sorted(
+                    locations, key=lambda loc: (loc["file"], loc["line_start"])
+                ),
+            }
+        )
+
+    # Largest first; a group wholly inside an accepted one is the same clone.
+    groups.sort(key=lambda g: (-g["nodes"] * (g["copies"] - 1), -g["nodes"]))
+    accepted: list[dict] = []
+    for group in groups:
+        inside = all(
+            any(
+                other["file"] == loc["file"]
+                and other["line_start"] <= loc["line_start"]
+                and loc["line_end"] <= other["line_end"]
+                for kept_group in accepted
+                for other in kept_group["locations"]
+            )
+            for loc in group["locations"]
+        )
+        if not inside:
+            accepted.append(group)
+    return {
+        "method": (
+            "windows of consecutive statements with at least "
+            f"{min_nodes} AST nodes, compared on the normalized AST (layout, "
+            "comments and docstrings ignored; names bound inside the window "
+            "renamed; called names, attributes and literals kept), grown while "
+            "every copy matches. `exact`: identical apart from layout; "
+            "`renamed`: identical up to local names. Test files are skipped."
+        ),
+        "min_nodes": min_nodes,
+        "min_lines": min_lines,
+        "groups_total": len(accepted),
+        "groups": accepted[:max_groups],
+        "capped": len(accepted) > max_groups,
+    }
+
+
 def main() -> None:
     from scan_common import exit_on_help
 
@@ -1002,6 +1287,7 @@ def main() -> None:
     argv = sys.argv[1:]
     i = 0
     key_types: dict[str, str] = {}
+    no_clones = False
     while i < len(argv):
         if argv[i] == "--max-files" and i + 1 < len(argv):
             max_files = int(argv[i + 1])
@@ -1015,6 +1301,9 @@ def main() -> None:
                 print(f"Error: {exc}", file=sys.stderr)
                 sys.exit(2)
             i += 2
+        elif argv[i] == "--no-clones":
+            no_clones = True
+            i += 1
         elif argv[i].startswith("--"):
             i += 1
         else:
@@ -1031,6 +1320,16 @@ def main() -> None:
         all_files = all_files[:max_files]
 
     file_analyses = [analyze_file(f, project_root) for f in all_files]
+    clone_inputs: list[tuple[str, ast.AST]] = []
+    if not no_clones:
+        for path, analysis in zip(all_files, file_analyses):
+            if analysis["parse_error"] or is_test_path(analysis["file"]):
+                continue
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+            except (SyntaxError, ValueError):
+                continue
+            clone_inputs.append((analysis["file"], tree))
 
     # Collect all functions and rank by score.
     all_functions = []
@@ -1083,6 +1382,11 @@ def main() -> None:
         "hotspots": hotspots[:30],  # Top 30 hotspots.
         # 4.6: the crossing is a first-class output, not the reader's job.
         "history_crossing": history_meta,
+        "clones": (
+            find_clones(clone_inputs)
+            if not no_clones
+            else {"skipped": True, "reason": "--no-clones", "groups": []}
+        ),
         "files": file_analyses,
     }
 

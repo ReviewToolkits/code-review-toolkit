@@ -774,5 +774,123 @@ class TestHistoryCrossingAttribution(unittest.TestCase):
         self.assertEqual(hotspots[0]["fix_commits_2y"], 1)
 
 
+# A retry step, written out twice: the shape clone detection looks for.
+_STEP = (
+    "    reply = fetch(url, timeout=limit)\n"
+    "    if reply.code in {429, 503}:\n"
+    "        pool.release(conn)\n"
+    "        conn = None\n"
+    "        if reply.code == 503:\n"
+    "            backoff(url)\n"
+    "        log_retry(url, reply.code)\n"
+    "        return\n"
+    "    if reply.code != 200:\n"
+    "        return\n"
+)
+_ARGS = "(url, limit, pool, conn)"
+
+
+def _indented(block: str) -> str:
+    return "".join("    " + line + "\n" for line in block.splitlines())
+
+
+def _clones(sources: dict) -> dict:
+    import ast as _ast
+
+    return mod.find_clones([(rel, _ast.parse(src)) for rel, src in sources.items()])
+
+
+class TestCloneDetection(unittest.TestCase):
+    """Near-duplicate statement windows are grouped; look-alikes are not."""
+
+    def test_copied_step_in_two_functions_is_one_exact_group(self):
+        source = (
+            f"def first{_ARGS}:\n    prepare(url)\n" + _STEP + "\n"
+            f"def second{_ARGS}:\n    connect(url)\n" + _STEP
+        )
+        result = _clones({"pkg/client.py": source})
+        self.assertEqual(result["groups_total"], 1)
+        group = result["groups"][0]
+        self.assertEqual(group["kind"], "exact")
+        self.assertEqual(group["copies"], 2)
+        self.assertEqual(
+            [loc["function"] for loc in group["locations"]], ["first", "second"]
+        )
+        self.assertEqual(group["statements"], 3)
+
+    def test_copy_with_renamed_locals_is_a_renamed_group(self):
+        other = _STEP.replace("reply", "resp").replace("conn", "sock")
+        source = (
+            f"def first{_ARGS}:\n" + _STEP + "\n"
+            "def second(url, limit, pool, sock):\n" + other
+        )
+        result = _clones({"pkg/a.py": source})
+        self.assertEqual([g["kind"] for g in result["groups"]], ["renamed"])
+
+    def test_across_files(self):
+        result = _clones(
+            {
+                "pkg/a.py": f"def f{_ARGS}:\n" + _STEP,
+                "pkg/b.py": f"def g{_ARGS}:\n" + _STEP,
+            }
+        )
+        self.assertEqual(
+            [loc["file"] for loc in result["groups"][0]["locations"]],
+            ["pkg/a.py", "pkg/b.py"],
+        )
+
+    def test_different_calls_or_constants_are_not_clones(self):
+        calls = _STEP.replace("log_retry", "log_failure")
+        consts = _STEP.replace("200", "204").replace("{429, 503}", "{429, 502}")
+        for variant in (calls, consts):
+            source = (
+                f"def first{_ARGS}:\n" + _STEP + f"\ndef second{_ARGS}:\n" + variant
+            )
+            result = _clones({"pkg/a.py": source})
+            self.assertEqual(result["groups_total"], 0, variant)
+
+    def test_short_repeats_are_not_reported(self):
+        source = (
+            "def first(x):\n    y = x + 1\n    return y\n\n"
+            "def second(x):\n    y = x + 1\n    return y\n"
+        )
+        self.assertEqual(_clones({"pkg/a.py": source})["groups_total"], 0)
+
+    def test_a_clone_inside_a_larger_clone_is_not_repeated(self):
+        # The whole `if` block matches, so the run inside it matches too; only
+        # the enclosing clone is reported.
+        guarded = "    if url:\n" + _indented(_STEP)
+        source = f"def first{_ARGS}:\n" + guarded + f"\ndef second{_ARGS}:\n" + guarded
+        result = _clones({"pkg/a.py": source})
+        self.assertEqual(result["groups_total"], 1)
+        self.assertEqual(result["groups"][0]["statements"], 1)
+
+    def test_main_reports_clones_and_skips_test_files(self):
+        import io
+        import sys
+
+        files = {
+            "pkg/__init__.py": "",
+            "pkg/a.py": f"def f{_ARGS}:\n" + _STEP,
+            "pkg/b.py": f"def g{_ARGS}:\n" + _STEP,
+            "tests/test_a.py": f"def h{_ARGS}:\n" + _STEP,
+        }
+        with TempProject(files) as root:
+            old_stdout, old_argv = sys.stdout, sys.argv
+            sys.stdout = io.StringIO()
+            sys.argv = ["measure_complexity.py", str(root)]
+            try:
+                mod.main()
+                output = json.loads(sys.stdout.getvalue())
+            finally:
+                sys.stdout, sys.argv = old_stdout, old_argv
+        groups = output["clones"]["groups"]
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(
+            sorted(loc["file"] for loc in groups[0]["locations"]),
+            ["pkg/a.py", "pkg/b.py"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
