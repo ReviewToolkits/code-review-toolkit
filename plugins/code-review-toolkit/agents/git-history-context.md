@@ -85,10 +85,12 @@ Pairs of files that frequently change together. Especially highlight pairs that:
 
 ### 5. Stability Assessment per Module
 
-Using architecture-mapper's module boundaries (if available) or top-level directories, rate each module's stability:
-- **Stable**: < 3 commits in the period
-- **Active**: 3-10 commits
-- **Volatile**: > 10 commits
+Using architecture-mapper's module boundaries (if available) or top-level directories, rate each module's stability. The thresholds are per 90 days; scale them by the window's length (`time_range.days` / 90) so the rating describes the module and not the window:
+- **Stable**: < 3 commits per 90 days
+- **Active**: 3-10 commits per 90 days
+- **Volatile**: > 10 commits per 90 days
+
+For a 365-day window that is < 12 / 12-40 / > 40 commits; for 30 days, < 1 / 1-3.3 / > 3.3. On a quiet project a short window rates everything Stable and a long one rates everything Active. State the window and the scaled thresholds in the table's heading. When `time_range.empty` is true, or the window holds fewer than about 10 commits, don't rate stability from it: widen the window (`--since`, `--last N`) and say which one you used.
 
 This helps every subsequent agent prioritize — findings in volatile modules are more urgent.
 
@@ -96,6 +98,8 @@ This helps every subsequent agent prioritize — findings in volatile modules ar
 
 ```
 ## Git History Context
+
+**Window**: [start → end, N days, how chosen (default / --since / --last N), commits in it]
 
 ### Change Velocity
 [2-3 sentences: development pace, fix:feature ratio, concentration]
@@ -117,7 +121,7 @@ This helps every subsequent agent prioritize — findings in volatile modules ar
 - Features (N): [brief summary of what was added]
 - Refactors (N): [brief summary]
 
-### Module Stability
+### Module Stability (window: N days; thresholds scaled to < A / A-B / > B commits)
 | Module | Commits | Status | Notes |
 |--------|---------|--------|-------|
 [Per module from architecture-mapper, or per top-level directory]
@@ -135,7 +139,7 @@ This helps every subsequent agent prioritize — findings in volatile modules ar
 - **Don't editorialize**: Report numbers and rankings, not quality judgments.
 - **"Context for Subsequent Agents" is the most important section**: Directly tell other agents what to prioritize based on temporal data.
 - **If function-level data is missing**: Note this and provide file-level data only. The script may fall back to file-level-only analysis for performance.
-- **Time range matters**: Note the analysis period clearly so users understand the scope.
+- **Time range matters**: State the window you analyzed (start, end, days, and the flags that chose it) at the top of the report. Every count and rating in it is relative to that window. If you re-ran with a wider window, say which run the report uses.
 
 ### Classification Guide
 - **FIX**: N/A — this agent provides context, not findings
