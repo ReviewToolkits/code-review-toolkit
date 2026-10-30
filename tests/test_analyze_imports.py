@@ -630,5 +630,71 @@ class TestPlainImportNames(unittest.TestCase):
         self.assertEqual(mod.resolve_edge_targets(edge, index), {"pkg/__init__.py"})
 
 
+def _cycles(files: dict[str, str], **kwargs) -> list[list[str]]:
+    with TempProject(files) as root:
+        paths = sorted(mod.discover_python_files(root))
+        analyses = [mod.analyze_file(p, root, {"pkg"}) for p in paths]
+        names = [a["file"] for a in analyses]
+        graph = mod.build_internal_graph(analyses)
+    return mod.detect_cycles(graph, all_files=names, **kwargs)
+
+
+_PARENT_INIT_CYCLE = {
+    "pkg/__init__.py": "",
+    "pkg/helpers.py": (
+        "from pkg.graph.consts import KEY\n\ndef helper():\n    return KEY\n"
+    ),
+    "pkg/graph/__init__.py": "from pkg.graph.vertex import Vertex\n",
+    "pkg/graph/consts.py": "KEY = 1\n",
+    "pkg/graph/vertex.py": "from pkg.helpers import helper\n\nclass Vertex:\n    pass\n",
+}
+
+
+class TestCycleThroughParentPackageInit(unittest.TestCase):
+    """`from pkg.graph.consts import K` runs `pkg/graph/__init__.py` first.
+
+    Verified on disk: with this layout, `import pkg.helpers` raises
+    `ImportError: cannot import name 'helper' from partially initialized
+    module 'pkg.helpers'`.
+    """
+
+    def test_cycle_through_the_parent_package_init_is_reported(self):
+        cycles = _cycles(_PARENT_INIT_CYCLE)
+        self.assertIn(
+            ["pkg/graph/__init__.py", "pkg/graph/vertex.py", "pkg/helpers.py"], cycles
+        )
+
+    def test_it_is_an_import_time_cycle(self):
+        self.assertTrue(_cycles(_PARENT_INIT_CYCLE, include_lazy=False))
+
+    def test_own_parent_package_adds_no_edge(self):
+        # A module inside pkg.graph importing pkg.graph.consts: pkg/graph/__init__.py
+        # is already running (or done) by the time node.py runs.
+        files = {
+            "pkg/__init__.py": "",
+            "pkg/graph/__init__.py": "from pkg.graph.vertex import Vertex\n",
+            "pkg/graph/consts.py": "KEY = 1\n",
+            "pkg/graph/vertex.py": "from pkg.graph.consts import KEY\n\nclass Vertex:\n    pass\n",
+        }
+        self.assertEqual(_cycles(files), [])
+
+    def test_top_level_facade_still_adds_no_edge(self):
+        files = {
+            "pkg/__init__.py": "from pkg.a import A\n",
+            "pkg/a.py": "from pkg.sub.b import B\nA = B\n",
+            "pkg/sub/__init__.py": "",
+            "pkg/sub/b.py": "B = 1\n",
+        }
+        self.assertEqual(_cycles(files), [])
+
+    def test_lazy_import_keeps_the_implicit_edge_lazy(self):
+        files = dict(_PARENT_INIT_CYCLE)
+        files["pkg/helpers.py"] = (
+            "def helper():\n    from pkg.graph.consts import KEY\n    return KEY\n"
+        )
+        self.assertTrue(_cycles(files))
+        self.assertEqual(_cycles(files, include_lazy=False), [])
+
+
 if __name__ == "__main__":
     unittest.main()

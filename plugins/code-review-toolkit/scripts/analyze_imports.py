@@ -735,6 +735,84 @@ def compute_metrics(graph: dict[str, list[dict]], all_files: list[str]) -> dict:
     }
 
 
+def implicit_package_inits(
+    target: str, importer: str, module_to_file: dict[str, str]
+) -> set[str]:
+    """Package ``__init__.py`` files an import of *target* runs on the way.
+
+    ``from a.b.c import X`` executes ``a/__init__.py`` and ``a/b/__init__.py``
+    before ``a/b/c.py``, so a cycle can close THROUGH a parent package: ``helpers``
+    imports ``pkg.graph.consts``, ``pkg/graph/__init__.py`` imports ``vertex``,
+    and ``vertex`` imports ``helpers``. Recording only the edge to
+    ``pkg.graph.consts``
+    hid exactly that cycle, which fails as ``ImportError`` when ``utils`` is
+    imported first.
+
+    Packages that enclose the importer itself are left out: they were imported
+    (at least partially) before the importer started running, so the import
+    cannot execute them again. Adding them would turn every
+    ``from pkg import x`` inside ``pkg`` into a phantom cycle through the
+    facade -- the false positive ``resolve_edge_targets`` exists to prevent.
+    """
+    importer_module = module_name_for(importer)
+    own = importer_module.split(".")
+    own_packages = {".".join(own[:i]) for i in range(1, len(own))}
+    if importer.endswith("__init__.py"):
+        own_packages.add(importer_module)
+    parts = target.split(".")
+    out: set[str] = set()
+    for i in range(1, len(parts) + 1):
+        package = ".".join(parts[:i])
+        path = module_to_file.get(package)
+        if path and path.endswith("__init__.py") and package not in own_packages:
+            out.add(path)
+    return out
+
+
+def file_adjacency(
+    graph: dict[str, list[dict]],
+    all_files: list[str] | None = None,
+    *,
+    include_type_checking: bool = False,
+    include_lazy: bool = True,
+) -> dict[str, set[str]]:
+    """``file -> files it depends on``, with edges resolved to concrete files.
+
+    Includes the implicit edge from an import of ``a.b.c`` to each parent
+    package ``__init__.py`` it executes (see ``implicit_package_inits``).
+    """
+    adj: dict[str, list[dict]] = {}
+    for source, edges in graph.items():
+        adj[source] = [
+            e
+            for e in edges
+            if (include_type_checking or not e.get("type_checking_only"))
+            and (include_lazy or not e.get("lazy"))
+        ]
+    # Index EVERY file, not only those that have imports of their own. A leaf
+    # module (coverage/env.py, fan-out 0) is absent from the graph keys, so
+    # indexing from them alone leaves `coverage.env` unresolvable -- and the
+    # bare-package fallback then attributes `from coverage import env` to the
+    # package __init__, manufacturing a cycle through the facade.
+    module_to_file = {
+        module_name_for(f): f for f in (all_files if all_files is not None else adj)
+    }
+    out: dict[str, set[str]] = {}
+    for f, edges in adj.items():
+        resolved: set[str] = set()
+        for edge in edges:
+            # No prefix fallback: an unresolvable target is not a file-level
+            # edge. A prefix match fabricated edges to the enclosing package's
+            # __init__, and with them phantom cycles.
+            resolved |= resolve_edge_targets(edge, module_to_file)
+            resolved |= implicit_package_inits(
+                edge.get("target") or "", f, module_to_file
+            )
+        resolved.discard(f)
+        out[f] = resolved
+    return out
+
+
 def detect_cycles(
     graph: dict[str, list[dict]],
     include_type_checking: bool = False,
@@ -753,49 +831,21 @@ def detect_cycles(
 
     ``include_lazy=False`` also drops function-level imports that do not run at
     import time, leaving the cycles that can fail a plain ``import``.
+
+    An import of ``a.b.c`` also depends on the parent package ``a/b/__init__.py``
+    (when the importer lives outside ``a.b``): importing it runs that file.
     """
-    # Build a simplified adjacency list: file -> set of live edges.
-    adj: dict[str, list[dict]] = {}
-    for source, edges in graph.items():
-        adj[source] = [
-            e
-            for e in edges
-            if (include_type_checking or not e.get("type_checking_only"))
-            and (include_lazy or not e.get("lazy"))
-        ]
+    file_adj = file_adjacency(
+        graph,
+        all_files,
+        include_type_checking=include_type_checking,
+        include_lazy=include_lazy,
+    )
+    return _cycles_in(file_adj)
 
-    # Collect all known file-stem identifiers so we can map dotted targets
-    # back to concrete files.
-    # Index EVERY file, not only those that have imports of their own. A leaf
-    # module (coverage/env.py, fan-out 0) is absent from the graph keys, so
-    # indexing from them alone leaves `coverage.env` unresolvable -- and the
-    # bare-package fallback then attributes `from coverage import env` to the
-    # package __init__, manufacturing a cycle through the facade. This is the
-    # same root cause as the prefix fallback removed earlier: the index was
-    # incomplete, not the matching rule.
-    file_to_module: dict[str, str] = {}
-    module_to_file: dict[str, str] = {}
-    for f in all_files if all_files is not None else list(adj):
-        mod = module_name_for(f)
-        file_to_module[f] = mod
-        module_to_file[mod] = f
 
-    # Resolve adjacency to file-level.
-    file_adj: dict[str, set[str]] = {}
-    for f, edges in adj.items():
-        resolved: set[str] = set()
-        for edge in edges:
-            resolved |= resolve_edge_targets(edge, module_to_file)
-            # No prefix fallback. `module_to_file` only covers files that have
-            # imports of their own, so a target naming an import-free module
-            # (mypkg.utils) is absent from it; a prefix match then resolved it to
-            # the enclosing package's __init__, fabricating an edge and with it a
-            # phantom cycle. An unresolvable target is simply not a file-level
-            # edge -- `from . import X` yields the exact target `mypkg`, so real
-            # package-level cycles still resolve.
-        resolved.discard(f)  # ignore self-imports
-        file_adj[f] = resolved
-
+def _cycles_in(file_adj: dict[str, set[str]]) -> list[list[str]]:
+    """Cycles found by a DFS over a file-level adjacency map."""
     # Standard cycle detection with DFS.
     WHITE, GRAY, BLACK = 0, 1, 2
     color: dict[str, int] = {f: WHITE for f in file_adj}
@@ -804,7 +854,7 @@ def detect_cycles(
 
     def dfs(u: str) -> None:
         color[u] = GRAY
-        for v in file_adj.get(u, set()):
+        for v in sorted(file_adj.get(u, ())):
             if v not in color:
                 color[v] = WHITE
             if color[v] == GRAY:
@@ -829,7 +879,7 @@ def detect_cycles(
                 dfs(v)
         color[u] = BLACK
 
-    for f in file_adj:
+    for f in sorted(file_adj):
         if color.get(f, WHITE) == WHITE:
             dfs(f)
 
