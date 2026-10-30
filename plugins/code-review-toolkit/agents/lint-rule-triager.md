@@ -71,14 +71,17 @@ For each one where you confirm a true positive, write a candidate catalog entry 
 `caught_as`, `differential` — and propose it. **A new shape is worth more than the finding that
 produced it**, because it makes every future run on every project find that class.
 
-Known-productive candidates from the benchmark runs, none of them yet catalogued:
+Known-productive candidates from the benchmark runs that are still uncatalogued:
 
-- **`B905`** `zip()` without `strict=` — silently truncates to the shorter iterable. 16 instances
-  across all three corpora. The single strongest candidate.
-- **`DTZ005`/`DTZ006`** naive `datetime.now()`/`fromtimestamp()` — silently wrong across DST and
-  time zones.
 - **`PLE0704`** bare `raise` outside an exception handler — a `RuntimeError` in the error path.
 - **`S608`** SQL built by string construction.
+
+Two former candidates are now catalogued, and their hits carry a `shape_id`, so merge them in
+Phase 2 instead of proposing them again: **`B905`** (`zip()` without `strict=`) →
+`zip-truncates-on-length-mismatch`, and **`DTZ005`/`DTZ006`** (naive `datetime.now()` /
+`fromtimestamp()`) → `naive-datetime-in-a-persisted-artifact`. The shapes are narrower than the
+rules: apply each shape's `differential`. A naive timestamp that never leaves the process is not
+that shape.
 
 ## Phase 5 — Report
 

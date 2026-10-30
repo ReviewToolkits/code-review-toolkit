@@ -54,6 +54,18 @@ class TestRuleToShape(unittest.TestCase):
             with self.subTest(code=code):
                 self.assertIn(shape, known)
 
+    def test_catalogued_zip_and_datetime_shapes_are_mapped(self):
+        # Unmapped, these were harvested as novel shapes although the catalog
+        # already had them (the B019 failure, repeated).
+        expected = {
+            "B905": "zip-truncates-on-length-mismatch",
+            "DTZ005": "naive-datetime-in-a-persisted-artifact",
+            "DTZ006": "naive-datetime-in-a-persisted-artifact",
+        }
+        for code, shape in expected.items():
+            with self.subTest(code=code):
+                self.assertEqual(mod.RULE_TO_SHAPE.get(code), shape)
+
 
 class TestSuppressionDetection(unittest.TestCase):
     """`has_suppression_comment` is the measured dismissal signal."""
@@ -92,7 +104,7 @@ class TestNormalize(unittest.TestCase):
         from pathlib import Path
 
         out = mod.normalize(
-            {"code": "B905", "filename": None, "location": None, "message": "m"},
+            {"code": "S608", "filename": None, "location": None, "message": "m"},
             Path("/p"),
             tier=1,
             cache={},

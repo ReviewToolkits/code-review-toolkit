@@ -145,6 +145,13 @@ RULE_TO_SHAPE = {
     "RUF009": "class-level-mutable-attribute",
     "RUF012": "class-level-mutable-attribute",
     "PLW1508": "unvalidated-numeric-from-environment",
+    # Catalogued while the agent prompt still listed them as novel; unmapped,
+    # they were harvested as "new shapes" again -- the B019 failure repeated.
+    # The shapes are narrower than the rules (DTZ fires on every naive `now()`,
+    # the shape needs a persisted artifact): the shape's `differential` decides.
+    "B905": "zip-truncates-on-length-mismatch",
+    "DTZ005": "naive-datetime-in-a-persisted-artifact",
+    "DTZ006": "naive-datetime-in-a-persisted-artifact",
 }
 
 _SUPPRESSION = re.compile(
