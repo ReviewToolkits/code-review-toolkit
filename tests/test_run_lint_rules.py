@@ -1,6 +1,7 @@
 """Tests for run_lint_rules.py -- the tiered, pinned ruff selection."""
 
 import unittest
+from pathlib import Path
 
 from helpers import import_script
 
@@ -224,10 +225,11 @@ def _fake_hit(root, relpath, line, needle, code="B008"):
     }
 
 
-def _analyze_with_fake_ruff(root, hits, **kwargs):
+def _analyze_with_fake_ruff(root, hits, project_hits=(), **kwargs):
     from unittest.mock import patch
 
     with (
+        patch.object(mod, "_run_project_ruff", return_value=(list(project_hits), None)),
         patch.object(mod, "ruff_version", return_value=mod.PINNED_RUFF_VERSION),
         patch.object(
             mod,
@@ -362,6 +364,90 @@ class TestExceptClosureFlag(unittest.TestCase):
         self.assertEqual(result["summary"]["suspect_tool_bug"], 1)
         # The genuine F821 keeps F821 a novel-shape candidate ...
         self.assertEqual(result["summary"]["novel_shape_candidates"], ["F821"])
+
+    def test_flagged_hits_carry_the_catalogued_shape(self):
+        from helpers import TempProject
+
+        with TempProject({"m.py": self.SOURCE}) as root:
+            result = _analyze_with_fake_ruff(
+                root,
+                [
+                    _fake_hit(root, "m.py", 5, "exc", code="F821"),
+                    _fake_hit(root, "m.py", 4, "exc", code="F841"),
+                ],
+                tier=2,
+            )
+        for hit in result["findings"]:
+            self.assertEqual(hit["shape_id"], "linter-autofix-breaks-closure-capture")
+            self.assertEqual(hit["except_lines"][0], 4)
+
+    def _project_f841(self, root, fix):
+        return {
+            "code": "F841",
+            "filename": str(root / "m.py"),
+            "location": {"row": 4, "column": 25},
+            "message": "Local variable `exc` is assigned to but never used",
+            "fix": fix,
+        }
+
+    def test_the_projects_own_safe_autofix_is_reported(self):
+        from helpers import TempProject
+
+        with TempProject({"m.py": self.SOURCE}) as root:
+            result = _analyze_with_fake_ruff(
+                root,
+                [_fake_hit(root, "m.py", 5, "exc", code="F821")],
+                project_hits=[self._project_f841(root, {"applicability": "safe"})],
+            )
+        (hit,) = result["findings"]
+        # The tier-1 F821 is enough: the project's F841 fix is the defect.
+        self.assertTrue(hit["project_config_autofixes"])
+        self.assertEqual(hit["project_fix_applicability"], "safe")
+        check = result["project_autofix_check"]
+        self.assertTrue(check["ran"])
+        self.assertEqual(check["autofixed_by_project_config"], 1)
+
+    def test_an_unfixable_or_unselected_f841_is_not_an_autofix(self):
+        from helpers import TempProject
+
+        # Not selected by the project (no F841), or listed as unfixable (ruff
+        # then reports the hit with no fix).
+        for unfixable in (False, True):
+            with TempProject({"m.py": self.SOURCE}) as root:
+                project_hits = [self._project_f841(root, None)] if unfixable else []
+                result = _analyze_with_fake_ruff(
+                    root,
+                    [_fake_hit(root, "m.py", 5, "exc", code="F821")],
+                    project_hits=project_hits,
+                )
+            (hit,) = result["findings"]
+            self.assertFalse(hit["project_config_autofixes"])
+            check = result["project_autofix_check"]
+            self.assertEqual(check["autofixed_by_project_config"], 0)
+
+    def test_a_failed_project_run_is_not_measured_not_clean(self):
+        from unittest.mock import patch
+
+        from helpers import TempProject
+
+        with TempProject({"m.py": self.SOURCE}) as root:
+            hit = _fake_hit(root, "m.py", 5, "exc", code="F821")
+            finding = mod.normalize(hit, root, {})
+            finding.update(
+                mod.except_closure_annotation(
+                    "F821", hit["message"], 5, root / "m.py", {}
+                )
+            )
+            with patch.object(mod, "_run_project_ruff", return_value=([], "boom")):
+                check = mod.project_autofix_check("ruff", [finding], root)
+        self.assertFalse(check["ran"])
+        self.assertEqual(check["error"], "boom")
+        self.assertIsNone(finding["project_config_autofixes"])
+
+    def test_no_except_closure_hits_skips_the_check(self):
+        check = mod.project_autofix_check("ruff", [], Path("/p"))
+        self.assertFalse(check["ran"])
+        self.assertIn("skipped", check)
 
     def test_a_known_tool_bug_alone_is_not_a_novel_shape(self):
         from helpers import TempProject

@@ -88,6 +88,15 @@ handler. It is a real NameError if the closure escapes (stored, returned, schedu
 Decide that one question per hit. These hits are kept out of `novel_shape_candidates`. Never
 recommend removing the `as exc`.
 
+They carry `shape_id: "linter-autofix-breaks-closure-capture"`, and the real defect is that shape:
+the project's **own** `ruff check --fix` deleting `as exc` while the closure still reads it. The
+script measures that under the project's config. `project_config_autofixes: true` on a hit means
+the project's ruff would apply that fix. Report it as a FIX: the error path breaks the next time
+someone runs the autofix. Also check whether `--fix` runs automatically anywhere (pre-commit, CI, a
+`make` target). `project_autofix_check.autofixed_by_project_config` counts these hits. If
+`project_autofix_check.error` is set, the question was not answered, so do not treat it as false.
+There is no scanner finding to merge these hits with: the hit is the evidence for the shape.
+
 For everything else, the ordinary rules apply: read the code, construct a concrete failure scenario,
 and drop anything you cannot make concrete. Rules that are policy rather than defect in a given
 project — `S101` (assert) in a test suite, `S603`/`S607` in a build script — are ACCEPTABLE, and

@@ -981,6 +981,9 @@ def closure_argument_hint(
 # ---------------------------------------------------------------------------
 
 EXCEPT_CLOSURE_ISSUE = "ruff#6878"
+# The catalogued shape for the real defect behind these hits: the project's
+# own `ruff check --fix` deleting `as NAME` that a closure still reads.
+EXCEPT_CLOSURE_SHAPE = "linter-autofix-breaks-closure-capture"
 
 _NAME_IN_MESSAGE = re.compile(r"`([^`]+)`")
 
@@ -1044,6 +1047,9 @@ def except_closure_match(code: str, message: str, line: int, bindings: list) -> 
             return {
                 "suspect_tool_bug": True,
                 "known_tool_issue": EXCEPT_CLOSURE_ISSUE,
+                "shape_id": EXCEPT_CLOSURE_SHAPE,
+                # The `except ... as NAME` header, where ruff puts the F841.
+                "except_lines": [first, header_end],
                 "tool_bug_note": (
                     f"`{name}` is the `except ... as {name}` binding, read from a "
                     "closure nested in that handler. Python keeps it bound until "
@@ -1057,6 +1063,9 @@ def except_closure_match(code: str, message: str, line: int, bindings: list) -> 
             return {
                 "suspect_tool_bug": True,
                 "known_tool_issue": EXCEPT_CLOSURE_ISSUE,
+                "shape_id": EXCEPT_CLOSURE_SHAPE,
+                # The `except ... as NAME` header, where ruff puts the F841.
+                "except_lines": [first, header_end],
                 "autofix_unsafe": True,
                 "tool_bug_note": (
                     f"`{name}` IS used, by a closure at line {min(reads)}. ruff's "
@@ -1262,6 +1271,91 @@ def _run_ruff(
     return findings, out.stderr, None
 
 
+def _run_project_ruff(
+    ruff_bin: str, files: list[Path], project_root: Path
+) -> tuple[list[dict], str | None]:
+    """ruff over *files* under the PROJECT's own config; (findings, error).
+
+    No --isolated and no --select: the question is what the project's own
+    `ruff check --fix` would do. --force-exclude honours the project's
+    excludes for explicitly named files, as a whole-project run would.
+    """
+    cmd = [ruff_bin, "check", "--output-format", "json", "--no-cache"]
+    cmd += ["--force-exclude", *(str(f) for f in files)]
+    try:
+        out = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=_RUFF_TIMEOUT,
+            cwd=str(project_root),
+            check=False,  # exit 1 means "findings"; the code is read below
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [], f"could not run ruff with the project config: {exc}"
+    try:
+        return (json.loads(out.stdout) if out.stdout.strip() else []), (
+            None if out.returncode in (0, 1) else (out.stderr.strip() or "ruff failed")
+        )
+    except json.JSONDecodeError as exc:
+        return [], f"ruff emitted unparseable JSON: {exc}"
+
+
+def project_autofix_check(
+    ruff_bin: str, findings: list[dict], project_root: Path
+) -> dict:
+    """Would the project's own ruff config autofix away an except-closure binding?
+
+    The ruff#6878 hits are false positives, but their F841 carries a "safe"
+    fix that deletes ``as NAME`` while a closure still reads it. Whether that
+    is a live defect depends on the PROJECT's config (is F841 selected and
+    fixable?), which the --isolated run cannot see. Each hit gets
+    ``project_config_autofixes`` (True / False, None if not measured).
+    """
+    hits = [f for f in findings if f.get("known_tool_issue") == EXCEPT_CLOSURE_ISSUE]
+    if not hits:
+        return {"ran": False, "skipped": "no except-closure (ruff#6878) hits"}
+    files = sorted({project_root / f["file"] for f in hits if f.get("file")})
+    raw, error = _run_project_ruff(ruff_bin, files, project_root)
+    if error:
+        for f in hits:
+            f["project_config_autofixes"] = None
+        return {"ran": False, "error": error, "hits_checked": 0}
+    fixes: dict[tuple[str, int], str | None] = {}
+    for item in raw:
+        if item.get("code") != "F841" or not item.get("filename"):
+            continue
+        rel = relative_to_root(Path(item["filename"]), project_root)
+        row = (item.get("location") or {}).get("row", 0)
+        fix = item.get("fix") or {}
+        fixes[(rel, row)] = fix.get("applicability") if fix else None
+    autofixed = 0
+    for f in hits:
+        first, last = f.get("except_lines") or (0, -1)
+        found = [
+            fixes[(f["file"], row)]
+            for row in range(first, last + 1)
+            if (f["file"], row) in fixes
+        ]
+        applicability = found[0] if found else None
+        # `ruff check --fix` applies "safe" fixes; "unsafe" needs --unsafe-fixes.
+        f["project_config_autofixes"] = applicability == "safe"
+        f["project_fix_applicability"] = applicability
+        autofixed += f["project_config_autofixes"]
+    return {
+        "ran": True,
+        "files": len(files),
+        "hits_checked": len(hits),
+        # Hits whose `except ... as NAME` the project's `ruff check --fix`
+        # would remove: the closure then raises NameError. A live defect.
+        "autofixed_by_project_config": autofixed,
+        "note": (
+            "Measured with this run's ruff binary, which may differ from the "
+            "project's pinned ruff."
+        ),
+    }
+
+
 def analyze(
     target: str,
     *,
@@ -1345,6 +1439,8 @@ def analyze(
         reason = f["dismissal_reason"]
         dismissed_by_reason[reason] = dismissed_by_reason.get(reason, 0) + 1
 
+    autofix = project_autofix_check(ruff_bin, findings, project_root)
+
     merged = [f for f in findings if f["shape_id"]]
     suppressed = [f for f in findings if f["has_suppression_comment"]]
 
@@ -1402,6 +1498,10 @@ def analyze(
             # `known_tool_issue` and `tool_bug_note`). Flagged, not dismissed.
             "suspect_tool_bug": sum(1 for f in findings if f.get("suspect_tool_bug")),
         },
+        # Whether the project's own ruff config would autofix the
+        # except-closure (ruff#6878) bindings away; see each hit's
+        # `project_config_autofixes`.
+        "project_autofix_check": autofix,
         "findings_capped": len(raw) > max_findings,
         "findings": findings + preview_findings,
         # Hits dismissed by a mechanical rule, each with its `dismissal_reason`
