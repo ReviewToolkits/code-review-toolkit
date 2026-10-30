@@ -86,23 +86,90 @@ def classify_files(
     return source, test
 
 
+def _is_skip_decorator(d: ast.expr) -> bool:
+    """`@unittest.skip...`, `@pytest.mark.skip/skipif` and the like."""
+    target = d.func if isinstance(d, ast.Call) else d
+    if isinstance(target, ast.Attribute):
+        return "skip" in target.attr.lower()
+    return isinstance(target, ast.Name) and "skip" in target.id.lower()
+
+
 def _is_skipped(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-    """True for `@unittest.skip...`, `@pytest.mark.skip/skipif` and the like."""
-    return any(
-        (isinstance(d, ast.Attribute) and "skip" in d.attr.lower())
-        or (isinstance(d, ast.Call)
-            and isinstance(d.func, ast.Attribute)
-            and "skip" in d.func.attr.lower())
-        or (isinstance(d, ast.Name) and "skip" in d.id.lower())
-        for d in func.decorator_list
-    )
+    """True for a test function or method decorated to be skipped."""
+    return any(_is_skip_decorator(d) for d in func.decorator_list)
+
+
+# pytest's own markers that select or configure tests rather than label them.
+# Skips are counted as skipped tests instead.
+_UNLABELLED_MARKS = frozenset({
+    "parametrize", "usefixtures", "filterwarnings", "skip", "skipif",
+})
+
+
+def _mark_name(expr: ast.expr) -> str | None:
+    """`slow` for `pytest.mark.slow` / `mark.slow(...)`; None otherwise."""
+    target = expr.func if isinstance(expr, ast.Call) else expr
+    if (
+        isinstance(target, ast.Attribute)
+        and isinstance(target.value, (ast.Attribute, ast.Name))
+        and (
+            getattr(target.value, "attr", None) == "mark"
+            or getattr(target.value, "id", None) == "mark"
+        )
+    ):
+        return target.attr
+    return None
+
+
+def _pytestmark(body: list[ast.stmt]) -> list[ast.expr]:
+    """The marks a module or class assigns to `pytestmark`."""
+    marks: list[ast.expr] = []
+    for node in body:
+        if (
+            isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in node.targets)
+        ):
+            value = node.value
+            marks.extend(value.elts if isinstance(value, (ast.List, ast.Tuple)) else [value])
+    return marks
+
+
+def _calls_pytest_skip(node: ast.AST, *, module_level: bool = False) -> bool:
+    """A `pytest.skip(...)` call (or `importorskip`, at module level) in *node*.
+
+    At module level only statements outside functions and classes count.
+    """
+    if module_level:
+        stack = [n for n in node.body if not isinstance(
+            n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        )]
+        nodes = (sub for n in stack for sub in ast.walk(n))
+    else:
+        nodes = ast.walk(node)
+    names = {"skip", "importorskip"} if module_level else {"skip"}
+    for sub in nodes:
+        if (
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Attribute)
+            and sub.func.attr in names
+            and isinstance(sub.func.value, ast.Name)
+            and sub.func.value.id == "pytest"
+        ):
+            return True
+    return False
 
 
 def _extract_test_info(filepath: Path) -> dict:
     """Extract test classes and methods from a test file.
 
     Counts unittest `TestCase` methods, methods of plain pytest classes and
-    pytest-style module-level `test*` functions alike.
+    pytest-style module-level `test*` functions alike. A skip decorator on
+    the class, or a skip mark in a module's or class's `pytestmark`, skips
+    every test under it. `markers` counts the tests carrying each pytest
+    mark (decorator, class or module `pytestmark`); `runtime_skip_tests`
+    names the tests whose body may call `pytest.skip()`, and `module_skip`
+    says the whole file may be skipped at import (`pytest.skip(...,
+    allow_module_level=True)`, `pytest.importorskip`).
     """
     try:
         source = filepath.read_text(encoding="utf-8", errors="replace")
@@ -112,24 +179,49 @@ def _extract_test_info(filepath: Path) -> dict:
             "classes": [],
             "standalone_tests": [],
             "skipped_standalone_tests": [],
+            "markers": {},
+            "runtime_skip_tests": [],
+            "module_skip": False,
             "parse_error": True,
         }
 
     classes: list[dict] = []
     standalone: list[str] = []
     skipped_standalone: list[str] = []
+    markers: dict[str, int] = {}
+    runtime_skip: list[str] = []
+
+    module_marks = _pytestmark(tree.body)
+    module_skipped = any(_is_skip_decorator(m) for m in module_marks)
+
+    def record(func: ast.FunctionDef | ast.AsyncFunctionDef,
+               inherited: list[ast.expr]) -> None:
+        names = {
+            name
+            for d in [*inherited, *func.decorator_list]
+            if (name := _mark_name(d)) and name not in _UNLABELLED_MARKS
+        }
+        for name in names:
+            markers[name] = markers.get(name, 0) + 1
+        if _calls_pytest_skip(func):
+            runtime_skip.append(func.name)
 
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.ClassDef):
+            class_marks = [*module_marks, *node.decorator_list, *_pytestmark(node.body)]
+            class_skipped = any(_is_skip_decorator(m) for m in class_marks)
             methods = []
             skipped = []
             for child in ast.iter_child_nodes(node):
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    if child.name.startswith("test"):
-                        if _is_skipped(child):
-                            skipped.append(child.name)
-                        else:
-                            methods.append(child.name)
+                if (
+                    isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and child.name.startswith("test")
+                ):
+                    if class_skipped or _is_skipped(child):
+                        skipped.append(child.name)
+                    else:
+                        methods.append(child.name)
+                    record(child, class_marks)
 
             classes.append({
                 "name": node.name,
@@ -138,17 +230,23 @@ def _extract_test_info(filepath: Path) -> dict:
                 "total_test_methods": len(methods) + len(skipped),
                 "line_start": node.lineno,
             })
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name.startswith("test"):
-                if _is_skipped(node):
-                    skipped_standalone.append(node.name)
-                else:
-                    standalone.append(node.name)
+        elif (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test")
+        ):
+            if module_skipped or _is_skipped(node):
+                skipped_standalone.append(node.name)
+            else:
+                standalone.append(node.name)
+            record(node, module_marks)
 
     return {
         "classes": classes,
         "standalone_tests": standalone,
         "skipped_standalone_tests": skipped_standalone,
+        "markers": dict(sorted(markers.items())),
+        "runtime_skip_tests": runtime_skip,
+        "module_skip": _calls_pytest_skip(tree, module_level=True),
         "parse_error": False,
     }
 
@@ -577,29 +675,21 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
     module_index = build_module_index(source_files, project_root)
     reexports = build_reexport_index(source_files, project_root)
     test_info: dict[str, dict] = {}
+    support_info: dict[str, dict] = {}
     for tf in test_files:
         rel = str(tf.relative_to(project_root))
         tinfo = _extract_test_info(tf)
-        matched_sources = _match_test_to_source(tf, source_files, project_root)
-        imported_modules = _read_test_imports(tf, project_root)
-        tinfo["matched_sources"] = matched_sources
-        tinfo["imported_modules"] = imported_modules
-        # Import-based correspondence. Feature-named suites (`test_*_race.py`
-        # for `storage/engine.py`) never match by file name, but they import
-        # the module under test. Only files that define tests count: a
-        # conftest.py or helper module importing the app tests nothing.
+        # Only files that define tests are test files. conftest.py, helpers
+        # and a test package's __init__.py are support files: their imports
+        # are reported (a conftest building the app imports half the
+        # project) but never make a source module "tested".
         has_tests = bool(
             tinfo["standalone_tests"]
             or tinfo["skipped_standalone_tests"]
             or any(c["total_test_methods"] for c in tinfo["classes"])
         )
-        tree = None
-        if has_tests and not tinfo["parse_error"]:
-            try:
-                tree = ast.parse(tf.read_text(encoding="utf-8", errors="replace"))
-            except (SyntaxError, ValueError):
-                tree = None
-        tinfo["imported_sources"] = sorted(
+        tree = None if tinfo["parse_error"] else parse_source(tf)
+        imported_sources = sorted(
             resolve_imported_sources(
                 tree,
                 module_index,
@@ -609,10 +699,30 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
             if tree is not None
             else []
         )
+        if not has_tests and not tinfo["parse_error"]:
+            if tf.name == "conftest.py":
+                kind = "conftest"
+            elif tf.name == "__init__.py":
+                kind = "package_init"
+            else:
+                kind = "helper"
+            support_info[rel] = {"kind": kind, "imported_sources": imported_sources}
+            continue
+        tinfo["matched_sources"] = _match_test_to_source(tf, source_files, project_root)
+        tinfo["imported_modules"] = _read_test_imports(tf, project_root)
+        # Import-based correspondence. Feature-named suites (`test_*_race.py`
+        # for `storage/engine.py`) never match by file name, but they import
+        # the module under test.
+        tinfo["imported_sources"] = imported_sources
         test_info[rel] = tinfo
 
     # Build the correlation map: source → tests, remembering how each matched.
     source_to_tests: dict[str, list[str]] = {s: [] for s in source_info}
+    by_support: dict[str, list[str]] = {s: [] for s in source_info}
+    for support_path, sinfo in support_info.items():
+        for src in sinfo["imported_sources"]:
+            if src in by_support:
+                by_support[src].append(support_path)
     by_name: dict[str, list[str]] = {s: [] for s in source_info}
     by_import: dict[str, list[str]] = {s: [] for s in source_info}
     for test_path, tinfo in test_info.items():
@@ -664,6 +774,9 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
             "match_method": match_method,
             "name_matched_test_files": by_name[src],
             "import_matched_test_files": by_import[src],
+            # conftest.py / helper files importing this module. Not counted
+            # in has_tests: an import for a fixture tests nothing by itself.
+            "support_imported_by": by_support[src],
             "test_method_count": total_test_methods,
             "skipped_test_count": total_skipped,
             "public_classes": len(src_info["classes"]),
@@ -681,7 +794,15 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
     # a test file twice when it correlates with two sources.
     suite_test_methods = 0
     suite_skipped = 0
-    for ti in test_info.values():
+    marked: dict[str, int] = {}
+    runtime_skips = 0
+    module_skips: list[str] = []
+    for rel, ti in test_info.items():
+        for name, count in ti["markers"].items():
+            marked[name] = marked.get(name, 0) + count
+        runtime_skips += len(ti["runtime_skip_tests"])
+        if ti["module_skip"]:
+            module_skips.append(rel)
         suite_test_methods += len(ti["standalone_tests"])
         suite_skipped += len(ti["skipped_standalone_tests"])
         for cls in ti["classes"]:
@@ -700,7 +821,10 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
         "warnings": warnings,
         "summary": {
             "source_files": total_source,
+            # Files that define tests; conftest.py, helpers and test-package
+            # __init__.py files are counted separately.
             "test_files": len(test_info),
+            "support_files": len(support_info),
             "source_files_with_tests": tested,
             "source_files_without_tests": len(untested),
             "source_files_with_tests_by_name": sum(1 for v in by_name.values() if v),
@@ -717,6 +841,14 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
             # included), skipped ones excluded; correlated or not.
             "total_test_methods": suite_test_methods,
             "total_skipped_tests": suite_skipped,
+            # Tests carrying each pytest mark (`slow`, `network`, ...): the
+            # ones a `-m "not slow"` run leaves out.
+            "marked_tests": dict(sorted(marked.items())),
+            # Skips decided at run time, invisible to the counts above: tests
+            # whose body calls pytest.skip(), and files that may skip at
+            # import (module-level pytest.skip / importorskip).
+            "tests_with_runtime_skip": runtime_skips,
+            "files_with_module_level_skip": sorted(module_skips),
             # Non-empty when the tests were found OUTSIDE the scanned tree, so a
             # reader can tell "this package has no tests" from "the tests live
             # somewhere else and the scope missed them".
@@ -729,6 +861,7 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
         "untested_sources": sorted(untested),
         "source_coverage": source_coverage,
         "test_details": test_info,
+        "support_files": support_info,
     }
 
 

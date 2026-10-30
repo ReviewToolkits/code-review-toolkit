@@ -603,6 +603,116 @@ class TestNameMatchingLayouts(unittest.TestCase):
         self.assertIn("app/nodes/stem_node.py", out["untested_sources"])
 
 
+class TestSupportFilesAndMarkers(unittest.TestCase):
+    """conftest.py and helpers are not test files; markers are counted."""
+
+    def _project(self) -> dict:
+        files = dict(_IMPORT_PROJECT)
+        files["tests/__init__.py"] = ""
+        files["tests/conftest.py"] = (
+            "import pytest\n"
+            "import pkg.service\n"
+            "\n"
+            "@pytest.fixture\n"
+            "def svc():\n    return pkg.service\n"
+        )
+        files["tests/helpers.py"] = "from pkg.registry import connect\n"
+        files["tests/test_engine.py"] = (
+            "import pytest\n"
+            "from pkg.storage.engine import Engine\n"
+            "\n"
+            "pytestmark = pytest.mark.slow\n"
+            "\n"
+            "def test_a():\n    Engine()\n"
+            "\n"
+            "def test_b():\n    Engine()\n"
+        )
+        files["tests/test_base.py"] = (
+            "import pytest\n"
+            "from pkg.storage.base import Base\n"
+            "\n"
+            "@pytest.mark.slow\n"
+            "@pytest.mark.parametrize('x', [1, 2])\n"
+            "def test_c(x):\n    Base()\n"
+            "\n"
+            "@pytest.mark.network\n"
+            "class TestRemote:\n"
+            "    def test_d(self):\n        Base()\n"
+            "\n"
+            "def test_e():\n"
+            "    if True:\n"
+            "        pytest.skip('needs a GPU')\n"
+        )
+        files["tests/test_optional.py"] = (
+            "import pytest\n"
+            "\n"
+            "np = pytest.importorskip('numpy')\n"
+            "\n"
+            "def test_f():\n    assert np\n"
+        )
+        return files
+
+    def test_support_files_are_not_test_files(self):
+        with TempProject(self._project()) as root:
+            out = mod.analyze(str(root))
+        self.assertEqual(out["summary"]["test_files"], 3)
+        self.assertEqual(out["summary"]["support_files"], 3)
+        self.assertNotIn("tests/conftest.py", out["test_details"])
+        self.assertEqual(out["support_files"]["tests/conftest.py"]["kind"], "conftest")
+        self.assertEqual(out["support_files"]["tests/helpers.py"]["kind"], "helper")
+        self.assertEqual(
+            out["support_files"]["tests/__init__.py"]["kind"], "package_init"
+        )
+
+    def test_conftest_imports_are_reported_but_not_counted(self):
+        with TempProject(self._project()) as root:
+            out = mod.analyze(str(root))
+        self.assertEqual(
+            out["support_files"]["tests/conftest.py"]["imported_sources"],
+            ["pkg/service.py"],
+        )
+        cov = {sc["source_file"]: sc for sc in out["source_coverage"]}
+        self.assertEqual(
+            cov["pkg/service.py"]["support_imported_by"], ["tests/conftest.py"]
+        )
+        # Reported, but a conftest import is not a test.
+        self.assertIn("pkg/service.py", out["untested_sources"])
+
+    def test_markers_and_runtime_skips_counted(self):
+        with TempProject(self._project()) as root:
+            out = mod.analyze(str(root))
+        summary = out["summary"]
+        # test_a, test_b (module pytestmark) and test_c (decorator).
+        self.assertEqual(summary["marked_tests"], {"network": 1, "slow": 3})
+        self.assertEqual(summary["tests_with_runtime_skip"], 1)
+        self.assertEqual(
+            summary["files_with_module_level_skip"], ["tests/test_optional.py"]
+        )
+        details = out["test_details"]["tests/test_base.py"]
+        self.assertEqual(details["runtime_skip_tests"], ["test_e"])
+
+    def test_class_and_module_skip_marks_count_as_skipped(self):
+        with TempProject({
+            "tests/test_x.py": (
+                "import pytest\n"
+                "pytestmark = pytest.mark.skipif(True, reason='x')\n"
+                "def test_a():\n    pass\n"
+            ),
+            "tests/test_y.py": (
+                "import unittest\n"
+                "@unittest.skip('x')\n"
+                "class TestY(unittest.TestCase):\n"
+                "    def test_b(self):\n        pass\n"
+                "\n"
+                "class TestZ(unittest.TestCase):\n"
+                "    def test_c(self):\n        pass\n"
+            ),
+        }) as root:
+            out = mod.analyze(str(root))
+        self.assertEqual(out["summary"]["total_skipped_tests"], 2)
+        self.assertEqual(out["summary"]["total_test_methods"], 1)
+
+
 class TestModuleNames(unittest.TestCase):
     def test_package_rooted_names(self):
         with TempProject({
