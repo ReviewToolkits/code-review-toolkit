@@ -133,6 +133,24 @@ For findings from other agents that touch recently-modified code:
 
 This capability prevents the toolkit from recommending reversal of intentional recent changes.
 
+### Annotating findings with `annotate_findings.py`
+
+To annotate many findings, especially every FIX in an `explore` run, don't hand-roll `git log -S` loops. Write the findings to a JSON file in your private directory (a list of `{"id", "file", "line"}`, plus optional `end_line`, `pattern` and `signature`) and run:
+
+```bash
+python3 <plugin_root>/scripts/annotate_findings.py [scope] --findings "$d/findings.json" [--key-type B=fix] > "$d/annotations.json"
+```
+
+Per finding it reports:
+- `introduced_by`: the newest change to those lines that is not layout only, from `git log -L`, which follows renames. Re-indents, re-wraps and comment edits are skipped and listed in `skipped_layout_only`.
+- `blame` (`git blame -w -C -C`) as a cross-check.
+- `pickaxe`, when you gave a `pattern`.
+- `first_release`: the first tag matching `--release-pattern`.
+- `related_fixes`: fix commits that changed the enclosing function.
+- `branches`: per unmerged remote branch, `unchanged` (the function is AST-identical to HEAD, so the finding applies there too), `changed` (read that branch's diff before calling the finding fixed or unfixed there), `function-absent` or `file-absent`. With a `signature`, `signature_present` says whether that code substring is still in the branch's function.
+
+A null `introduced_by` or `pickaxe` comes with a reason. Report it as unknown. Never substitute HEAD or the last commit you happened to look at: an empty pickaxe used to fall back to HEAD silently in hand-written helpers. When `introduced_by` and `blame` disagree, read both commits. A `pattern` is whitespace-sensitive and matches a single line, so after a reformatting sweep prefer `introduced_by`.
+
 ## Capability 6: Co-Change Coupling Analysis
 
 Using git-history-context's co-change data + architecture-mapper's import graph:
@@ -241,3 +259,34 @@ For each:
 - **CONSIDER**: Potentially incomplete fix, possibly vulnerable analogous code, or feature gaps (no tests, no docs)
 - **POLICY**: New feature introduces a pattern requiring a project-level decision, or co-change coupling suggests architectural restructuring
 - **ACCEPTABLE**: Fix is complete and correct, similar code is already properly handled, or co-change is natural for the module structure
+
+## Running the script
+
+These rules apply to every script call this agent makes.
+
+- **Timeout.** Give the Bash call `timeout: 300000` (5 min). The 120 s default kills the script on
+  large projects. If it may run longer still, use `run_in_background` and wait for the completion
+  notification rather than polling. `annotate_findings.py` stops starting new findings after about
+  270 s and lists the rest in `skipped`; split a long list into several runs.
+- **A private output location.** Other agents run the toolkit's scripts concurrently in `parallel`
+  mode, so never write to a fixed path. Create a directory of your own and keep stdout and stderr
+  apart, in one Bash call:
+
+  ```bash
+  d=$(mktemp -d "${TMPDIR:-/tmp}/crt-git-history-analyzer.XXXXXX") && echo "$d" &&
+  python3 <plugin_root>/scripts/annotate_findings.py [scope] --findings "$d/findings.json" > "$d/out.json" 2> "$d/out.err"; echo "exit=$?"
+  ```
+
+  Each Bash call is a fresh shell: a `$$` suffix or a shell variable does not survive into the next
+  call. Reuse the literal path `echo` printed.
+- **Running the project's own code** (its tests, a reproducer, an import check): do it in an
+  exported copy, never in the checkout, and set `TMPDIR` to your private directory so the project's
+  own temp files land there instead of a shared `/tmp`.
+- **Forward `--max-files N`** when the caller gave one (it caps the distinct files whose findings
+  are annotated), and say so in the report whenever the envelope's `files_capped` is true.
+- **Check before you read.** A non-zero `exit` or an empty `out.json` means the run did not
+  succeed. Read `out.err`, and any `error` field in `out.json`. A finding listed in `skipped` was
+  not annotated: say so, don't drop it.
+- **Do not retry a script that timed out or failed.** Answer the same question with `git log -L`,
+  `git blame -w -C -C` and Read, and state in the report that the script did not complete. A run
+  that failed is never "no findings".
