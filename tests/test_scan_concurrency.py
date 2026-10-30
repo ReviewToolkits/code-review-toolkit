@@ -785,6 +785,89 @@ class TestLockContextManagerKind(unittest.TestCase):
         )
 
 
+class TestCallResolution(unittest.TestCase):
+    """Two classes share a method name: resolve to the receiver's class, and say
+    so in the chain when only the name was used."""
+
+    def test_local_provenance_avoids_a_false_lock_cycle(self):
+        src = """
+        import threading
+
+        class Registry:
+            def __init__(self):
+                self._lock = threading.Lock()
+
+            def get_config(self, name):
+                with self._lock:
+                    return {}
+
+        class Store:
+            def __init__(self, registry=None):
+                self._state = threading.Lock()
+                self._guard = threading.Lock()
+                self._registry = registry or Registry()
+
+            def get_config(self, name):
+                with self._state:
+                    return self._bootstrap()
+
+            def _bootstrap(self):
+                registry = self._registry
+                with self._guard:
+                    return registry.get_config("x")
+        """
+        self.assertEqual(of(scan(src), "lock-order-inversion"), [])
+
+    _SHARED = """
+    import threading, time
+    from typing import Protocol
+
+    class ShelfBase(Protocol):
+        def metrics(self) -> dict: ...
+
+    class DiskShelf{base}:
+        def metrics(self):
+            time.sleep(1)
+            return {{}}
+
+    class Registry:
+        def metrics(self):
+            return {{}}
+
+    lock = threading.Lock()
+
+    def refresh({param}):
+        with lock:
+            return shelf.metrics()
+    """
+
+    def _found(self, base: str, param: str) -> list[dict]:
+        src = self._SHARED.format(base=base, param=param)
+        return of(scan(src), "blocking-call-under-lock")
+
+    def test_receiver_name_picks_the_class_and_hop_is_marked_weak(self):
+        found = self._found("", "shelf")
+        self.assertEqual(len(found), 1)
+        self.assertTrue(found[0]["chain"][0].endswith("[weak: name-only]"))
+        self.assertIn("DiskShelf.metrics", found[0]["chain"][1])
+
+    def test_ambiguous_hop_names_its_candidate_count(self):
+        src = (
+            self._SHARED.format(base="", param="shelf")
+            .replace("shelf.metrics()", "thing.metrics()")
+            .replace("def refresh(shelf)", "def refresh(thing)")
+        )
+        found = of(scan(src), "blocking-call-under-lock")
+        self.assertEqual(len(found), 1)
+        self.assertIn("[weak: name-only, 1 of 2 candidates]", found[0]["chain"][0])
+
+    def test_protocol_annotation_resolves_to_its_one_implementation(self):
+        found = self._found("(ShelfBase)", "shelf: ShelfBase")
+        self.assertEqual(len(found), 1)
+        self.assertNotIn("[weak", " ".join(found[0]["chain"]))
+        self.assertIn("DiskShelf.metrics", found[0]["chain"][1])
+
+
 class TestConditions(unittest.TestCase):
     def test_wait_without_predicate_loop(self):
         src = """

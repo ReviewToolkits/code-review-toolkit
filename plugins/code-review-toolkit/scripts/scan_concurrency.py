@@ -30,10 +30,13 @@ holds a lock around ``yield`` (e.g. ``read_lock()``/``write_lock()`` on a
 custom reader/writer lock, or ``_guard_for(key)``).
 
 Calls are resolved through ``self.method``, module functions, ``from x import
-f`` aliases, attributes whose type is known from a constructor call or an
-annotation, and -- marked ``weak`` -- a method name defined by exactly one project
-class. Every chain-based finding carries its ``chain`` so the agent can check
-each hop.
+f`` aliases, attributes and locals whose type is known from a constructor call,
+an annotation or a return annotation (an interface stub resolves to its
+implementations), and -- marked ``weak`` -- a method name defined by at most a
+few project classes, narrowed to the class the receiver's name points at
+(``index`` -> ``SearchIndex``). Every chain-based finding carries its ``chain``
+so the agent can check each hop; a weak hop ends in ``[weak: name-only]`` (with
+the candidate count when more than one class remains).
 
 Confidence levels:
     high    -- the mechanism holds on every resolved hop
@@ -461,8 +464,10 @@ class Project:
         self.lock_cm_mode: dict[str, str] = {}
         self.lock_cm_via: dict[str, str] = {}
         self.lock_cm_alias: dict[str, str] = {}  # derived CM -> wrapped lock's key
+        self._subclasses: dict[str, list[str]] | None = None
         for rel, tree in corpus:
             self._index_module(rel, tree)
+        self._infer_attr_types()
         self._resolve_lock_cms()
         for func in self.funcs.values():
             _FunctionScanner(self, func).run()
@@ -709,6 +714,140 @@ class Project:
             cls_key = nxt
         return None
 
+    # -- pass 1a: what type an attribute or a local holds --------------------
+
+    def annotation_class(self, mod: ModuleInfo, ann: ast.AST | None) -> str | None:
+        """The project class an annotation names (`X`, `X | None`, `Optional[X]`)."""
+        if ann is None:
+            return None
+        if isinstance(ann, ast.Constant) and isinstance(ann.value, str):
+            try:
+                ann = ast.parse(ann.value, mode="eval").body
+            except SyntaxError:
+                return None
+        if isinstance(ann, ast.BinOp):  # X | None
+            return self.annotation_class(mod, ann.left) or self.annotation_class(
+                mod, ann.right
+            )
+        if isinstance(ann, ast.Subscript):
+            # Only wrappers that still mean "an X": `list[X]` is not an X.
+            if _dotted(ann.value).split(".")[-1] not in _TYPE_WRAPPERS:
+                return None
+            inner = ann.slice
+            elts = inner.elts if isinstance(inner, ast.Tuple) else [inner]
+            for elt in elts:
+                found = self.annotation_class(mod, elt)
+                if found:
+                    return found
+            return None
+        return self.resolve_class(mod, ann)
+
+    def return_class(self, func_key: str) -> str | None:
+        func = self.funcs[func_key]
+        return self.annotation_class(self.modules[func.module], func.node.returns)
+
+    def value_class(
+        self,
+        mod: ModuleInfo,
+        cls_key: str | None,
+        value: ast.AST | None,
+        env: dict[str, str],
+    ) -> str | None:
+        """The project class *value* evaluates to, when its provenance shows it:
+        a constructor, a call with a return annotation, an annotated parameter
+        (*env*), an attribute of known type, or either side of `a or b`."""
+        if isinstance(value, ast.Call):
+            found = self.resolve_class(mod, value.func)
+            if found:
+                return found
+            func = value.func
+            callee = None
+            method = _self_attr(func)
+            if method and cls_key:
+                callee = self.method_of(cls_key, method)
+            elif isinstance(func, ast.Name) and func.id in mod.functions:
+                callee = mod.functions[func.id]
+            return self.return_class(callee) if callee else None
+        if isinstance(value, ast.BoolOp):
+            for operand in value.values:
+                found = self.value_class(mod, cls_key, operand, env)
+                if found:
+                    return found
+            return None
+        if isinstance(value, ast.IfExp):
+            return self.value_class(mod, cls_key, value.body, env) or self.value_class(
+                mod, cls_key, value.orelse, env
+            )
+        if isinstance(value, ast.Name):
+            return env.get(value.id)
+        attr = _self_attr(value)
+        if attr and cls_key and cls_key in self.classes:
+            return self.classes[cls_key].attr_types.get(attr)
+        return None
+
+    def param_env(
+        self, mod: ModuleInfo, fn: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> dict[str, str]:
+        args = fn.args
+        env: dict[str, str] = {}
+        for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs]:
+            found = self.annotation_class(mod, arg.annotation)
+            if found:
+                env[arg.arg] = found
+        return env
+
+    def _infer_attr_types(self) -> None:
+        """`self.x = param`, `self.x = a or Factory()`, `self.x: X = ...`: the
+        attribute's class, beyond the direct constructor call pass 1 sees."""
+        for info in self.classes.values():
+            mod = self.modules[info.module]
+            for func_key in info.methods.values():
+                fn = self.funcs[func_key].node
+                env = self.param_env(mod, fn)
+                for sub in _walk_scope(fn):
+                    if isinstance(sub, ast.AnnAssign):
+                        attr = _self_attr(sub.target)
+                        found = self.annotation_class(mod, sub.annotation)
+                    elif isinstance(sub, ast.Assign) and len(sub.targets) == 1:
+                        attr = _self_attr(sub.targets[0])
+                        found = (
+                            self.value_class(mod, info.key, sub.value, env)
+                            if attr
+                            else None
+                        )
+                    else:
+                        continue
+                    if attr and found and attr not in info.lock_attrs:
+                        info.attr_types.setdefault(attr, found)
+
+    def implementations(self, cls_key: str, name: str) -> list[str]:
+        """Non-stub definitions of *name* in the project subclasses of *cls_key*."""
+        if self._subclasses is None:
+            self._subclasses = {}
+            for key, info in self.classes.items():
+                mod = self.modules[info.module]
+                for base in info.bases:
+                    try:
+                        base_node = ast.parse(base, mode="eval").body
+                    except SyntaxError:
+                        continue
+                    base_key = self.resolve_class(mod, base_node) if base else None
+                    if base_key:
+                        self._subclasses.setdefault(base_key, []).append(key)
+        out: list[str] = []
+        seen = {cls_key}
+        queue = list(self._subclasses.get(cls_key, ()))
+        while queue:
+            sub = queue.pop(0)
+            if sub in seen:
+                continue
+            seen.add(sub)
+            found = self.classes[sub].methods.get(name)
+            if found and not _is_stub(self.funcs[found].node):
+                out.append(found)
+            queue.extend(self._subclasses.get(sub, ()))
+        return out
+
     # -- pass 1b: which context managers hold a lock -------------------------
 
     def _resolve_lock_cms(self) -> None:
@@ -862,6 +1001,56 @@ def _yield_with_items(fn: ast.AST) -> list[tuple[ast.expr, bool]]:
 
 
 _REENTRANT_KINDS = ("custom-reentrant", "RLock", "Condition")
+_TYPE_WRAPPERS = frozenset(
+    {"Optional", "Union", "Annotated", "Final", "ClassVar", "type", "Type"}
+)
+
+
+def _is_stub(fn: ast.AST) -> bool:
+    """A body that does nothing: `...`, `pass`, a docstring, `raise NotImplementedError`."""
+    body = list(getattr(fn, "body", []))
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    for stmt in body:
+        if isinstance(stmt, ast.Pass):
+            continue
+        if (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and stmt.value.value is Ellipsis
+        ):
+            continue
+        if isinstance(stmt, ast.Raise) and stmt.exc is not None:
+            exc = stmt.exc.func if isinstance(stmt.exc, ast.Call) else stmt.exc
+            if _dotted(exc).endswith("NotImplementedError"):
+                continue
+        return False
+    return True
+
+
+def _receiver_matches(receiver: ast.AST, func: Func) -> bool:
+    """Does the receiver's name point at the class that defines *func*?
+
+    `index.query(...)` -> `SearchIndex`, `self._cache.put(...)` -> `DiskCache`.
+    """
+    if not func.cls:
+        return False
+    if isinstance(receiver, ast.Call):
+        receiver = receiver.func
+    name = (
+        receiver.attr
+        if isinstance(receiver, ast.Attribute)
+        else getattr(receiver, "id", "")
+    )
+    cls_name = func.cls.split(":", 1)[-1].lower()
+    tokens = [t for t in name.lower().split("_") if len(t) >= 3]
+    tokens = [t for t in tokens if t not in ("get", "ensure", "make", "new", "self")]
+    return any(t in cls_name for t in tokens)
 
 
 def _combine_kinds(kinds: list[str]) -> str:
@@ -917,6 +1106,7 @@ class _FunctionScanner:
         for extra in (args.vararg, args.kwarg):
             if extra:
                 self.locals.add(extra.arg)
+        self.local_types = self._local_types()
         for node in _walk_scope(func.node):
             if (
                 isinstance(node, ast.Name)
@@ -926,18 +1116,43 @@ class _FunctionScanner:
                 self.locals.add(node.id)
 
     def _annotation_class(self, ann: ast.AST | None) -> str | None:
-        if ann is None:
-            return None
-        if isinstance(ann, ast.Constant) and isinstance(ann.value, str):
-            try:
-                ann = ast.parse(ann.value, mode="eval").body
-            except SyntaxError:
-                return None
-        if isinstance(ann, ast.BinOp):  # X | None
-            return self._annotation_class(ann.left) or self._annotation_class(ann.right)
-        if isinstance(ann, ast.Subscript):  # Optional[X]
-            return self._annotation_class(ann.slice)
-        return self.p.resolve_class(self.mod, ann)
+        return self.p.annotation_class(self.mod, ann)
+
+    def _local_types(self) -> dict[str, str]:
+        """`index = self._index`, `db = self._open_db()`: a local's class, when
+        every assignment to it agrees."""
+        seen: dict[str, str | None] = {}
+        for node in _walk_scope(self.f.node):
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                name = node.target.id
+                found = self._annotation_class(node.annotation)
+            elif (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+            ):
+                name = node.targets[0].id
+                found = self.p.value_class(
+                    self.mod, self.f.cls, node.value, self.param_types
+                )
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.withitem)):
+                target = (
+                    node.target
+                    if not isinstance(node, ast.withitem)
+                    else node.optional_vars
+                )
+                if isinstance(target, ast.Name):
+                    seen[target.id] = None
+                continue
+            else:
+                continue
+            if name in self.param_types:
+                continue
+            if name in seen and seen[name] != found:
+                seen[name] = None
+            else:
+                seen.setdefault(name, found)
+        return {k: v for k, v in seen.items() if v}
 
     def run(self) -> None:
         self._body(self.f.node.body, (), loop_depth=0)
@@ -1416,14 +1631,43 @@ class _FunctionScanner:
         if attr and self.f.cls:
             cls_key = self.p.classes[self.f.cls].attr_types.get(attr)
         elif isinstance(receiver, ast.Name):
-            cls_key = self.param_types.get(receiver.id)
+            cls_key = self.param_types.get(receiver.id) or self.local_types.get(
+                receiver.id
+            )
         if cls_key:
             found = self.p.method_of(cls_key, method)
+            if found and _is_stub(self.p.funcs[found].node):
+                # An interface (Protocol / ABC): the code that runs is an
+                # implementation. One subclass is as good as the class itself.
+                impls = self.p.implementations(cls_key, method)
+                if impls:
+                    return [(k, len(impls) == 1) for k in impls]
+                return self._weak_candidates(method, receiver) or [(found, True)]
             return [(found, True)] if found else []
         # Any other receiver: a method name only a few project classes define.
+        return self._weak_candidates(method, receiver)
+
+    def _weak_candidates(
+        self, method: str, receiver: ast.AST
+    ) -> list[tuple[str, bool]]:
+        """Name-only resolution: the project classes that define *method*.
+
+        Interface stubs are dropped when a real body exists, and when the
+        receiver's name points at one class (`index` -> `SearchIndex`) the
+        others are dropped too. What is left is a weak edge each.
+        """
         if method in _BUILTIN_METHOD_NAMES or method.startswith("__"):
             return []
         candidates = self.p.method_index.get(method, [])
+        real = [c for c in candidates if not _is_stub(self.p.funcs[c].node)]
+        if real:
+            candidates = real
+        if len(candidates) > 1:
+            named = [
+                c for c in candidates if _receiver_matches(receiver, self.p.funcs[c])
+            ]
+            if named:
+                candidates = named
         if 0 < len(candidates) <= _MAX_WEAK_CANDIDATES:
             return [(c, False) for c in candidates]
         return []
@@ -1514,9 +1758,26 @@ class Step:
     rel: str
     line: int
     text: str
+    weak: str = ""  # why this hop is uncertain ("weak: 1 of 2 candidates")
 
     def render(self) -> str:
-        return f"{self.rel}:{self.line} {self.func}: {self.text}"
+        out = f"{self.rel}:{self.line} {self.func}: {self.text}"
+        return f"{out} [{self.weak}]" if self.weak else out
+
+
+def _call_step(func: Func, call: Call, strong: bool, text: str = "") -> Step:
+    """The chain step for *call*, marked `[weak]` when resolved by method name only."""
+    weak = ""
+    if not strong:
+        n = sum(1 for _c, st in call.callees if not st)
+        weak = f"weak: name-only, 1 of {n} candidates" if n > 1 else "weak: name-only"
+    return Step(
+        func.qualname,
+        func.rel,
+        getattr(call.node, "lineno", 0),
+        text or f"calls {_text(call.node.func)}(...)",
+        weak,
+    )
 
 
 class Summaries:
@@ -1596,9 +1857,7 @@ class Summaries:
             changed = False
             rounds += 1
             for key, func, call, callee, strong in edges:
-                step = self._step(
-                    func, call.node, f"calls {_text(call.node.func)}(...)"
-                )
+                step = _call_step(func, call, strong)
                 for category, (chain, cstrong) in self.blocks[callee].items():
                     if len(chain) >= _MAX_CHAIN:
                         continue
@@ -1707,8 +1966,10 @@ class Summaries:
                 for call in func.calls:
                     if not call.held:
                         continue
-                    step = self._step(func, call.node, f"calls {_text(call.node.func)}")
                     for callee, strong in call.callees:
+                        step = _call_step(
+                            func, call, strong, f"calls {_text(call.node.func)}"
+                        )
                         for category, (chain, cstrong) in self.blocks.get(
                             callee, {}
                         ).items():
@@ -2184,12 +2445,7 @@ def _check_lock_order_and_reentry(p: Project, s: Summaries) -> list[dict]:
                 for lock_key, (lock, chain, cstrong, same) in s.acquires[
                     callee
                 ].items():
-                    step = Step(
-                        func.qualname,
-                        func.rel,
-                        call.node.lineno,
-                        f"calls {_text(call.node.func)}(...)",
-                    )
+                    step = _call_step(func, call, strong)
                     for h in call.held:
                         if h.anonymous:
                             continue
@@ -2399,12 +2655,7 @@ def _check_blocking_under_lock(p: Project, s: Summaries) -> list[dict]:
                     )  # through a call: one more hop to verify
                     if not (strong and cstrong):
                         confidence = _lower(confidence)
-                    step = Step(
-                        func.qualname,
-                        func.rel,
-                        call.node.lineno,
-                        f"calls {_text(call.node.func)}(...)",
-                    )
+                    step = _call_step(func, call, strong)
                     out.append(
                         _finding(
                             "blocking-call-under-lock",
@@ -2484,12 +2735,7 @@ def _check_transitive_blocking_in_async(p: Project, s: Summaries) -> list[dict]:
                 if verdict is None:
                     continue
                 confidence, label, chain = verdict
-                step = Step(
-                    func.qualname,
-                    func.rel,
-                    call.node.lineno,
-                    f"calls {_text(call.node.func)}(...)",
-                )
+                step = _call_step(func, call, strong)
                 detail = (
                     "a coroutine in this module already offloads sync work "
                     "(run_in_executor/to_thread): this call is its unguarded twin. "
