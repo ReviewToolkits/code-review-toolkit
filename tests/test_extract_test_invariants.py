@@ -836,6 +836,103 @@ class TestBugFixAttribution(unittest.TestCase):
         self.assertEqual(entries[0]["attribution"], "function")
 
 
+# Two ways to install a record: create validates the spec first; restore
+# copies it in from an archive and never does. Their names share nothing.
+_ENTRY_POINT_SRC = {
+    "pkg/__init__.py": "",
+    "pkg/registry.py": (
+        "class Registry:\n"
+        "    def create_record(self, key, spec):\n"
+        "        check_spec(spec)\n"
+        "        with self._record_lock(key):\n"
+        "            path = self._record_path(key)\n"
+        "            self._write_spec(path, spec)\n"
+        "\n"
+        "    def import_from_archive(self, key, blob):\n"
+        "        spec = blob['spec']\n"
+        "        with self._record_lock(key):\n"
+        "            path = self._record_path(key)\n"
+        "            self._write_spec(path, spec)\n"
+        "\n"
+        "    def describe(self, key):\n"
+        "        # Shares only the busy lock: not the same operation.\n"
+        "        with self._record_lock(key):\n"
+        "            return key\n"
+        "\n"
+        "    def _record_lock(self, key):\n        return key\n"
+        "    def _record_path(self, key):\n        return key\n"
+        "    def _write_spec(self, path, spec):\n        return path\n"
+        "    def compact_all(self):\n"
+        "        for key in []:\n"
+        "            with self._record_lock(key):\n                pass\n"
+        "    def rename(self, key):\n"
+        "        with self._record_lock(key):\n                pass\n"
+        "\n"
+        "def check_spec(spec):\n"
+        "    if not spec:\n"
+        "        raise ValueError('empty')\n"
+    ),
+    "tests/test_registry.py": (
+        "import pytest\n"
+        "from pkg.registry import Registry\n"
+        "\n"
+        "def test_create_record_rejects_empty_spec():\n"
+        "    reg = Registry()\n"
+        "    with pytest.raises(ValueError):\n"
+        "        reg.create_record('k', {})\n"
+    ),
+}
+
+
+class TestEntryPointSiblings(unittest.TestCase):
+    """Functions calling the tested path's helpers are other entry points."""
+
+    def test_sibling_entry_point_found_with_missing_guard(self):
+        with TempProject(_ENTRY_POINT_SRC) as root:
+            result = mod.analyze(str(root))
+        (inv,) = result["invariants"]
+        self.assertEqual(inv["tested_function"]["function"], "Registry.create_record")
+        siblings = {s["function"]: s for s in inv["entry_point_siblings"]}
+        self.assertIn("Registry.import_from_archive", siblings)
+        sib = siblings["Registry.import_from_archive"]
+        self.assertEqual(sib["missing_guards"], ["check_spec"])
+        self.assertEqual(
+            sorted(sib["shared_calls"]),
+            ["_record_lock", "_record_path", "_write_spec"],
+        )
+        # True negative: one common helper alone is not the same operation.
+        self.assertNotIn("Registry.describe", siblings)
+        top = result["entry_point_siblings"]
+        self.assertEqual(top[0]["function"], "Registry.import_from_archive")
+        self.assertEqual(top[0]["sibling_of"], "Registry.create_record")
+        self.assertFalse(top[0]["tested"])
+
+    def test_same_named_layers_are_one_operation(self):
+        files = dict(_ENTRY_POINT_SRC)
+        files["pkg/service.py"] = (
+            "from pkg.registry import Registry\n"
+            "\n"
+            "def create_record(key, spec):\n"
+            "    return Registry().create_record(key, spec)\n"
+        )
+        files["tests/test_registry.py"] = (
+            "import pytest\n"
+            "from pkg.service import create_record\n"
+            "\n"
+            "def test_create_record_rejects_empty_spec():\n"
+            "    with pytest.raises(ValueError):\n"
+            "        create_record('k', {})\n"
+        )
+        with TempProject(files) as root:
+            result = mod.analyze(str(root))
+        (inv,) = result["invariants"]
+        self.assertEqual(inv["tested_function"]["file"], "pkg/service.py")
+        names = [s["function"] for s in inv["entry_point_siblings"]]
+        self.assertIn("Registry.import_from_archive", names)
+        # The deeper layer of the same operation is not its own sibling.
+        self.assertNotIn("Registry.create_record", names)
+
+
 class TestFixCommitClassification(unittest.TestCase):
     """A commit type or tag outranks fix vocabulary in the subject."""
 

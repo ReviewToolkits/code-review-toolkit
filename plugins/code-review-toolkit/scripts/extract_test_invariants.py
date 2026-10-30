@@ -1061,6 +1061,202 @@ def find_similar_functions(
 
 
 # ---------------------------------------------------------------------------
+# Entry-point siblings: other ways into the same operation
+# ---------------------------------------------------------------------------
+#
+# Name similarity cannot see that `import_record` and `create_record` both
+# install a record, or that a bulk and a single upload both write rows. What
+# they share is the operation: the project helpers they call
+# (the write lock, the path builder, the cleanup). A function that calls
+# several of the tested path's helpers is another entry point into the
+# same operation, and the guard the tested path applies first (`validate_*`,
+# `require_*`, an `if ...: raise`) is the invariant it should keep.
+
+# A helper called by more functions than this is infrastructure, not an
+# operation (`_with_retry` around every query).
+_SINK_MAX_FAN_IN = 20
+# One shared helper is enough only when it is this rare.
+_RARE_SINK_FAN_IN = 4
+_GUARD_VERBS = ("validate", "require", "check", "ensure", "verify", "assert")
+
+
+def _own_nodes(func: ast.AST):
+    """Nodes in *func*'s body, not descending into nested defs or classes."""
+    stack = list(ast.iter_child_nodes(func))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        yield node
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def _distinctive(name: str) -> bool:
+    core = name.strip("_")
+    return (
+        not name.startswith("__")
+        and core.lower() not in _GENERIC_TOKENS
+        and ("_" in core or len(core) >= 8)
+    )
+
+
+class CallIndex:
+    """Which project functions each function calls, and its guards.
+
+    Functions are keyed `(file, qualname)` like `extract_source_functions`.
+    Calls resolve by their last name only (`self._lock(...)` → `_lock`), so
+    only names some source function defines count.
+    """
+
+    def __init__(self, source_files: list[Path], project_root: Path,
+                 source_functions: dict[str, list[dict]]):
+        defined_names = {
+            loc["name"] for locs in source_functions.values() for loc in locs
+        }
+        self.abstract = {
+            (loc["file"], qual)
+            for qual, locs in source_functions.items()
+            for loc in locs
+            if loc.get("is_abstract")
+        }
+        self.calls: dict[tuple[str, str], set[str]] = {}
+        self.guards: dict[tuple[str, str], set[str]] = {}
+        self.lines: dict[tuple[str, str], int] = {}
+        self.callers: dict[str, set[tuple[str, str]]] = defaultdict(set)
+        self.defs: dict[str, set[tuple[str, str]]] = defaultdict(set)
+        for path in source_files:
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+            except (SyntaxError, ValueError):
+                continue
+            rel = str(path.relative_to(project_root))
+            owners = {
+                id(child): cls.name
+                for cls in ast.walk(tree)
+                if isinstance(cls, ast.ClassDef)
+                for child in cls.body
+            }
+            # `from .service import create as svc_create`: a call to the
+            # alias is a call to the original name.
+            aliases = {
+                alias.asname: alias.name
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ImportFrom)
+                for alias in node.names
+                if alias.asname
+            }
+
+            def called(call: ast.Call) -> str | None:
+                name = _get_call_name(call.func)
+                if isinstance(call.func, ast.Name):
+                    name = aliases.get(name, name)
+                return name
+
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                owner = owners.get(id(node))
+                key = (rel, f"{owner}.{node.name}" if owner else node.name)
+                if key in self.calls:
+                    continue
+                calls: set[str] = set()
+                guards: set[str] = set()
+                for sub in _own_nodes(node):
+                    if isinstance(sub, ast.Call):
+                        name = called(sub)
+                        if name and name in defined_names:
+                            calls.add(name)
+                            if _tokens(name)[:1] and _tokens(name)[0] in _GUARD_VERBS:
+                                guards.add(name)
+                    elif isinstance(sub, (ast.If, ast.Assert)):
+                        # `if not is_allowed(x): raise ...`: a project
+                        # predicate deciding a refusal.
+                        raises = isinstance(sub, ast.Assert) or any(
+                            isinstance(stmt, ast.Raise) for stmt in sub.body
+                        )
+                        if raises:
+                            guards |= {
+                                n for c in ast.walk(sub.test)
+                                if isinstance(c, ast.Call)
+                                and (n := called(c)) in defined_names
+                                and _distinctive(n)
+                            }
+                self.calls[key] = calls
+                self.guards[key] = guards
+                self.lines[key] = node.lineno
+                self.defs[node.name].add(key)
+                for name in calls:
+                    self.callers[name].add(key)
+
+    def chain(self, key: tuple[str, str]) -> list[tuple[str, str]]:
+        """*key* and the same-named functions it reaches through calls.
+
+        A route handler calls the service function of the same name, which
+        calls the store method of the same name: one operation in three
+        layers, and the sinks that matter sit in the deepest one. Only a
+        distinctive name is followed.
+        """
+        name = key[1].rsplit(".", 1)[-1]
+        found = [key]
+        if not _distinctive(name):
+            return found  # `run` calling `child.run()` is not a layer
+        frontier = [key]
+        while frontier:
+            current = frontier.pop()
+            if name not in self.calls.get(current, ()):
+                continue
+            for target in sorted(self.defs.get(name, ())):
+                if target not in found and target not in self.abstract:
+                    found.append(target)
+                    frontier.append(target)
+        return found
+
+    def siblings(self, key: tuple[str, str], max_results: int = 5) -> list[dict]:
+        """Other entry points into the operation *key* performs."""
+        if key not in self.calls:
+            return []
+        chain = self.chain(key)
+        sinks: dict[str, int] = {}
+        for member in chain:
+            for name in self.calls[member]:
+                fan_in = len(self.callers[name])
+                if _distinctive(name) and 2 <= fan_in <= _SINK_MAX_FAN_IN:
+                    sinks[name] = fan_in
+        chain_names = {member[1].rsplit(".", 1)[-1] for member in chain}
+        tested_guards = set().union(*(self.guards[m] for m in chain))
+        shared: dict[tuple[str, str], list[str]] = defaultdict(list)
+        for name in sinks:
+            for caller in self.callers[name]:
+                if caller in chain or caller in self.abstract:
+                    continue
+                short = caller[1].rsplit(".", 1)[-1]
+                if short in chain_names or short in sinks:
+                    continue  # another layer of the same operation, or a sink
+                shared[caller].append(name)
+        results = []
+        for caller, names in shared.items():
+            if len(names) < 2 and sinks[names[0]] > _RARE_SINK_FAN_IN:
+                continue
+            missing = sorted(tested_guards - self.guards[caller] - self.calls[caller])
+            results.append({
+                "function": caller[1],
+                "file": caller[0],
+                "line": self.lines[caller],
+                "shared_calls": sorted(names, key=lambda n: (sinks[n], n)),
+                # Guards the tested path applies that this entry point does
+                # not: the invariant most likely to be missing here.
+                "missing_guards": missing,
+                "score": round(sum(1 / sinks[n] for n in names), 3),
+            })
+        # Public functions first: they are the entry points a caller reaches.
+        results.sort(key=lambda r: (
+            r["function"].rsplit(".", 1)[-1].startswith("_"),
+            -r["score"], r["file"], r["function"],
+        ))
+        return results[:max_results]
+
+
+# ---------------------------------------------------------------------------
 # Test selection (three-tier)
 # ---------------------------------------------------------------------------
 
@@ -1539,6 +1735,8 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
     selected = select_tests(all_test_info, bug_fix_tests, max_tests=30)
     bug_fix_tests = bug_fix_tests[:_BUG_FIX_LIST_CAP]
 
+    call_index = CallIndex(source_files, project_root, source_functions)
+
     # For each selected test with a resolved tested function, find similar functions
     invariants: list[dict] = []
     for test in selected:
@@ -1547,6 +1745,7 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
             invariants.append({
                 **test,
                 "similar_functions": [],
+                "entry_point_siblings": [],
             })
             continue
 
@@ -1561,6 +1760,11 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
         invariants.append({
             **test,
             "similar_functions": similar,
+            # Functions sharing the tested path's helpers: other entry points
+            # into the same operation, whatever their names.
+            "entry_point_siblings": call_index.siblings(
+                (tested["file"], func_name)
+            ),
         })
 
     # Find untested similar functions (functions similar to tested ones but with no tests)
@@ -1599,6 +1803,23 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
     untested_similar_total = len(deduped)
     untested_similar = deduped[:20]
 
+    entry_points: list[dict] = []
+    seen_entry: set[tuple[str, str]] = set()
+    for inv in invariants:
+        for sib in inv["entry_point_siblings"]:
+            key = (sib["file"], sib["function"])
+            if key in seen_entry:
+                continue
+            seen_entry.add(key)
+            entry_points.append({
+                **sib,
+                "sibling_of": inv["tested_function"]["function"],
+                "tested_in": inv["file"],
+                "tested": key in tested_funcs,
+                "invariant_types": inv["invariant_types"],
+            })
+    entry_points_total = len(entry_points)
+
     return {
         **build_envelope(project_root, scan_root, files_total, len(all_files)),
         # "no_tests_found" when no test file was found anywhere: an empty
@@ -1624,6 +1845,9 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
             "untested_similar_functions": len(untested_similar),
             "untested_similar_functions_total": untested_similar_total,
             "untested_similar_functions_capped": untested_similar_total > 20,
+            "entry_point_siblings": min(entry_points_total, 20),
+            "entry_point_siblings_total": entry_points_total,
+            "entry_point_siblings_capped": entry_points_total > 20,
             "bug_fix_tests_found": len(bug_fix_tests),
             "bug_fix_tests_total": bug_fix_tests_total,
             "bug_fix_tests_capped": bug_fix_tests_total > _BUG_FIX_LIST_CAP,
@@ -1631,6 +1855,7 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
         "invariants": invariants,
         "bug_fix_tests": bug_fix_tests,
         "untested_similar_functions": untested_similar,
+        "entry_point_siblings": entry_points[:20],
     }
 
 
