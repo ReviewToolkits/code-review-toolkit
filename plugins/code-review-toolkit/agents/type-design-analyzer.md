@@ -32,7 +32,10 @@ Key fields:
   `kind: "class_attribute"` entries add `class`, `attribute`, `annotation` (their `location` is the class line, `line` the attribute's)
 - `container_inventory`: categorized data containers (dataclass, TypedDict, NamedTuple, Protocol, Enum)
 - `unannotated_public_functions`: priority annotation targets (up to 50), each `{file, name, line}`; `unannotated_public_functions_total` is the uncapped count
-- `files[]`: per-file details including per-function annotation status and class attribute analysis
+- `files[]`: per-file details including per-function annotation status and class attribute analysis.
+  `files[].functions` lists **module-level functions only**; methods are under `files[].classes[].methods`.
+  For per-file coverage use `files[].coverage` (`total_functions`, `annotation_coverage_all`, `annotation_coverage_public`, ...),
+  which counts methods like the summary does; a percentage is `null` when the file has no functions, and `coverage` is `null` on a parse error
 
 ## External Tool Integration
 

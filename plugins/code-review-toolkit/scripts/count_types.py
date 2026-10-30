@@ -137,6 +137,8 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
         "type_ignore_count": 0,
         "untyped_containers": [],
         "parse_error": None,
+        # Filled in below; stays None when the file could not be parsed.
+        "coverage": None,
     }
 
     try:
@@ -287,7 +289,34 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
                 "content": line.strip(),
             })
 
+    result["coverage"] = _file_coverage(_all_file_functions(result))
     return result
+
+
+def _percent(part: int, whole: int) -> float | None:
+    """`part/whole` as a percentage; None when there is nothing to measure."""
+    return round(100 * part / whole, 1) if whole else None
+
+
+def _file_coverage(funcs: list[dict]) -> dict:
+    """Per-file annotation coverage over functions AND methods.
+
+    `files[].functions` lists module-level functions only, while the summary
+    counts methods too; coverage computed from `functions` alone is badly
+    wrong for class-heavy modules (a module with 2 functions and 160
+    methods reads as 2). A file with no functions reports null, not 0%.
+    """
+    public = [f for f in funcs if f["is_public"]]
+    annotated = sum(1 for f in funcs if f["fully_annotated"])
+    annotated_public = sum(1 for f in public if f["fully_annotated"])
+    return {
+        "total_functions": len(funcs),
+        "public_functions": len(public),
+        "fully_annotated_functions": annotated,
+        "fully_annotated_public": annotated_public,
+        "annotation_coverage_all": _percent(annotated, len(funcs)),
+        "annotation_coverage_public": _percent(annotated_public, len(public)),
+    }
 
 
 def _all_file_functions(file_analysis: dict) -> list[dict]:

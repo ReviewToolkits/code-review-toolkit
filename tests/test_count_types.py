@@ -262,6 +262,61 @@ class TestClassAttributes(unittest.TestCase):
             self.assertEqual(cls["unannotated_attributes"][0], "untyped")
 
 
+class TestPerFileCoverage(unittest.TestCase):
+    """`files[].coverage` counts methods, matching the summary's denominator."""
+
+    def test_methods_counted_in_file_coverage(self):
+        with TempProject({
+            "mod.py": (
+                "def helper(x: int) -> int:\n"
+                "    return x\n"
+                "\n"
+                "class Store:\n"
+                "    def get(self, k):\n"
+                "        return k\n"
+                "\n"
+                "    def put(self, k, v):\n"
+                "        pass\n"
+                "\n"
+                "    def _evict(self) -> None:\n"
+                "        pass\n"
+            ),
+        }) as root:
+            result = mod.analyze_file(root / "mod.py", root)
+        cov = result["coverage"]
+        # `functions` stays module-level only; coverage covers methods too.
+        self.assertEqual(len(result["functions"]), 1)
+        self.assertEqual(cov["total_functions"], 4)
+        self.assertEqual(cov["fully_annotated_functions"], 2)
+        self.assertEqual(cov["annotation_coverage_all"], 50.0)
+        self.assertEqual(cov["public_functions"], 3)
+        self.assertEqual(cov["annotation_coverage_public"], 33.3)
+
+    def test_file_coverage_sums_to_summary(self):
+        with TempProject({
+            "pkg/a.py": "class A:\n    def m(self) -> None:\n        pass\n",
+            "pkg/b.py": "def f(x):\n    return x\n",
+        }) as root:
+            out = _run_main(root / "pkg")
+        self.assertEqual(
+            sum(f["coverage"]["total_functions"] for f in out["files"]),
+            out["summary"]["total_functions"],
+        )
+
+    def test_empty_file_coverage_is_null_not_zero(self):
+        with TempProject({"mod.py": "X = 1\n"}) as root:
+            cov = mod.analyze_file(root / "mod.py", root)["coverage"]
+        self.assertEqual(cov["total_functions"], 0)
+        self.assertIsNone(cov["annotation_coverage_all"])
+        self.assertIsNone(cov["annotation_coverage_public"])
+
+    def test_unparseable_file_coverage_is_null(self):
+        with TempProject({"mod.py": "def broken(:\n"}) as root:
+            result = mod.analyze_file(root / "mod.py", root)
+        self.assertIsNotNone(result["parse_error"])
+        self.assertIsNone(result["coverage"])
+
+
 class TestTypeIgnoreCount(unittest.TestCase):
 
     def test_counts_type_ignore(self):
