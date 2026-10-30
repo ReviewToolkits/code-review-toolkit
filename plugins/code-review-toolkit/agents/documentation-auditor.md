@@ -39,6 +39,14 @@ Survey public API documentation:
 - **Class docstrings**: Do public classes explain their responsibility and usage?
 - **Function/method docstrings**: Do public functions document parameters, returns, and raises?
 - **Property docstrings**: Are non-obvious properties documented?
+- **HTTP API metadata** (FastAPI and similar): a route's `summary=` / `description=`, a Pydantic
+  `Field(description=...)`, and `Query` / `Path` / `Body` / `Header(description=...)`. For a web
+  service these strings *are* the public API reference: they are rendered in the OpenAPI page
+  that clients read. Audit them like docstrings, and check every promise in them against the
+  handler ("returns 404 when the item is missing": does it?). The survey counts a route as
+  documented when its decorator carries `summary=` or `description=` (kind `route`, nested route
+  factories included), and lists the claims in these strings with `source: route_description`
+  or `field_description`.
 
 Classify coverage:
 - **Fully documented**: Docstring covers purpose, parameters, returns, raises, and any important behavior notes
@@ -47,6 +55,23 @@ Classify coverage:
 - **Trivially documented**: Docstring restates the function name ("Gets the value" on `get_value()`)
 
 Calculate coverage percentages by module and overall.
+
+### 1b. Is the documentation published?
+
+Severity depends on who reads a docstring. Check whether the project renders it:
+
+```bash
+grep -rlE "mkdocstrings|^\s*:::" mkdocs.y*ml docs/ 2>/dev/null       # mkdocs + mkdocstrings
+grep -rnE "sphinx\.ext\.autodoc|autoapi|automodule|autoclass" docs/ doc/ 2>/dev/null
+grep -rnE "\bpdoc\b|pydoc-markdown" Makefile pyproject.toml tox.ini noxfile.py .github/ 2>/dev/null
+grep -rnE "FastAPI\(|docs_url|openapi_url" [scope]                    # OpenAPI page served?
+```
+
+When it is, note which members the configuration renders (`members:`, `filters:`,
+`:private-members:`, `show_if_no_docstring`). A wrong docstring that is rendered as the API
+reference misleads every user, so it is a FIX even when the code itself is fine. One that only
+maintainers read is usually CONSIDER. Say in the overview whether the docs are published and by
+what.
 
 ### 2. Documentation Accuracy
 
@@ -74,12 +99,15 @@ For documented code, verify accuracy:
 - Do references to other functions/classes still exist?
 - Do described behaviors match the actual implementation?
 
-### 2b. Concurrency and availability claims
+### 2b. Safety claims: concurrency, availability, security
 
-Docstrings and comments in threaded or async code make promises that tests rarely check:
-"lock-free", "called with the lock held", "thread-safe", "does not block the event loop", "other
-collections keep serving during X", "safe to call concurrently", "idempotent". Each is a testable
-claim and, in practice, one of the most productive places to look:
+Docstrings and comments make promises that tests rarely check, and in practice they are one of
+the most productive places to look. The procedure is the same for every kind: **find the guard
+the claim relies on, then check that it covers every path.**
+
+**Concurrency and availability** (`category: "concurrency"`): "lock-free", "called with the lock
+held", "thread-safe", "does not block the event loop", "other collections keep serving during
+X", "safe to call concurrently", "idempotent".
 
 - For "called with the lock held": find every caller and check it holds the lock.
 - For "does not block" / "keeps serving": follow the call to any lock or blocking call it reaches,
@@ -102,6 +130,25 @@ qualified names and paths, and `function_key` / `class_key` use its `module:qual
 4. Scanner `summary.slow_locks`: locks held across slow work. A "does not block" or "keeps
    serving" claim on a function that reaches one of these (directly, or through a callee that
    takes it) is the typical broken promise.
+
+**Security** (`category: "safety"`): "secure", "safely", "sandboxed", "restricted", "escaped",
+"sanitized", "redacted" / "masked" / "hidden", "never logged", "constant-time", and the reason
+on a security suppression comment (step 3).
+
+- For a sandbox ("safely evaluates", "restricted globals"): list what the guard blocks, then try
+  one construct it doesn't (in an export, with a harmless payload).
+- For escaping or sanitizing: find the escape call and check every path reaches it, including
+  the error path and any second renderer.
+- For hiding secrets ("hides sensitive data", "masked in logs"): follow the secret through every
+  channel it can leave by, such as headers, URL query, body, redirects, exceptions, logs and
+  reports. Check that the hiding runs before each one, not only on the main path.
+- For "constant-time": find the comparison and check it is `hmac.compare_digest` (or equivalent)
+  on every branch, including the length check.
+
+**Invariants** (`category: "invariant"`, docstrings and API descriptions only): "never",
+"always", "guarantees", "exactly once". This is the long tail. Check the ones on code that
+changed recently first. When a docstring states an invariant, look for sibling docstrings that
+say why it matters: they tell you which caller breaks when it doesn't hold.
 
 A claim the code doesn't keep is a FIX when callers rely on it. Where you can, force the
 interleaving to check it (see `docs/reproduction-convention.md`).
@@ -131,9 +178,11 @@ Check whether docstrings follow a consistent style:
 [2-3 sentence summary: documentation maturity, biggest gaps, overall quality]
 
 ### Coverage Statistics
+- Published: [yes: mkdocstrings / Sphinx autodoc / OpenAPI page, and which members | no]
 - Public modules: N documented / N total (X%)
 - Public classes: N documented / N total (X%)
 - Public functions/methods: N documented / N total (X%)
+- HTTP routes (if any): N documented / N total (X%), docstring or `summary=`/`description=`
 - Docstring style: [identified style or "inconsistent"]
 
 ## Critical Issues
