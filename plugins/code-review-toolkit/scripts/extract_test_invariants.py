@@ -849,10 +849,56 @@ def resolve_tested_function(
 # Source function extraction and similarity
 # ---------------------------------------------------------------------------
 
+_ABSTRACT_BASES = frozenset({"ABC", "Protocol", "ABCMeta"})
+
+
+def _is_abstract(
+    node: ast.FunctionDef | ast.AsyncFunctionDef, owner: ast.ClassDef | None
+) -> bool:
+    """True for a declaration with no behaviour to hold an invariant.
+
+    `@abstractmethod` / `@overload`, or a body (after any docstring) that is
+    only `...` or `raise NotImplementedError`. A bare `pass` counts only in an
+    ABC or Protocol class: elsewhere it is a real no-op implementation, and
+    a no-op `close()` can violate an invariant its siblings keep.
+    """
+    for dec in node.decorator_list:
+        chain = _dotted_chain(dec.func if isinstance(dec, ast.Call) else dec)
+        if chain and chain[-1] in ("abstractmethod", "overload"):
+            return True
+    body = node.body
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    if len(body) != 1:
+        return not body  # docstring only
+    stmt = body[0]
+    if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
+        return stmt.value.value is Ellipsis
+    if isinstance(stmt, ast.Raise) and stmt.exc is not None:
+        exc = stmt.exc.func if isinstance(stmt.exc, ast.Call) else stmt.exc
+        chain = _dotted_chain(exc)
+        return bool(chain) and chain[-1] == "NotImplementedError"
+    if isinstance(stmt, ast.Pass) and owner is not None:
+        bases = {chain[-1] for chain in map(_dotted_chain, owner.bases) if chain}
+        bases |= {
+            chain[-1]
+            for kw in owner.keywords
+            if kw.arg == "metaclass" and (chain := _dotted_chain(kw.value))
+        }
+        return bool(bases & _ABSTRACT_BASES)
+    return False
+
+
 def extract_source_functions(source_files: list[Path], project_root: Path) -> dict[str, list[dict]]:
     """Extract all function/method definitions from source files.
 
-    Returns {qualified_name: [{file, line, params, is_method}]}.
+    Returns {qualified_name: [{file, line, params, is_method, is_abstract,
+    ...}]}.
     """
     functions: dict[str, list[dict]] = defaultdict(list)
 
@@ -864,25 +910,22 @@ def extract_source_functions(source_files: list[Path], project_root: Path) -> di
             continue
 
         rel = str(filepath.relative_to(project_root))
+        # The class each method is defined directly in.
+        owners: dict[int, ast.ClassDef] = {
+            id(child): cls
+            for cls in ast.walk(tree)
+            if isinstance(cls, ast.ClassDef)
+            for child in cls.body
+        }
 
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                # Build qualified name
                 params = [a.arg for a in node.args.args if a.arg != "self"]
                 is_method = any(
                     a.arg == "self" for a in node.args.args
                 )
-
-                # Get parent class name if method
-                # (simplified — checks direct parent)
-                parent_name = ""
-                for parent in ast.walk(tree):
-                    if isinstance(parent, ast.ClassDef):
-                        if node in ast.iter_child_nodes(parent):
-                            parent_name = parent.name
-                            break
-
-                qualified = f"{parent_name}.{node.name}" if parent_name else node.name
+                owner = owners.get(id(node))
+                qualified = f"{owner.name}.{node.name}" if owner else node.name
 
                 functions[qualified].append({
                     "file": rel,
@@ -891,6 +934,7 @@ def extract_source_functions(source_files: list[Path], project_root: Path) -> di
                     "param_count": len(params),
                     "is_method": is_method,
                     "is_async": isinstance(node, ast.AsyncFunctionDef),
+                    "is_abstract": _is_abstract(node, owner),
                     "name": node.name,
                 })
 
@@ -933,7 +977,13 @@ def find_similar_functions(
 
     Candidates outside the tested function's top-level directory (benchmarks/
     and scripts/ for a package's function), private helpers of a public
-    function, and dunder methods are not considered.
+    function, dunder methods and abstract declarations (`...`,
+    `raise NotImplementedError`, `@abstractmethod`: no body to hold an
+    invariant) are not considered. Nor is a bare verb that is all of the
+    shared prefix (`_check` for `_check_spec_version`: a dispatcher, not a
+    sibling); and one shared non-generic word is enough only with the same
+    shape (method or not, parameter count within one) or a second shared
+    word further on (`_parse_options` is no sibling of `Loader._parse_header`).
     """
     results: list[dict] = []
     base_name = func_info.get("name", func_name.rsplit(".", 1)[-1])
@@ -955,6 +1005,7 @@ def find_similar_functions(
                 cand for cand in locations
                 if (cand["file"], cand["line"]) != (base_file, base_line)
                 and _top_dir(cand["file"]) == base_top
+                and not cand.get("is_abstract")
             ),
             None,
         )
@@ -962,11 +1013,21 @@ def find_similar_functions(
             continue
 
         same_name = short == base_name
-        shared = _shared_leading_words(base_words, _tokens(short))
+        words = _tokens(short)
+        shared = _shared_leading_words(base_words, words)
         needed = 2 if base_words and base_words[0] in _GENERIC_TOKENS else 1
         prefix_match = (
             not same_name and shared >= needed and len(base_words[0]) > 2
+            # A bare verb that is all of the shared prefix is a dispatcher.
+            and not (shared == len(words) < len(base_words))
         )
+        if prefix_match and shared == 1:
+            same_shape = (
+                loc.get("is_method") == func_info.get("is_method")
+                and abs(loc.get("param_count", 0) - base_params) <= 1
+            )
+            more_shared = bool(set(words[1:]) & set(base_words[1:]))
+            prefix_match = same_shape or more_shared
         if not (same_name or prefix_match):
             continue
 

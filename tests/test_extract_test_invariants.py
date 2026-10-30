@@ -281,6 +281,97 @@ class TestSimilarFunctionPrecision(unittest.TestCase):
         self.assertEqual(self._similar("ensure_key", funcs), ["ensure_token"])
 
 
+class TestSimilarFunctionNoise(unittest.TestCase):
+    """Abstract declarations and bare-verb prefixes are not siblings."""
+
+    def _similar(self, tested: str, funcs: dict[str, dict]) -> list[str]:
+        table = {name: [info] for name, info in funcs.items()}
+        return [
+            s["function"]
+            for s in mod.find_similar_functions(tested, funcs[tested], table)
+        ]
+
+    def test_bare_verb_is_not_a_prefix_sibling(self):
+        funcs = {
+            "Converter._verify_spec_version": _fn(
+                "Converter._verify_spec_version", "pkg/conv.py", 1, True
+            ),
+            "Node._verify": _fn("Node._verify", "pkg/node.py", 0, True),
+            "Converter._verify_spec_layout": {**_fn(
+                "Converter._verify_spec_layout", "pkg/conv.py", 1, True
+            ), "line": 20},
+        }
+        self.assertEqual(
+            self._similar("Converter._verify_spec_version", funcs),
+            ["Converter._verify_spec_layout"],
+        )
+
+    def test_one_shared_word_needs_more_than_the_word(self):
+        funcs = {
+            "Loader._parse_header": _fn("Loader._parse_header", "pkg/a.py", 1, True),
+            # Same shape (method, one parameter): kept.
+            "Loader._parse_footer": {
+                **_fn("Loader._parse_footer", "pkg/a.py", 1, True), "line": 20
+            },
+            # A module function with three more parameters, nothing else shared.
+            "_parse_options": _fn("_parse_options", "pkg/b.py", 4, False),
+            # Shares a second word: kept despite the different shape.
+            "_parse_header_line": _fn("_parse_header_line", "pkg/c.py", 4, False),
+        }
+        self.assertEqual(
+            sorted(self._similar("Loader._parse_header", funcs)),
+            ["Loader._parse_footer", "_parse_header_line"],
+        )
+
+    def test_abstract_declarations_are_skipped(self):
+        funcs = {
+            "DiskStore.close": _fn("DiskStore.close", "pkg/disk.py", 0, True),
+            "BaseStore.close": {**_fn("BaseStore.close", "pkg/base.py", 0, True),
+                                "is_abstract": True},
+            "NetStore.close": _fn("NetStore.close", "pkg/net.py", 0, True),
+        }
+        self.assertEqual(self._similar("DiskStore.close", funcs), ["NetStore.close"])
+
+    def test_abstract_bodies_detected(self):
+        with TempProject({
+            "pkg/base.py": (
+                "import abc\n"
+                "from typing import Protocol, overload\n"
+                "\n"
+                "class Base(abc.ABC):\n"
+                "    @abc.abstractmethod\n"
+                "    def run(self):\n"
+                "        \"\"\"Run.\"\"\"\n"
+                "    def stop(self):\n"
+                "        raise NotImplementedError('subclass')\n"
+                "    def reset(self):\n"
+                "        ...\n"
+                "    def close(self):\n"
+                "        pass\n"
+                "\n"
+                "class Backend(Protocol):\n"
+                "    def search(self, q): pass\n"
+                "\n"
+                "class Real:\n"
+                "    def close(self):\n"
+                "        pass\n"
+                "    def flush(self):\n"
+                "        raise NotImplementedError if self else None\n"
+            ),
+        }) as root:
+            funcs = mod.extract_source_functions([root / "pkg/base.py"], root)
+        abstract = {
+            name: locs[0]["is_abstract"] for name, locs in funcs.items()
+        }
+        self.assertEqual(abstract, {
+            "Base.run": True, "Base.stop": True, "Base.reset": True,
+            # `pass` in an ABC or Protocol is a declaration...
+            "Base.close": True, "Backend.search": True,
+            # ...but in a concrete class it is a real (no-op) implementation.
+            "Real.close": False, "Real.flush": False,
+        })
+
+
 class TestSelectTests(unittest.TestCase):
     """Test the three-tier test selection algorithm."""
 
