@@ -713,6 +713,95 @@ class TestSupportFilesAndMarkers(unittest.TestCase):
         self.assertEqual(out["summary"]["total_test_methods"], 1)
 
 
+_ROUTE_PROJECT = {
+    "web/__init__.py": "",
+    "web/app.py": (
+        "from web.routes import admin, items\n"
+        "app = object()\n"
+    ),
+    "web/routes/__init__.py": "",
+    "web/routes/admin.py": (
+        "from framework import Router\n"
+        "\n"
+        "def build(router):\n"
+        "    @router.get('/admin/stats')\n"
+        "    def stats():\n        return {}\n"
+        "\n"
+        "    @router.post('/admin/groups/{group}/{name}/rebuild')\n"
+        "    def rebuild(group, name):\n        return {}\n"
+        "    return router\n"
+    ),
+    "web/routes/items.py": (
+        "from framework import Router\n"
+        "router = Router(prefix='/items')\n"
+        "\n"
+        "@router.get('/{item_id}')\n"
+        "def read(item_id):\n    return {}\n"
+    ),
+    "web/routes/reports.py": (
+        "def build(router):\n"
+        "    @router.get('/reports/{rid}')\n"
+        "    def report(rid):\n        return {}\n"
+    ),
+    "tests/conftest.py": (
+        "import pytest\n"
+        "from web.app import app\n"
+        "\n"
+        "@pytest.fixture\n"
+        "def client():\n    return app\n"
+    ),
+}
+
+
+class TestRouteCorrelation(unittest.TestCase):
+    """Tests that drive a module over HTTP correlate with it by route."""
+
+    def test_url_literals_match_route_decorators(self):
+        files = dict(_ROUTE_PROJECT)
+        files["tests/test_ops.py"] = (
+            "import pytest\n"
+            "\n"
+            "def test_stats(client):\n"
+            "    assert client.get('/v1/admin/stats').status_code == 200\n"
+            "\n"
+            "@pytest.mark.parametrize('path', [\n"
+            "    '/v1/admin/groups/acme/books/rebuild',\n"
+            "])\n"
+            "def test_rebuild(client, path):\n"
+            "    assert client.post(path).status_code == 202\n"
+            "\n"
+            "def test_item(client):\n"
+            "    item = 7\n"
+            "    assert client.get(f'/v1/items/{item}').status_code == 200\n"
+        )
+        with TempProject(files) as root:
+            out = mod.analyze(str(root))
+        cov = {sc["source_file"]: sc for sc in out["source_coverage"]}
+        self.assertEqual(cov["web/routes/admin.py"]["match_method"], "route")
+        self.assertEqual(
+            cov["web/routes/admin.py"]["route_matched_test_files"],
+            ["tests/test_ops.py"],
+        )
+        # The router's own prefix is part of the template.
+        self.assertEqual(cov["web/routes/items.py"]["match_method"], "route")
+        self.assertNotIn("web/routes/admin.py", out["untested_sources"])
+        # True negative: no test URL names /reports/.
+        self.assertIn("web/routes/reports.py", out["untested_sources"])
+        self.assertEqual(out["summary"]["source_files_with_tests_by_route_only"], 2)
+
+    def test_filesystem_paths_do_not_match_routes(self):
+        files = dict(_ROUTE_PROJECT)
+        files["tests/test_paths.py"] = (
+            "def test_tmp():\n"
+            "    assert '/var/admin/notes.txt' != '/tmp/items'\n"
+        )
+        with TempProject(files) as root:
+            out = mod.analyze(str(root))
+        self.assertIn("web/routes/admin.py", out["untested_sources"])
+        # A bare prefix with a wildcard and no literal after it is not enough.
+        self.assertIn("web/routes/items.py", out["untested_sources"])
+
+
 class TestModuleNames(unittest.TestCase):
     def test_package_rooted_names(self):
         with TempProject({

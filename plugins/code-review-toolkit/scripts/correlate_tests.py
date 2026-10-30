@@ -349,6 +349,187 @@ def _match_test_to_source(
     return list(dict.fromkeys(matches))
 
 
+# ---------------------------------------------------------------------------
+# HTTP routes: a test that drives a module through a test client imports the
+# app, not the module, so it correlates by URL instead.
+# ---------------------------------------------------------------------------
+
+HTTP_VERBS = frozenset({"get", "post", "put", "patch", "delete", "head", "options"})
+ROUTE_DECORATORS = HTTP_VERBS | {"route", "api_route", "websocket"}
+
+
+def path_segments(node: ast.expr) -> list[str | None] | None:
+    """URL path segments of a str / f-string literal; None marks a wildcard.
+
+    `{}` / `{name}` placeholders (for `.format()`) are wildcards too. Returns
+    None for anything that is not a literal starting with `/`.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        text = node.value
+    elif isinstance(node, ast.JoinedStr):
+        pieces = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                pieces.append(value.value)
+            else:
+                pieces.append("\0")
+        text = "".join(pieces)
+    else:
+        return None
+    if not text.startswith("/") or any(c.isspace() for c in text):
+        return None
+    text = text.split("?", 1)[0]
+    return [
+        None if ("\0" in seg or "{" in seg) else seg
+        for seg in text.strip("/").split("/")
+        if seg
+    ]
+
+
+def template_segments(path: str) -> list[str | None]:
+    """Segments of a route template; `{param}` / `<param>` become wildcards."""
+    return [
+        None if ("{" in seg or "<" in seg) else seg
+        for seg in path.strip("/").split("/")
+        if seg
+    ]
+
+
+def router_prefixes(tree: ast.Module) -> dict[str, str]:
+    """`router = APIRouter(prefix="/x")` / `Blueprint(url_prefix=...)` → {name: prefix}."""
+    prefixes: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)):
+            continue
+        for kw in node.value.keywords:
+            if (
+                kw.arg in ("prefix", "url_prefix")
+                and isinstance(kw.value, ast.Constant)
+                and isinstance(kw.value.value, str)
+            ):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        prefixes[target.id] = kw.value.value
+    return prefixes
+
+
+def route_templates(
+    func: ast.FunctionDef | ast.AsyncFunctionDef,
+    prefixes: dict[str, str] | None = None,
+) -> list[tuple[set[str], str]]:
+    """`(methods, path)` for each route decorator on *func*.
+
+    Recognizes `@x.get("/p")` (any HTTP verb), `@x.route("/p", methods=[...])`,
+    `@x.api_route` and `@x.websocket`, with the path positional or as
+    `path=`. A router created in the same file with a `prefix=` /
+    `url_prefix=` gets that prefix prepended.
+    """
+    found: list[tuple[set[str], str]] = []
+    for dec in func.decorator_list:
+        if not (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)):
+            continue
+        verb = dec.func.attr
+        if verb not in ROUTE_DECORATORS:
+            continue
+        path = dec.args[0] if dec.args else next(
+            (kw.value for kw in dec.keywords if kw.arg in ("path", "rule")), None
+        )
+        if not (isinstance(path, ast.Constant) and isinstance(path.value, str)):
+            continue
+        if not path.value.startswith("/"):
+            continue
+        if verb in HTTP_VERBS:
+            methods = {verb}
+        else:
+            methods = {"get"}
+            for kw in dec.keywords:
+                if kw.arg == "methods" and isinstance(kw.value, (ast.List, ast.Tuple)):
+                    methods = {
+                        e.value.lower()
+                        for e in kw.value.elts
+                        if isinstance(e, ast.Constant) and isinstance(e.value, str)
+                    }
+        prefix = ""
+        if prefixes and isinstance(dec.func.value, ast.Name):
+            prefix = prefixes.get(dec.func.value.id, "").rstrip("/")
+        found.append((methods, prefix + path.value))
+    return found
+
+
+def build_route_index(source_files: list[Path], project_root: Path) -> list[dict]:
+    """Every route decorator in *source_files*: `{file, function, line, segments}`."""
+    routes: list[dict] = []
+    for sf in source_files:
+        tree = parse_source(sf)
+        if tree is None:
+            continue
+        prefixes = router_prefixes(tree)
+        rel = str(sf.relative_to(project_root))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for methods, path in route_templates(node, prefixes):
+                    routes.append({
+                        "file": rel,
+                        "function": node.name,
+                        "line": node.lineno,
+                        "methods": methods,
+                        "segments": template_segments(path),
+                    })
+    return routes
+
+
+def best_routes(
+    segments: list[str | None], routes: list[dict], verb: str | None = None
+) -> list[dict]:
+    """The most specific routes whose template is a suffix of *segments*.
+
+    A template matches when each of its literal segments equals the URL's
+    segment at the same position from the end (wildcards match anything) and
+    at least one literal segment matched: the app may mount a router under a
+    prefix (`/v1`) the decorator never spells. Most literal segments wins,
+    then the longest template; ties are all returned.
+    """
+    best: list[dict] = []
+    best_key = (0, 0)
+    for route in routes:
+        if verb is not None and verb not in route["methods"]:
+            continue
+        tmpl = route["segments"]
+        if not tmpl or len(tmpl) > len(segments):
+            continue
+        tail = segments[len(segments) - len(tmpl):]
+        literal = 0
+        for want, got in zip(tmpl, tail):
+            if want is None or got is None:
+                continue
+            if want != got:
+                break
+            literal += 1
+        else:
+            key = (literal, len(tmpl))
+            if not literal or key < best_key:
+                continue
+            if key > best_key:
+                best, best_key = [], key
+            best.append(route)
+    return best
+
+
+def route_matched_sources(tree: ast.AST, routes: list[dict]) -> set[str]:
+    """Source files whose routes a test file's URL literals reach."""
+    if not routes:
+        return set()
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.JoinedStr) or (
+            isinstance(node, ast.Constant) and isinstance(node.value, str)
+        ):
+            segments = path_segments(node)
+            if segments:
+                found.update(r["file"] for r in best_routes(segments, routes))
+    return found
+
+
 def _read_test_imports(filepath: Path, project_root: Path) -> list[str]:
     """Extract internal modules imported by a test file."""
     try:
@@ -674,6 +855,7 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
     # Analyze test files and build correlations.
     module_index = build_module_index(source_files, project_root)
     reexports = build_reexport_index(source_files, project_root)
+    routes = build_route_index(source_files, project_root)
     test_info: dict[str, dict] = {}
     support_info: dict[str, dict] = {}
     for tf in test_files:
@@ -714,6 +896,11 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
         # for `storage/engine.py`) never match by file name, but they import
         # the module under test.
         tinfo["imported_sources"] = imported_sources
+        # Route handlers driven through a test client: the test imports the
+        # app, never the handler's module, but its URL literals name it.
+        tinfo["route_matched_sources"] = sorted(
+            route_matched_sources(tree, routes) if tree is not None else []
+        )
         test_info[rel] = tinfo
 
     # Build the correlation map: source → tests, remembering how each matched.
@@ -725,6 +912,7 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
                 by_support[src].append(support_path)
     by_name: dict[str, list[str]] = {s: [] for s in source_info}
     by_import: dict[str, list[str]] = {s: [] for s in source_info}
+    by_route: dict[str, list[str]] = {s: [] for s in source_info}
     for test_path, tinfo in test_info.items():
         for src in tinfo["matched_sources"]:
             if src in by_name:
@@ -732,8 +920,13 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
         for src in tinfo["imported_sources"]:
             if src in by_import:
                 by_import[src].append(test_path)
+        for src in tinfo["route_matched_sources"]:
+            if src in by_route:
+                by_route[src].append(test_path)
     for src in source_info:
-        source_to_tests[src] = sorted(set(by_name[src]) | set(by_import[src]))
+        source_to_tests[src] = sorted(
+            set(by_name[src]) | set(by_import[src]) | set(by_route[src])
+        )
 
     # Identify untested source files.
     untested = [s for s, tests in source_to_tests.items() if not tests]
@@ -757,23 +950,27 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
             + sum(len(c["public_methods"]) for c in src_info["classes"])
         )
 
-        if by_name[src] and by_import[src]:
-            match_method = "name+import"
-        elif by_name[src]:
-            match_method = "name"
-        elif by_import[src]:
-            match_method = "import"
-        else:
-            match_method = None
+        match_method = "+".join(
+            kind
+            for kind, hits in (
+                ("name", by_name[src]),
+                ("import", by_import[src]),
+                ("route", by_route[src]),
+            )
+            if hits
+        ) or None
         source_coverage.append({
             "source_file": src,
             "test_files": tests,
             # How the correspondence was found: the test file's name matches
-            # the source's ("name"), a test file imports it ("import"), or
-            # both. A name match is the stronger signal.
+            # the source's ("name"), a test file imports it ("import"), a
+            # test's URL literal reaches one of its route decorators
+            # ("route"), or a "+"-joined combination. A name match is the
+            # strongest signal.
             "match_method": match_method,
             "name_matched_test_files": by_name[src],
             "import_matched_test_files": by_import[src],
+            "route_matched_test_files": by_route[src],
             # conftest.py / helper files importing this module. Not counted
             # in has_tests: an import for a fixture tests nothing by itself.
             "support_imported_by": by_support[src],
@@ -830,6 +1027,11 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
             "source_files_with_tests_by_name": sum(1 for v in by_name.values() if v),
             "source_files_with_tests_by_import_only": sum(
                 1 for s in source_info if by_import[s] and not by_name[s]
+            ),
+            "source_files_with_tests_by_route_only": sum(
+                1
+                for s in source_info
+                if by_route[s] and not by_name[s] and not by_import[s]
             ),
             "coverage_percentage": (
                 round(100 * tested / total_source, 1)

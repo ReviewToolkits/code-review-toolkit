@@ -20,11 +20,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from correlate_tests import (  # noqa: E402
+    HTTP_VERBS,
+    router_prefixes,
+    best_routes,
     build_module_index,
     classify_files,
     defines_tests,
     find_external_tests,
     module_name,
+    path_segments,
+    route_templates,
+    template_segments,
 )
 from scan_common import (  # noqa: E402
     build_envelope,
@@ -189,8 +195,7 @@ def extract_assertions(func_node: ast.FunctionDef) -> list[dict]:
 # local variables, conftest fixtures and HTTP route decorators, and only
 # then falls back to name matching.
 
-_HTTP_VERBS = frozenset({"get", "post", "put", "patch", "delete", "head", "options"})
-_ROUTE_DECORATORS = _HTTP_VERBS | {"route", "api_route", "websocket"}
+_HTTP_VERBS = HTTP_VERBS
 # One-word names too generic to identify a function from a test name alone.
 _GENERIC_TOKENS = frozenset({
     "get", "set", "run", "add", "new", "make", "main", "call", "init", "load",
@@ -252,37 +257,6 @@ def _tokens(name: str) -> list[str]:
     return [t for t in name.lower().strip("_").split("_") if t]
 
 
-def _path_segments(node: ast.expr) -> list[str | None] | None:
-    """URL path segments of a str / f-string literal; None marks a wildcard."""
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        text = node.value
-    elif isinstance(node, ast.JoinedStr):
-        pieces = []
-        for value in node.values:
-            if isinstance(value, ast.Constant) and isinstance(value.value, str):
-                pieces.append(value.value)
-            else:
-                pieces.append("\0")
-        text = "".join(pieces)
-    else:
-        return None
-    if not text.startswith("/"):
-        return None
-    text = text.split("?", 1)[0]
-    return [
-        None if "\0" in seg else seg for seg in text.strip("/").split("/") if seg
-    ]
-
-
-def _template_segments(path: str) -> list[str | None]:
-    """Segments of a route template; `{param}` / `<param>` become wildcards."""
-    return [
-        None if ("{" in seg or "<" in seg) else seg
-        for seg in path.strip("/").split("/")
-        if seg
-    ]
-
-
 class SourceIndex:
     """What a test may reach in the source tree, indexed for call resolution."""
 
@@ -309,6 +283,7 @@ class SourceIndex:
 
     def _index_tree(self, tree: ast.Module, rel: str) -> None:
         method_nodes: set[int] = set()
+        prefixes = router_prefixes(tree)
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef):
                 methods: dict[str, int] = {}
@@ -331,40 +306,22 @@ class SourceIndex:
                     self.short_names[name].append((rel, f"{node.name}.{name}"))
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                self._index_route(node, rel)
+                self._index_route(node, rel, prefixes)
                 if id(node) not in method_nodes and (rel, node.name) not in self.functions:
                     self.functions[(rel, node.name)] = node.lineno
                     self.short_names[node.name].append((rel, node.name))
 
-    def _index_route(self, node: ast.FunctionDef | ast.AsyncFunctionDef, rel: str):
-        for dec in node.decorator_list:
-            if not (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)):
-                continue
-            verb = dec.func.attr
-            if verb not in _ROUTE_DECORATORS or not dec.args:
-                continue
-            path = dec.args[0]
-            if not (isinstance(path, ast.Constant) and isinstance(path.value, str)):
-                continue
-            if not path.value.startswith("/"):
-                continue
-            if verb in _HTTP_VERBS:
-                methods = {verb}
-            else:
-                methods = {"get"}
-                for kw in dec.keywords:
-                    if kw.arg == "methods" and isinstance(kw.value, (ast.List, ast.Tuple)):
-                        methods = {
-                            e.value.lower()
-                            for e in kw.value.elts
-                            if isinstance(e, ast.Constant) and isinstance(e.value, str)
-                        }
+    def _index_route(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef, rel: str,
+        prefixes: dict[str, str],
+    ) -> None:
+        for methods, path in route_templates(node, prefixes):
             self.routes.append({
                 "file": rel,
                 "line": node.lineno,
                 "function": node.name,
                 "methods": methods,
-                "segments": _template_segments(path.value),
+                "segments": template_segments(path),
             })
 
     # -- resolution ---------------------------------------------------------
@@ -414,27 +371,8 @@ class SourceIndex:
 
     def match_route(self, verb: str, segments: list[str | None]) -> dict | None:
         """The most specific route whose template is a suffix of the path."""
-        best = None
-        best_key = (0, 0)
-        for route in self.routes:
-            if verb not in route["methods"]:
-                continue
-            tmpl = route["segments"]
-            if len(tmpl) > len(segments) or not tmpl:
-                continue
-            tail = segments[len(segments) - len(tmpl):]
-            literal = 0
-            for want, got in zip(tmpl, tail):
-                if want is None or got is None:
-                    continue
-                if want != got:
-                    break
-                literal += 1
-            else:
-                key = (literal, len(tmpl))
-                if literal and key > best_key:
-                    best, best_key = route, key
-        return best
+        best = best_routes(segments, self.routes, verb)
+        return best[0] if best else None
 
 
 class _TestFileContext:
@@ -645,7 +583,7 @@ def _call_candidates(
             continue
         # client.post("/api/...") → the route handler.
         if isinstance(func, ast.Attribute) and func.attr in _HTTP_VERBS and call.args:
-            segments = _path_segments(call.args[0])
+            segments = path_segments(call.args[0])
             if segments is not None:
                 route = index.match_route(func.attr, segments)
                 if route:
