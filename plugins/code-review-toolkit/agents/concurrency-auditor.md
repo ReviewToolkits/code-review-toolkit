@@ -168,6 +168,9 @@ These rules apply to every script call this agent makes.
   Each Bash call is a fresh shell: a `$$` suffix or a shell variable does not survive into the next
   call. Reuse the literal path `echo` printed. Put your own scratch files (reproducers, notes) in the
   same directory, never in a shared fixed path.
+- **Running the project's own code** (its tests, a reproducer, an import check): do it in an
+  exported copy, never in the checkout, and set `TMPDIR` to your private directory so the project's
+  own temp files land there instead of a shared `/tmp`.
 - **Forward `--max-files N`** when the caller gave one, and say so in the report whenever the
   envelope's `files_capped` is true.
 - **Check before you read.** A non-zero `exit` or an empty `out.json` means the run did not

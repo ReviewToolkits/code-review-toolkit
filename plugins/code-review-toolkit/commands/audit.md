@@ -41,11 +41,11 @@ Terminal state is one of:
 ```bash
 for s in scan_python_pitfalls scan_concurrency analyze_imports find_dead_symbols measure_complexity \
          collect_debt correlate_tests count_types extract_test_invariants; do
-  python <plugin_root>/scripts/$s.py [scope] > reports/audit/$s.json 2>reports/audit/$s.err
+  python3 <plugin_root>/scripts/$s.py [scope] > reports/audit/$s.json 2>reports/audit/$s.err
   echo "$s exit=$?"
 done
-python <plugin_root>/scripts/run_lint_rules.py [scope] --tier 1 > reports/audit/lint.json
-python <plugin_root>/scripts/check_typing.py [scope] > reports/audit/typing.json
+python3 <plugin_root>/scripts/run_lint_rules.py [scope] --tier 1 > reports/audit/lint.json
+python3 <plugin_root>/scripts/check_typing.py [scope] > reports/audit/typing.json
 ```
 
 For each: a non-zero exit, an `error` key, a `status: FAILED`, or `files_analyzed: 0` is a
@@ -58,7 +58,7 @@ stderr; a rule that silently did nothing means its absence from the findings pro
 ### 2. Regression-check against the known catalog, if one exists
 
 ```bash
-python <plugin_root>/scripts/check_known_findings.py [scope] --catalog <catalog.tsv>
+python3 <plugin_root>/scripts/check_known_findings.py [scope] --catalog <catalog.tsv>
 ```
 
 Anything `present` is a **regression or a never-fixed finding** and belongs in the FIX count

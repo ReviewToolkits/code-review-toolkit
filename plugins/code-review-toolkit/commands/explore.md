@@ -120,7 +120,7 @@ Tell every agent its report path and its artifacts directory, and these rules, v
 If external analysis tools are available on the system, run them to gather additional data for subsequent agents:
 
 ```bash
-python <plugin_root>/scripts/run_external_tools.py [scope]
+python3 <plugin_root>/scripts/run_external_tools.py [scope]
 ```
 
 This phase is OPTIONAL — if no external tools are installed, skip it silently. Do not warn the user about missing tools unless they specifically request external tool analysis.

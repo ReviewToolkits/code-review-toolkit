@@ -50,13 +50,13 @@ prints, because each Bash call is a fresh shell:
 
 ```bash
 d=$(mktemp -d "${TMPDIR:-/tmp}/crt-informed-explore.XXXXXX") && echo "$d" &&
-python <plugin_root>/scripts/build_informed_briefing.py [scope] > "$d/briefing.md"; echo "exit=$?"
+python3 <plugin_root>/scripts/build_informed_briefing.py [scope] > "$d/briefing.md"; echo "exit=$?"
 ```
 
 For a per-agent briefing scoped to just the shapes that agent owns (shorter, more focused):
 
 ```bash
-python <plugin_root>/scripts/build_informed_briefing.py [scope] --agent silent-failure-hunter
+python3 <plugin_root>/scripts/build_informed_briefing.py [scope] --agent silent-failure-hunter
 ```
 
 The briefing assembles three things:
@@ -78,7 +78,7 @@ runs, its **confirmed** entries are folded in automatically as "verify, then mov
 `*-review-findings` companions:
 
 ```bash
-python <plugin_root>/scripts/build_informed_briefing.py [scope] \
+python3 <plugin_root>/scripts/build_informed_briefing.py [scope] \
     --agent pattern-consistency-checker \
     --catalog ~/projects/code-review-findings
 ```

@@ -16,7 +16,7 @@ Analyze the scope provided. Default: the entire project.
 Before starting your qualitative analysis, run the debt collection script:
 
 ```bash
-python <plugin_root>/scripts/collect_debt.py [scope]
+python3 <plugin_root>/scripts/collect_debt.py [scope]
 ```
 
 where `<plugin_root>` is the root of the code-review-toolkit plugin directory.
@@ -36,7 +36,7 @@ says nothing about the debt. Before running the script, look at the CHANGELOG, R
 commit subjects for a key scheme. If there is one, pass it:
 
 ```bash
-python <plugin_root>/scripts/collect_debt.py [scope] --key-regex '\b(?:ABC|PROJ)-\d+\b'
+python3 <plugin_root>/scripts/collect_debt.py [scope] --key-regex '\b(?:ABC|PROJ)-\d+\b'
 ```
 
 `tracker_keys` then lists every key cited in comments, docstrings and docs (project root plus
@@ -115,7 +115,7 @@ Look for patterns that indicate debt without explicit markers:
   whether it already has (run the import, or the tests, against the latest release).
 - **Runtime deprecations**: APIs the code calls that the installed Python or libraries already
   deprecate. If the test suite can run (in an exported copy), run it once with
-  `python -W error::DeprecationWarning -m pytest` (or `-W default` and bucket the warnings) and
+  `python3 -W error::DeprecationWarning -m pytest` (or `-W default` and bucket the warnings) and
   list each deprecated call with the version that removes it.
 - **Tracker keys as debt**: projects that track work by keys (`ABC-123`, `B92`) in a roadmap file
   and cite them in code comments carry debt in that form; resolve each cited key's status rather
@@ -227,11 +227,14 @@ These rules apply to every script call this agent makes.
 
   ```bash
   d=$(mktemp -d "${TMPDIR:-/tmp}/crt-tech-debt-inventory.XXXXXX") && echo "$d" &&
-  python <plugin_root>/scripts/collect_debt.py [scope] [options] > "$d/out.json" 2> "$d/out.err"; echo "exit=$?"
+  python3 <plugin_root>/scripts/collect_debt.py [scope] [options] > "$d/out.json" 2> "$d/out.err"; echo "exit=$?"
   ```
 
   Each Bash call is a fresh shell: a `$$` suffix or a shell variable does not survive into the next
   call. Reuse the literal path `echo` printed.
+- **Running the project's own code** (its tests, a reproducer, an import check): do it in an
+  exported copy, never in the checkout, and set `TMPDIR` to your private directory so the project's
+  own temp files land there instead of a shared `/tmp`.
 - **Forward `--max-files N`** when the caller gave one, and say so in the report whenever the
   envelope's `files_capped` is true.
 - **Check before you read.** A non-zero `exit` or an empty `out.json` means the run did not

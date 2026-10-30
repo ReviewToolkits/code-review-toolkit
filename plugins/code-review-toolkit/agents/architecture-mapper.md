@@ -16,7 +16,7 @@ Analyze the scope provided. Default: the entire project. The user may specify a 
 Before starting your qualitative analysis, run the import analysis script to get structured dependency data:
 
 ```bash
-python <plugin_root>/scripts/analyze_imports.py [scope]
+python3 <plugin_root>/scripts/analyze_imports.py [scope]
 ```
 
 where `<plugin_root>` is the root of the code-review-toolkit plugin directory.
@@ -201,11 +201,14 @@ These rules apply to every script call this agent makes.
 
   ```bash
   d=$(mktemp -d "${TMPDIR:-/tmp}/crt-architecture-mapper.XXXXXX") && echo "$d" &&
-  python <plugin_root>/scripts/analyze_imports.py [scope] [options] > "$d/out.json" 2> "$d/out.err"; echo "exit=$?"
+  python3 <plugin_root>/scripts/analyze_imports.py [scope] [options] > "$d/out.json" 2> "$d/out.err"; echo "exit=$?"
   ```
 
   Each Bash call is a fresh shell: a `$$` suffix or a shell variable does not survive into the next
   call. Reuse the literal path `echo` printed.
+- **Running the project's own code** (its tests, a reproducer, an import check): do it in an
+  exported copy, never in the checkout, and set `TMPDIR` to your private directory so the project's
+  own temp files land there instead of a shared `/tmp`.
 - **Forward `--max-files N`** when the caller gave one, and say so in the report whenever the
   envelope's `files_capped` is true.
 - **Check before you read.** A non-zero `exit` or an empty `out.json` means the run did not

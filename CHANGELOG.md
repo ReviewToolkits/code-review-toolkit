@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Agents and commands invoke `python3`**, not `python`, which some hosts don't have. Every
+  script-backed agent's *Running the script* section also says to run the project's own code in an
+  exported copy with `TMPDIR` pointing at the agent's private directory.
+
 ### Fixed — scan_common, pitfall precision, imports, debt (#57)
 
 - **`--help`/`-h` prints usage and exits 0 in every script**, instead of silently running a full
