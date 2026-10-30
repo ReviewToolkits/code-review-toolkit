@@ -74,7 +74,35 @@ For code blocks in README and docs, check:
 - Do the function signatures match (parameter names, required params)?
 - Are the return types / usage patterns consistent with actual code?
 
-Don't execute the examples — just verify they're structurally valid against the current API.
+**Run the examples when it's cheap.** A command can have a valid name, valid flags and valid
+ids and still fail, because the code behind it regressed. Only running it shows that. Run the
+README and guide quickstarts, CLI invocations and short snippets:
+
+- in an exported copy (`git archive HEAD | tar -x -C "$d/export"`), never in the checkout, with
+  `TMPDIR` pointing at your private directory, and with the package importing from the export
+  (assert `pkg.__file__` is under it);
+- never anything destructive, and never against a real external service or real credentials.
+  Use a local server the docs tell you to start, or fall back to the structural checks above.
+
+A doc example that fails because the docs are stale is a doc finding. One that fails because
+the code is wrong goes under "Behaviour Defects Found Through the Docs" in the output. Mark
+which examples you ran and which you only checked structurally.
+
+### Project-Provided Doc-Drift Checks
+
+Many projects generate their reference pages (CLI reference, config reference, OpenAPI
+snapshot) and ship a check that diffs them against the code. Find it and run it in the export
+before validating those pages by hand:
+
+```bash
+grep -nE -- "--check|docs?-(check|ref)|ref-check|snapshot|cog\b" Makefile justfile tox.ini noxfile.py \
+  .pre-commit-config.yaml .github/workflows/*.y*ml 2>/dev/null
+ls scripts/ tools/ 2>/dev/null
+```
+
+A failing check is a finding by itself (the committed reference is stale). A passing one settles
+the generated pages in seconds, so audit by hand only what the generator doesn't cover:
+hand-written usage lines, prose around the generated tables, and the pages that link to them.
 
 ### Documented `make` Targets
 
@@ -263,7 +291,7 @@ For each:
 [Same structure, briefer]
 
 ### Valid References Checked
-[Count: "N references validated, N broken, N stale"]
+[Count: "N references validated, N broken, N stale; N examples run, N checked structurally only; doc-drift checks run: <names or none>"]
 
 ## Cross-File Consistency
 
@@ -292,6 +320,17 @@ For each:
 - Configuration options: N documented / N total
 - Environment variables: N documented / N total
 - Public modules: N mentioned / N total
+
+## Behaviour Defects Found Through the Docs
+
+[Code defects, not doc defects, that came to light while validating the docs: an example or a
+quickstart that fails because the code regressed, a documented default the code no longer
+applies. List them here, not under Broken References, so they reach the code reviewers.]
+For each:
+- **Doc**: [file:line of the example or statement]
+- **Ran**: [the exact command or snippet, and where: export path]
+- **Expected (per the docs)** / **Actual**: [...]
+- **Classification and status**: [FIX / CONSIDER; reproduced / confirmed / candidate]
 
 ## Recommendations
 
