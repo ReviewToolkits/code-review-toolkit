@@ -32,7 +32,10 @@ with open(os.path.join(cache, "marker"), "w") as fh:
 with open(os.environ["FAKE_MYPY_RESPONSES"]) as fh:
     responses = json.load(fh)
 key = ""
-for flag in ("--disallow-any-unimported", "--warn-unreachable", "--warn-unused-ignores"):
+if "--config-file" in args and "ignore-missing-imports-off" in args[args.index("--config-file") + 1]:
+    key = "silenced"
+for flag in ("--disallow-any-unimported", "--warn-unreachable", "--warn-unused-ignores",
+             "--check-untyped-defs"):
     if flag in args:
         key = flag
 out = responses.get(key, responses.get("", ""))
@@ -210,6 +213,15 @@ class TestParseOutput(unittest.TestCase):
             [f["kind"] for f in findings],
             ["defect", "missing-annotation", "other"],
         )
+
+    def test_root_cause_codes_are_defects(self):
+        """`name-defined`, `return` and `method-assign` used to land in `other`."""
+        findings, _ = mod.parse_output(
+            'a.py:1: error: Name "Sequnce" is not defined  [name-defined]\n'
+            "a.py:2: error: Missing return statement  [return]\n"
+            "a.py:3: error: Cannot assign to a method  [method-assign]\n"
+        )
+        self.assertEqual([f["kind"] for f in findings], ["defect"] * 3)
 
 
 class TestFailureIsNeverClean(unittest.TestCase):
@@ -457,6 +469,325 @@ class TestUnreachablePass(unittest.TestCase):
         self.assertEqual(result["summary"]["unreachable"], 0)
         self.assertEqual(result["summary"]["phantom_imports"], 0)
         self.assertTrue(result["summary"]["labelled_passes"]["warn-unreachable"]["ran"])
+
+
+class TestUnreachableSource(unittest.TestCase):
+    """With warn_unreachable on in the project's config, the labelled pass is
+    a no-op: its `added: 0` read as a measurement. The baseline is the source."""
+
+    def test_project_config_is_the_source_and_no_pass_runs(self):
+        files = {**_PKG, "mypy.ini": "[mypy]\nwarn_unreachable = True\n"}
+        result, flags_seen = _run(files, {"": _UNREACHABLE + _BASE_ERR + _TWO_ERRORS})
+        summary = result["summary"]
+        self.assertEqual(summary["unreachable_source"], "project-config")
+        self.assertEqual(summary["unreachable"], 1)
+        self.assertEqual(result["unreachable_findings"][0]["line"], 7)
+        self.assertNotIn("warn-unreachable", summary["labelled_passes"])
+        self.assertFalse(any("--warn-unreachable" in f for f in flags_seen))
+
+    def test_strict_does_not_imply_warn_unreachable(self):
+        files = {**_PKG, "mypy.ini": "[mypy]\nstrict = True\n"}
+        result, flags_seen = _run(files, {"": _BASE_ERR + _ONE_ERROR})
+        self.assertEqual(
+            result["summary"]["unreachable_source"], "warn-unreachable-pass"
+        )
+        self.assertTrue(any("--warn-unreachable" in f for f in flags_seen))
+
+    def test_without_it_the_labelled_pass_is_the_source(self):
+        result, _ = _run(_PKG, {"": _BASE_ERR + _ONE_ERROR})
+        self.assertEqual(
+            result["summary"]["unreachable_source"], "warn-unreachable-pass"
+        )
+
+    def test_skipped_pass_has_no_source(self):
+        result, _ = _run(_PKG, {"": _BASE_ERR + _ONE_ERROR}, unreachable_pass=False)
+        self.assertIsNone(result["summary"]["unreachable_source"])
+
+
+class TestLineGroups(unittest.TestCase):
+    """Several findings on one line are usually one root cause."""
+
+    def test_findings_are_grouped_by_line(self):
+        out = (
+            "pkg/m.py:4: error: a  [arg-type]\n"
+            "pkg/m.py:4: error: b  [arg-type]\n"
+            "pkg/m.py:4: error: c  [no-untyped-call]\n"
+            "pkg/m.py:9: error: d  [union-attr]\n"
+            "Found 4 errors in 1 file (checked 2 source files)\n"
+        )
+        result, _ = _run(_PKG, {"": out})
+        summary = result["summary"]
+        self.assertEqual(summary["total"], 4)
+        self.assertEqual(summary["distinct_lines"], 2)
+        self.assertEqual(summary["defect_lines"], 2)
+        (group,) = result["line_groups"]
+        self.assertEqual((group["line"], group["count"]), (4, 3))
+        self.assertEqual(group["codes"], {"arg-type": 2, "no-untyped-call": 1})
+
+    def test_one_finding_per_line_has_no_groups(self):
+        result, _ = _run(_PKG, {"": _BASE_ERR + _ONE_ERROR})
+        self.assertEqual(result["line_groups"], [])
+        self.assertEqual(result["summary"]["distinct_lines"], 1)
+
+
+class TestUntypedBodies(unittest.TestCase):
+    """With check_untyped_defs off (mypy's default), the bodies of unannotated
+    functions are never checked, and nothing in the output said how many."""
+
+    _FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/m.py": (
+            "def untyped(a, b):\n"
+            "    def inner():\n"
+            "        return 1\n"
+            "    return a + b\n"
+            "def typed(a: int):\n"
+            "    return a\n"
+            "def returns() -> None:\n"
+            "    pass\n"
+            "class C:\n"
+            "    def __init__(self):\n"
+            "        self.x = 1\n"
+        ),
+    }
+    _BODY_ERR = "pkg/m.py:4: error: Unsupported operand  [operator]\n"
+
+    def test_unchecked_bodies_are_counted_and_the_pass_reports_their_errors(self):
+        result, flags_seen = _run(
+            self._FILES,
+            {
+                "": _BASE_ERR + _ONE_ERROR,
+                "--check-untyped-defs": _BASE_ERR + self._BODY_ERR + _TWO_ERRORS,
+            },
+        )
+        summary = result["summary"]
+        # untyped, inner, C.__init__ -- not the two with any annotation.
+        self.assertEqual(summary["untyped_defs"], 3)
+        self.assertEqual(summary["unchecked_untyped_bodies"], 3)
+        self.assertEqual(summary["untyped_body_errors"], 1)
+        self.assertEqual(result["untyped_body_findings"][0]["line"], 4)
+        self.assertEqual(summary["total"], 1)
+        self.assertFalse(result["effective_flags"]["check_untyped_defs"])
+        self.assertEqual(result["effective_flags"]["source"], "mypy-defaults")
+        self.assertTrue(any("--check-untyped-defs" in f for f in flags_seen))
+
+    def test_project_config_that_checks_them_needs_no_pass(self):
+        files = {**self._FILES, "mypy.ini": "[mypy]\ncheck_untyped_defs = True\n"}
+        result, flags_seen = _run(files, {"": _BASE_ERR + _ONE_ERROR})
+        summary = result["summary"]
+        self.assertEqual(summary["untyped_defs"], 3)
+        self.assertEqual(summary["unchecked_untyped_bodies"], 0)
+        self.assertIsNone(summary["untyped_body_errors"])
+        self.assertTrue(result["effective_flags"]["check_untyped_defs"])
+        self.assertEqual(result["effective_flags"]["source"], "project-config")
+        self.assertFalse(any("--check-untyped-defs" in f for f in flags_seen))
+
+    def test_skipped_pass_is_null_not_zero(self):
+        result, _ = _run(
+            self._FILES, {"": _BASE_ERR + _ONE_ERROR}, untyped_defs_pass=False
+        )
+        self.assertIsNone(result["summary"]["untyped_body_errors"])
+        self.assertEqual(result["summary"]["unchecked_untyped_bodies"], 3)
+
+
+_STUBS = 'pkg/m.py:1: error: Library stubs not installed for "yaml"  [import-untyped]\n'
+_NOT_FOUND = (
+    "pkg/m.py:3: error: Cannot find implementation or library stub for module "
+    'named "nowhere.sub"  [import-not-found]\n'
+)
+_THREE_ERRORS = "Found 3 errors in 1 file (checked 2 source files)\n"
+
+
+class TestSilencedImports(unittest.TestCase):
+    """Which imports did ignore_missing_imports turn into Any? A labelled pass
+    on a copy of the config with the option off answers it; the
+    --disallow-any-unimported pass only fires where an annotation names one."""
+
+    def test_global_option_is_measured_by_a_derived_config(self):
+        files = {**_PKG, "mypy.ini": "[mypy]\nignore_missing_imports = True\n"}
+        with (
+            TempProject(files) as root,
+            FakeMypy(
+                {
+                    "": _BASE_ERR + _ONE_ERROR,
+                    "silenced": _STUBS + _BASE_ERR + _NOT_FOUND + _THREE_ERRORS,
+                }
+            ) as fake,
+        ):
+            result = mod.analyze(str(root / "pkg"), mypy_bin=str(fake.bin))
+            configs = [
+                c["argv"][c["argv"].index("--config-file") + 1] for c in fake.calls()
+            ]
+        derived = [c for c in configs if "ignore-missing-imports-off" in c]
+        self.assertEqual(len(derived), 1)
+        summary = result["summary"]
+        self.assertEqual(summary["silenced_imports"], 2)
+        self.assertEqual(
+            summary["silenced_imports_source"], "ignore-missing-imports-off-pass"
+        )
+        self.assertEqual(
+            sorted(f["module"] for f in result["silenced_import_findings"]),
+            ["nowhere.sub", "yaml"],
+        )
+        self.assertEqual(result["effective_flags"]["ignore_missing_imports"], "global")
+        # The baseline stays the project's own.
+        self.assertEqual(summary["total"], 1)
+
+    def test_without_the_option_there_is_nothing_to_silence(self):
+        result, _ = _run(_PKG, {"": _BASE_ERR + _ONE_ERROR})
+        summary = result["summary"]
+        self.assertEqual(summary["silenced_imports"], 0)
+        self.assertEqual(summary["silenced_imports_source"], "not-configured")
+        self.assertIsNone(result["effective_flags"]["ignore_missing_imports"])
+        self.assertNotIn("ignore-missing-imports-off", summary["labelled_passes"])
+
+    def test_skipped_pass_is_null_with_a_reason(self):
+        files = {**_PKG, "mypy.ini": "[mypy]\nignore_missing_imports = True\n"}
+        result, _ = _run(
+            files, {"": _BASE_ERR + _ONE_ERROR}, silenced_imports_pass=False
+        )
+        self.assertIsNone(result["summary"]["silenced_imports"])
+        self.assertIn("not measured", result["summary"]["silenced_imports_reason"])
+
+    def test_mypy_python_is_recorded(self):
+        result, _ = _run(_PKG, {"": _BASE_ERR + _ONE_ERROR})
+        info = result["mypy_python"]
+        self.assertEqual(info["source"], "mypy-launcher")
+        self.assertEqual(
+            Path(info["executable"]).resolve(), Path(sys.executable).resolve()
+        )
+        self.assertTrue(info["site_packages"])
+
+
+class TestDeriveConfig(unittest.TestCase):
+    def test_ini_copy_turns_every_section_off_and_keeps_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "setup.cfg"
+            src.write_text(
+                "[metadata]\nname = x\n"
+                "[mypy]\nignore_missing_imports = True\n"
+                "plugins = tools/plug.py, some.module\n"
+                "mypy_path = $MYPY_CONFIG_FILE_DIR/stubs\n"
+                "[mypy-vendor.*]\nignore_missing_imports = True\n"
+            )
+            self.assertEqual(mod.ignore_missing_imports_scope(str(src)), "global")
+            out, why = mod.derive_config_without_ignores(str(src), tmp + "/out")
+            self.assertIsNone(why)
+            import configparser
+
+            parser = configparser.RawConfigParser()
+            parser.read(out)
+        self.assertEqual(parser.sections(), ["mypy", "mypy-vendor.*"])
+        for section in parser.sections():
+            self.assertEqual(parser.get(section, "ignore_missing_imports"), "False")
+        self.assertEqual(
+            parser.get("mypy", "plugins"),
+            f"{Path(tmp).resolve()}/tools/plug.py, some.module",
+        )
+        self.assertEqual(
+            parser.get("mypy", "mypy_path"), f"{Path(tmp).resolve()}/stubs"
+        )
+
+    @unittest.skipIf(sys.version_info < (3, 11), "tomllib is 3.11+")
+    def test_toml_per_module_override_is_turned_off(self):
+        import tomllib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "pyproject.toml"
+            src.write_text(
+                "[tool.mypy]\nstrict = true\nexclude = ['build/']\n"
+                "[[tool.mypy.overrides]]\nmodule = ['a.*', 'b']\n"
+                "ignore_missing_imports = true\n"
+            )
+            self.assertEqual(mod.ignore_missing_imports_scope(str(src)), "per-module")
+            out, why = mod.derive_config_without_ignores(str(src), tmp + "/out")
+            self.assertIsNone(why)
+            data = tomllib.loads(Path(out).read_text())["tool"]["mypy"]
+        self.assertIs(data["strict"], True)
+        self.assertEqual(data["exclude"], ["build/"])
+        self.assertIs(data["ignore_missing_imports"], False)
+        (override,) = data["overrides"]
+        self.assertEqual(override["module"], ["a.*", "b"])
+        self.assertIs(override["ignore_missing_imports"], False)
+
+    def test_no_option_means_no_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "mypy.ini"
+            src.write_text("[mypy]\nstrict = True\n")
+            self.assertIsNone(mod.ignore_missing_imports_scope(str(src)))
+        self.assertIsNone(mod.ignore_missing_imports_scope(None))
+
+
+class TestDependencyDrift(unittest.TestCase):
+    """A call an installed dependency rejects is tagged with that dependency,
+    so it does not sit in the same bucket as stub noise."""
+
+    _OUT = (
+        'pkg/m.py:3: error: Unexpected keyword argument "retries" for "Client"  '
+        "[call-arg]\n"
+        'pkg/m.py:3: note: "Client" defined in "extlib.client"\n'
+        'pkg/m.py:5: error: Signature of "f" incompatible with supertype '
+        '"bounded.base.Base"  [override]\n'
+        'pkg/m.py:7: error: Module "winreg" has no attribute "QueryThing"  '
+        "[attr-defined]\n"
+        'pkg/m.py:9: error: Signature of "g" incompatible with supertype '
+        '"pkg.base.Base"  [override]\n'
+        "pkg/m.py:11: error: Incompatible return value  [return-value]\n"
+        'pkg/m.py:11: note: "h" defined in "extlib.other"\n'
+        'pkg/m.py:13: error: Module "loose" has no attribute "gone"  '
+        "[attr-defined]\n"
+        "Found 6 errors in 1 file (checked 2 source files)\n"
+    )
+
+    def test_third_party_callees_are_tagged_with_their_declaration(self):
+        files = {
+            **_PKG,
+            "pkg/base.py": "class Base: ...\n",
+            "setup.py": (
+                "from setuptools import setup\n"
+                "setup(install_requires=['extlib[extra]>=1.0', "
+                "'bounded>=2,<3'])\n"
+            ),
+        }
+        result, _ = _run(files, {"": self._OUT})
+        tagged = {
+            f["line"]: f["dependency"] for f in result["dependency_drift_findings"]
+        }
+        # stdlib (7), the project's own package (9) and a code outside the
+        # drift set (11) are not tagged.
+        self.assertEqual(sorted(tagged), [3, 5, 13])
+        self.assertEqual(tagged[3]["module"], "extlib.client")
+        self.assertEqual(tagged[3]["declared"], "extlib[extra]>=1.0")
+        self.assertIs(tagged[3]["upper_bounded"], False)
+        self.assertIs(tagged[5]["upper_bounded"], True)
+        self.assertIsNone(tagged[13]["declared"])
+        self.assertIsNone(tagged[13]["upper_bounded"])
+        summary = result["summary"]
+        self.assertEqual(summary["dependency_drift_candidates"], 3)
+        self.assertEqual(summary["dependency_drift_unbounded"], 1)
+        # Tagging adds a field; the finding stays in `findings`.
+        self.assertIn("dependency", result["findings"][0])
+
+    def test_declared_dependencies_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "requirements-dev.txt").write_text(
+                "# comment\n-r base.txt\nSome_Lib==1.2 ; python_version>'3'\n"
+            )
+            (root / "setup.cfg").write_text(
+                "[options]\ninstall_requires =\n    other.pkg~=3.1\n"
+            )
+            declared = mod.declared_dependencies(root)
+        self.assertEqual(
+            declared,
+            {
+                "some-lib": "Some_Lib==1.2 ; python_version>'3'",
+                "other-pkg": "other.pkg~=3.1",
+            },
+        )
+        self.assertTrue(mod._upper_bounded(declared["some-lib"]))
+        self.assertTrue(mod._upper_bounded(declared["other-pkg"]))
+        self.assertFalse(mod._upper_bounded("lib>=1,!=1.5"))
 
 
 class TestConfigDiscovery(unittest.TestCase):

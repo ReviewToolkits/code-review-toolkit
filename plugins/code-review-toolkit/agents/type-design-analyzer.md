@@ -26,15 +26,27 @@ where `<plugin_root>` is the root of the code-review-toolkit plugin directory.
 Parse the JSON output. This gives you precise annotation coverage statistics, Any usage locations, type:ignore counts, data container inventory, and unannotated public function lists. Use this as your factual foundation — do not re-count annotations manually.
 
 Key fields:
-- `summary`: coverage percentages (`annotation_coverage_all`, `annotation_coverage_public`), counts of functions/classes/Any usages/type ignores, container type breakdown
-- `any_usages`: every Any usage. All entries carry `kind`, `file`, `line` (and the legacy `location` = `"file:line"`).
-  `kind: "function"` entries add `function`, `details` (the parameters whose annotation contains Any; empty when Any is only in the return) and `in_return`;
-  `kind: "class_attribute"` entries add `class`, `attribute`, `annotation` (their `location` is the class line, `line` the attribute's)
-- `container_inventory`: categorized data containers (dataclass, TypedDict, NamedTuple, Protocol, Enum)
+- `summary`: coverage percentages (`annotation_coverage_all`, `annotation_coverage_public`), counts of functions/classes/Any usages/type ignores, container type breakdown, and:
+  - `nested_functions`, `fully_annotated_nested`, `annotation_coverage_nested`: functions defined inside other functions (route handlers inside a router factory, closures). They are **not** in `total_functions`; report them on their own line, because an HTTP surface built in a factory is otherwise invisible
+  - `modules_with_functions`, `modules_fully_annotated`: the "Modules with complete typing" line
+  - `classes_with_attributes`, `classes_attributes_fully_typed`: the "Classes with attribute annotations" line (class-level and `__init__` instance attributes; enum members excluded)
+  - `total_any_via_alias_usages`, `any_via_alias_sites`, `type_aliases`: see `any_via_alias_usages` below
+  - `untyped_containers`, `inconsistent_parameters`, `untyped_boundaries`: counts of the lists below
+- `any_usages`: every **direct** Any usage. All entries carry `kind`, `file`, `line` (and the legacy `location` = `"file:line"`).
+  `kind: "function"` entries add `function`, `details` (the parameters whose annotation contains Any; empty when Any is only in the return), `in_return`, and `nested: true` for a nested function;
+  `kind: "class_attribute"` entries add `class`, `attribute`, `annotation` (their `location` is the class line, `line` the attribute's);
+  `kind: "instance_attribute"` entries are the same for `self.x: T = ...` in `__init__`
+- `any_via_alias_usages`: annotations whose Any is reached **only through a type alias** (`body: Payload` where `Payload = dict[str, Any]`). Each names the `aliases` involved. On alias-heavy code this can exceed the direct count, so report both
+- `alias_inventory`: every module-level type alias with its `definition`, `contains_any` and `annotation_uses`. An alias of `dict[str, Any]` used 40 times is a container-choice question (TypedDict? dataclass?), not 40 separate Any findings
+- `container_inventory`: categorized data containers (dataclass, TypedDict, NamedTuple, Protocol, Enum, ABC), plus `pseudo-enum` (a class of UPPER_CASE constants acting as an enum) and `dict-subclass` / `list-subclass` / `set-subclass`
 - `unannotated_public_functions`: priority annotation targets (up to 50), each `{file, name, line}`; `unannotated_public_functions_total` is the uncapped count
+- `untyped_containers`: bare `list` / `dict` / `tuple` / `set` (and `List`, `Dict`, ...) in parameter, return and variable annotations, each `{file, line, content, annotation, where}`; `untyped_containers_total` is the uncapped count. Also per file as `files[].untyped_containers`
+- `inconsistent_parameters`: a parameter name annotated at some definitions and bare at others, with `annotated`, `unannotated`, `dominant_annotation`, `annotations` and sample `unannotated_sites`. `session: Session` in a few functions and bare `session` in dozens is dozens of unchecked boundaries whose type is already known
+- `untyped_boundaries`: bare parameters of in-scope functions that **typed** code passes arguments to, with `call_sites`, `arg_annotations` (when the caller's name says the type) and `sample_call_sites`. These are the candidates for the annotate-and-re-run step below
 - `files[]`: per-file details including per-function annotation status and class attribute analysis.
-  `files[].functions` lists **module-level functions only**; methods are under `files[].classes[].methods`.
-  For per-file coverage use `files[].coverage` (`total_functions`, `annotation_coverage_all`, `annotation_coverage_public`, ...),
+  `files[].functions` lists **module-level functions only**; methods are under `files[].classes[].methods` and nested functions under `files[].nested_functions`.
+  `files[].classes[]` carries `annotated_attributes`, `unannotated_attributes`, `instance_attributes` (each with `typed_via`: `annotation`, `class_annotation`, `parameter` -- `self.x = x` with `x` annotated -- or null) and, for an Enum, `enum_members`.
+  For per-file coverage use `files[].coverage` (`total_functions`, `annotation_coverage_all`, `annotation_coverage_public`, `nested_functions`, ...),
   which counts methods like the summary does; a percentage is `null` when the file has no functions, and `coverage` is `null` on a parse error
 
 ## External Tool Integration
@@ -77,7 +89,33 @@ These are actual type errors — places where the type checker determined that t
 - Total type errors: N
 - Config used: [project / curated]
 - Annotation accuracy: [N functions annotated, M with type errors]
+- Annotation lies behind Any: [N found by annotate-and-re-run experiments, or "not run"]
 ```
+
+A 0 in "M with type errors" says nothing about annotations that resolve to `Any`
+(directly or through an alias): mypy cannot check them. Only the experiment below
+can show that such an annotation is wrong, so say whether it was run.
+
+### Annotate the untyped boundary, then re-run mypy
+
+The strongest evidence a type review can produce is a defect mypy *proves* once one signature
+is annotated. `untyped_boundaries` lists the candidates: a typed caller passes a value into a bare
+parameter, so the caller's type is dropped and the callee's body is never checked against it.
+`inconsistent_parameters` gives the type to use where the same name is annotated elsewhere.
+
+For the top few candidates (most `call_sites`, or an `arg_annotations` entry):
+
+1. Export a copy; never edit the checkout. In your private directory `$d`:
+   `git -C <project> archive HEAD | tar -x -C "$d/copy"` (or `cp -r` for a non-git tree).
+2. In the copy, annotate the callee's parameter with the type from `arg_annotations` (or
+   `dominant_annotation`). Change nothing else.
+3. Re-run the checker on the copy, with the original's interpreter:
+   `python3 <plugin_root>/scripts/check_typing.py "$d/copy/<scope>" --mypy-bin <mypy> > "$d/exp1.json"`.
+4. Diff its `findings` against the run on the unmodified copy. The **new** errors inside the
+   callee are what the missing annotation was hiding. Read each before reporting it.
+
+Report each experiment as `callee(param: T)` → N new errors, and classify the errors, not the
+annotation. An experiment that adds nothing is worth one line: it says the boundary is sound.
 
 If external tool output is not available, proceed with your standard analysis unchanged. Do not suggest the user install specific tools unless they explicitly ask about improving analysis depth.
 
@@ -87,7 +125,8 @@ If external tool output is not available, proceed with your standard analysis un
 
 The script output provides precise coverage statistics. Review `summary` for:
 - **Function signatures**: `annotation_coverage_all` and `annotation_coverage_public` give exact percentages
-- **Class attributes**: Per-class `annotated_attributes` and `unannotated_attributes` in the file details
+- **Nested functions**: `annotation_coverage_nested` covers route handlers and closures that the totals leave out
+- **Class attributes**: `classes_attributes_fully_typed` / `classes_with_attributes`; per class, `annotated_attributes`, `unannotated_attributes` and `instance_attributes` (an attribute with `typed_via: parameter` is typed by inference -- not a gap). Enum members are listed as `enum_members` and must not be annotated
 - **Coverage distribution**: Compare per-file data to identify modules with concentrated gaps
 
 Using `unannotated_public_functions` from the script, classify each as:
@@ -123,13 +162,14 @@ For each significant type (dataclass, TypedDict, NamedTuple, Protocol, class wit
 
 The script provides data for several anti-patterns; apply your judgment to assess which matter:
 
-- **`Any` overuse**: The script's `any_usages` lists every location. Review each to determine if a more specific type is feasible.
-- **`dict` as catch-all**: Using `Dict[str, Any]` when a TypedDict or dataclass would be clearer
+- **`Any` overuse**: The script's `any_usages` lists every direct location, and `any_via_alias_usages` the ones hidden behind an alias. Review each to determine if a more specific type is feasible.
+- **`dict` as catch-all**: Using `Dict[str, Any]` when a TypedDict or dataclass would be clearer. Check `alias_inventory` first: one `X = dict[str, Any]` alias with many `annotation_uses` is one finding with one fix
+- **Inconsistently annotated parameters**: `inconsistent_parameters`. When `consistent` is true the annotation can be copied as-is; confirm with the annotate-and-re-run step before calling it a defect
 - **Tuple overload**: Using `Tuple[str, int, bool, str]` when a NamedTuple or dataclass would give names to fields
 - **Optional everywhere**: Excessive `Optional[X]` that could be eliminated with better API design
 - **String typing**: Using string literals where an Enum or Literal type would constrain values
 - **Type: ignore proliferation**: The script's `summary.total_type_ignores` and per-file `type_ignore_count` give exact counts. Many comments indicate a type system mismatch.
-- **Untyped containers**: The script's `untyped_containers` lists bare `list`, `dict`, `set` without type parameters.
+- **Untyped containers**: The script's top-level `untyped_containers` (per file in `files[].untyped_containers`) lists bare `list`, `dict`, `set`, `tuple` without type parameters, including return annotations such as `-> tuple`.
 - **Mutable defaults**: Mutable default arguments that could cause shared-state bugs
 
 ### 4. Data Container Choice Assessment
@@ -147,6 +187,11 @@ The script's `container_inventory` lists all data containers by type. For each, 
 | `Enum` | Fixed set of named constants |
 | Plain class | Complex types with custom behavior beyond simple data holding |
 
+Two inventory categories are questions rather than choices: a `pseudo-enum` (a class of constants
+acting as an enum) accepts any `str`/`int` where one of its values is meant -- ask whether an `Enum`
+or `Literal` would catch real misuse; a `dict-subclass` / `list-subclass` inherits the whole
+mutable container API -- ask whether callers rely on it or whether composition would hold the invariant.
+
 ### 5. Type Consistency
 
 Check whether typing patterns are consistent across the codebase:
@@ -163,10 +208,11 @@ Check whether typing patterns are consistent across the codebase:
 [2-3 sentence summary: type maturity level, coverage, quality of type design]
 
 ### Coverage Statistics (from script summary)
-- Functions with full signatures: N / N total (X%)
-- Classes with attribute annotations: N / N total (X%)
-- Modules with complete typing: N / N total (X%)
-- Uses of Any: N (list locations if <20, from any_usages)
+- Functions with full signatures: N / N total (X%)  [fully_annotated_functions / total_functions]
+- Nested functions with full signatures: N / N (X%)  [fully_annotated_nested / nested_functions]
+- Classes with attribute annotations: N / N total (X%)  [classes_attributes_fully_typed / classes_with_attributes]
+- Modules with complete typing: N / N total (X%)  [modules_fully_annotated / modules_with_functions]
+- Uses of Any: N direct (list locations if <20, from any_usages) + M annotation sites through aliases (any_via_alias_sites)
 - Type: ignore comments: N
 
 ## Type Design Reviews
