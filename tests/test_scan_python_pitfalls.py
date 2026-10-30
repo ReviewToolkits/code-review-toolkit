@@ -566,6 +566,150 @@ class TestExceptExceptionTooBroad(unittest.TestCase):
         self.assertNotIn("except-exception-too-broad", shapes(src))
 
 
+def broad(source: str) -> list[dict]:
+    return [x for x in scan(source) if x["shape"] == "except-exception-too-broad"]
+
+
+def scan_result(source: str) -> dict:
+    with TempProject({"mod.py": source}) as root:
+        return mod.analyze(str(root / "mod.py"))
+
+
+class TestExceptExceptionTooBroadGrading(unittest.TestCase):
+    """Graded by what the handler does with the failure. On a real web-service
+    codebase the shape was 77 of 100 findings, ~95% dismissable, when graded
+    by try-body size."""
+
+    def test_error_envelope_is_suppressed_but_counted(self):
+        # A service-layer boundary: log at warning, return {"ok": False, ...}.
+        src = (
+            "import logging\nlog = logging.getLogger(__name__)\n"
+            "def get(store, k):\n    try:\n        return {'ok': True, 'v': store.get(k)}\n"
+            "    except Exception as e:\n        log.warning('get failed: %s', e)\n"
+            "        return {'ok': False, 'code': 'get_failed'}\n"
+        )
+        result = scan_result(src)
+        self.assertEqual(
+            [
+                f
+                for f in result["findings"]
+                if f["shape"] == "except-exception-too-broad"
+            ],
+            [],
+        )
+        self.assertEqual(
+            result["summary"]["suppressed_by_differential"],
+            {"except-exception-too-broad": {"returns-error-result": 1}},
+        )
+        self.assertEqual(result["suppressed"][0]["line"], 6)
+
+    def test_returned_error_response_builder_is_suppressed(self):
+        # A route handler: `return error(500, ...)` is a response, not a log call.
+        src = (
+            "def route(svc, request):\n    try:\n        out = svc.run()\n"
+            "    except Exception as exc:\n"
+            "        return error(500, 'failed', str(exc), request=request)\n"
+            "    return out\n"
+        )
+        self.assertEqual(broad(src), [])
+
+    def test_exception_carried_as_value_is_suppressed(self):
+        src = (
+            "class Job:\n    def finish(self):\n        try:\n"
+            "            self.cleanup_dir()\n        except Exception as exc:\n"
+            "            self.last_error = exc\n"
+        )
+        self.assertEqual(broad(src), [])
+
+    def test_catch_all_in_del_is_suppressed(self):
+        # A raising __del__ is its own shape; the broad catch is its guard.
+        src = (
+            "class R:\n    def __del__(self):\n        try:\n            self.close()\n"
+            "        except Exception:\n            pass\n"
+        )
+        self.assertEqual(broad(src), [])
+
+    def test_best_effort_close_is_low(self):
+        src = (
+            "def reset(self):\n    try:\n        self._db.close()\n"
+            "    except Exception:\n        pass\n    self._db = None\n"
+        )
+        f = broad(src)
+        self.assertEqual((f[0]["confidence"], f[0]["severity"]), ("low", "CONSIDER"))
+
+    def test_parse_with_default_is_low(self):
+        src = (
+            "import json\ndef meta(payload):\n    try:\n        loaded = json.loads(payload)\n"
+            "    except Exception:\n        return {}\n    return loaded\n"
+        )
+        self.assertEqual(broad(src)[0]["confidence"], "low")
+
+    def test_empty_fallback_read_as_no_history_is_high(self):
+        # Confirmed shape: a failed read becomes an empty result the caller trusts.
+        src = (
+            "def snapshot(store):\n    try:\n        stored = store.load_counters()\n"
+            "    except Exception:\n        stored = {}\n    return merge(stored)\n"
+        )
+        f = broad(src)
+        self.assertEqual((f[0]["confidence"], f[0]["severity"]), ("high", "FIX"))
+
+    def test_false_read_as_consistent_is_high(self):
+        # Confirmed shape: a read error becomes a `False` the caller acts on.
+        src = (
+            "def needs_rebuild(self, backend, db):\n    if self.dirty:\n        return True\n"
+            "    try:\n        rids = db.list_ids()\n    except Exception:\n"
+            "        return False\n    return backend.rids() != rids\n"
+        )
+        self.assertEqual(broad(src)[0]["confidence"], "high")
+
+    def test_fallback_matching_an_established_return_is_medium(self):
+        # flush() already returns False for "not flushed" on a guard path.
+        src = (
+            "def flush(store):\n    if store is None:\n        return False\n"
+            "    try:\n        gen = store.generation()\n    except Exception:\n"
+            "        return False\n    return store.apply(gen)\n"
+        )
+        f = broad(src)
+        self.assertEqual(f[0]["confidence"], "medium")
+        self.assertIn("line 3", f[0]["detail"])
+
+    def test_none_fallback_checked_right_after_is_medium(self):
+        # `dim = None` then `if dim is None: probe`.
+        src = (
+            "def load(model):\n    try:\n        dim = int(model.dimension())\n"
+            "    except Exception:\n        dim = None\n    if dim is None:\n"
+            "        dim = probe(model)\n    return dim\n"
+        )
+        self.assertEqual(broad(src)[0]["confidence"], "medium")
+
+    def test_swallowed_flush_in_a_large_body_is_reported_above_low(self):
+        # Confirmed shape: flush/close/bookkeeping swallowed by `pass`.
+        src = (
+            "def evict(self, backend, key):\n    try:\n        backend.flush()\n"
+            "        backend.close()\n        self._clear_dirty(key)\n"
+            "        self._count('evictions')\n    except Exception:\n        pass\n"
+        )
+        f = broad(src)
+        self.assertEqual(f[0]["confidence"], "medium")
+        self.assertIn("flush", f[0]["detail"])
+
+    def test_logger_warning_downgrades_a_skipped_side_effect_to_low(self):
+        src = (
+            "import logging\nlog = logging.getLogger(__name__)\n"
+            "def warm(store):\n    try:\n        store.warm()\n"
+            "    except Exception as exc:\n        log.warning('warm-up failed: %s', exc)\n"
+        )
+        self.assertEqual(broad(src)[0]["confidence"], "low")
+
+    def test_bare_error_call_is_not_a_loud_log(self):
+        # `error(...)` without a logger receiver must not count as logging.
+        src = (
+            "def f(o):\n    try:\n        o.flush()\n    except Exception:\n"
+            "        error('flush failed')\n"
+        )
+        self.assertEqual(broad(src)[0]["confidence"], "high")
+
+
 class TestCleanupOnlyOnSuccess(unittest.TestCase):
     def test_close_last_in_try_is_flagged(self):
         src = (
