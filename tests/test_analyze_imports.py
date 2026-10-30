@@ -696,5 +696,79 @@ class TestCycleThroughParentPackageInit(unittest.TestCase):
         self.assertEqual(_cycles(files, include_lazy=False), [])
 
 
+_PLUGIN_FACTORY = {
+    "pkg/__init__.py": "",
+    "pkg/plugins/__init__.py": "",
+    "pkg/plugins/factory.py": (
+        "import importlib\n\n"
+        "def build(kind):\n"
+        "    return importlib.import_module(f'pkg.plugins.{kind}').Plugin()\n"
+        "\n"
+        "def default_options():\n"
+        "    return {}\n"
+    ),
+    "pkg/plugins/alpha.py": (
+        "class Plugin:\n"
+        "    def options(self):\n"
+        "        from pkg.plugins.factory import default_options\n"
+        "        return default_options()\n"
+    ),
+    "pkg/plugins/beta.py": "class Plugin:\n    pass\n",
+}
+
+
+class TestDynamicImportExpansion(unittest.TestCase):
+    """A computed import name with a literal prefix can reach every module
+    under that prefix; a cycle through it is invisible to the static graph."""
+
+    def _run(self, files):
+        with TempProject(files) as root:
+            return mod.analyze(str(root))
+
+    def test_prefix_is_expanded_into_targets(self):
+        out = self._run(_PLUGIN_FACTORY)
+        (site,) = out["dynamic_import_sites"]
+        self.assertEqual(
+            site["expanded_targets"],
+            ["pkg/plugins/alpha.py", "pkg/plugins/beta.py"],
+        )
+
+    def test_cycle_through_the_factory_is_a_dynamic_cycle(self):
+        out = self._run(_PLUGIN_FACTORY)
+        self.assertEqual(out["cycles"], [])
+        (cycle,) = out["dynamic_cycles"]
+        self.assertEqual(
+            cycle["cycle"], ["pkg/plugins/alpha.py", "pkg/plugins/factory.py"]
+        )
+        self.assertEqual(
+            cycle["via_dynamic_import"],
+            [{"from": "pkg/plugins/factory.py", "to": "pkg/plugins/alpha.py"}],
+        )
+        self.assertFalse(cycle["import_time"])
+
+    def test_no_back_edge_means_no_dynamic_cycle(self):
+        files = dict(_PLUGIN_FACTORY)
+        files["pkg/plugins/alpha.py"] = "class Plugin:\n    pass\n"
+        self.assertEqual(self._run(files)["dynamic_cycles"], [])
+
+    def test_relative_prefix_is_resolved_against_the_importer(self):
+        files = dict(_PLUGIN_FACTORY)
+        files["pkg/plugins/factory.py"] = files["pkg/plugins/factory.py"].replace(
+            "f'pkg.plugins.{kind}'", "f'.{kind}', __package__"
+        )
+        (site,) = self._run(files)["dynamic_import_sites"]
+        self.assertIn("pkg/plugins/alpha.py", site["expanded_targets"])
+
+    def test_site_without_a_prefix_expands_to_nothing(self):
+        files = dict(_PLUGIN_FACTORY)
+        files["pkg/plugins/factory.py"] = (
+            "import importlib\ndef build(name):\n"
+            "    return importlib.import_module(name)\n"
+        )
+        out = self._run(files)
+        self.assertEqual(out["dynamic_import_sites"][0]["expanded_targets"], [])
+        self.assertEqual(out["dynamic_cycles"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

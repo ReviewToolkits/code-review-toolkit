@@ -886,12 +886,98 @@ def _cycles_in(file_adj: dict[str, set[str]]) -> list[list[str]]:
     return cycles
 
 
-def main() -> None:
-    target_arg, max_files = parse_common_args(sys.argv[1:], __doc__)
-    target = Path(target_arg).resolve()
+def _prefix_module(site: dict, project_root: Path) -> str | None:
+    """The dotted prefix a computed dynamic import name starts with, resolved
+    against the importing file when it is relative (`f".{name}"`)."""
+    prefix = site.get("prefix")
+    if not prefix:
+        return None
+    if not prefix.startswith("."):
+        return prefix
+    level = len(prefix) - len(prefix.lstrip("."))
+    base = _resolve_relative_import(
+        project_root / site["file"], project_root, level, None
+    )
+    rest = prefix.lstrip(".")
+    return f"{base}.{rest}" if base else None
 
-    project_root = find_project_root(target)
-    scan_root = target if target.is_dir() else project_root
+
+def expand_dynamic_sites(
+    sites: list[dict], all_files: list[str], project_root: Path
+) -> dict[str, list[dict]]:
+    """Possible edges for computed-name dynamic imports with a literal prefix.
+
+    ``importlib.import_module(f"pkg.plugins.{kind}")`` can load any module
+    directly under ``pkg.plugins``. Those modules are recorded on the site as
+    ``expanded_targets`` and returned as edges (``possible: true``), so a cycle
+    that closes only through the factory -- factory -> plugin -> factory -- can
+    be reported. Only direct children of the prefix are expanded; an allowlist
+    in the code may narrow the real set further, which is why they are
+    "possible".
+    """
+    modules = {module_name_for(f): f for f in all_files}
+    extra: dict[str, list[dict]] = {}
+    for site in sites:
+        prefix = _prefix_module(site, project_root)
+        targets: list[str] = []
+        if prefix:
+            for module, path in sorted(modules.items()):
+                rest = module[len(prefix) :] if module.startswith(prefix) else ""
+                if rest and "." not in rest and path != site["file"]:
+                    targets.append(path)
+                    extra.setdefault(site["file"], []).append(
+                        {
+                            "target": module,
+                            "names": [{"name": module, "alias": None}],
+                            "line": site["line"],
+                            "type_checking_only": False,
+                            "conditional": False,
+                            "scope": site.get("scope", "module"),
+                            "lazy": site.get("lazy", False),
+                            "dynamic": True,
+                            "form": "dynamic",
+                            "possible": True,
+                        }
+                    )
+        site["expanded_targets"] = targets
+    return extra
+
+
+def dynamic_cycles(
+    graph: dict[str, list[dict]],
+    extra: dict[str, list[dict]],
+    all_files: list[str],
+) -> list[dict]:
+    """Cycles that close only through an expanded dynamic-import edge."""
+    if not extra:
+        return []
+    merged = {k: list(v) for k, v in graph.items()}
+    for source, edges in extra.items():
+        merged.setdefault(source, []).extend(edges)
+    static = file_adjacency(graph, all_files)
+    eager = file_adjacency(merged, all_files, include_lazy=False)
+    out: list[dict] = []
+    for cycle in _cycles_in(file_adjacency(merged, all_files)):
+        pairs = list(zip(cycle, cycle[1:] + cycle[:1]))
+        via = [{"from": a, "to": b} for a, b in pairs if b not in static.get(a, set())]
+        if via:
+            out.append(
+                {
+                    "cycle": cycle,
+                    "via_dynamic_import": via,
+                    # Every step also runs at import time (no lazy edge).
+                    "import_time": all(b in eager.get(a, set()) for a, b in pairs),
+                }
+            )
+    return out
+
+
+def analyze(target: str, *, max_files: int = 0) -> dict:
+    """Import graph, metrics and cycles for *target* (see the module docstring)."""
+    target_path = Path(target).resolve()
+
+    project_root = find_project_root(target_path)
+    scan_root = target_path if target_path.is_dir() else project_root
     project_packages = identify_project_packages(project_root, scan_root)
 
     all_files = sorted(discover_python_files(scan_root))
@@ -913,6 +999,10 @@ def main() -> None:
         for fa in file_analyses
         for site in fa.get("dynamic_import_sites", [])
     ]
+    possible_edges = expand_dynamic_sites(
+        dynamic_import_sites, all_file_paths, project_root
+    )
+    cycles_via_dynamic = dynamic_cycles(internal_graph, possible_edges, all_file_paths)
 
     # Collect external dependencies.
     external: dict[str, list[str]] = {}
@@ -1017,10 +1107,19 @@ def main() -> None:
         # `dynamic: true`; these are not edges, so modules reached only this
         # way show fan-in 0.
         "dynamic_import_sites": dynamic_import_sites,
+        # Cycles that close only through a computed-name dynamic import whose
+        # literal prefix was expanded to the modules under it
+        # (`dynamic_import_sites[].expanded_targets`). Possible, not certain:
+        # the code may only ever load some of those modules.
+        "dynamic_cycles": cycles_via_dynamic,
         "re_exports": re_exports,
     }
+    return output
 
-    json.dump(output, sys.stdout, indent=2)
+
+def main() -> None:
+    target_arg, max_files = parse_common_args(sys.argv[1:], __doc__)
+    json.dump(analyze(target_arg, max_files=max_files), sys.stdout, indent=2)
     sys.stdout.write("\n")
 
 
