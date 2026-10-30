@@ -185,11 +185,25 @@ def get_items():
         return  # May mask bugs in source() that raise StopIteration incorrectly
 ```
 
-### Step 3b: What if the handler itself raises?
+### Step 3b (required): What if the handler itself raises?
 
-The most damaging error-handling defects are often not swallowed exceptions but handlers, `finally`
-blocks and cleanup code that **raise the wrong thing**. For every handler and every `finally`, ask
-what happens if a statement *inside it* raises:
+This pass is mandatory, not optional depth. The most damaging error-handling defects are often not
+swallowed exceptions but handlers, `finally` blocks and cleanup code that **raise the wrong thing**,
+and no lint rule sees them. For every handler and every `finally` in the survey, ask what happens
+if a statement *inside it* raises.
+
+Start from the survey's leads, then cover the rest:
+
+1. Handlers with `maybe_unbound` names.
+2. Handlers flagged `cleanup-last-in-try` (`cleanup_call` names the call).
+3. `finally` blocks with `unguarded_calls` that do I/O (an ops log, metrics, an audit write,
+   `close()` on a file being written), and any `control_flow_exit`.
+4. Broad `suppress` blocks with more than one statement: everything after the first failing
+   statement is skipped, silently.
+5. Handlers whose body does work before it re-raises (rollback, status writes): a failure there
+   replaces the original exception.
+
+The shapes:
 
 - **Cleanup inside the `try` whose `except` rolls back** (`cleanup-inside-try-triggers-rollback`):
   post-success cleanup (`rmtree` of a backup, temp-file removal) as the last statement of the `try`
@@ -204,6 +218,9 @@ what happens if a statement *inside it* raises:
 
 Reproduce environmental failures cheaply where you can: a read-only directory (`chmod 0555`) for
 undeletable files, `/dev/full` as a log or output path for "disk full".
+
+State in the report that the pass ran and how many handlers and `finally` blocks it covered. A
+report with no Step 3b section is incomplete.
 
 ### Step 4: Assess Impact
 
