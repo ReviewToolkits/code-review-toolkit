@@ -27,7 +27,7 @@ What counts as a lock: objects built from ``threading``/``multiprocessing``/
 ``asyncio`` primitives; names that look like locks (``_lock``, ``mutex``,
 ``_cv``, ``cond``, ``sem``); and the project's own context managers whose body
 holds a lock around ``yield`` (e.g. ``read_lock()``/``write_lock()`` on a
-custom reader/writer lock, or ``_collection_write_lock(key)``).
+custom reader/writer lock, or ``_guard_for(key)``).
 
 Calls are resolved through ``self.method``, module functions, ``from x import
 f`` aliases, attributes whose type is known from a constructor call or an
@@ -455,6 +455,12 @@ class Project:
         self.extra_blocking = extra_blocking
         # contextmanager func key -> ("own", None) | ("param", index) | None
         self.lock_cms: dict[str, tuple[str, int | None] | None] = {}
+        # For a lock CM: the kind and mode it inherits from the locks it holds at
+        # `yield`, and (when it holds another project lock CM) the one it wraps.
+        self.lock_cm_kind: dict[str, str] = {}
+        self.lock_cm_mode: dict[str, str] = {}
+        self.lock_cm_via: dict[str, str] = {}
+        self.lock_cm_alias: dict[str, str] = {}  # derived CM -> wrapped lock's key
         for rel, tree in corpus:
             self._index_module(rel, tree)
         self._resolve_lock_cms()
@@ -706,45 +712,125 @@ class Project:
     # -- pass 1b: which context managers hold a lock -------------------------
 
     def _resolve_lock_cms(self) -> None:
-        """Decide, for each project @contextmanager, whether it holds a lock at `yield`."""
-        for key, func in self.funcs.items():
-            if not _is_contextmanager(func.node):
-                continue
-            params = [a.arg for a in func.node.args.args]
-            result: tuple[str, int | None] | None = None
-            for node in ast.walk(func.node):
-                if not isinstance(node, (ast.With, ast.AsyncWith)):
+        """Decide, for each project @contextmanager, whether it holds a lock at `yield`.
+
+        Three rounds:
+
+        1. Direct: a `with` around `yield` on a lock (or on a parameter), or an
+           `acquire()` in the body.
+        2. A fixpoint over the project's own context managers: a CM whose `with`
+           around `yield` enters another lock CM holds that lock too
+           (`with self._locks(key): yield`), however deep the nesting.
+        3. A second fixpoint for the kind: a CM inherits the reentrancy of the
+           locks it holds at `yield`, so a CM over an `RLock` is reentrant and one
+           over a plain `Lock` is not.
+        """
+        cms = {k: f for k, f in self.funcs.items() if _is_contextmanager(f.node)}
+        for key, func in cms.items():
+            self.lock_cms[key] = self._direct_lock_cm(func)
+        scanners: dict[str, _FunctionScanner] = {}
+
+        def scanner(key: str) -> _FunctionScanner:
+            if key not in scanners:
+                scanners[key] = _FunctionScanner(self, cms[key])
+            return scanners[key]
+
+        for _ in range(len(cms) + 1):
+            changed = False
+            for key, func in cms.items():
+                if self.lock_cms[key] is not None:
                     continue
-                if not any(
-                    isinstance(n, (ast.Yield, ast.YieldFrom)) for n in ast.walk(node)
+                for expr, is_async in _yield_with_items(func.node):
+                    if not isinstance(expr, ast.Call):
+                        continue
+                    inner = scanner(key)._lock_of(expr, is_async)
+                    if inner is not None:
+                        self.lock_cms[key] = ("own", None)
+                        self.lock_cm_via[key] = inner.text
+                        if not inner.anonymous:
+                            # Same lock, two spellings: `with self._guard(k)` and
+                            # `with self._guards(k)` must count as one guard.
+                            self.lock_cm_alias[key] = inner.key
+                        changed = True
+                        break
+            if not changed:
+                break
+        for _ in range(len(cms) + 1):
+            changed = False
+            for key, func in cms.items():
+                if self.lock_cms[key] != ("own", None):
+                    continue
+                held = self._cm_held(scanner(key), func)
+                kind = _combine_kinds([h.kind for h in held])
+                modes = {h.mode for h in held}
+                mode = modes.pop() if len(modes) == 1 else ""
+                if (
+                    self.lock_cm_kind.get(key) != kind
+                    or self.lock_cm_mode.get(key) != mode
                 ):
-                    continue
-                for item in node.items:
-                    expr = item.context_expr
-                    base = expr.func if isinstance(expr, ast.Call) else expr
-                    while isinstance(base, ast.Attribute) and _MODE_METHODS.match(
-                        base.attr
-                    ):
-                        base = base.value
-                    if isinstance(base, ast.Name) and base.id in params:
-                        result = ("param", params.index(base.id))
-                        break
-                    if self._looks_like_lock(func, expr):
-                        result = ("own", None)
-                        break
-                if result:
-                    break
-            if result is None:
-                # `lock.acquire()` ... `yield` ... `lock.release()`
-                acquired = any(
-                    isinstance(n, ast.Call)
-                    and isinstance(n.func, ast.Attribute)
-                    and n.func.attr == "acquire"
-                    for n in ast.walk(func.node)
-                )
-                if acquired:
-                    result = ("own", None)
-            self.lock_cms[key] = result
+                    self.lock_cm_kind[key] = kind
+                    self.lock_cm_mode[key] = mode
+                    changed = True
+            if not changed:
+                break
+
+    def _direct_lock_cm(self, func: Func) -> tuple[str, int | None] | None:
+        params = [a.arg for a in func.node.args.args]
+        for expr, _is_async in _yield_with_items(func.node):
+            base = expr.func if isinstance(expr, ast.Call) else expr
+            while isinstance(base, ast.Attribute) and _MODE_METHODS.match(base.attr):
+                base = base.value
+            if isinstance(base, ast.Name) and base.id in params:
+                return ("param", params.index(base.id))
+            if self._looks_like_lock(func, expr):
+                return ("own", None)
+        # `lock.acquire()` ... `yield` ... `lock.release()`
+        receivers = [
+            n.func.value
+            for n in ast.walk(func.node)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "acquire"
+        ]
+        if not receivers:
+            return None
+        # `lock.acquire()` on a parameter: the caller's argument is the lock.
+        if len(receivers) == 1:
+            recv = receivers[0]
+            if isinstance(recv, ast.Name) and recv.id in params:
+                return ("param", params.index(recv.id))
+        return ("own", None)
+
+    @staticmethod
+    def _cm_held(scanner: _FunctionScanner, func: Func) -> list[Held]:
+        """The locks a context manager holds at `yield`, as far as they resolve.
+
+        A `with` item that resolves to no lock (an `ExitStack`, a helper CM) or an
+        `enter_context()` call may hold a lock this cannot see, so it adds an
+        unknown (`custom`) entry: the CM is then never taken to be reentrant.
+        """
+        held: list[Held] = []
+        unknown = Held("?", "", False, "custom", "?")
+        for expr, is_async in _yield_with_items(func.node):
+            lock = scanner._lock_of(expr, is_async)
+            held.append(lock if lock is not None else unknown)
+        if any(
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr in ("enter_context", "enter_async_context")
+            for n in ast.walk(func.node)
+        ):
+            held.append(unknown)
+        for n in ast.walk(func.node):
+            if (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "acquire"
+            ):
+                lock = scanner._lock_of(n.func.value, False, explicit=True)
+                if lock is not None:
+                    held.append(lock)
+        return held
 
     def _looks_like_lock(self, func: Func, expr: ast.AST) -> bool:
         base = expr.func if isinstance(expr, ast.Call) else expr
@@ -755,6 +841,43 @@ class Project:
             return True
         name = base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", "")
         return bool(name and _LOCKISH_NAME.search(name))
+
+
+def _yield_with_items(fn: ast.AST) -> list[tuple[ast.expr, bool]]:
+    """`with` items whose block contains the function's own `yield`."""
+    out: list[tuple[ast.expr, bool]] = []
+    for node in _walk_scope(fn):
+        if not isinstance(node, (ast.With, ast.AsyncWith)):
+            continue
+        if not any(
+            isinstance(n, (ast.Yield, ast.YieldFrom))
+            for stmt in node.body
+            for n in [stmt, *_walk_scope(stmt)]
+        ):
+            continue
+        out.extend(
+            (item.context_expr, isinstance(node, ast.AsyncWith)) for item in node.items
+        )
+    return out
+
+
+_REENTRANT_KINDS = ("custom-reentrant", "RLock", "Condition")
+
+
+def _combine_kinds(kinds: list[str]) -> str:
+    """The kind of a context manager that holds all of *kinds* at once.
+
+    One non-reentrant lock makes the whole CM non-reentrant; it is reentrant only
+    when every lock it holds is known to be. Anything else is unknown (`custom`).
+    """
+    for kind in kinds:
+        if kind in _NON_REENTRANT:
+            return kind
+    if kinds and all(k == "async" for k in kinds):
+        return "async"
+    if kinds and all(k in _REENTRANT_KINDS for k in kinds):
+        return next(k for k in _REENTRANT_KINDS if k in kinds)
+    return "custom"
 
 
 def _walk_scope(node: ast.AST):
@@ -1087,12 +1210,17 @@ class _FunctionScanner:
                             return self._lock_of(expr.args[idx], is_async)
                     family = self.p.funcs[key].qualname
                     instance = ", ".join(_text(a) for a in expr.args)
-                    mode = _mode_of(self.p.funcs[key].name)
+                    mode = _mode_of(self.p.funcs[key].name) or self.p.lock_cm_mode.get(
+                        key, ""
+                    )
+                    kind = self.p.lock_cm_kind.get(key, "custom")
                     return Held(
-                        f"{self.p.funcs[key].module}:{family}",
+                        self.p.lock_cm_alias.get(
+                            key, f"{self.p.funcs[key].module}:{family}"
+                        ),
                         mode,
-                        is_async,
-                        "custom",
+                        is_async or kind == "async",
+                        kind,
                         _text(expr),
                         instance,
                     )
@@ -2608,6 +2736,24 @@ def analyze(
         "locks_declared": dict(sorted(lock_kinds.items())),
         "lock_context_managers": sorted(
             project.funcs[k].qualname for k, v in project.lock_cms.items() if v
+        ),
+        # The reentrancy each lock CM inherits from the locks it holds at `yield`
+        # (`custom` = unknown), and the project lock CM a nested one wraps.
+        "lock_context_manager_kinds": {
+            project.funcs[k].qualname: project.lock_cm_kind.get(k, "custom")
+            for k, v in sorted(project.lock_cms.items())
+            if v == ("own", None)
+        },
+        "lock_context_managers_wrapping": {
+            project.funcs[k].qualname: via
+            for k, via in sorted(project.lock_cm_via.items())
+        },
+        # Context managers with a `with` around `yield` that did not resolve to
+        # a lock: check each by hand, a missed lock CM hides every site using it.
+        "possible_lock_cms_missed": sorted(
+            f"{project.funcs[k].qualname}: with {', '.join(_text(e) for e, _ in items)}"
+            for k, v in project.lock_cms.items()
+            if v is None and (items := _yield_with_items(project.funcs[k].node))
         ),
         "guards_inferred": len(guards),
         "slow_locks": sorted(k.split(":", 1)[-1] for k in summaries.slow_locks),

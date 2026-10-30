@@ -525,6 +525,266 @@ class TestReentry(unittest.TestCase):
         self.assertEqual(of(scan(src), self.shape), [])
 
 
+class TestNestedLockContextManagers(unittest.TestCase):
+    """A @contextmanager that enters another lock context manager holds its lock."""
+
+    _NESTED = """
+    import threading
+    from contextlib import contextmanager
+
+    class Pool:
+        def __init__(self, model):
+            self._lock = threading.{kind}()
+            self.model = model
+
+        @contextmanager
+        def _guards(self, *keys):
+            with self._lock:
+                yield
+
+        @contextmanager
+        def _guard(self, key):
+            with self._guards(key):
+                yield
+
+        @contextmanager
+        def _outer_guard(self, key):
+            with self._guard(key):
+                yield
+
+        def job(self, texts):
+            with self._guard("k"):
+                return self.model.embed_many(texts)
+
+        def deep_job(self, texts):
+            with self._outer_guard("k"):
+                return self.model.embed_many(texts)
+    """
+
+    def test_nested_cm_is_a_lock_cm(self):
+        result = scan_project(
+            {"pkg/mod.py": self._NESTED.format(kind="Lock")}, blocking=["embed_many"]
+        )
+        cms = result["summary"]["lock_context_managers"]
+        self.assertEqual(set(cms), {"Pool._guards", "Pool._guard", "Pool._outer_guard"})
+        found = of(result["findings"], "blocking-call-under-lock")
+        self.assertEqual(
+            sorted(f["function"] for f in found), ["Pool.deep_job", "Pool.job"]
+        )
+        self.assertEqual(
+            result["summary"]["lock_context_managers_wrapping"]["Pool._guard"],
+            "self._guards(key)",
+        )
+        self.assertEqual(result["summary"]["possible_lock_cms_missed"], [])
+
+    def test_wrapper_and_wrapped_cm_are_one_guard(self):
+        # Most callers take the single-key wrapper; one takes the multi-key CM
+        # it wraps. Both hold the same lock, so the helper is guarded everywhere.
+        src = """
+        import threading
+        from contextlib import contextmanager
+
+        class Shelf:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self._items = {}
+
+            @contextmanager
+            def _guards(self, *keys):
+                with self._lock:
+                    yield
+
+            @contextmanager
+            def _guard(self, key):
+                with self._guards(key):
+                    yield
+
+            def _load(self, key):
+                return self._items.get(key)
+
+            def a(self, k):
+                with self._guard(k):
+                    return self._load(k)
+
+            def b(self, k):
+                with self._guard(k):
+                    return self._load(k)
+
+            def c(self, k):
+                with self._guard(k):
+                    return self._load(k)
+
+            def move(self, k1, k2):
+                with self._guards(k1, k2):
+                    return self._load(k1)
+        """
+        found = of(scan(src), "unguarded-access-to-lock-guarded-state")
+        self.assertEqual(found, [])
+
+    def test_cm_over_a_non_lock_cm_is_not_a_lock(self):
+        src = """
+        from contextlib import contextmanager
+
+        class Timer:
+            @contextmanager
+            def _timed(self, op):
+                yield
+
+            @contextmanager
+            def _scope(self, op):
+                with self._timed(op):
+                    yield
+
+            @contextmanager
+            def _opened(self, path):
+                with open(path) as fh:
+                    yield fh
+
+            def run(self, model):
+                with self._scope("x"):
+                    model.embed_many([])
+        """
+        result = scan_project({"pkg/mod.py": src}, blocking=["embed_many"])
+        self.assertEqual(result["summary"]["lock_context_managers"], [])
+        self.assertEqual(of(result["findings"], "blocking-call-under-lock"), [])
+        # Unresolved CMs with a `with` around `yield` are listed for a manual check.
+        missed = result["summary"]["possible_lock_cms_missed"]
+        self.assertEqual(len(missed), 2)
+        self.assertTrue(any(m.startswith("Timer._scope: with") for m in missed))
+
+
+class TestLockContextManagerKind(unittest.TestCase):
+    """A CM-derived lock inherits the reentrancy of the lock it wraps."""
+
+    shape = "non-reentrant-lock-reacquired"
+
+    _READING = """
+    import threading
+    from contextlib import contextmanager
+
+    class Table:
+        def __init__(self):
+            self._read_mutex = threading.{kind}()
+            self._rows = {{}}
+
+        @contextmanager
+        def _reading(self):
+            self._read_mutex.acquire()
+            try:
+                yield self._rows
+            finally:
+                self._read_mutex.release()
+
+        def get_many(self, keys):
+            with self._reading():
+                return [self.get(k) for k in keys]
+
+        def get(self, key):
+            with self._reading() as rows:
+                return rows.get(key)
+    """
+
+    def test_reader_over_rlock_is_silent(self):
+        self.assertEqual(of(scan(self._READING.format(kind="RLock")), self.shape), [])
+
+    def test_reader_over_plain_lock_is_flagged_as_non_reentrant(self):
+        result = scan_project({"pkg/mod.py": self._READING.format(kind="Lock")})
+        found = of(result["findings"], self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertIn("non-reentrant Lock", found[0]["message"])
+        self.assertEqual(
+            result["summary"]["lock_context_manager_kinds"]["Table._reading"], "Lock"
+        )
+
+    _WRITING = """
+    import threading
+    from contextlib import contextmanager
+
+    class Table:
+        def __init__(self):
+            self._write_mutex = threading.{kind}()
+            self._rows = {{}}
+
+        @contextmanager
+        def _writing_with(self, lock):
+            lock.acquire()
+            try:
+                yield self._rows
+            finally:
+                lock.release()
+
+        @contextmanager
+        def _writing(self):
+            with self._writing_with(self._write_mutex) as rows:
+                yield rows
+
+        def put_many(self, items):
+            with self._writing():
+                for k, v in items:
+                    self.put(k, v)
+
+        def put(self, key, value):
+            with self._writing() as rows:
+                rows[key] = value
+    """
+
+    def test_nested_writer_over_lock_parameter(self):
+        found = of(scan(self._WRITING.format(kind="Lock")), self.shape)
+        self.assertEqual([f["function"] for f in found], ["Table.put_many"])
+        self.assertEqual(of(scan(self._WRITING.format(kind="RLock")), self.shape), [])
+
+    def test_cm_holding_a_reentrant_and_a_plain_lock_is_not_reentrant(self):
+        src = """
+        import threading
+        from contextlib import contextmanager
+
+        class Box:
+            def __init__(self):
+                self._outer = threading.RLock()
+                self._inner = threading.Lock()
+
+            @contextmanager
+            def _both(self):
+                with self._outer, self._inner:
+                    yield
+
+            def a(self):
+                with self._both():
+                    self.b()
+
+            def b(self):
+                with self._both():
+                    pass
+        """
+        result = scan_project({"pkg/mod.py": src})
+        self.assertEqual(
+            result["summary"]["lock_context_manager_kinds"]["Box._both"], "Lock"
+        )
+        self.assertEqual(len(of(result["findings"], self.shape)), 1)
+
+    def test_cm_with_an_unresolved_item_is_not_taken_as_reentrant(self):
+        # The ExitStack may enter a non-reentrant lock the scanner cannot see.
+        src = """
+        import threading
+        from contextlib import ExitStack, contextmanager
+
+        class Box:
+            def __init__(self):
+                self._outer = threading.RLock()
+
+            @contextmanager
+            def _all(self, items):
+                with self._outer, ExitStack() as stack:
+                    for item in items:
+                        stack.enter_context(item.write_lock())
+                    yield
+        """
+        result = scan_project({"pkg/mod.py": src})
+        self.assertEqual(
+            result["summary"]["lock_context_manager_kinds"]["Box._all"], "custom"
+        )
+
+
 class TestConditions(unittest.TestCase):
     def test_wait_without_predicate_loop(self):
         src = """
@@ -676,10 +936,10 @@ class TestBlockingUnderLock(unittest.TestCase):
 
         def go(model):
             with lock:
-                model.encode_batch([])
+                model.embed_many([])
         """
         self.assertEqual(of(scan(src), self.shape), [])
-        found = of(scan(src, blocking=["encode_batch"]), self.shape)
+        found = of(scan(src, blocking=["embed_many"]), self.shape)
         self.assertEqual(len(found), 1)
 
 
