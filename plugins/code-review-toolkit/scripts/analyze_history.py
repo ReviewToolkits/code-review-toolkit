@@ -335,6 +335,27 @@ def _check_script_timeout() -> bool:
     return (time.monotonic() - _SCRIPT_START) > _SCRIPT_TIMEOUT
 
 
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T")
+
+# `git log` record header: hash, author date, committer date, author, subject.
+LOG_FORMAT = "COMMIT:%H|%aI|%cI|%an|%s"
+
+
+def _parse_commit_header(payload: str) -> tuple[str, str, str, str, str] | None:
+    """Split a COMMIT: header into (hash, author_date, committer_date, author, subject).
+
+    Also accepts the older four-field form (no committer date), in which case
+    the author date stands in for both.
+    """
+    parts = payload.split("|", 4)
+    if len(parts) == 5 and _ISO_DATE_RE.match(parts[2]):
+        return parts[0], parts[1], parts[2], parts[3], parts[4]
+    parts = payload.split("|", 3)
+    if len(parts) < 4:
+        return None
+    return parts[0], parts[1], parts[1], parts[2], parts[3]
+
+
 def parse_git_log(
     lines: Iterable[str],
     max_commits: int,
@@ -345,6 +366,12 @@ def parse_git_log(
 
     Returns (commits, file_stats) where commits is a list of commit dicts
     and file_stats is accumulated per-file change data.
+
+    The window is selected with `--since`/`--until`, which git applies to the
+    COMMITTER date, so the per-file first/last dates use the committer date
+    too. Using the author date put `first_commit_in_range` a month before the
+    window's start on a validation project (a commit authored five weeks
+    before it was committed).
     """
     commits: list[dict] = []
     file_changes: dict[str, dict] = {}
@@ -359,15 +386,16 @@ def parse_git_log(
             commit_count += 1
             if commit_count > max_commits:
                 break
-            parts = line[7:].split("|", 3)
-            if len(parts) < 4:
+            header = _parse_commit_header(line[7:])
+            if header is None:
                 current_commit = None
                 continue
-            commit_hash, date_str, author, message = parts
+            commit_hash, author_date, date_str, author, message = header
             detail = classify_commit_detail(message, key_types)
             current_commit = {
                 "hash": commit_hash,
-                "date": date_str,
+                "date": author_date,
+                "committer_date": date_str,
                 "author": author,
                 "message": message,
                 "type": detail["type"],
@@ -436,6 +464,7 @@ def parse_git_log(
                 "lines_removed": fc["lines_removed"],
                 "churn_rate": churn_rate,
                 "authors": len(fc["authors"]),
+                # Committer dates: the same clock the window was selected on.
                 "first_commit_in_range": fc["first_date"],
                 "last_modified": fc["last_date"],
             }
@@ -677,6 +706,7 @@ def get_commit_details(
                 "commit_short": commit["hash"][:7],
                 "message": commit["message"],
                 "date": commit["date"],
+                "committer_date": commit.get("committer_date", commit["date"]),
                 "author": commit["author"],
                 "files": commit["files"],
                 "functions_modified": functions_modified,
@@ -882,7 +912,7 @@ def analyze(argv: list[str] | None = None) -> dict:
     git_args = [
         "log",
         "--numstat",
-        "--format=COMMIT:%H|%aI|%an|%s",
+        f"--format={LOG_FORMAT}",
     ]
     if last_n is not None:
         git_args.append(f"-{last_n}")
@@ -908,8 +938,8 @@ def analyze(argv: list[str] | None = None) -> dict:
     # If using --last, derive time range from actual commits.
     commit_cap_applied = len(commits) >= max_commits
     if last_n is not None and commits:
-        since = commits[-1]["date"]
-        until = commits[0]["date"]
+        since = commits[-1]["committer_date"]
+        until = commits[0]["committer_date"]
         # Calculate days.
         try:
             start_dt = datetime.fromisoformat(since)
@@ -972,6 +1002,10 @@ def analyze(argv: list[str] | None = None) -> dict:
             "end": until,
             "days": days,
             "commit_cap_applied": commit_cap_applied,
+            # --since/--until select on the committer date; every in-window
+            # date below that is not labelled `date` (author) is a committer
+            # date too.
+            "date_basis": "committer",
         },
         "summary": {
             "total_commits": len(commits),

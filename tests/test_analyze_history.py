@@ -17,6 +17,7 @@ class GitTempProject(TempProject):
       - files: dict of {path: content} to create/modify
       - message: commit message
       - date: optional ISO date string (defaults to sequential dates)
+      - committer_date: optional, when it should differ from `date`
       - author: optional author name (defaults to "Test Author")
     """
 
@@ -61,7 +62,7 @@ class GitTempProject(TempProject):
             )
             env = os.environ.copy()
             env["GIT_AUTHOR_DATE"] = date
-            env["GIT_COMMITTER_DATE"] = date
+            env["GIT_COMMITTER_DATE"] = commit.get("committer_date", date)
             env["GIT_AUTHOR_NAME"] = author
             env["GIT_COMMITTER_NAME"] = author
             env["GIT_AUTHOR_EMAIL"] = "test@test.com"
@@ -830,6 +831,40 @@ class TestTaggedAndKeyedClassification(unittest.TestCase):
         self.assertTrue(any("--key-type" in n for n in plain["notes"]))
         self.assertEqual(keyed["summary"]["commits_by_type"], {"feature": 1, "fix": 1})
         self.assertEqual(keyed["summary"]["classified_by"], {"key": 2})
+
+
+class TestCommitterDateWindow(unittest.TestCase):
+    """The window selects on the committer date, so the reported
+    first/last dates must be committer dates too."""
+
+    def test_first_commit_in_range_is_inside_the_window(self):
+        with GitTempProject(
+            [
+                {
+                    "files": {"a.py": "x = 1\n"},
+                    "message": "Add a",
+                    # Authored before the window, committed inside it (a rebase).
+                    "date": "2024-11-01T12:00:00+00:00",
+                    "committer_date": "2025-01-10T12:00:00+00:00",
+                },
+            ]
+        ) as root:
+            result = mod.analyze([str(root), *_WINDOW])
+        churn = {f["file"]: f for f in result["file_churn"]}["a.py"]
+        self.assertTrue(churn["first_commit_in_range"].startswith("2025-01-10"))
+        self.assertTrue(churn["last_modified"].startswith("2025-01-10"))
+        self.assertEqual(result["time_range"]["date_basis"], "committer")
+        feature = result["recent_features"][0]
+        self.assertTrue(feature["date"].startswith("2024-11-01"))
+        self.assertTrue(feature["committer_date"].startswith("2025-01-10"))
+
+    def test_old_four_field_header_still_parses(self):
+        commits, _ = mod.parse_git_log(
+            ["COMMIT:abc|2025-01-01T12:00:00+00:00|Alice|Add a | b\n"],
+            10,
+        )
+        self.assertEqual(commits[0]["message"], "Add a | b")
+        self.assertEqual(commits[0]["committer_date"], "2025-01-01T12:00:00+00:00")
 
 
 if __name__ == "__main__":
