@@ -30,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from run_lint_rules import (  # noqa: E402
+    closure_argument_hint,
     detect_target_version,
     dismissal_reason,
     except_closure_annotation,
@@ -561,19 +562,17 @@ def run_ruff_toolkit_pass(
             continue
         filename = item.get("filename")
         path = Path(filename) if filename else None
-        reason = dismissal_reason(
-            {
-                "code": finding["rule"],
-                "line": finding["line"],
-                "column": finding["column"],
-            },
-            path,
-            trees,
-            lines,
-        )
+        located = {
+            "code": finding["rule"],
+            "line": finding["line"],
+            "column": finding["column"],
+            "end": item.get("end_location"),
+        }
+        reason = dismissal_reason(located, path, trees, lines)
         if reason:
             dismissed[reason] = dismissed.get(reason, 0) + 1
             continue
+        finding.update(closure_argument_hint(located, path, trees, lines))
         finding["selection"] = "toolkit"
         added.append(_flag_known_tool_bugs(finding, filename, closures))
 

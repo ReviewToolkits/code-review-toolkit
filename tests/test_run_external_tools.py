@@ -1099,6 +1099,35 @@ class TestToolkitRuffPass(unittest.TestCase):
             out["toolkit_pass"]["dismissed"], {"fastapi-dependency-marker": 1}
         )
 
+    def test_the_lint_dismissals_and_closure_hint_apply_to_the_feed(self):
+        source = (
+            "def main(run, items, helper):\n"
+            "    try:\n"
+            "        run()\n"
+            "    except KeyError:\n"
+            "        raise SystemExit(2)\n"
+            "    for item in items:\n"
+            "        helper(lambda: item)\n"
+        )
+
+        def fake_run(cmd, **kwargs):
+            toolkit = "--select" in cmd
+            hits = [
+                _hit(root, "B904", 5, 9),
+                _hit(root, "B023", 7, 24),
+            ] if toolkit else []
+            return MagicMock(stdout=json.dumps(hits), stderr="")
+
+        with TempProject({"app.py": source}) as root:
+            with patch.object(mod.subprocess, "run", side_effect=fake_run):
+                out = mod.run_ruff(mod.parse_args([str(root)]), root, root)
+        self.assertEqual(
+            out["toolkit_pass"]["dismissed"], {"raise-systemexit-in-except": 1}
+        )
+        (b023,) = [f for f in out["findings"] if f["rule"] == "B023"]
+        self.assertTrue(b023["closure_passed_as_argument"])
+        self.assertEqual(b023["callee"], "helper")
+
     def test_toolkit_command_keeps_the_project_config_and_no_cache(self):
         _, calls = self._run()
         toolkit_cmd = calls[1]

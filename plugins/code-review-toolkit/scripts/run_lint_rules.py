@@ -281,6 +281,12 @@ DISMISSAL_REASONS = {
         "subclass registers (`add_constructor`) are not checked: review them "
         "on their own."
     ),
+    "closure-called-synchronously": (
+        "B023 on a lambda passed straight to a function in the same file that "
+        "only calls that parameter (never stores, returns or defers it) and is "
+        "neither async nor a generator: the lambda runs inside the iteration "
+        "that created it, so it sees the current loop value."
+    ),
     "sql-built-from-literals": (
         "S608 on SQL whose every interpolated value is built only from string "
         "literals in the same file (a `','.join(['?'] * n)` placeholder list, a "
@@ -683,6 +689,151 @@ def _yaml_safe_subclass(ctx: _FileContext, line: int, col: int) -> bool:
     return _safe_yaml_loader_class(ctx.tree, names[0].id, modules, loaders, set())
 
 
+def _enclosing_lambda_call(ctx: _FileContext, line: int, col: int):
+    """For a B023 hit: (lambda, the Call it is a direct argument of), or None."""
+    names = ctx.at(line, col, ast.Name)
+    if not names:
+        return None
+    cur = ctx.parents.get(names[0])
+    while cur is not None and not isinstance(cur, (*_SCOPES, ast.Module)):
+        cur = ctx.parents.get(cur)
+    if not isinstance(cur, ast.Lambda):
+        return None
+    call = ctx.parents.get(cur)
+    if isinstance(call, ast.keyword):
+        call = ctx.parents.get(call)
+    if not isinstance(call, ast.Call) or call.func is cur:
+        return None
+    return cur, call
+
+
+def _callee_def(ctx: _FileContext, call: ast.Call):
+    """(the FunctionDef *call* resolves to in this file, implicit first args)."""
+    func = call.func
+    scope = ctx.scope_of(call)
+    if isinstance(func, ast.Name):
+        while True:
+            defs = [
+                n
+                for n in _scope_nodes(scope)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and n.name == func.id
+            ]
+            values = _bindings(scope, func.id) if not defs else []
+            if defs or values is None or values:
+                return (defs[0], 0) if len(defs) == 1 else None
+            if isinstance(scope, ast.Module):
+                return None
+            scope = ctx.scope_of(scope)
+    if (
+        isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Name)
+        and isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and isinstance(ctx.parents.get(scope), ast.ClassDef)
+        and scope.args.args
+        and func.value.id == scope.args.args[0].arg
+    ):
+        cls = ctx.parents[scope]
+        members = [
+            n
+            for n in cls.body
+            if (
+                isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and n.name == func.attr
+            )
+            or (
+                isinstance(n, (ast.Assign, ast.AnnAssign))
+                and any(
+                    isinstance(t, ast.Name) and t.id == func.attr
+                    for t in (n.targets if isinstance(n, ast.Assign) else [n.target])
+                )
+            )
+        ]
+        if len(members) != 1 or not isinstance(members[0], ast.FunctionDef):
+            return None
+        decorators = {
+            d.id for d in members[0].decorator_list if isinstance(d, ast.Name)
+        }
+        return members[0], 0 if "staticmethod" in decorators else 1
+    return None
+
+
+def _calls_param_only(fn: ast.FunctionDef, param: str) -> bool:
+    """Is *param* only ever called, directly, in *fn*'s own body?"""
+    for node in _scope_nodes(fn):
+        if isinstance(node, (ast.Yield, ast.YieldFrom)):
+            return False  # a generator does not run its body when called
+        if isinstance(node, (*_SCOPES, *_COMPREHENSIONS)) and any(
+            isinstance(n, ast.Name) and n.id == param for n in ast.walk(node)
+        ):
+            return False  # captured: may run later
+    parents: dict = {}
+    for node in ast.walk(fn):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Name) and node.id == param:
+            parent = parents.get(node)
+            if not (
+                isinstance(node.ctx, ast.Load)
+                and isinstance(parent, ast.Call)
+                and parent.func is node
+            ):
+                return False
+    return True
+
+
+def closure_argument_check(ctx: _FileContext, line: int, col: int) -> dict:
+    """For a B023 hit on a lambda passed as a call argument.
+
+    Returns ``{"dismiss": True}`` when the callee is verified to call the
+    lambda synchronously, ``{"closure_passed_as_argument": True, "callee":
+    ...}`` when the lambda is an argument but the callee could not be
+    verified, and ``{}`` otherwise.
+    """
+    found = _enclosing_lambda_call(ctx, line, col)
+    if found is None:
+        return {}
+    lam, call = found
+    hint = {"closure_passed_as_argument": True, "callee": ast.unparse(call.func)}
+    # The call must run in the loop's own frame, not inside another closure.
+    cur = ctx.parents.get(call)
+    while cur is not None and not isinstance(
+        cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)
+    ):
+        if isinstance(cur, (ast.Lambda, *_COMPREHENSIONS)):
+            return hint
+        cur = ctx.parents.get(cur)
+    resolved = _callee_def(ctx, call)
+    if resolved is None:
+        return hint
+    callee, implicit = resolved
+    if not isinstance(callee, ast.FunctionDef):
+        return hint
+    allowed = {"staticmethod", "classmethod"}
+    if any(
+        not (isinstance(d, ast.Name) and d.id in allowed) for d in callee.decorator_list
+    ):
+        return hint
+    a = callee.args
+    positional = [*a.posonlyargs, *a.args][implicit:]
+    param = None
+    if lam in call.args:
+        index = call.args.index(lam)
+        if any(isinstance(x, ast.Starred) for x in call.args[: index + 1]):
+            return hint
+        if index < len(positional):
+            param = positional[index].arg
+    else:
+        kw = next(k for k in call.keywords if k.value is lam)
+        names = {p.arg for p in (*a.args[implicit:], *a.kwonlyargs)}
+        if kw.arg in names:
+            param = kw.arg
+    if param is None or not _calls_param_only(callee, param):
+        return hint
+    return {"dismiss": True}
+
+
 def _fastapi_marker(ctx: _FileContext, line: int, col: int, end) -> str | None:
     if not ctx.fastapi_markers and not ctx.fastapi_modules:
         return None
@@ -706,6 +857,12 @@ def _yaml_loader(ctx: _FileContext, line: int, col: int, end) -> str | None:
     return None
 
 
+def _sync_closure(ctx: _FileContext, line: int, col: int, end) -> str | None:
+    if closure_argument_check(ctx, line, col).get("dismiss"):
+        return "closure-called-synchronously"
+    return None
+
+
 def _literal_sql(ctx: _FileContext, line: int, col: int, end) -> str | None:
     if _sql_from_literals(ctx, line, col, end):
         return "sql-built-from-literals"
@@ -718,6 +875,7 @@ _DISMISSERS = {
     "B008": _fastapi_marker,
     "B904": _systemexit,
     "S506": _yaml_loader,
+    "B023": _sync_closure,
     "S608": _literal_sql,
 }
 
@@ -731,7 +889,7 @@ def dismissal_reason(
     in that same file: a local ``Depends`` class, or a ``Query()`` from
     another library, is still reported. B904 only for the builtin
     ``SystemExit``; S506 only for a Loader class whose bases are all safe yaml
-    loaders; S608 only when every
+    loaders; B023 only when the callee is verified; S608 only when every
     interpolated value is a literal. *finding* may carry ruff's
     ``end`` location, which pins the flagged node exactly.
     """
@@ -748,6 +906,21 @@ def dismissal_reason(
     if end and end.get("row"):
         end_key = (end["row"], _byte_col(path, end["row"], end.get("column", 0), cache))
     return check(ctx, line, col, end_key)
+
+
+def closure_argument_hint(
+    finding: dict, path: Path | None, trees: dict, cache: dict
+) -> dict:
+    """Annotation for a B023 hit whose lambda is passed to an unverified callee."""
+    if finding["code"] != "B023" or path is None:
+        return {}
+    ctx = _file_context(path, trees)
+    if ctx is None:
+        return {}
+    col = _byte_col(path, finding["line"], finding["column"], cache)
+    hint = closure_argument_check(ctx, finding["line"], col)
+    hint.pop("dismiss", None)
+    return hint
 
 
 # ---------------------------------------------------------------------------
@@ -1090,6 +1263,9 @@ def analyze(
         if reason:
             dismissed.append({**finding, "dismissal_reason": reason})
         else:
+            # A B023 lambda passed to a callee that could not be verified:
+            # one callee to read instead of every call site.
+            finding.update(closure_argument_hint(finding, path, trees, cache))
             findings.append(finding)
 
     preview_findings: list[dict] = []

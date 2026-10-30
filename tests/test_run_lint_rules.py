@@ -501,6 +501,69 @@ class TestYamlSafeLoaderSubclassDismissal(unittest.TestCase):
         self.assertEqual(_kept_lines(result), {23, 24, 25})
 
 
+class TestClosureCalledSynchronouslyDismissal(unittest.TestCase):
+    """B023 on a lambda that a same-file helper calls before returning."""
+
+    SOURCE = (
+        "import threading\n"
+        "\n"
+        "def run_now(label, fn):\n"
+        "    for _ in range(2):\n"
+        "        try:\n"
+        "            return fn(label)\n"
+        "        except OSError:\n"
+        "            pass\n"
+        "\n"
+        "def keep(fn):\n"
+        "    PENDING.append(fn)\n"
+        "\n"
+        "async def run_async(fn):\n"
+        "    return fn(1)\n"
+        "\n"
+        "def run_gen(fn):\n"
+        "    yield fn(1)\n"
+        "\n"
+        "def run_later(fn):\n"
+        "    threading.Timer(1, lambda: fn(1)).start()\n"
+        "\n"
+        "class Store:\n"
+        "    def _retry(self, op, fn):\n"
+        "        return fn(op)\n"
+        "\n"
+        "    def update(self, items, external):\n"
+        "        for item in items:\n"
+        "            self._retry('u', lambda c: c.put(item))\n"
+        "            run_now('x', fn=lambda c: c.put(item))\n"
+        "            keep(lambda c: c.put(item))\n"
+        "            run_async(lambda c: c.put(item))\n"
+        "            run_gen(lambda c: c.put(item))\n"
+        "            run_later(lambda c: c.put(item))\n"
+        "            external(lambda c: c.put(item))\n"
+        "            self._retry('u', (lambda c: c.put(item)) if item else None)\n"
+    )
+
+    def test_verified_callees_are_dismissed_and_others_hinted(self):
+        from helpers import TempProject
+
+        with TempProject({"store.py": self.SOURCE}) as root:
+            hits = [
+                _fake_hit(root, "store.py", n, "item)", code="B023")
+                for n in range(28, 36)
+            ]
+            result = _analyze_with_fake_ruff(root, hits)
+        reason = "closure-called-synchronously"
+        self.assertEqual(_dismissed_lines(result), {28: reason, 29: reason})
+        kept = {f["line"]: f for f in result["findings"]}
+        self.assertEqual(set(kept), {30, 31, 32, 33, 34, 35})
+        # Stored, async, generator, deferred, unresolvable: the agent checks
+        # the one callee each names.
+        for line, callee in ((30, "keep"), (31, "run_async"), (34, "external")):
+            self.assertTrue(kept[line]["closure_passed_as_argument"])
+            self.assertEqual(kept[line]["callee"], callee)
+        # Not a direct argument: no hint.
+        self.assertNotIn("closure_passed_as_argument", kept[35])
+
+
 class TestSqlFromLiteralsDismissal(unittest.TestCase):
     """S608 on a query whose interpolated values are all literals."""
 
