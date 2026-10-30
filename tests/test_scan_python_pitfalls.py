@@ -754,6 +754,62 @@ class TestCleanupOnlyOnSuccess(unittest.TestCase):
         self.assertNotIn("cleanup-only-on-success-path", shapes(src))
 
 
+class TestCleanupOnlyOnSuccessDifferentials(unittest.TestCase):
+    shape = "cleanup-only-on-success-path"
+
+    def _suppressed(self, src: str) -> list[str]:
+        with TempProject({"mod.py": src}) as root:
+            result = mod.analyze(str(root / "mod.py"))
+        self.assertNotIn(self.shape, [f["shape"] for f in result["findings"]])
+        return [e["reason"] for e in result["suppressed"] if e["shape"] == self.shape]
+
+    def test_acquired_in_the_try_is_flagged(self):
+        src = (
+            "def f(host, msg):\n    try:\n        conn = connect(host)\n"
+            "        conn.send(msg)\n        conn.close()\n    except OSError:\n        pass\n"
+        )
+        self.assertIn(self.shape, shapes(src))
+
+    def test_acquired_just_before_the_try_is_flagged(self):
+        src = (
+            "def f(p):\n    fh = open(p)\n    try:\n        data = fh.read()\n"
+            "        fh.close()\n    except OSError:\n        return None\n    return data\n"
+        )
+        self.assertIn(self.shape, shapes(src))
+
+    def test_close_inside_finally_is_suppressed(self):
+        src = (
+            "def f(fallback, op):\n    try:\n        return op()\n    finally:\n"
+            "        try:\n            fallback.flush()\n            fallback.close()\n"
+            "        except Exception:\n            pass\n"
+        )
+        self.assertEqual(self._suppressed(src), ["inside-finally"])
+
+    def test_close_all_loop_is_suppressed(self):
+        src = (
+            "def close_all(dbs):\n    for db in dbs:\n        try:\n"
+            "            db.close()\n        except Exception:\n            pass\n"
+        )
+        self.assertEqual(self._suppressed(src), ["release-is-the-whole-try"])
+
+    def test_release_chained_on_acquire_is_suppressed(self):
+        src = (
+            "import urllib.request\ndef probe(url):\n    try:\n        check(url)\n"
+            "        urllib.request.urlopen(url, timeout=2).close()\n"
+            "    except OSError:\n        return False\n    return True\n"
+        )
+        self.assertEqual(self._suppressed(src), ["release-chained-on-acquire"])
+
+    def test_handle_opened_elsewhere_is_suppressed(self):
+        src = (
+            "class Store:\n    def reopen(self, path):\n        try:\n"
+            "            self._handle.flush()\n            self._handle.close()\n"
+            "        except Exception:\n            pass\n"
+            "        self._handle = open(path)\n"
+        )
+        self.assertEqual(self._suppressed(src), ["not-acquired-here"])
+
+
 class TestErrorReportedBelowWarning(unittest.TestCase):
     def test_debug_only_is_flagged(self):
         src = (
@@ -778,6 +834,37 @@ class TestErrorReportedBelowWarning(unittest.TestCase):
             "    except Exception:\n        log.debug('x')\n        raise\n"
         )
         self.assertNotIn("error-reported-below-warning", shapes(src))
+
+
+class TestErrorReportedBelowWarningDifferential(unittest.TestCase):
+    shape = "error-reported-below-warning"
+
+    def test_rejection_returned_as_error_result_is_suppressed(self):
+        src = (
+            "import logging\nlog = logging.getLogger(__name__)\n"
+            "def create(name):\n    try:\n        validate(name)\n"
+            "    except ValueError as e:\n        log.info('rejected %s: %s', name, e)\n"
+            "        if 'exists' in str(e):\n"
+            "            return {'ok': False, 'code': 'conflict', 'error': str(e)}\n"
+            "        return {'ok': False, 'code': 'invalid', 'error': str(e)}\n"
+            "    return {'ok': True}\n"
+        )
+        with TempProject({"mod.py": src}) as root:
+            result = mod.analyze(str(root / "mod.py"))
+        self.assertNotIn(self.shape, [f["shape"] for f in result["findings"]])
+        self.assertEqual(
+            result["summary"]["suppressed_by_differential"][self.shape],
+            {"returns-error-result": 1},
+        )
+
+    def test_returning_a_default_is_still_flagged(self):
+        src = (
+            "import logging\nlog = logging.getLogger(__name__)\n"
+            "def load(path):\n    try:\n        return read(path)\n"
+            "    except OSError:\n        log.info('cannot read %s', path)\n"
+            "        return {}\n"
+        )
+        self.assertIn(self.shape, shapes(src))
 
 
 class TestExceptInLoopWithoutExit(unittest.TestCase):
@@ -866,6 +953,89 @@ class TestRaiseWithoutFrom(unittest.TestCase):
             "    except ValueError as err:\n        raise err\n"
         )
         self.assertNotIn("raise-without-from-in-except", shapes(src))
+
+
+class TestRaiseWithoutFromDifferentials(unittest.TestCase):
+    shape = "raise-without-from-in-except"
+
+    def _reasons(self, src: str) -> tuple[list[dict], list[str]]:
+        with TempProject({"mod.py": src}) as root:
+            result = mod.analyze(str(root / "mod.py"))
+        found = [f for f in result["findings"] if f["shape"] == self.shape]
+        reasons = [
+            e["reason"] for e in result["suppressed"] if e["shape"] == self.shape
+        ]
+        return found, reasons
+
+    def test_system_exit_is_suppressed(self):
+        src = (
+            "import logging\nlog = logging.getLogger(__name__)\n"
+            "def main(spec):\n    try:\n        run(spec)\n"
+            "    except FileNotFoundError as e:\n        log.error(e)\n"
+            "        raise SystemExit(2)\n"
+        )
+        self.assertEqual(self._reasons(src), ([], ["system-exit"]))
+
+    def test_raise_caught_by_its_own_nested_try_is_suppressed(self):
+        src = (
+            "def rollback(moved, errors):\n    try:\n        apply(moved)\n"
+            "    except Exception:\n        for entry in moved:\n            try:\n"
+            "                if not entry.exists():\n"
+            "                    raise FileNotFoundError(entry)\n"
+            "                restore(entry)\n"
+            "            except OSError as exc:\n                errors.append(exc)\n"
+            "        raise\n"
+        )
+        self.assertEqual(self._reasons(src), ([], ["caught-inside-the-handler"]))
+
+    def test_nested_try_that_does_not_catch_it_still_flags(self):
+        src = (
+            "def f(t):\n    try:\n        return int(t)\n    except ValueError:\n"
+            "        try:\n            raise TypeError('bad')\n"
+            "        except KeyError:\n            pass\n"
+        )
+        found, reasons = self._reasons(src)
+        self.assertEqual((len(found), reasons), (1, []))
+
+    def test_raise_in_a_nested_handler_is_reported_once(self):
+        src = (
+            "def f(t):\n    try:\n        return int(t)\n    except ValueError:\n"
+            "        try:\n            cleanup()\n"
+            "        except OSError:\n            raise RuntimeError('cleanup')\n"
+        )
+        found, _ = self._reasons(src)
+        self.assertEqual(len(found), 1)
+
+
+class TestFalsyOrInheritance(unittest.TestCase):
+    shape = "falsy-or-inheritance"
+
+    def _found(self, src: str) -> list[dict]:
+        return [f for f in scan(src) if f["shape"] == self.shape]
+
+    def test_get_with_zero_default_or_parent(self):
+        src = (
+            "class Node:\n    @property\n    def retries(self):\n"
+            "        own = self.spec.get('retries', 0)\n"
+            "        return int(own or getattr(self.parent, 'retries', 0))\n"
+        )
+        found = self._found(src)
+        self.assertEqual([f["confidence"] for f in found], ["high"])
+
+    def test_inline_get_or_value(self):
+        src = "def timeout(cfg, fallback):\n    return cfg.get('timeout', 0) or fallback\n"
+        self.assertEqual([f["confidence"] for f in self._found(src)], ["medium"])
+
+    def test_name_or_parent_attribute(self):
+        src = "def level(node, own):\n    return own or node.parent.level\n"
+        self.assertEqual([f["confidence"] for f in self._found(src)], ["low"])
+
+    def test_none_default_and_plain_or_are_silent(self):
+        src = (
+            "def name(cfg, other):\n    a = cfg.get('name') or 'anon'\n"
+            "    b = cfg.get('n', None) or other\n    return a or b\n"
+        )
+        self.assertEqual(self._found(src), [])
 
 
 class TestFlagNotResetOnEarlyExit(unittest.TestCase):
@@ -1253,6 +1423,202 @@ class TestSignedLengthFromHeader(unittest.TestCase):
             "    version, = struct.unpack('<h', data[:2])\n    return version\n"
         )
         self.assertNotIn("signed-length-from-untrusted-header", shapes(src))
+
+
+class TestAsymmetricAccessorPair(unittest.TestCase):
+    shape = "asymmetric-encode-decode-pair"
+
+    def _found(self, src: str) -> list[dict]:
+        return [f for f in scan(src) if f["shape"] == self.shape]
+
+    def test_get_set_pair_with_different_codecs(self):
+        src = (
+            "import json, pickle\n"
+            "def _get_state(msg):\n    return json.loads(msg.body)\n"
+            "def _set_state(msg, value):\n    msg.body = pickle.dumps(value)\n"
+        )
+        found = self._found(src)
+        self.assertEqual([f["confidence"] for f in found], ["medium"])
+        self.assertIn("_get_state", found[0]["message"])
+
+    def test_lenient_decode_strict_encode_pair(self):
+        src = (
+            "class Note:\n"
+            "    def parse_text(self, raw):\n        return raw.decode('utf-8', errors='replace')\n"
+            "    def format_text(self, text):\n        return text.encode('utf-8')\n"
+        )
+        self.assertEqual([f["confidence"] for f in self._found(src)], ["high"])
+
+    def test_json_accessor_over_a_foreign_object_is_a_low_lead(self):
+        src = (
+            "import json\n"
+            "def _get_json_body(msg):\n    return json.loads(msg.content)\n"
+            "def _set_json_body(msg, value):\n    msg.content = json.dumps(value).encode('utf-8')\n"
+        )
+        self.assertEqual([f["confidence"] for f in self._found(src)], ["low"])
+
+    def test_own_storage_pair_and_matching_codecs_are_silent(self):
+        src = (
+            "import json\n"
+            "class Settings:\n"
+            "    def get_setting(self, key):\n        return json.loads(self.db[key])\n"
+            "    def set_setting(self, key, value):\n"
+            "        self.db[key] = json.dumps(value, sort_keys=True)\n"
+            "def load_blob(raw):\n    return raw.decode('utf-8')\n"
+            "def dump_blob(text):\n    return text.encode('utf-8')\n"
+            "def _load_doc(payload):\n    return json.loads(payload)\n"
+            "def _dump_doc(payload):\n    return json.dumps(payload)\n"
+        )
+        self.assertEqual(self._found(src), [])
+
+
+class TestParsedJsonAssumedObject(unittest.TestCase):
+    shape = "parsed-json-assumed-object"
+
+    def _found(self, src: str) -> list[dict]:
+        return [f for f in scan(src) if f["shape"] == self.shape]
+
+    def test_helper_result_tested_with_in(self):
+        src = (
+            "import json\n"
+            "def _get_json(msg):\n    return json.loads(msg.content)\n"
+            "def redact(msg, field):\n    doc = _get_json(msg)\n"
+            "    if doc and field in doc:\n        doc[field] = '***'\n"
+        )
+        found = self._found(src)
+        self.assertEqual([(f["line"], f["confidence"]) for f in found], [(6, "medium")])
+
+    def test_file_json_is_a_low_lead(self):
+        src = (
+            "import json\ndef load(path):\n    m = json.loads(path.read_text())\n"
+            "    return m['version']\n"
+        )
+        self.assertEqual([f["confidence"] for f in self._found(src)], ["low"])
+
+    def test_isinstance_guard_and_index_use_are_silent(self):
+        src = (
+            "import json\n"
+            "def a(resp, k):\n    doc = resp.json()\n"
+            "    if isinstance(doc, dict) and k in doc:\n        return doc[k]\n"
+            "def b(raw):\n    items = json.loads(raw)\n    return items[0]\n"
+        )
+        self.assertEqual(self._found(src), [])
+
+
+class TestNarrowParseExcept(unittest.TestCase):
+    shape = "narrow-parse-except-misses-decode-error"
+
+    def _found(self, src: str) -> list[dict]:
+        return [f for f in scan(src) if f["shape"] == self.shape]
+
+    def test_bytes_body_with_json_decode_error_only(self):
+        src = (
+            "import json\nfrom json import JSONDecodeError\n"
+            "def parse(msg):\n    try:\n        body = read_body(msg)\n"
+            "        return json.loads(body)\n    except JSONDecodeError:\n"
+            "        return None\n"
+        )
+        self.assertEqual(len(self._found(src)), 1)
+
+    def test_value_error_or_str_input_is_silent(self):
+        src = (
+            "import json\n"
+            "def a(msg):\n    try:\n        return json.loads(msg.content)\n"
+            "    except ValueError:\n        return None\n"
+            "def b(msg):\n    try:\n        return json.loads(msg.text)\n"
+            "    except json.JSONDecodeError:\n        return None\n"
+            "def c(msg):\n    try:\n        return json.loads(msg.content.decode('utf-8', 'replace'))\n"
+            "    except json.JSONDecodeError:\n        return None\n"
+        )
+        self.assertEqual(self._found(src), [])
+
+
+class TestCleanupInsideTryTriggersRollback(unittest.TestCase):
+    shape = "cleanup-inside-try-triggers-rollback"
+
+    def _found(self, src: str) -> list[dict]:
+        return [f for f in scan(src) if f["shape"] == self.shape]
+
+    def test_backup_removal_inside_rollback_try(self):
+        src = (
+            "import shutil\n"
+            "def swap(new, live, backup):\n    shutil.move(live, backup)\n    try:\n"
+            "        shutil.move(new, live)\n        shutil.rmtree(backup)\n"
+            "    except Exception:\n        shutil.rmtree(live, ignore_errors=True)\n"
+            "        shutil.move(backup, live)\n        raise\n"
+        )
+        found = self._found(src)
+        self.assertEqual([(f["line"], f["confidence"]) for f in found], [(6, "high")])
+
+    def test_cleanup_before_an_early_return_inside_the_try(self):
+        src = (
+            "def export(self, out):\n    try:\n        staged = self.stage()\n"
+            "        if out is not None:\n            self.write(staged, out)\n"
+            "            self._remove_path(staged)\n            return out\n"
+            "        return staged\n    except Exception:\n"
+            "        self._remove_path(staged)\n        raise\n"
+        )
+        self.assertEqual([f["confidence"] for f in self._found(src)], ["medium"])
+
+    def test_cleanup_after_the_try_is_silent(self):
+        src = (
+            "import shutil\n"
+            "def swap(new, live, backup):\n    try:\n        shutil.move(new, live)\n"
+            "    except Exception:\n        shutil.move(backup, live)\n        raise\n"
+            "    try:\n        shutil.rmtree(backup)\n    except OSError:\n        pass\n"
+        )
+        self.assertEqual(self._found(src), [])
+
+
+class TestSideChannelRaiseInFinally(unittest.TestCase):
+    shape = "side-channel-raise-in-finally"
+
+    def _found(self, src: str) -> list[dict]:
+        return [f for f in scan(src) if f["shape"] == self.shape]
+
+    def test_audit_emit_in_finally(self):
+        src = (
+            "def wrapper(fn, audit):\n    status = 'error'\n    try:\n"
+            "        result = fn()\n        status = 'ok'\n        return result\n"
+            "    finally:\n        audit.emit(op='write', status=status)\n"
+        )
+        self.assertEqual(len(self._found(src)), 1)
+
+    def test_logging_close_and_guarded_emit_are_silent(self):
+        src = (
+            "import logging\nlog = logging.getLogger(__name__)\n"
+            "def a(fn, fh):\n    try:\n        return fn()\n    finally:\n"
+            "        log.info('done')\n        fh.close()\n"
+            "def b(fn, audit):\n    try:\n        return fn()\n    finally:\n"
+            "        try:\n            audit.emit(op='x')\n"
+            "        except Exception:\n            pass\n"
+        )
+        self.assertEqual(self._found(src), [])
+
+
+class TestWideSuppressException(unittest.TestCase):
+    shape = "wide-suppress-exception-block"
+
+    def _found(self, src: str) -> list[dict]:
+        return [f for f in scan(src) if f["shape"] == self.shape]
+
+    def test_block_of_bookkeeping(self):
+        body = "".join(f"        state.step{i}()\n" for i in range(5))
+        src = (
+            "from contextlib import suppress\ndef finish(state):\n"
+            "    with suppress(Exception):\n" + body
+        )
+        found = self._found(src)
+        self.assertEqual([f["confidence"] for f in found], ["medium"])
+
+    def test_single_best_effort_call_and_narrow_suppress_are_silent(self):
+        src = (
+            "import contextlib, os\ndef cleanup(p, q):\n"
+            "    with contextlib.suppress(Exception):\n        os.unlink(p)\n"
+            "    with contextlib.suppress(OSError):\n"
+            "        os.unlink(p)\n        os.unlink(q)\n        os.rmdir(p)\n        os.rmdir(q)\n"
+        )
+        self.assertEqual(self._found(src), [])
 
 
 class TestAsymmetricEncodeDecode(unittest.TestCase):
