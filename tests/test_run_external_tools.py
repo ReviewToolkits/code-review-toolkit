@@ -958,6 +958,123 @@ class TestExceptClosureFalsePositive(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Toolkit-selected second ruff pass for the category feeds (#38/#66)
+# ---------------------------------------------------------------------------
+
+FEED_SOURCE = """\
+from fastapi import Depends
+
+def route(db=Depends(get_db), items=[]):
+    if items:
+        return True
+    else:
+        return False
+
+x = "%s" % db
+"""
+
+
+def _hit(root, code, line, column, message="m"):
+    return {
+        "code": code,
+        "filename": str(root / "app.py"),
+        "location": {"row": line, "column": column},
+        "message": message,
+        "fix": None,
+    }
+
+
+class TestToolkitRuffPass(unittest.TestCase):
+    """A narrow project selection must not leave the agents' feeds empty."""
+
+    PYPROJECT = '[project]\nname = "x"\n\n[tool.ruff.lint]\nselect = ["B006"]\n'
+
+    def _run(self, argv=(), pyproject=PYPROJECT, toolkit_error=None):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            toolkit = "--select" in cmd and "UP" in cmd[cmd.index("--select") + 1]
+            if toolkit and toolkit_error:
+                raise toolkit_error
+            hits = [_hit(root, "B006", 3, 37)]  # the project's own rule
+            if toolkit:
+                hits += [
+                    _hit(root, "B008", 3, 14),  # FastAPI marker: dismissed
+                    _hit(root, "SIM103", 4, 5),
+                    _hit(root, "UP031", 9, 5),
+                ]
+            return MagicMock(stdout=json.dumps(hits), stderr="")
+
+        with TempProject({"app.py": FEED_SOURCE}) as root:
+            (root / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+            with patch.object(mod.subprocess, "run", side_effect=fake_run):
+                out = mod.run_ruff(mod.parse_args([str(root), *argv]), root, root)
+        return out, calls
+
+    def test_feeds_are_filled_and_labelled_as_the_toolkits(self):
+        out, _ = self._run()
+        by_rule = {f["rule"]: f for f in out["findings"]}
+        self.assertEqual(by_rule["B006"]["selection"], "project")
+        self.assertEqual(by_rule["SIM103"]["selection"], "toolkit")
+        self.assertEqual(by_rule["SIM103"]["category"], "simplification")
+        self.assertEqual(by_rule["UP031"]["category"], "deprecated")
+        meta = out["toolkit_pass"]
+        self.assertTrue(meta["ran"])
+        self.assertIn("UP", meta["selection"]["deprecated"])
+        self.assertIn("NOT the project's", meta["note"])
+        self.assertEqual(meta["by_category"], {"deprecated": 1, "simplification": 1})
+        # The project's own numbers still describe the project's pass only.
+        self.assertEqual(out["total_findings"], 1)
+        self.assertEqual(out["rules_applied"], ["B006"])
+
+    def test_project_hits_are_not_reported_twice(self):
+        out, _ = self._run()
+        self.assertEqual(sum(f["rule"] == "B006" for f in out["findings"]), 1)
+        self.assertEqual(out["toolkit_pass"]["duplicates_of_project_findings"], 1)
+
+    def test_fastapi_markers_are_counted_not_fed(self):
+        out, _ = self._run()
+        self.assertNotIn("B008", {f["rule"] for f in out["findings"]})
+        self.assertEqual(
+            out["toolkit_pass"]["dismissed"], {"fastapi-dependency-marker": 1}
+        )
+
+    def test_toolkit_command_keeps_the_project_config_and_no_cache(self):
+        _, calls = self._run()
+        toolkit_cmd = calls[1]
+        self.assertIn("--no-cache", toolkit_cmd)
+        self.assertNotIn("--isolated", toolkit_cmd)
+        # target-version comes from the project's config.
+        self.assertNotIn("--target-version", toolkit_cmd)
+
+    def test_without_a_ruff_config_the_target_version_is_pinned(self):
+        _, calls = self._run(
+            pyproject='[project]\nname = "x"\nrequires-python = ">=3.11"\n'
+        )
+        toolkit_cmd = calls[1]
+        index = toolkit_cmd.index("--target-version")
+        self.assertEqual(toolkit_cmd[index + 1], "py311")
+
+    def test_explicit_rules_or_the_flag_skip_the_pass(self):
+        for argv, reason in (
+            (["--ruff-rules", "F"], "explicit --ruff-rules selection"),
+            (["--no-toolkit-ruff-pass"], "--no-toolkit-ruff-pass"),
+        ):
+            with self.subTest(argv=argv):
+                out, calls = self._run(argv)
+                self.assertEqual(len(calls), 1)
+                self.assertFalse(out["toolkit_pass"]["ran"])
+                self.assertEqual(out["toolkit_pass"]["skipped_reason"], reason)
+
+    def test_a_failed_toolkit_pass_keeps_the_project_findings(self):
+        out, _ = self._run(toolkit_error=subprocess.TimeoutExpired("ruff", 120))
+        self.assertEqual([f["rule"] for f in out["findings"]], ["B006"])
+        self.assertFalse(out["toolkit_pass"]["ran"])
+        self.assertIn("failed", out["toolkit_pass"]["error"])
+
+
+# ---------------------------------------------------------------------------
 # Integration: full pipeline with mocked tools
 # ---------------------------------------------------------------------------
 
