@@ -118,6 +118,47 @@ class TestAnyDetection(unittest.TestCase):
         self.assertEqual(len(result["any_usages"]), 0)
 
 
+class TestAnyUsageSchema(unittest.TestCase):
+    """Every `any_usages[]` entry shares `kind`, `file` and `line`."""
+
+    def _usages(self, source: str) -> list[dict]:
+        with TempProject({"mod.py": source}) as root:
+            return mod.analyze_file(root / "mod.py", root)["any_usages"]
+
+    def test_function_method_and_attribute_share_keys(self):
+        usages = self._usages(
+            "from typing import Any\n"
+            "\n"
+            "def f(x: Any) -> None:\n"
+            "    pass\n"
+            "\n"
+            "class C:\n"
+            "    attr: Any\n"
+            "\n"
+            "    def m(self) -> Any:\n"
+            "        pass\n"
+        )
+        by_kind = {u["kind"]: u for u in usages if u["kind"] != "function"}
+        functions = [u for u in usages if u["kind"] == "function"]
+        self.assertEqual(
+            sorted((u["file"], u["line"]) for u in functions),
+            [("mod.py", 3), ("mod.py", 9)],
+        )
+        attr = by_kind["class_attribute"]
+        # The attribute's own line, not the class line.
+        self.assertEqual((attr["file"], attr["line"]), ("mod.py", 7))
+        self.assertEqual(attr["attribute"], "attr")
+        # The legacy `location` key is kept for existing consumers.
+        self.assertTrue(all("location" in u for u in usages))
+
+    def test_return_only_any_has_empty_details(self):
+        (usage,) = self._usages(
+            "from typing import Any\n\ndef g() -> Any:\n    pass\n"
+        )
+        self.assertEqual(usage["details"], [])
+        self.assertTrue(usage["in_return"])
+
+
 class TestContainerTypeDetection(unittest.TestCase):
     """Test detection of dataclass, TypedDict, NamedTuple, etc."""
 
@@ -221,6 +262,61 @@ class TestClassAttributes(unittest.TestCase):
             self.assertEqual(cls["unannotated_attributes"][0], "untyped")
 
 
+class TestPerFileCoverage(unittest.TestCase):
+    """`files[].coverage` counts methods, matching the summary's denominator."""
+
+    def test_methods_counted_in_file_coverage(self):
+        with TempProject({
+            "mod.py": (
+                "def helper(x: int) -> int:\n"
+                "    return x\n"
+                "\n"
+                "class Store:\n"
+                "    def get(self, k):\n"
+                "        return k\n"
+                "\n"
+                "    def put(self, k, v):\n"
+                "        pass\n"
+                "\n"
+                "    def _evict(self) -> None:\n"
+                "        pass\n"
+            ),
+        }) as root:
+            result = mod.analyze_file(root / "mod.py", root)
+        cov = result["coverage"]
+        # `functions` stays module-level only; coverage covers methods too.
+        self.assertEqual(len(result["functions"]), 1)
+        self.assertEqual(cov["total_functions"], 4)
+        self.assertEqual(cov["fully_annotated_functions"], 2)
+        self.assertEqual(cov["annotation_coverage_all"], 50.0)
+        self.assertEqual(cov["public_functions"], 3)
+        self.assertEqual(cov["annotation_coverage_public"], 33.3)
+
+    def test_file_coverage_sums_to_summary(self):
+        with TempProject({
+            "pkg/a.py": "class A:\n    def m(self) -> None:\n        pass\n",
+            "pkg/b.py": "def f(x):\n    return x\n",
+        }) as root:
+            out = _run_main(root / "pkg")
+        self.assertEqual(
+            sum(f["coverage"]["total_functions"] for f in out["files"]),
+            out["summary"]["total_functions"],
+        )
+
+    def test_empty_file_coverage_is_null_not_zero(self):
+        with TempProject({"mod.py": "X = 1\n"}) as root:
+            cov = mod.analyze_file(root / "mod.py", root)["coverage"]
+        self.assertEqual(cov["total_functions"], 0)
+        self.assertIsNone(cov["annotation_coverage_all"])
+        self.assertIsNone(cov["annotation_coverage_public"])
+
+    def test_unparseable_file_coverage_is_null(self):
+        with TempProject({"mod.py": "def broken(:\n"}) as root:
+            result = mod.analyze_file(root / "mod.py", root)
+        self.assertIsNotNone(result["parse_error"])
+        self.assertIsNone(result["coverage"])
+
+
 class TestTypeIgnoreCount(unittest.TestCase):
 
     def test_counts_type_ignore(self):
@@ -263,6 +359,54 @@ class TestMaxFiles(unittest.TestCase):
             self.assertEqual(output["files_analyzed"], 3)
             self.assertTrue(output["files_capped"])
             self.assertGreater(output["files_total"], 3)
+
+
+def _run_main(root) -> dict:
+    """Run count_types.main() on *root* and return its parsed JSON."""
+    import io
+    import sys
+
+    old_stdout, old_argv = sys.stdout, sys.argv
+    sys.stdout = io.StringIO()
+    sys.argv = ["count_types.py", str(root)]
+    try:
+        mod.main()
+        return json.loads(sys.stdout.getvalue())
+    finally:
+        sys.stdout, sys.argv = old_stdout, old_argv
+
+
+class TestUnannotatedPublicFunctions(unittest.TestCase):
+    """`unannotated_public_functions[]` entries must say which file they are in."""
+
+    def test_same_name_in_two_files_is_distinguishable(self):
+        with TempProject({
+            "pkg/a.py": "def build(x):\n    return x\n",
+            "pkg/b.py": "def build(x):\n    return x\n",
+        }) as root:
+            out = _run_main(root / "pkg")
+        entries = out["unannotated_public_functions"]
+        self.assertEqual(
+            sorted((e["file"], e["name"]) for e in entries),
+            [("pkg/a.py", "build"), ("pkg/b.py", "build")],
+        )
+
+    def test_method_entry_carries_its_file(self):
+        with TempProject({
+            "pkg/a.py": "class C:\n    def run(self, x):\n        return x\n",
+        }) as root:
+            out = _run_main(root / "pkg")
+        self.assertEqual(
+            out["unannotated_public_functions"],
+            [{"file": "pkg/a.py", "name": "C.run", "line": 2}],
+        )
+
+    def test_annotated_function_not_listed(self):
+        with TempProject({
+            "pkg/a.py": "def build(x: int) -> int:\n    return x\n",
+        }) as root:
+            out = _run_main(root / "pkg")
+        self.assertEqual(out["unannotated_public_functions"], [])
 
 
 if __name__ == "__main__":

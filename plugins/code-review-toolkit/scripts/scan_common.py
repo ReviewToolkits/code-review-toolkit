@@ -27,6 +27,7 @@ EXCLUDE_DIRS = frozenset(
         "venv",
         "__pycache__",
         "node_modules",
+        ".claude",
         ".eggs",
         "build",
         "dist",

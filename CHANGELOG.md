@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — test-side scripts (#54)
+
+- **`correlate_tests.py` correlates tests with the modules they import**, not just by file name
+  (`match_method` says which matched), honours pytest `testpaths`, and counts pytest-style test
+  functions in `total_test_methods`. On a real service: reported coverage 25.6% → 86%, close to
+  the measured 85%.
+- **`extract_test_invariants.py` finds the project's tests when the scope has none** (a sibling
+  `tests/`), and says so; with no tests at all it reports `status: no_tests_found` instead of a
+  clean run. Tests map to the code they exercise through imports, fixtures and routes; selection
+  is round-robin across files with fix attribution per test (race, cancel, rollback, lock, timeout
+  and thread now count as bug-fix keywords); "similar functions" require a name relation.
+- **`count_types.py`**: every `unannotated_public_functions` entry names its file, `any_usages`
+  has one schema, and per-file coverage counts methods.
+- `.claude/` is excluded from file discovery (agent worktrees nested there multiplied scans).
+
 ### Fixed
 
 - **Agents and commands invoke `python3`**, not `python`, which some hosts don't have. Every

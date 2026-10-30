@@ -46,16 +46,38 @@ def classify_files(
     return source, test
 
 
+def _is_skipped(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """True for `@unittest.skip...`, `@pytest.mark.skip/skipif` and the like."""
+    return any(
+        (isinstance(d, ast.Attribute) and "skip" in d.attr.lower())
+        or (isinstance(d, ast.Call)
+            and isinstance(d.func, ast.Attribute)
+            and "skip" in d.func.attr.lower())
+        or (isinstance(d, ast.Name) and "skip" in d.id.lower())
+        for d in func.decorator_list
+    )
+
+
 def _extract_test_info(filepath: Path) -> dict:
-    """Extract test classes and methods from a test file."""
+    """Extract test classes and methods from a test file.
+
+    Counts unittest `TestCase` methods, methods of plain pytest classes and
+    pytest-style module-level `test*` functions alike.
+    """
     try:
         source = filepath.read_text(encoding="utf-8", errors="replace")
         tree = ast.parse(source, filename=str(filepath))
     except SyntaxError:
-        return {"classes": [], "standalone_tests": [], "parse_error": True}
+        return {
+            "classes": [],
+            "standalone_tests": [],
+            "skipped_standalone_tests": [],
+            "parse_error": True,
+        }
 
     classes: list[dict] = []
     standalone: list[str] = []
+    skipped_standalone: list[str] = []
 
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.ClassDef):
@@ -64,15 +86,7 @@ def _extract_test_info(filepath: Path) -> dict:
             for child in ast.iter_child_nodes(node):
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     if child.name.startswith("test"):
-                        is_skipped = any(
-                            (isinstance(d, ast.Attribute) and "skip" in d.attr.lower())
-                            or (isinstance(d, ast.Call)
-                                and isinstance(d.func, ast.Attribute)
-                                and "skip" in d.func.attr.lower())
-                            or (isinstance(d, ast.Name) and "skip" in d.id.lower())
-                            for d in child.decorator_list
-                        )
-                        if is_skipped:
+                        if _is_skipped(child):
                             skipped.append(child.name)
                         else:
                             methods.append(child.name)
@@ -86,11 +100,15 @@ def _extract_test_info(filepath: Path) -> dict:
             })
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if node.name.startswith("test"):
-                standalone.append(node.name)
+                if _is_skipped(node):
+                    skipped_standalone.append(node.name)
+                else:
+                    standalone.append(node.name)
 
     return {
         "classes": classes,
         "standalone_tests": standalone,
+        "skipped_standalone_tests": skipped_standalone,
         "parse_error": False,
     }
 
@@ -219,6 +237,203 @@ def _read_test_imports(filepath: Path, project_root: Path) -> list[str]:
     return modules
 
 
+def pytest_testpaths(project_root: Path) -> list[Path]:
+    """Directories named by the project's pytest `testpaths` setting.
+
+    Reads the first pytest config pytest itself would use: `pytest.ini`,
+    `pyproject.toml` (`[tool.pytest.ini_options]`), `tox.ini`, `setup.cfg`.
+    Returns only entries that exist as directories; globs are expanded.
+    """
+    import configparser
+
+    raw: list[str] | None = None
+    for name, section in (
+        ("pytest.ini", "pytest"),
+        ("pyproject.toml", None),
+        ("tox.ini", "pytest"),
+        ("setup.cfg", "tool:pytest"),
+    ):
+        path = project_root / name
+        if not path.is_file():
+            continue
+        if section is None:
+            try:
+                import tomllib
+            except ImportError:  # Python 3.10: no TOML parser in the stdlib.
+                continue
+            try:
+                data = tomllib.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            opts = data.get("tool", {}).get("pytest", {}).get("ini_options")
+            if opts is None:
+                continue
+            value = opts.get("testpaths", [])
+            raw = [value] if isinstance(value, str) else list(value)
+            break
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            parser.read(path, encoding="utf-8")
+        except (configparser.Error, OSError, UnicodeDecodeError):
+            continue
+        if not parser.has_section(section):
+            continue
+        raw = parser.get(section, "testpaths", fallback="").split()
+        break
+
+    dirs: list[Path] = []
+    for entry in raw or []:
+        for match in sorted(project_root.glob(str(entry))):
+            if match.is_dir() and match not in dirs:
+                dirs.append(match)
+    return dirs
+
+
+def find_external_tests(
+    scan_root: Path, project_root: Path
+) -> tuple[list[Path], list[str], str | None]:
+    """Find the project's tests when none live under *scan_root*.
+
+    Returns `(test_files, roots, how)`: the test files, the directories they
+    came from (relative to the project root), and `"pytest_testpaths"` or
+    `"conventional_dir"` (`None` when nothing was found). The pytest
+    `testpaths` setting wins; otherwise `tests/`, `test/` and `testing/` are
+    tried at the project root and beside the scanned tree (CPython keeps
+    `Lib/test/` beside `Lib/_pyrepl/`). A subdirectory dedicated to the
+    scanned package is preferred: scanning all of CPython's Lib/test to review
+    one package would be both slow and wrong.
+    """
+    package = scan_root.name
+
+    def narrowed(root: Path) -> Path:
+        targets = [
+            root / f"test_{package}",
+            root / f"test_{package.lstrip('_')}",
+            root / package,
+        ]
+        return next((c for c in targets if c.is_dir()), root)
+
+    configured = pytest_testpaths(project_root)
+    if configured:
+        files: list[Path] = []
+        roots: list[str] = []
+        for root in configured:
+            candidate = narrowed(root)
+            found = sorted(discover_python_files(candidate))
+            if found:
+                # Everything under a configured test path is test code, even
+                # where the directory is not named `test`/`tests`.
+                files.extend(f for f in found if f not in files)
+                roots.append(str(candidate.relative_to(project_root)))
+        if files:
+            return files, roots, "pytest_testpaths"
+
+    for base in (project_root, scan_root.parent):
+        for name in ("tests", "test", "testing"):
+            root = base / name
+            if not root.is_dir():
+                continue
+            candidate = narrowed(root)
+            found = sorted(discover_python_files(candidate))
+            _, discovered = classify_files(found, project_root)
+            if discovered:
+                return (
+                    discovered,
+                    [str(candidate.relative_to(project_root))],
+                    "conventional_dir",
+                )
+    return [], [], None
+
+
+def module_name(path: Path, project_root: Path) -> str:
+    """Dotted import name of *path*, rooted at its topmost package.
+
+    Leading directories that are not packages (`src/`, CPython's `Lib/`) are
+    not part of the import name: `src/pkg/a.py` is `pkg.a`, and
+    `pkg/sub/__init__.py` is `pkg.sub`.
+    """
+    rel = path.relative_to(project_root).with_suffix("")
+    parts = list(rel.parts)
+    depth = 0
+    parent = path.parent
+    while parent != project_root and (parent / "__init__.py").is_file():
+        depth += 1
+        parent = parent.parent
+    parts = parts[-(depth + 1):]
+    if parts[-1] == "__init__" and len(parts) > 1:
+        parts = parts[:-1]
+    return ".".join(parts)
+
+
+def build_module_index(
+    source_files: list[Path], project_root: Path
+) -> dict[str, list[str]]:
+    """Map dotted module names to the source files that define them.
+
+    Each file is indexed under its package-rooted name and, when different,
+    under its plain path from the project root (minus a leading `src`), so a
+    namespace package without `__init__.py` still resolves.
+    """
+    index: dict[str, list[str]] = {}
+    for sf in source_files:
+        rel = str(sf.relative_to(project_root))
+        names = {module_name(sf, project_root)}
+        parts = list(sf.relative_to(project_root).with_suffix("").parts)
+        if parts[-1] == "__init__" and len(parts) > 1:
+            parts = parts[:-1]
+        if parts[0] == "src" and len(parts) > 1:
+            parts = parts[1:]
+        names.add(".".join(parts))
+        for name in names:
+            index.setdefault(name, []).append(rel)
+    return index
+
+
+def resolve_imported_sources(
+    tree: ast.AST, index: dict[str, list[str]], package: str = ""
+) -> dict[str, str]:
+    """Source files a module imports, as `{source_rel_path: import_name}`.
+
+    Handles `import a.b`, `import a.b as x`, `from a.b import c` (where `c` may
+    be a submodule or a name defined in `a.b`), and relative imports resolved
+    against *package* (the importing module's package). Imports inside
+    functions count too: pytest tests often import there.
+    """
+    found: dict[str, str] = {}
+
+    def add(name: str) -> bool:
+        for src in index.get(name, ()):
+            found.setdefault(src, name)
+        return name in index
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                parts = alias.name.split(".")
+                # `import a.b.c` where only `a.b` is a source file.
+                while parts and not add(".".join(parts)):
+                    parts.pop()
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                base = package.split(".") if package else []
+                if node.level > 1:
+                    base = base[: len(base) - (node.level - 1)]
+                module = ".".join(base + ([node.module] if node.module else []))
+            else:
+                module = node.module or ""
+            if not module:
+                continue
+            submodule_hit = False
+            for alias in node.names:
+                if alias.name != "*" and add(f"{module}.{alias.name}"):
+                    submodule_hit = True
+            if not submodule_hit or any(
+                f"{module}.{a.name}" not in index for a in node.names
+            ):
+                add(module)
+    return found
+
+
 def main() -> None:
     from scan_common import exit_on_help
 
@@ -255,32 +470,10 @@ def main() -> None:
     # reads as a finding about the project when it is an artefact of the scope.
     external_test_roots: list[str] = []
     if not test_files and scan_root != project_root:
-        package = scan_root.name
-        # Search the project root AND the scanned tree's own parent: CPython puts
-        # `Lib/test/` beside `Lib/_pyrepl/`, not at the repository root.
-        for base in (project_root, scan_root.parent):
-            for name in ("tests", "test", "testing"):
-                root = base / name
-                if not root.is_dir():
-                    continue
-                # Prefer a subdirectory dedicated to this package -- scanning all
-                # of CPython's Lib/test to review one package would be both slow
-                # and wrong.
-                targets = [
-                    root / f"test_{package}",
-                    root / f"test_{package.lstrip('_')}",
-                    root / package,
-                ]
-                candidate = next((c for c in targets if c.is_dir()), root)
-                found = sorted(discover_python_files(candidate))
-                _, discovered = classify_files(found, project_root)
-                if not discovered:
-                    continue
-                test_files.extend(discovered)
-                external_test_roots.append(str(candidate.relative_to(project_root)))
-                break
-            if external_test_roots:
-                break
+        discovered, external_test_roots, _ = find_external_tests(
+            scan_root, project_root
+        )
+        test_files.extend(discovered)
 
     # Analyze source files.
     source_info: dict[str, dict] = {}
@@ -290,6 +483,7 @@ def main() -> None:
         source_info[rel] = info
 
     # Analyze test files and build correlations.
+    module_index = build_module_index(source_files, project_root)
     test_info: dict[str, dict] = {}
     for tf in test_files:
         rel = str(tf.relative_to(project_root))
@@ -298,14 +492,43 @@ def main() -> None:
         imported_modules = _read_test_imports(tf, project_root)
         tinfo["matched_sources"] = matched_sources
         tinfo["imported_modules"] = imported_modules
+        # Import-based correspondence. Feature-named suites (`test_*_race.py`
+        # for `storage/engine.py`) never match by file name, but they import
+        # the module under test. Only files that define tests count: a
+        # conftest.py or helper module importing the app tests nothing.
+        has_tests = bool(
+            tinfo["standalone_tests"]
+            or tinfo["skipped_standalone_tests"]
+            or any(c["total_test_methods"] for c in tinfo["classes"])
+        )
+        tree = None
+        if has_tests and not tinfo["parse_error"]:
+            try:
+                tree = ast.parse(tf.read_text(encoding="utf-8", errors="replace"))
+            except (SyntaxError, ValueError):
+                tree = None
+        tinfo["imported_sources"] = sorted(
+            resolve_imported_sources(
+                tree, module_index, module_name(tf, project_root).rpartition(".")[0]
+            )
+            if tree is not None
+            else []
+        )
         test_info[rel] = tinfo
 
-    # Build the correlation map: source → tests.
+    # Build the correlation map: source → tests, remembering how each matched.
     source_to_tests: dict[str, list[str]] = {s: [] for s in source_info}
+    by_name: dict[str, list[str]] = {s: [] for s in source_info}
+    by_import: dict[str, list[str]] = {s: [] for s in source_info}
     for test_path, tinfo in test_info.items():
         for src in tinfo["matched_sources"]:
-            if src in source_to_tests:
-                source_to_tests[src].append(test_path)
+            if src in by_name:
+                by_name[src].append(test_path)
+        for src in tinfo["imported_sources"]:
+            if src in by_import:
+                by_import[src].append(test_path)
+    for src in source_info:
+        source_to_tests[src] = sorted(set(by_name[src]) | set(by_import[src]))
 
     # Identify untested source files.
     untested = [s for s, tests in source_to_tests.items() if not tests]
@@ -321,6 +544,7 @@ def main() -> None:
                 total_test_methods += len(cls["test_methods"])
                 total_skipped += len(cls["skipped_methods"])
             total_test_methods += len(ti["standalone_tests"])
+            total_skipped += len(ti["skipped_standalone_tests"])
 
         src_info = source_info[src]
         public_surface = (
@@ -328,9 +552,23 @@ def main() -> None:
             + sum(len(c["public_methods"]) for c in src_info["classes"])
         )
 
+        if by_name[src] and by_import[src]:
+            match_method = "name+import"
+        elif by_name[src]:
+            match_method = "name"
+        elif by_import[src]:
+            match_method = "import"
+        else:
+            match_method = None
         source_coverage.append({
             "source_file": src,
             "test_files": tests,
+            # How the correspondence was found: the test file's name matches
+            # the source's ("name"), a test file imports it ("import"), or
+            # both. A name match is the stronger signal.
+            "match_method": match_method,
+            "name_matched_test_files": by_name[src],
+            "import_matched_test_files": by_import[src],
             "test_method_count": total_test_methods,
             "skipped_test_count": total_skipped,
             "public_classes": len(src_info["classes"]),
@@ -342,6 +580,18 @@ def main() -> None:
     # Summary.
     total_source = len(source_info)
     tested = total_source - len(untested)
+    # Suite-wide counts. These used to be summed over `source_coverage`, which
+    # counts only correlated test files (about a fifth of a feature-named
+    # pytest suite) and counts
+    # a test file twice when it correlates with two sources.
+    suite_test_methods = 0
+    suite_skipped = 0
+    for ti in test_info.values():
+        suite_test_methods += len(ti["standalone_tests"])
+        suite_skipped += len(ti["skipped_standalone_tests"])
+        for cls in ti["classes"]:
+            suite_test_methods += len(cls["test_methods"])
+            suite_skipped += len(cls["skipped_methods"])
 
     output = {
         "project_root": str(project_root),
@@ -354,15 +604,18 @@ def main() -> None:
             "test_files": len(test_info),
             "source_files_with_tests": tested,
             "source_files_without_tests": len(untested),
+            "source_files_with_tests_by_name": sum(1 for v in by_name.values() if v),
+            "source_files_with_tests_by_import_only": sum(
+                1 for s in source_info if by_import[s] and not by_name[s]
+            ),
             "coverage_percentage": (
                 round(100 * tested / total_source, 1) if total_source else 0
             ),
-            "total_test_methods": sum(
-                sc["test_method_count"] for sc in source_coverage
-            ),
-            "total_skipped_tests": sum(
-                sc["skipped_test_count"] for sc in source_coverage
-            ),
+            # Every test function and method in every test file found
+            # (pytest-style module-level functions and plain-class methods
+            # included), skipped ones excluded; correlated or not.
+            "total_test_methods": suite_test_methods,
+            "total_skipped_tests": suite_skipped,
             # Non-empty when the tests were found OUTSIDE the scanned tree, so a
             # reader can tell "this package has no tests" from "the tests live
             # somewhere else and the scope missed them".
