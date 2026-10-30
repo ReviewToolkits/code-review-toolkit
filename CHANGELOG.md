@@ -300,7 +300,7 @@ mutant kills 92 tests, proving non-equivalence. Catalog **97 → 101 shapes**.
   recommends. The check meant to skip nested defs, but `continue` inside `ast.walk` only skips the
   `def` node; its body was already queued. It now walks with `_walk_same_scope`, which also stops a
   blocking call in a nested `async def` being reported twice (once per enclosing coroutine). Found
-  while preparing a pavedb review, whose routes offload work through exactly this shape (#46).
+  while preparing a review of a FastAPI service whose routes offload work through exactly this shape (#46).
 - **`check_typing.py` reported `0 type errors` whenever `FORCE_COLOR` is set in the
   environment.** mypy honours `FORCE_COLOR` even when its stdout is a pipe, and the ANSI codes land
   between the `file:line:` prefix and `error:`, so `_LINE` stopped matching and **every finding was
