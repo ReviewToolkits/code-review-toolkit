@@ -29,13 +29,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scan_common import (  # noqa: E402
-    find_project_root,
-)
 from run_lint_rules import (  # noqa: E402
     detect_target_version,
     dismissal_reason,
     except_closure_annotation,
+)
+from scan_common import (  # noqa: E402
+    find_project_root,
 )
 
 _KNOWN_TOOLS = ("ruff", "mypy", "vulture", "coverage")

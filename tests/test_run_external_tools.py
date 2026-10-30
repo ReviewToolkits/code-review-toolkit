@@ -842,11 +842,11 @@ class TestNoCacheInReviewedProject(unittest.TestCase):
             seen["cache"] = Path(cmd[cmd.index("--cache-dir") + 1])
             raise subprocess.TimeoutExpired(cmd, 300)
 
-        with TempProject({"m.py": "x = 1\n"}) as root:
-            with patch.object(mod.subprocess, "run", side_effect=fake_run):
-                result = mod.run_tool_safely(
-                    "mypy", mod.parse_args([str(root)]), root, root
-                )
+        with (
+            TempProject({"m.py": "x = 1\n"}) as root,
+            patch.object(mod.subprocess, "run", side_effect=fake_run),
+        ):
+            result = mod.run_tool_safely("mypy", mod.parse_args([str(root)]), root, root)
         self.assertIn("timed out", result["error"])
         self.assertFalse(seen["cache"].exists())
 
@@ -1148,10 +1148,12 @@ class TestVultureConfidence(unittest.TestCase):
     """Unused methods are scored 60% by vulture: the default must keep them."""
 
     def _run(self, argv=()):
-        with TempProject({"pkg/a.py": "x = 1\n"}) as root:
-            with patch.object(mod.subprocess, "run") as run:
-                run.return_value = MagicMock(stdout=VULTURE_OUTPUT, stderr="")
-                out = mod.run_vulture(mod.parse_args([str(root), *argv]), root, root)
+        with (
+            TempProject({"pkg/a.py": "x = 1\n"}) as root,
+            patch.object(mod.subprocess, "run") as run,
+        ):
+            run.return_value = MagicMock(stdout=VULTURE_OUTPUT, stderr="")
+            out = mod.run_vulture(mod.parse_args([str(root), *argv]), root, root)
         return out, run.call_args.args[0]
 
     def test_default_threshold_keeps_unused_methods(self):
@@ -1184,12 +1186,14 @@ class TestVultureConfidence(unittest.TestCase):
 
     def test_mypy_capping_is_reported(self):
         lines = "\n".join(f"a.py:{i}: error: Bad [misc]" for i in range(5))
-        with TempProject({"a.py": "x = 1\n"}) as root:
-            with patch.object(mod.subprocess, "run") as run:
-                run.return_value = MagicMock(stdout=lines, stderr="")
-                out = mod.run_mypy(
-                    mod.parse_args([str(root), "--max-findings", "2"]), root, root
-                )
+        with (
+            TempProject({"a.py": "x = 1\n"}) as root,
+            patch.object(mod.subprocess, "run") as run,
+        ):
+            run.return_value = MagicMock(stdout=lines, stderr="")
+            out = mod.run_mypy(
+                mod.parse_args([str(root), "--max-findings", "2"]), root, root
+            )
         self.assertEqual(len(out["findings"]), 2)
         self.assertEqual(out["total_findings"], 5)
         self.assertTrue(out["findings_capped"])
