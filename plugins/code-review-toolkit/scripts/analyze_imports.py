@@ -31,44 +31,233 @@ from scan_common import (  # noqa: E402
 # Comprehensive stdlib module list (Python 3.10+).  Used to distinguish
 # stdlib imports from third-party imports when we cannot rely on
 # importlib.metadata or sys.stdlib_module_names being available.
-_STDLIB_TOP_LEVEL = frozenset({
-    "__future__", "_thread", "abc", "aifc", "argparse", "array", "ast",
-    "asynchat", "asyncio", "asyncore", "atexit", "audioop", "base64",
-    "bdb", "binascii", "binhex", "bisect", "builtins", "bz2", "calendar",
-    "cgi", "cgitb", "chunk", "cmath", "cmd", "code", "codecs", "codeop",
-    "collections", "colorsys", "compileall", "concurrent", "configparser",
-    "contextlib", "contextvars", "copy", "copyreg", "cProfile", "crypt",
-    "csv", "ctypes", "curses", "dataclasses", "datetime", "dbm", "decimal",
-    "difflib", "dis", "distutils", "doctest", "email", "encodings",
-    "enum", "errno", "faulthandler", "fcntl", "filecmp", "fileinput",
-    "fnmatch", "fractions", "ftplib", "functools", "gc", "getopt",
-    "getpass", "gettext", "glob", "graphlib", "grp", "gzip", "hashlib",
-    "heapq", "hmac", "html", "http", "idlelib", "imaplib", "imghdr",
-    "imp", "importlib", "inspect", "io", "ipaddress", "itertools", "json",
-    "keyword", "lib2to3", "linecache", "locale", "logging", "lzma",
-    "mailbox", "mailcap", "marshal", "math", "mimetypes", "mmap",
-    "modulefinder", "multiprocessing", "netrc", "nis", "nntplib",
-    "numbers", "operator", "optparse", "os", "ossaudiodev", "pathlib",
-    "pdb", "pickle", "pickletools", "pipes", "pkgutil", "platform",
-    "plistlib", "poplib", "posix", "posixpath", "pprint", "profile",
-    "pstats", "pty", "pwd", "py_compile", "pyclbr", "pydoc", "queue",
-    "quopri", "random", "re", "readline", "reprlib", "resource",
-    "rlcompleter", "runpy", "sched", "secrets", "select", "selectors",
-    "shelve", "shlex", "shutil", "signal", "site", "smtpd", "smtplib",
-    "sndhdr", "socket", "socketserver", "spwd", "sqlite3", "sre_compile",
-    "sre_constants", "sre_parse", "ssl", "stat", "statistics", "string",
-    "stringprep", "struct", "subprocess", "sunau", "symtable", "sys",
-    "sysconfig", "syslog", "tabnanny", "tarfile", "telnetlib", "tempfile",
-    "termios", "test", "textwrap", "threading", "time", "timeit",
-    "tkinter", "token", "tokenize", "tomllib", "trace", "traceback",
-    "tracemalloc", "tty", "turtle", "turtledemo", "types", "typing",
-    "unicodedata", "unittest", "urllib", "uu", "uuid", "venv", "warnings",
-    "wave", "weakref", "webbrowser", "winreg", "winsound", "wsgiref",
-    "xdrlib", "xml", "xmlrpc", "zipapp", "zipfile", "zipimport", "zlib",
-    "zoneinfo", "_ast", "_collections_abc", "_compat_pickle", "_compression",
-    "_markupbase", "_osx_support", "_pydecimal", "_pyio", "_sitebuiltins",
-    "_strptime", "_threading_local", "_weakrefset", "antigravity", "this",
-})
+_STDLIB_TOP_LEVEL = frozenset(
+    {
+        "__future__",
+        "_thread",
+        "abc",
+        "aifc",
+        "argparse",
+        "array",
+        "ast",
+        "asynchat",
+        "asyncio",
+        "asyncore",
+        "atexit",
+        "audioop",
+        "base64",
+        "bdb",
+        "binascii",
+        "binhex",
+        "bisect",
+        "builtins",
+        "bz2",
+        "calendar",
+        "cgi",
+        "cgitb",
+        "chunk",
+        "cmath",
+        "cmd",
+        "code",
+        "codecs",
+        "codeop",
+        "collections",
+        "colorsys",
+        "compileall",
+        "concurrent",
+        "configparser",
+        "contextlib",
+        "contextvars",
+        "copy",
+        "copyreg",
+        "cProfile",
+        "crypt",
+        "csv",
+        "ctypes",
+        "curses",
+        "dataclasses",
+        "datetime",
+        "dbm",
+        "decimal",
+        "difflib",
+        "dis",
+        "distutils",
+        "doctest",
+        "email",
+        "encodings",
+        "enum",
+        "errno",
+        "faulthandler",
+        "fcntl",
+        "filecmp",
+        "fileinput",
+        "fnmatch",
+        "fractions",
+        "ftplib",
+        "functools",
+        "gc",
+        "getopt",
+        "getpass",
+        "gettext",
+        "glob",
+        "graphlib",
+        "grp",
+        "gzip",
+        "hashlib",
+        "heapq",
+        "hmac",
+        "html",
+        "http",
+        "idlelib",
+        "imaplib",
+        "imghdr",
+        "imp",
+        "importlib",
+        "inspect",
+        "io",
+        "ipaddress",
+        "itertools",
+        "json",
+        "keyword",
+        "lib2to3",
+        "linecache",
+        "locale",
+        "logging",
+        "lzma",
+        "mailbox",
+        "mailcap",
+        "marshal",
+        "math",
+        "mimetypes",
+        "mmap",
+        "modulefinder",
+        "multiprocessing",
+        "netrc",
+        "nis",
+        "nntplib",
+        "numbers",
+        "operator",
+        "optparse",
+        "os",
+        "ossaudiodev",
+        "pathlib",
+        "pdb",
+        "pickle",
+        "pickletools",
+        "pipes",
+        "pkgutil",
+        "platform",
+        "plistlib",
+        "poplib",
+        "posix",
+        "posixpath",
+        "pprint",
+        "profile",
+        "pstats",
+        "pty",
+        "pwd",
+        "py_compile",
+        "pyclbr",
+        "pydoc",
+        "queue",
+        "quopri",
+        "random",
+        "re",
+        "readline",
+        "reprlib",
+        "resource",
+        "rlcompleter",
+        "runpy",
+        "sched",
+        "secrets",
+        "select",
+        "selectors",
+        "shelve",
+        "shlex",
+        "shutil",
+        "signal",
+        "site",
+        "smtpd",
+        "smtplib",
+        "sndhdr",
+        "socket",
+        "socketserver",
+        "spwd",
+        "sqlite3",
+        "sre_compile",
+        "sre_constants",
+        "sre_parse",
+        "ssl",
+        "stat",
+        "statistics",
+        "string",
+        "stringprep",
+        "struct",
+        "subprocess",
+        "sunau",
+        "symtable",
+        "sys",
+        "sysconfig",
+        "syslog",
+        "tabnanny",
+        "tarfile",
+        "telnetlib",
+        "tempfile",
+        "termios",
+        "test",
+        "textwrap",
+        "threading",
+        "time",
+        "timeit",
+        "tkinter",
+        "token",
+        "tokenize",
+        "tomllib",
+        "trace",
+        "traceback",
+        "tracemalloc",
+        "tty",
+        "turtle",
+        "turtledemo",
+        "types",
+        "typing",
+        "unicodedata",
+        "unittest",
+        "urllib",
+        "uu",
+        "uuid",
+        "venv",
+        "warnings",
+        "wave",
+        "weakref",
+        "webbrowser",
+        "winreg",
+        "winsound",
+        "wsgiref",
+        "xdrlib",
+        "xml",
+        "xmlrpc",
+        "zipapp",
+        "zipfile",
+        "zipimport",
+        "zlib",
+        "zoneinfo",
+        "_ast",
+        "_collections_abc",
+        "_compat_pickle",
+        "_compression",
+        "_markupbase",
+        "_osx_support",
+        "_pydecimal",
+        "_pyio",
+        "_sitebuiltins",
+        "_strptime",
+        "_threading_local",
+        "_weakrefset",
+        "antigravity",
+        "this",
+    }
+)
 
 
 def _is_stdlib(top_level_name: str) -> bool:
@@ -176,9 +365,7 @@ def analyze_file(
                 if isinstance(handler.type, ast.Name):
                     names = [handler.type.id]
                 elif isinstance(handler.type, ast.Tuple):
-                    names = [
-                        e.id for e in handler.type.elts if isinstance(e, ast.Name)
-                    ]
+                    names = [e.id for e in handler.type.elts if isinstance(e, ast.Name)]
                 if any(n in ("ImportError", "ModuleNotFoundError") for n in names):
                     start = node.body[0].lineno if node.body else node.lineno
                     end = node.end_lineno or node.lineno
@@ -208,22 +395,22 @@ def analyze_file(
             for alias in node.names:
                 top = alias.name.split(".")[0]
                 category = _classify(top, project_packages)
-                result["imports"].append({
-                    "module": alias.name,
-                    "names": None,
-                    "alias": alias.asname,
-                    "top_level": top,
-                    "category": category,
-                    "line": node.lineno,
-                    "is_relative": False,
-                    "relative_level": 0,
-                    "type_checking_only": _in_type_checking(node.lineno),
-                    "conditional": _is_conditional(node.lineno),
-                })
+                result["imports"].append(
+                    {
+                        "module": alias.name,
+                        "names": None,
+                        "alias": alias.asname,
+                        "top_level": top,
+                        "category": category,
+                        "line": node.lineno,
+                        "is_relative": False,
+                        "relative_level": 0,
+                        "type_checking_only": _in_type_checking(node.lineno),
+                        "conditional": _is_conditional(node.lineno),
+                    }
+                )
         elif isinstance(node, ast.ImportFrom):
-            names_imported = [
-                {"name": a.name, "alias": a.asname} for a in node.names
-            ]
+            names_imported = [{"name": a.name, "alias": a.asname} for a in node.names]
             level = node.level or 0
             module_str = node.module or ""
             is_relative = level > 0
@@ -238,22 +425,27 @@ def analyze_file(
                 top = module_str.split(".")[0] if module_str else None
                 category = _classify(top, project_packages)
 
-            result["imports"].append({
-                "module": module_str,
-                "names": names_imported,
-                "alias": None,
-                "top_level": top,
-                "category": category,
-                "line": node.lineno,
-                "is_relative": is_relative,
-                "relative_level": level,
-                "resolved_module": (
-                    _resolve_relative_import(filepath, project_root, level, node.module)
-                    if is_relative else None
-                ),
-                "type_checking_only": _in_type_checking(node.lineno),
-                "conditional": _is_conditional(node.lineno),
-            })
+            result["imports"].append(
+                {
+                    "module": module_str,
+                    "names": names_imported,
+                    "alias": None,
+                    "top_level": top,
+                    "category": category,
+                    "line": node.lineno,
+                    "is_relative": is_relative,
+                    "relative_level": level,
+                    "resolved_module": (
+                        _resolve_relative_import(
+                            filepath, project_root, level, node.module
+                        )
+                        if is_relative
+                        else None
+                    ),
+                    "type_checking_only": _in_type_checking(node.lineno),
+                    "conditional": _is_conditional(node.lineno),
+                }
+            )
 
     return result
 
@@ -301,13 +493,15 @@ def build_internal_graph(
             if imp["category"] != "internal":
                 continue
             target_module = imp.get("resolved_module") or imp["module"]
-            edges.append({
-                "target": target_module,
-                "names": imp.get("names"),
-                "line": imp["line"],
-                "type_checking_only": imp["type_checking_only"],
-                "conditional": imp["conditional"],
-            })
+            edges.append(
+                {
+                    "target": target_module,
+                    "names": imp.get("names"),
+                    "line": imp["line"],
+                    "type_checking_only": imp["type_checking_only"],
+                    "conditional": imp["conditional"],
+                }
+            )
         if edges:
             graph[source] = edges
     return graph
@@ -400,9 +594,7 @@ def detect_cycles(
     adj: dict[str, list[dict]] = {}
     for source, edges in graph.items():
         adj[source] = [
-            e
-            for e in edges
-            if include_type_checking or not e.get("type_checking_only")
+            e for e in edges if include_type_checking or not e.get("type_checking_only")
         ]
 
     # Collect all known file-stem identifiers so we can map dotted targets
@@ -503,10 +695,7 @@ def main() -> None:
     if max_files > 0 and files_total > max_files:
         all_files = all_files[:max_files]
 
-    file_analyses = [
-        analyze_file(f, project_root, project_packages)
-        for f in all_files
-    ]
+    file_analyses = [analyze_file(f, project_root, project_packages) for f in all_files]
 
     all_file_paths = [fa["file"] for fa in file_analyses]
     internal_graph = build_internal_graph(file_analyses)
@@ -518,18 +707,18 @@ def main() -> None:
     for fa in file_analyses:
         for imp in fa["imports"]:
             if imp["category"] == "external" and imp["top_level"]:
-                external.setdefault(
-                    imp["top_level"], []
-                ).append(fa["file"])
+                external.setdefault(imp["top_level"], []).append(fa["file"])
 
     # Collect re-exports.
     re_exports: list[dict] = []
     for fa in file_analyses:
         if fa["is_init"] and fa["all_declaration"] is not None:
-            re_exports.append({
-                "file": fa["file"],
-                "all": fa["all_declaration"],
-            })
+            re_exports.append(
+                {
+                    "file": fa["file"],
+                    "all": fa["all_declaration"],
+                }
+            )
         elif fa["is_init"]:
             # __init__.py without __all__ — list what it imports.
             init_imports = [
@@ -538,11 +727,13 @@ def main() -> None:
                 if imp["category"] == "internal"
             ]
             if init_imports:
-                re_exports.append({
-                    "file": fa["file"],
-                    "all": None,
-                    "re_imported_modules": init_imports,
-                })
+                re_exports.append(
+                    {
+                        "file": fa["file"],
+                        "all": None,
+                        "re_imported_modules": init_imports,
+                    }
+                )
 
     # Prune intermediate fields from file analyses to reduce memory.
     for fa in file_analyses:
@@ -601,8 +792,7 @@ def main() -> None:
         "files": file_analyses,
         "internal_graph": internal_graph,
         "external_dependencies": {
-            k: sorted(set(v))
-            for k, v in sorted(external.items())
+            k: sorted(set(v)) for k, v in sorted(external.items())
         },
         "metrics": metrics,
         "cycles": cycles,

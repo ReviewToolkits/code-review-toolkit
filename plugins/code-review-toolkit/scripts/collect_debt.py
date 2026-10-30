@@ -31,15 +31,11 @@ _MARKER_PATTERNS: dict[str, re.Pattern[str]] = {
     "XXX": re.compile(r"#\s*XXX\b[:\s]*(.*)", re.IGNORECASE),
     "NOQA": re.compile(r"#\s*noqa\b[:\s]*(.*)", re.IGNORECASE),
     "TYPE_IGNORE": re.compile(r"#\s*type:\s*ignore\b(.*)", re.IGNORECASE),
-    "PRAGMA_NO_COVER": re.compile(
-        r"#\s*pragma:\s*no\s*cover\b(.*)", re.IGNORECASE
-    ),
+    "PRAGMA_NO_COVER": re.compile(r"#\s*pragma:\s*no\s*cover\b(.*)", re.IGNORECASE),
 }
 
 # Decorator-based markers (searched in AST-like fashion via regex).
-_SKIP_PATTERN = re.compile(
-    r"@(?:unittest\.)?skip(?:If|Unless)?\s*\(", re.IGNORECASE
-)
+_SKIP_PATTERN = re.compile(r"@(?:unittest\.)?skip(?:If|Unless)?\s*\(", re.IGNORECASE)
 
 
 def _has_git(project_root: Path) -> bool:
@@ -97,9 +93,7 @@ def _classify_age(date_str: str | None) -> str:
         return "unknown"
 
 
-def scan_file(
-    filepath: Path, project_root: Path, use_git: bool
-) -> list[dict]:
+def scan_file(filepath: Path, project_root: Path, use_git: bool) -> list[dict]:
     """Scan a file for debt markers."""
     try:
         lines = filepath.read_text(encoding="utf-8", errors="replace").splitlines()

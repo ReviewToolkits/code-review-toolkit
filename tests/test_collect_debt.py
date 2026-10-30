@@ -35,7 +35,9 @@ class TestMarkerDetection(unittest.TestCase):
     def test_workaround(self):
         items = self._scan("# WORKAROUND: upstream bug\n")
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["category"], "HACK")  # HACK and WORKAROUND share category
+        self.assertEqual(
+            items[0]["category"], "HACK"
+        )  # HACK and WORKAROUND share category
 
     def test_xxx(self):
         items = self._scan("# XXX: needs review\n")
@@ -58,22 +60,14 @@ class TestMarkerDetection(unittest.TestCase):
         self.assertEqual(items[0]["category"], "PRAGMA_NO_COVER")
 
     def test_case_insensitive(self):
-        items = self._scan(
-            "# todo: lowercase\n"
-            "# Todo: mixed case\n"
-            "# TODO: uppercase\n"
-        )
+        items = self._scan("# todo: lowercase\n# Todo: mixed case\n# TODO: uppercase\n")
         self.assertEqual(len(items), 3)
         for item in items:
             self.assertEqual(item["category"], "TODO")
 
     def test_skip_decorator(self):
         items = self._scan(
-            "import unittest\n"
-            "\n"
-            "@unittest.skip('broken')\n"
-            "def test_foo():\n"
-            "    pass\n"
+            "import unittest\n\n@unittest.skip('broken')\ndef test_foo():\n    pass\n"
         )
         skip_items = [i for i in items if i["category"] == "SKIP"]
         self.assertEqual(len(skip_items), 1)
@@ -102,21 +96,14 @@ class TestMarkerDetection(unittest.TestCase):
 
     def test_context_captured(self):
         items = self._scan(
-            "def process():\n"
-            "    # TODO: optimize this loop\n"
-            "    for x in range(100):\n"
+            "def process():\n    # TODO: optimize this loop\n    for x in range(100):\n"
         )
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["context_before"], "def process():")
         self.assertEqual(items[0]["context_after"], "for x in range(100):")
 
     def test_line_numbers_correct(self):
-        items = self._scan(
-            "line1 = 1\n"
-            "line2 = 2\n"
-            "# TODO: on line 3\n"
-            "line4 = 4\n"
-        )
+        items = self._scan("line1 = 1\nline2 = 2\n# TODO: on line 3\nline4 = 4\n")
         self.assertEqual(items[0]["line"], 3)
 
 
@@ -154,21 +141,15 @@ class TestEndToEnd(unittest.TestCase):
     """Integration test: scan a small project without git."""
 
     def test_project_scan(self):
-        with TempProject({
-            "pkg/core.py": (
-                "# TODO: refactor this\n"
-                "def main():\n"
-                "    pass  # FIXME: implement\n"
-            ),
-            "pkg/utils.py": (
-                "def helper():\n"
-                "    return 42\n"
-            ),
-            "tests/test_core.py": (
-                "import unittest\n"
-                "# TODO: add more tests\n"
-            ),
-        }) as root:
+        with TempProject(
+            {
+                "pkg/core.py": (
+                    "# TODO: refactor this\ndef main():\n    pass  # FIXME: implement\n"
+                ),
+                "pkg/utils.py": ("def helper():\n    return 42\n"),
+                "tests/test_core.py": ("import unittest\n# TODO: add more tests\n"),
+            }
+        ) as root:
             files = mod.discover_python_files(root)
             all_items = []
             for f in files:
@@ -188,19 +169,21 @@ class TestMaxFiles(unittest.TestCase):
 
     def test_max_files_caps_output(self):
         files = {
-            f"pkg/mod{i}.py": f"# TODO: fix mod{i}\nx{i} = {i}\n"
-            for i in range(10)
+            f"pkg/mod{i}.py": f"# TODO: fix mod{i}\nx{i} = {i}\n" for i in range(10)
         }
         files["pkg/__init__.py"] = ""
         with TempProject(files) as root:
             import io
             import sys
+
             old_stdout = sys.stdout
             sys.stdout = io.StringIO()
             old_argv = sys.argv
             sys.argv = [
-                "collect_debt.py", str(root),
-                "--max-files", "3",
+                "collect_debt.py",
+                str(root),
+                "--max-files",
+                "3",
             ]
             try:
                 mod.main()
