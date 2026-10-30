@@ -28,13 +28,20 @@ where `<plugin_root>` is the root of the code-review-toolkit plugin directory.
 Parse the JSON output. This gives you file/function churn, commit classification, recent fixes/features/refactors, and co-change clusters. Use this as your factual foundation.
 
 Key fields:
-- `summary`: total commits, commits by type (fix/feature/refactor/docs/test/chore/unknown), files changed, functions changed, author count
-- `file_churn`: per-file commit counts, lines added/removed, churn rate, author count
-- `function_churn`: per-function commit counts and lines changed
-- `recent_fixes`: detailed info on fix commits with diffs and functions modified
+- `summary`: total commits, commits by type (fix/feature/refactor/docs/test/chore/unknown), `classified_by` (which signal decided each type: `conventional` type, leading bracketed `tag`, tracker `key`, `keyword`, or `none`), files changed, functions changed, author count
+- `tracker_keys`: tracker keys found in subjects (`K7`, `T1-20`, `ABC-123`). `by_prefix` shows how each prefix's commits were classified; `repeated` lists keys carried by more than one commit (a multi-part fix, or a fix that had to be redone)
+- `file_churn`: per-file commit counts, lines added/removed, churn rate, author count. `first_commit_in_range` and `last_modified` are committer dates, the same clock `--since`/`--until` select on (`time_range.date_basis`)
+- `function_churn`: per-function churn, keyed by file path and qualified name (`Class.method`, `factory.handler`). Each commit's hunks are mapped onto the functions of *that commit's* version of the file, and a change inside a nested function is credited to it, not to its enclosing function. `commits`, `lines_added`/`lines_removed`/`lines_changed` (lines changed inside the function over the window), `current_length` (its length at HEAD), `line_start`/`line_end` at HEAD, and `exists_at_head` (false, with null lines, for a function since deleted or renamed)
+- `function_attribution`: how many commits and file changes could not be attributed (a timeout, the parse cap, or a file version that does not parse). When it is non-zero, the function counts are lower bounds; say so
+- `recent_fixes`: detailed info on fix commits with diffs and `functions_modified` (named at that commit; `functions_modified_complete` is false when a file could not be attributed). `date` is the author date, `committer_date` the committer date
 - `recent_features`: detailed info on feature commits
 - `recent_refactors`: detailed info on refactor commits
 - `co_change_clusters`: file pairs that frequently change together with co-occurrence counts
+- `unmerged_branches`: remote branches with commits the default branch (`base`) lacks, as of the last fetch: `ahead`/`behind`, `last_commit_date`, up to 20 commit subjects with their type and keys, and the in-scope files they change. This is prior art. Name every branch carrying fix commits under Context for Subsequent Agents, so a finding already fixed or attempted there is reported as such and not as new
+
+**Tracker keys.** If `notes` says many commits are `unknown` and `tracker_keys.by_prefix` shows a prefix whose commits are mostly `unknown`, find what the prefix means (CONTRIBUTING, the roadmap, the tracker) and re-run with `--key-type PREFIX=TYPE` (for example `--key-type B=fix,F=feature` where B keys mark bugs and F keys features) before quoting a fix:feature ratio. State the mapping you used in the report.
+
+Other flags: `--no-branches` skips the unmerged-branch listing; `--no-function` skips function churn.
 
 ## Analysis
 
