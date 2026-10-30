@@ -770,5 +770,98 @@ class TestDynamicImportExpansion(unittest.TestCase):
         self.assertEqual(out["dynamic_cycles"], [])
 
 
+def _effects(src: str) -> list[dict]:
+    import ast as _ast
+
+    return mod.import_time_side_effects(_ast.parse(src))
+
+
+class TestImportTimeSideEffects(unittest.TestCase):
+    """Process-wide operations a module performs on import."""
+
+    def test_root_logger_setup_through_a_called_helper(self):
+        src = (
+            "import logging\n"
+            "def _setup():\n"
+            "    root = logging.getLogger()\n"
+            "    root.handlers = []\n"
+            "    root.addHandler(logging.StreamHandler())\n"
+            "    return root\n"
+            "_LOG = _setup()\n"
+        )
+        effects = _effects(src)
+        self.assertEqual(
+            [(e["line"], e["category"], e["via"], e["call_line"]) for e in effects],
+            [(4, "logging", ["_setup"], 7), (5, "logging", ["_setup"], 7)],
+        )
+
+    def test_direct_module_level_operations(self):
+        src = (
+            "import os, sys, warnings\n"
+            "from logging import basicConfig\n"
+            "basicConfig(level=10)\n"
+            "os.environ['MODE'] = 'x'\n"
+            "os.environ.setdefault('A', '1')\n"
+            "sys.path.insert(0, '.')\n"
+            "warnings.simplefilter('ignore')\n"
+            "with open('state.txt', 'w') as fh:\n"
+            "    pass\n"
+        )
+        self.assertEqual(
+            [(e["line"], e["category"]) for e in _effects(src)],
+            [
+                (3, "logging"),
+                (4, "environment"),
+                (5, "environment"),
+                (6, "sys"),
+                (7, "process_global"),
+                (8, "filesystem"),
+            ],
+        )
+
+    def test_transitive_chain_records_the_whole_path(self):
+        src = (
+            "import os\n"
+            "def _inner():\n    os.makedirs('cache', exist_ok=True)\n"
+            "def _outer():\n    _inner()\n"
+            "class Config:\n    DIR = _outer()\n"
+        )
+        (effect,) = _effects(src)
+        self.assertEqual(effect["via"], ["_outer", "_inner"])
+        self.assertEqual(effect["call_line"], 7)
+
+    def test_uncalled_function_main_guard_and_reads_are_not_effects(self):
+        src = (
+            "import logging, os, sys\n"
+            "log = logging.getLogger(__name__)\n"
+            "log.setLevel(logging.DEBUG)\n"
+            "MODE = os.environ.get('MODE')\n"
+            "def configure():\n    logging.basicConfig()\n"
+            "def read():\n    return open('data.txt').read()\n"
+            "if __name__ == '__main__':\n"
+            "    configure()\n    sys.path.insert(0, '.')\n"
+        )
+        self.assertEqual(_effects(src), [])
+
+    def test_reported_by_analyze(self):
+        files = {
+            "pkg/__init__.py": "",
+            "pkg/log.py": "import logging\nlogging.basicConfig()\n",
+        }
+        with TempProject(files) as root:
+            out = mod.analyze(str(root))
+        self.assertEqual(
+            out["import_time_side_effects"],
+            [
+                {
+                    "file": "pkg/log.py",
+                    "line": 2,
+                    "category": "logging",
+                    "operation": "logging.basicConfig",
+                }
+            ],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

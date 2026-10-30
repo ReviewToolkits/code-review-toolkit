@@ -535,7 +535,311 @@ def analyze_file(
             )
 
     result["dynamic_import_sites"] = dynamic_sites
+    result["import_time_side_effects"] = import_time_side_effects(tree)
     return result
+
+
+# --- import-time side effects ------------------------------------------------
+#
+# A module-level statement runs when the module is imported, so a library that
+# calls `logging.basicConfig()` -- or a helper that does -- at import time
+# rewrites its host's logging the moment anyone imports it. These are the
+# process-wide operations worth knowing about; each maps to a category.
+_SIDE_EFFECT_CALLS: dict[str, str] = {
+    **dict.fromkeys(
+        (
+            "logging.basicConfig",
+            "logging.disable",
+            "logging.captureWarnings",
+            "logging.setLoggerClass",
+            "logging.setLogRecordFactory",
+            "logging.config.dictConfig",
+            "logging.config.fileConfig",
+        ),
+        "logging",
+    ),
+    **dict.fromkeys(
+        (
+            "os.putenv",
+            "os.unsetenv",
+            "os.environ.update",
+            "os.environ.setdefault",
+            "os.environ.pop",
+            "os.environ.popitem",
+            "os.environ.clear",
+            "os.environ.__setitem__",
+            "os.environ.__delitem__",
+        ),
+        "environment",
+    ),
+    **dict.fromkeys(
+        (
+            "open",
+            "os.makedirs",
+            "os.mkdir",
+            "os.remove",
+            "os.unlink",
+            "os.rename",
+            "os.replace",
+            "os.rmdir",
+            "os.removedirs",
+            "os.symlink",
+            "os.chmod",
+            "shutil.copy",
+            "shutil.copy2",
+            "shutil.copyfile",
+            "shutil.copytree",
+            "shutil.move",
+            "shutil.rmtree",
+            "tempfile.mkdtemp",
+            "tempfile.mkstemp",
+            "logging.FileHandler",
+            "logging.handlers.RotatingFileHandler",
+            "logging.handlers.TimedRotatingFileHandler",
+        ),
+        "filesystem",
+    ),
+    **dict.fromkeys(
+        (
+            "sys.path.insert",
+            "sys.path.append",
+            "sys.path.extend",
+            "sys.setrecursionlimit",
+            "sys.settrace",
+            "sys.setprofile",
+            "sys.setswitchinterval",
+        ),
+        "sys",
+    ),
+    **dict.fromkeys(
+        (
+            "os.chdir",
+            "os.umask",
+            "signal.signal",
+            "warnings.filterwarnings",
+            "warnings.simplefilter",
+            "socket.setdefaulttimeout",
+            "locale.setlocale",
+            "faulthandler.enable",
+            "asyncio.set_event_loop_policy",
+            "multiprocessing.set_start_method",
+        ),
+        "process_global",
+    ),
+}
+# Assigning to (or into) one of these replaces process-wide state.
+_SIDE_EFFECT_TARGETS: dict[str, str] = {
+    "os.environ": "environment",
+    "sys.path": "sys",
+    "sys.modules": "sys",
+    "sys.excepthook": "sys",
+    "sys.stdout": "sys",
+    "sys.stderr": "sys",
+    "sys.stdin": "sys",
+    "threading.excepthook": "process_global",
+}
+# pathlib methods that write to disk.
+_FS_METHODS = frozenset({"mkdir", "write_text", "write_bytes", "touch"})
+# Mutations of a logger object; flagged only on the ROOT logger.
+_LOGGER_MUTATORS = frozenset(
+    {"addHandler", "removeHandler", "setLevel", "addFilter", "removeFilter"}
+)
+_LIST_MUTATORS = frozenset({"append", "extend", "insert", "remove", "clear", "pop"})
+
+
+def _import_aliases(tree: ast.Module) -> dict[str, str]:
+    """Local name -> dotted origin for module-level imports (`environ` ->
+    `os.environ`, `lg` -> `logging`)."""
+    aliases: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname:
+                    aliases[alias.asname] = alias.name
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            for alias in node.names:
+                aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+    return aliases
+
+
+def _is_main_guard(node: ast.If) -> bool:
+    test = node.test
+    return (
+        isinstance(test, ast.Compare)
+        and isinstance(test.left, ast.Name)
+        and test.left.id == "__name__"
+    )
+
+
+def _is_type_checking_guard(node: ast.If) -> bool:
+    test = node.test
+    return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+        isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+    )
+
+
+def _executed_nodes(stmts: list[ast.stmt]):
+    """Every node *stmts* execute when run, without entering nested function or
+    lambda bodies, `if __name__ == "__main__":` or `if TYPE_CHECKING:`."""
+    stack: list[ast.AST] = list(reversed(stmts))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # Decorators and defaults run at definition time; the body does not.
+            children: list[ast.AST] = [*node.decorator_list, node.args]
+        elif isinstance(node, ast.Lambda):
+            children = [node.args]
+        elif isinstance(node, ast.If) and (
+            _is_main_guard(node) or _is_type_checking_guard(node)
+        ):
+            children = list(node.orelse)
+        else:
+            children = list(ast.iter_child_nodes(node))
+        stack.extend(reversed(children))
+
+
+def import_time_side_effects(tree: ast.Module) -> list[dict]:
+    """Process-wide operations a module performs when it is imported.
+
+    Covers module-level (and class-body) code, plus the bodies of module-level
+    functions that code calls -- transitively, within the same file -- since
+    `_LOG = _setup_logging()` runs `_setup_logging` on import. Each entry has
+    the `line` of the operation, its `category` (logging, environment,
+    filesystem, sys, process_global), the `operation`, and, when it happens
+    inside a called function, `via` (the call chain) and `call_line` (the
+    module-level call that triggers it).
+    """
+    aliases = _import_aliases(tree)
+    functions = {
+        n.name: n
+        for n in tree.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    def canon(node: ast.AST) -> str:
+        name = _dotted_name(node)
+        head, _, rest = name.partition(".")
+        if head in aliases:
+            return f"{aliases[head]}.{rest}" if rest else aliases[head]
+        return name
+
+    def is_root_logger(node: ast.AST, roots: set[str]) -> bool:
+        if isinstance(node, ast.Name) and node.id in roots:
+            return True
+        if isinstance(node, ast.Attribute) and canon(node) == "logging.root":
+            return True
+        if isinstance(node, ast.Call) and canon(node.func) == "logging.getLogger":
+            if not node.args and not node.keywords:
+                return True
+            arg = node.args[0] if node.args else node.keywords[0].value
+            return isinstance(arg, ast.Constant) and arg.value in (None, "")
+        return False
+
+    def effect(node: ast.AST, roots: set[str]) -> tuple[str, str] | None:
+        if isinstance(node, ast.Call):
+            name = canon(node.func)
+            if name in _SIDE_EFFECT_CALLS:
+                if name == "open" and not _opens_for_writing(node):
+                    return None
+                return _SIDE_EFFECT_CALLS[name], name
+            func = node.func
+            if isinstance(func, ast.Attribute):
+                if func.attr in _LOGGER_MUTATORS and is_root_logger(func.value, roots):
+                    return "logging", f"root logger .{func.attr}()"
+                if (
+                    func.attr in _LIST_MUTATORS
+                    and isinstance(func.value, ast.Attribute)
+                    and func.value.attr == "handlers"
+                    and is_root_logger(func.value.value, roots)
+                ):
+                    return "logging", f"root logger .handlers.{func.attr}()"
+                if func.attr in _FS_METHODS:
+                    return "filesystem", f".{func.attr}()"
+            return None
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)) and node.value:
+            targets = [node.target]
+        elif isinstance(node, ast.Delete):
+            targets = list(node.targets)
+        for target in targets:
+            base = target.value if isinstance(target, ast.Subscript) else target
+            name = canon(base)
+            if name in _SIDE_EFFECT_TARGETS:
+                return _SIDE_EFFECT_TARGETS[name], f"{name} assignment"
+            if (
+                isinstance(base, ast.Attribute)
+                and base.attr in ("handlers", "level", "propagate")
+                and is_root_logger(base.value, roots)
+            ):
+                return "logging", f"root logger .{base.attr} assignment"
+        return None
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    queue: list[tuple[list[ast.stmt], list[str], int | None]] = [(tree.body, [], None)]
+    while queue:
+        body, via, call_line = queue.pop(0)
+        nodes = list(_executed_nodes(body))
+        roots = {
+            t.id
+            for n in nodes
+            if isinstance(n, ast.Assign) and is_root_logger(n.value, set())
+            for t in n.targets
+            if isinstance(t, ast.Name)
+        }
+        for node in nodes:
+            found = effect(node, roots)
+            if found:
+                entry = {
+                    "line": node.lineno,
+                    "category": found[0],
+                    "operation": found[1],
+                }
+                if via:
+                    entry["via"] = via
+                    entry["call_line"] = call_line
+                out.append(entry)
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in functions
+                and node.func.id not in seen
+            ):
+                seen.add(node.func.id)
+                queue.append(
+                    (
+                        functions[node.func.id].body,
+                        [*via, node.func.id],
+                        call_line if via else node.lineno,
+                    )
+                )
+    out.sort(key=lambda e: (e.get("call_line") or e["line"], e["line"]))
+    return out
+
+
+def _dotted_name(node: ast.AST) -> str:
+    """`a.b.c` for a Name/Attribute chain, else ''."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        inner = _dotted_name(node.value)
+        return f"{inner}.{node.attr}" if inner else ""
+    return ""
+
+
+def _opens_for_writing(call: ast.Call) -> bool:
+    mode = call.args[1] if len(call.args) > 1 else None
+    for kw in call.keywords:
+        if kw.arg == "mode":
+            mode = kw.value
+    return (
+        isinstance(mode, ast.Constant)
+        and isinstance(mode.value, str)
+        and any(c in mode.value for c in "wax+")
+    )
 
 
 def _scope_map(tree: ast.AST) -> dict[int, tuple[str, str | None]]:
@@ -999,6 +1303,11 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
         for fa in file_analyses
         for site in fa.get("dynamic_import_sites", [])
     ]
+    side_effects = [
+        {"file": fa["file"], **effect}
+        for fa in file_analyses
+        for effect in fa.get("import_time_side_effects", [])
+    ]
     possible_edges = expand_dynamic_sites(
         dynamic_import_sites, all_file_paths, project_root
     )
@@ -1112,6 +1421,11 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
         # (`dynamic_import_sites[].expanded_targets`). Possible, not certain:
         # the code may only ever load some of those modules.
         "dynamic_cycles": cycles_via_dynamic,
+        # Process-wide operations a module performs when it is imported
+        # (root-logger setup, environment writes, files, sys.path, signal and
+        # warning filters), directly or through a module-level function the
+        # module calls on import (`via`, `call_line`).
+        "import_time_side_effects": side_effects,
         "re_exports": re_exports,
     }
     return output
