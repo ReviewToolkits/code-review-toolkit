@@ -56,7 +56,7 @@ gh api -X GET search/issues -f q="repo:$R is:issue TERM1 TERM2" \
   GitLab "work items" (tasks, epics) may not appear in the issues endpoint; check the project's
   web UI once to see where its tracking lives.
 - **No public tracker, or a private one.** Many projects track work by **keys** in commit subjects
-  and docs (`[fix] ... (B92)`, `ABC-123`, a `ROADMAP.md` or `TODO.md` with key → status). That is
+  and docs (`[fix] ... (B12)`, `ABC-123`, a `ROADMAP.md` or `TODO.md` with key → status). That is
   prior art too, and it's local:
 
   ```bash
