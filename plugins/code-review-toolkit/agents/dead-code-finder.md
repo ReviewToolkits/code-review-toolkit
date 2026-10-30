@@ -27,11 +27,13 @@ Parse the JSON output. This gives you unused imports, unreferenced functions/cla
 
 Key fields:
 - `unused_imports`: with `confidence` ratings, accounting for `__all__` and `__init__.py` re-exports. `line` is the line of the imported **name** (the line ruff F401 reports), so the two merge by `file:line`; `statement_line` is where the `import` statement starts
-- `unreferenced_symbols`: functions, classes **and methods** (`type: "method"`) with no reference anywhere — not in the scanned tree, its tests, its scripts or its docs — with `confidence` ratings, accounting for magic methods, test discovery, and `__main__` guards. A private method with no reference is `medium`; a public one is `low`, because code outside the project may call it
+- `unreferenced_symbols`: functions, classes **and methods** (`type: "method"`) with no reference anywhere — not in the scanned tree, its tests, its scripts, its docs or its templates — with `confidence` ratings, accounting for magic methods, test discovery, and `__main__` guards. A private method with no reference is `medium`; a public one is `low`, because code outside the project may call it. When several classes define a method of the same name, a `self.`/`cls.`/`super().` call counts only within the calling class's hierarchy, so `A._load()` no longer keeps an unrelated `B._load()` alive; a call through any other receiver (`obj._load()`) still counts for every class
 - `referenced_only_from_tests`: production functions, classes and methods whose **only** references are in tests (`mentioned_in_docs` says whether the docs name it too). Not dead — removing one means editing tests, and it may be deliberate API — but a refactor often leaves exactly this behind: the production caller is gone and only the tests written for it keep it alive. Report as CONSIDER, never FIX
 - `orphan_files`: with `confidence` ratings
 - `commented_code_blocks`: with line ranges and previews
 - `summary`: aggregate counts for each category plus high/medium/low confidence totals. `methods_excluded_by_reason` counts the methods a name-reference scan cannot judge and so left out: `dunder`, `sunder_hook` (`_missing_`), `test_file`, `decorated` (a registering decorator such as `@app.get(...)` or `@validator`), `property_accessor`, `framework_base` (the class inherits from a class outside the project, so a method may override a hook the framework calls), `dynamic_dispatch` (a computed `getattr(self, f"cmd_{x}")` can reach it). Say in the report how many methods were checked and how many were left out; never present an empty list as "every method is used"
+- `summary.functions_excluded_by_reason`: top-level functions left out because a decorator registers them (`@dispatcher.register(list)`, `@app.get(...)`, `@pytest.fixture`)
+- `summary.template_files_scanned`: Jinja/HTML templates inside the scan whose `{{ }}`/`{% %}` blocks were read as production references. Templates elsewhere (a sibling `templates/` directory, a string template) are not read: Grep them before calling a symbol unused
 - `summary.external_reference_scope_kinds`: which directories outside the scan supplied references, as `test`, `docs` or `production` (`setup.py`, `scripts/`, `tools/`, `benchmarks/`, `examples/`, `bin/`)
 
 ## External Tool Integration
@@ -54,7 +56,7 @@ Filter the ruff output for `category: "dead-code"` findings:
 
 **Auto-fixable findings** (significance: "reduced"): ruff can auto-fix `F401` and some `F841` findings. Include these but classify as CONSIDER rather than FIX unless our script also flags them with high confidence (in which case classify as FIX — the double detection increases confidence).
 
-**Never recommend the F841 autofix on an `except ... as NAME` binding without reading the handler.** If NAME is used inside a lambda or nested def in that handler, the linter is wrong (it doesn't see the closure use; ruff reports a matching F821 there), and the autofix deletes `as NAME`, turning the error path into a `NameError`. `run_external_tools.py` marks the ones it recognizes with `autofix_unsafe: true` and `category: "suspected-tool-false-positive"` (not `dead-code`); never recommend a fix so marked. Report these as false positives, and as a hazard if the project runs `--fix` anywhere (shape `linter-autofix-breaks-closure-capture`). The same caution applies to any "unused" name whose only use is in a closure.
+**Never recommend the F841 autofix on an `except ... as NAME` binding without reading the handler.** If NAME is used inside a lambda or nested def in that handler, the linter is wrong (it doesn't see the closure use; ruff reports a matching F821 there), and the autofix deletes `as NAME`, turning the error path into a `NameError`. `run_external_tools.py` marks the ones it recognizes with `autofix_unsafe: true` and `category: "suspected-tool-false-positive"` (not `dead-code`); never recommend a fix so marked. Report these as false positives, and as a hazard (shape `linter-autofix-breaks-closure-capture`). Ruff classes this F841 fix as **safe**, so a plain `ruff check --fix` applies it without `--unsafe-fixes` — including a run meant only to sort imports (I001). One contributor running the default fix command is enough, so the hazard does not depend on the project running `--fix` in CI. The same caution applies to any "unused" name whose only use is in a closure.
 
 ### Vulture Findings
 
@@ -75,7 +77,11 @@ The script's `unused_imports` identifies imports never referenced in the file bo
 
 ### Unreferenced Functions and Classes
 The script's `unreferenced_symbols` lists functions, classes and methods defined but never referenced anywhere in the codebase. The script already excludes magic methods, test methods, setUp/tearDown, `__all__` entries, `__main__`-guarded functions, and the method shapes listed in `methods_excluded_by_reason`. An identifier-like string constant counts as a reference (`getattr(obj, "name")`). Review medium- and low-confidence items especially for:
-- Registered callbacks, decorators, and plugin hooks — these may be called dynamically
+- Registered callbacks, decorators, and plugin hooks — these may be called dynamically.
+  `functools.singledispatch` overloads (`@fn.register(list)`) are reached through the base
+  function's dispatch, never by name
+- Mapping-protocol reachability: a class with `keys()` and `__getitem__` is read by `dict(obj)`
+  and `**obj`, so its `keys` is live even with no `.keys()` call
 - Classes that may be instantiated by deserializers or frameworks
 
 ### Orphan Files
@@ -86,6 +92,25 @@ Not covered by the script — check manually:
 - Code after unconditional `return`, `raise`, `break`, `continue`
 - Branches guarded by always-true or always-false conditions (if constants are deterministic)
 - `else` branches after `if` blocks that always return/raise
+
+### Runtime-Dead Branches
+No static scan sees a branch that is referenced and fully covered by tests yet never runs in real
+use (a fallback for a response type the real client never returns). When the project has a
+realistic end-to-end command (a CLI run against a local fixture server, an example script), diff
+the coverage of the test suite against the coverage of that run, both in an exported copy:
+
+```bash
+cd "$d" && export TMPDIR="$d" PYTHONDONTWRITEBYTECODE=1
+COVERAGE_FILE="$d/cov.tests" python -m coverage run --source=<copy>/<pkg> -m pytest <copy>/tests -q
+COVERAGE_FILE="$d/cov.tests" python -m coverage json -o "$d/tests.json"
+COVERAGE_FILE="$d/cov.real" python -m coverage run --source=<copy>/<pkg> -m <pkg> <real arguments>
+COVERAGE_FILE="$d/cov.real" python -m coverage json -o "$d/real.json"
+python3 -c 'import json, sys; t, r = (json.load(open(p))["files"] for p in sys.argv[1:]); [print(f, sorted(set(r[f]["missing_lines"]) & set(t.get(f, {}).get("executed_lines", [])))) for f in sorted(r)]' "$d/tests.json" "$d/real.json"
+```
+
+Lines executed by the tests but missing from the real run are candidates: read each and decide
+whether real input can ever reach it. One run is one input; report these as CONSIDER with the
+command you ran, never as FIX.
 
 ### Stale Conditional Code
 Not covered by the script — check manually:
@@ -101,6 +126,21 @@ Not covered by the script — check manually:
 
 ### Commented-Out Code
 The script's `commented_code_blocks` identifies significant blocks of commented-out code (3+ consecutive lines matching code patterns). Review each block — the script distinguishes code from documentation comments.
+
+## Before Recommending a Removal
+
+**Check the unmerged branches.** A symbol or import that is unused on the default branch may be
+used by work in progress. Removing an "unused" import merges cleanly with a branch that starts
+using it, and the merged result raises `NameError`. For each removal you recommend:
+
+```bash
+git -C <repo> for-each-ref --format='%(refname:short)' refs/heads refs/remotes |
+  while read -r ref; do git -C <repo> grep -n -w '<name>' "$ref" -- '*.py' 2>/dev/null; done
+```
+
+(`git grep` on a ref reads the object store; it changes nothing in the checkout.) If a branch not
+merged into the default branch uses the name, keep the finding but downgrade it to CONSIDER and
+name the branch. Skip this when the repository has no other branches, and say so.
 
 ## False Positive Avoidance
 
