@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import ClassVar
 
 from helpers import TempProject, import_script
 
@@ -274,7 +275,10 @@ class TestMaxFiles(unittest.TestCase):
     """#61: --max-files was accepted and silently ignored, and the output had
     no files_capped field."""
 
-    _FILES = {"pkg/__init__.py": "", **{f"pkg/m{i}.py": "x = 1\n" for i in range(5)}}
+    _FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        **{f"pkg/m{i}.py": "x = 1\n" for i in range(5)},
+    }
 
     def test_cap_hands_mypy_only_the_first_n_files(self):
         with TempProject(self._FILES) as root, FakeMypy(_CLEAN_RUN) as fake:
