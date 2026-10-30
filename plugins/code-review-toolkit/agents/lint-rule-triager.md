@@ -56,6 +56,15 @@ tier-1 findings carried one and **every one was a deliberate idiom** — `open =
 disable=redefined-builtin`, which captures the builtin at import time so later mocking cannot break
 the module. Dismiss those *with the author's stated reason*, do not re-litigate them.
 
+**The script has already dismissed one mechanical class.** `dismissed` holds hits moved out of
+`findings`, each with a `dismissal_reason` that `dismissal_reasons` explains. `summary.total`
+still counts them, so it stays comparable with the calibrated totals. `summary.reported` is what is
+left to triage. Today the only reason is `fastapi-dependency-marker`: B008 on `Depends(...)`,
+`Query(...)`, `Body(...)` and the other FastAPI dependency markers, when the call resolves to a
+fastapi import in that file. That default is the framework's injection idiom, not a shared mutable
+value. On a FastAPI service it can be most of tier 1. List the count in the report's Dismissed
+section, and do not re-triage those hits.
+
 For everything else, the ordinary rules apply: read the code, construct a concrete failure scenario,
 and drop anything you cannot make concrete. Rules that are policy rather than defect in a given
 project — `S101` (assert) in a test suite, `S603`/`S607` in a build script — are ACCEPTABLE, and

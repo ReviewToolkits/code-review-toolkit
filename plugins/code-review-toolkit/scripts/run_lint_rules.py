@@ -47,6 +47,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
 import subprocess
@@ -55,7 +56,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scan_common import emit, find_project_root, relative_to_root  # noqa: E402
+from scan_common import (  # noqa: E402
+    emit,
+    find_project_root,
+    parse_source,
+    relative_to_root,
+)
 
 # A ruff bump is a calibration event. Bump this WITH a fixture-corpus re-run.
 PINNED_RUFF_VERSION = "0.16.0"
@@ -158,6 +164,108 @@ _SUPPRESSION = re.compile(
     r"#\s*(noqa|type:\s*ignore|pylint:\s*disable|ruff:\s*noqa|nosec|pragma)",
     re.IGNORECASE,
 )
+
+# FastAPI's dependency-injection markers. `def route(db=Depends(get_db))` is the
+# framework's documented idiom: the call builds an immutable marker object that
+# FastAPI reads at startup, so B008's "evaluated once at definition time" is the
+# intended behaviour, not a defect. On a FastAPI service these markers can be
+# most of tier 1 -- every one false, and every one counted as an overlap with
+# the `mutable-default-argument` shape.
+FASTAPI_DEPENDENCY_MARKERS = frozenset(
+    {"Depends", "Query", "Body", "File", "Form", "Header", "Path", "Security", "Cookie"}
+)
+
+# Why a hit was moved from `findings` to `dismissed`. Every dismissal is
+# counted and kept, never silently dropped.
+DISMISSAL_REASONS = {
+    "fastapi-dependency-marker": (
+        "B008 on a FastAPI dependency marker (Depends/Query/Body/...) imported from "
+        "fastapi: the default is the framework's injection idiom, not a shared "
+        "mutable value."
+    ),
+}
+
+
+def _fastapi_bindings(tree: ast.Module) -> tuple[dict[str, str], set[str]]:
+    """Names this module binds from fastapi.
+
+    Returns ``(markers, modules)``: *markers* maps a local name to the
+    dependency marker it was imported as (``from fastapi import Depends as D``
+    gives ``{"D": "Depends"}``); *modules* holds local names bound to fastapi
+    itself or one of its submodules (``import fastapi``, ``from fastapi import
+    params``), through which ``fastapi.Depends(...)`` is reached.
+    """
+    markers: dict[str, str] = {}
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            if node.module != "fastapi" and not node.module.startswith("fastapi."):
+                continue
+            for alias in node.names:
+                local = alias.asname or alias.name
+                if alias.name in FASTAPI_DEPENDENCY_MARKERS:
+                    markers[local] = alias.name
+                else:
+                    modules.add(local)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "fastapi" or alias.name.startswith("fastapi."):
+                    modules.add(alias.asname or alias.name.split(".")[0])
+    return markers, modules
+
+
+def _is_fastapi_marker_call(call: ast.Call, markers: dict, modules: set) -> bool:
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id in markers
+    if isinstance(func, ast.Attribute) and func.attr in FASTAPI_DEPENDENCY_MARKERS:
+        root = func.value
+        while isinstance(root, ast.Attribute):
+            root = root.value
+        return isinstance(root, ast.Name) and root.id in modules
+    return False
+
+
+def _default_calls(tree: ast.Module) -> dict[tuple[int, int], ast.Call]:
+    """Every call that is a parameter default, keyed by ``(line, byte column)``."""
+    calls: dict[tuple[int, int], ast.Call] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            for default in (*node.args.defaults, *node.args.kw_defaults):
+                if isinstance(default, ast.Call):
+                    calls[(default.lineno, default.col_offset)] = default
+    return calls
+
+
+def dismissal_reason(
+    finding: dict, path: Path | None, trees: dict, cache: dict
+) -> str | None:
+    """The DISMISSAL_REASONS key that dismisses *finding*, or None.
+
+    B008 is dismissed only when the flagged call resolves to a fastapi import
+    in that same file: a local ``Depends`` class, or a ``Query()`` from
+    another library, is still reported.
+    """
+    if finding["code"] != "B008" or path is None:
+        return None
+    if path not in trees:
+        tree = parse_source(path)
+        trees[path] = (
+            (tree, _default_calls(tree), *_fastapi_bindings(tree)) if tree else None
+        )
+    entry = trees[path]
+    if entry is None:
+        return None
+    _, calls, markers, modules = entry
+    if not markers and not modules:
+        return None
+    # ruff's column is 1-based characters; ast's col_offset is 0-based UTF-8 bytes.
+    text = _source_line(path, finding["line"], cache)
+    byte_col = len(text[: max(finding["column"] - 1, 0)].encode("utf-8"))
+    call = calls.get((finding["line"], byte_col))
+    if call is not None and _is_fastapi_marker_call(call, markers, modules):
+        return "fastapi-dependency-marker"
+    return None
 
 
 def _tier_codes(tier: int) -> list[str]:
@@ -359,7 +467,20 @@ def analyze(
         ruff_bin, runnable, scan_root, preview=False, target_version=target_version
     )
     cache: dict[Path, list[str]] = {}
-    findings = [normalize(f, project_root, tier, cache) for f in raw[:max_findings]]
+    trees: dict = {}
+    findings: list[dict] = []
+    # Hits with a known, mechanical dismissal: kept and counted, never dropped.
+    dismissed: list[dict] = []
+    for raw_finding in raw[:max_findings]:
+        finding = normalize(raw_finding, project_root, tier, cache)
+        filename = raw_finding.get("filename")
+        reason = dismissal_reason(
+            finding, Path(filename) if filename else None, trees, cache
+        )
+        if reason:
+            dismissed.append({**finding, "dismissal_reason": reason})
+        else:
+            findings.append(finding)
 
     preview_findings: list[dict] = []
     preview_stderr = ""
@@ -376,9 +497,15 @@ def analyze(
             for f in praw[:max_findings]
         ]
 
+    # by_code counts every hit ruff returned, dismissed ones included, so it
+    # stays comparable with the calibrated totals.
     by_code: dict[str, int] = {}
-    for f in findings + preview_findings:
+    for f in findings + dismissed + preview_findings:
         by_code[f["code"]] = by_code.get(f["code"], 0) + 1
+    dismissed_by_reason: dict[str, int] = {}
+    for f in dismissed:
+        reason = f["dismissal_reason"]
+        dismissed_by_reason[reason] = dismissed_by_reason.get(reason, 0) + 1
 
     merged = [f for f in findings if f["shape_id"]]
     suppressed = [f for f in findings if f["has_suppression_comment"]]
@@ -399,10 +526,16 @@ def analyze(
         "stderr": (stderr + preview_stderr).strip(),
         "error": error,
         "summary": {
-            "total": len(findings) + len(preview_findings),
+            # Every hit ruff returned, dismissed ones included (the calibrated
+            # number); `reported` is what is left in `findings` to triage.
+            "total": len(findings) + len(dismissed) + len(preview_findings),
+            "reported": len(findings) + len(preview_findings),
+            "dismissed": len(dismissed),
+            "dismissed_by_reason": dismissed_by_reason,
             "preview": len(preview_findings),
             "by_code": dict(sorted(by_code.items(), key=lambda kv: -kv[1])),
-            # Findings that overlap a catalogued shape: merge, do not re-report.
+            # Reported findings that overlap a catalogued shape: merge, do not
+            # re-report. Dismissed hits are not counted here.
             "overlaps_a_shape": len(merged),
             # ~30 selected rules have no shape at all. A confirmed true positive
             # from one of those is a NEW CATALOG ENTRY -- the highest-value
@@ -414,6 +547,10 @@ def analyze(
         },
         "findings_capped": len(raw) > max_findings,
         "findings": findings + preview_findings,
+        # Hits dismissed by a mechanical rule, each with its `dismissal_reason`
+        # (explained in `dismissal_reasons`). Not triaged, but not hidden.
+        "dismissed": dismissed,
+        "dismissal_reasons": {k: DISMISSAL_REASONS[k] for k in dismissed_by_reason},
     }
 
 

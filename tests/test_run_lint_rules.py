@@ -135,6 +135,124 @@ class TestRuffInvocation(unittest.TestCase):
         self.assertNotIn("--extend-select", cmd)
 
 
+def _fake_hit(root, relpath, line, needle, code="B008"):
+    """A ruff JSON finding at the first *needle* on *line* (1-based columns)."""
+    path = root / relpath
+    text = path.read_text(encoding="utf-8").splitlines()[line - 1]
+    return {
+        "code": code,
+        "filename": str(path),
+        "location": {"row": line, "column": text.index(needle) + 1},
+        "message": f"hit on {needle}",
+    }
+
+
+def _analyze_with_fake_ruff(root, hits):
+    from unittest.mock import patch
+
+    with (
+        patch.object(mod, "ruff_version", return_value=mod.PINNED_RUFF_VERSION),
+        patch.object(
+            mod,
+            "validate_rules",
+            return_value={"ok": [], "unknown": [], "removed": [], "preview_gated": []},
+        ),
+        patch.object(mod, "_run_ruff", return_value=(hits, "", None)),
+    ):
+        return mod.analyze(str(root))
+
+
+class TestFastapiMarkerDismissal(unittest.TestCase):
+    """B008 on a FastAPI dependency marker is the framework's idiom (#26)."""
+
+    ROUTES = (
+        "from fastapi import Depends, Query as Q\n"
+        "import fastapi\n"
+        "\n"
+        "def route(db=Depends(get_db), q: str = Q(None)):\n"
+        "    pass\n"
+        "\n"
+        "def other(x=fastapi.Security(scheme)):\n"
+        "    pass\n"
+        "\n"
+        "def café(n=Depends(get_n)):\n"
+        "    pass\n"
+        "\n"
+        "def real(items=make_list()):\n"
+        "    pass\n"
+    )
+
+    def test_markers_are_dismissed_with_a_reason_and_counted(self):
+        from helpers import TempProject
+
+        with TempProject({"routes.py": self.ROUTES}) as root:
+            hits = [
+                _fake_hit(root, "routes.py", 4, "Depends("),
+                _fake_hit(root, "routes.py", 4, "Q("),
+                _fake_hit(root, "routes.py", 7, "fastapi.Security("),
+                # Non-ASCII before the call: ruff counts characters, ast bytes.
+                _fake_hit(root, "routes.py", 10, "Depends("),
+            ]
+            result = _analyze_with_fake_ruff(root, hits)
+        self.assertEqual(result["findings"], [])
+        self.assertEqual(len(result["dismissed"]), 4)
+        for hit in result["dismissed"]:
+            self.assertEqual(hit["dismissal_reason"], "fastapi-dependency-marker")
+        summary = result["summary"]
+        self.assertEqual(summary["total"], 4)
+        self.assertEqual(summary["reported"], 0)
+        self.assertEqual(summary["dismissed"], 4)
+        self.assertEqual(
+            summary["dismissed_by_reason"], {"fastapi-dependency-marker": 4}
+        )
+        # A dismissed hit is not a shape overlap to merge.
+        self.assertEqual(summary["overlaps_a_shape"], 0)
+        self.assertIn("fastapi-dependency-marker", result["dismissal_reasons"])
+
+    def test_a_real_call_default_in_a_fastapi_file_is_still_reported(self):
+        from helpers import TempProject
+
+        with TempProject({"routes.py": self.ROUTES}) as root:
+            result = _analyze_with_fake_ruff(
+                root, [_fake_hit(root, "routes.py", 13, "make_list(")]
+            )
+        self.assertEqual(len(result["findings"]), 1)
+        self.assertEqual(result["dismissed"], [])
+
+    def test_a_marker_name_not_imported_from_fastapi_is_still_reported(self):
+        from helpers import TempProject
+
+        source = (
+            "from fastapi import APIRouter\n"
+            "from mylib import Query\n"
+            "\n"
+            "class Depends:\n"
+            "    pass\n"
+            "\n"
+            "def f(a=Depends(), b=Query()):\n"
+            "    pass\n"
+        )
+        with TempProject({"m.py": source}) as root:
+            result = _analyze_with_fake_ruff(
+                root,
+                [
+                    _fake_hit(root, "m.py", 7, "Depends("),
+                    _fake_hit(root, "m.py", 7, "Query("),
+                ],
+            )
+        self.assertEqual(len(result["findings"]), 2)
+        self.assertEqual(result["summary"]["dismissed"], 0)
+
+    def test_other_codes_on_a_marker_line_are_not_dismissed(self):
+        from helpers import TempProject
+
+        with TempProject({"routes.py": self.ROUTES}) as root:
+            result = _analyze_with_fake_ruff(
+                root, [_fake_hit(root, "routes.py", 4, "Depends(", code="B006")]
+            )
+        self.assertEqual(len(result["findings"]), 1)
+
+
 class TestMissingRuff(unittest.TestCase):
     def test_absent_binary_is_an_error_not_an_empty_result(self):
         result = mod.analyze(".", ruff_bin="definitely-not-a-real-ruff-binary")
