@@ -87,6 +87,56 @@ refactor that moves every line number.
 
 ---
 
+## A shared harness, and one verdict line
+
+When a review produces more than a few reproducers, give them one small harness module (isolated
+`HOME` and data directories, the project's test configuration, fakes for anything slow or
+networked such as model downloads) and one runner that exports a git ref and runs a reproducer
+against that export:
+
+```bash
+./run.sh F-012.py main              # the default branch: must print BUG
+./run.sh F-012.py origin/fix-branch  # a branch that claims a fix: should print OK
+```
+
+Every reproducer ends by printing exactly one line, `BUG: <what went wrong, with the observed
+value>` or `OK: <what correct looks like>`. That makes a sweep over all reproducers and all
+branches mechanical, and it turns "fixed on branch X" into an observation rather than a reading.
+Keep each reproducer to the fewest lines that show the defect (5–25 is typical; a race may need
+50), and say in a comment what, if anything, is simulated.
+
+---
+
+## Reproducing races and stalls
+
+A race you've argued is a hypothesis; a race you've forced is a fact. **Never loop over random
+timing until something happens**: a reproducer that fails one run in fifty proves nothing when it
+passes.
+
+- **Force the interleaving.** Monkeypatch a function on path A so it blocks on a
+  `threading.Event` at the critical point; start path A in a thread, wait until it's parked, run
+  path B, then release A. The window is now explicit and the result deterministic.
+- **Start threads together** with a `threading.Barrier` when the question is "can these two
+  operations overlap at all".
+- **Event-loop stalls:** hold the lock (or run the slow operation) from a thread, then time a
+  trivial coroutine on the loop (`asyncio.sleep(0)`, or a health endpoint through an in-process
+  client) with a short timeout. "Did not return within 2 s" is the observation.
+- **Deadlocks:** run the scenario in a subprocess with a timeout, and call
+  `faulthandler.dump_traceback_later(timeout, exit=True)` inside it so a hang leaves every thread's
+  stack behind instead of a silent timeout.
+- **Cancellation:** cancel the task explicitly (`task.cancel()`) at the point under test, but then
+  establish separately whether anything in production actually cancels it there. Frameworks often
+  don't (anyio's `run_in_threadpool` defers cancellation until the thread finishes), and a finding
+  whose only trigger is the injected cancel must say so.
+- **Slow constants:** scale them down and say so (`TIMEOUT = 0.2  # real: 300 s`).
+- **Environmental failures** (disk full, a locked database, a failing `unlink`): inject the real
+  exception type with the narrowest monkeypatch, and name what it stands for.
+- `sys.setswitchinterval(1e-6)` and a free-threaded build (`python3.14t`) raise the odds of an
+  unforced race showing up in a stress run. They're for exploration; the reproducer itself still
+  forces the interleaving.
+
+---
+
 ## Windowed fault injection
 
 For a finding that depends on an allocation or syscall failing, injecting failure **everywhere** is

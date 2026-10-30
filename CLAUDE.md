@@ -209,9 +209,9 @@ Tracked honestly so the next session does not have to re-derive them:
    is young and takes chances, coverage.py is a large third-party project. A threaded/async
    application has since been reviewed privately for its maintainer; its report stays outside this
    repo, so the threading shapes it motivated are `documented` until its findings can be cited.
-2. **82 of 114 shapes are `confirmed`; 32 remain `documented`**, including all 13 threading
+2. **82 of 117 shapes are `confirmed`; 35 remain `documented`**, including all 13 threading
    shapes.
-3. **51 of 114 shapes are executable.** `scan_python_pitfalls.py` implements 39 (37 per-file, 2
+3. **51 of 117 shapes are executable.** `scan_python_pitfalls.py` implements 39 (37 per-file, 2
    project-level) and `scan_concurrency.py` 12 (all project-level). The rest are `implementable` or
    `agent-only` — `detectability` in the catalog says which.
 4. **The companion findings repository is `devdanzin/code-review-findings`** (`coveragepy/`,

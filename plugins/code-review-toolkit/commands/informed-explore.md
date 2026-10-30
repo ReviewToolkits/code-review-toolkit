@@ -138,8 +138,14 @@ Produce the same report as `explore`, with three additions:
 3. **Proposed new false-positive classes** — anything an agent flagged that triage dismissed, with
    the reason and the real-bug discriminator, ready for `data/python_non_bugs.md`.
 
-Then **write the findings memory** so the next run is informed, at
-`<scope>/.code-review/findings.json`:
+Then **write the findings memory** so the next run is informed. Write it into the run directory
+(`<run_dir>/findings-memory.json`), **not into the reviewed checkout**: the checkout belongs to
+someone else, and a stray `.code-review/` directory in it is a side effect of reviewing. Next time,
+pass it back with `--catalog <run_dir>/findings-memory.json` (its `project` must contain, or be
+contained in, the target directory's name: that is how the briefing recognizes the entries as
+this project's). Only when the user owns the checkout
+and asks for it, write it to `<scope>/.code-review/findings.json`, where it is picked up
+automatically:
 
 ```json
 {
