@@ -13,7 +13,26 @@ Analyze the scope provided. Default: the entire project. You may receive archite
 
 ## Analysis Process
 
+### 0. Run the survey
+
+Run `survey_docstrings.py` on the scope first (see "Running the script"). It returns four
+inventories. Each one is a starting point for a step below, not a finding: read the code before
+you report anything from it.
+
+| Key | Feeds | What it holds |
+|---|---|---|
+| `coverage` | step 1 | documented / total per kind (`module`, `class`, `function`, `method`, `route`), `per_file`, `undocumented`, `trivial` |
+| `contract_issues` | step 2 | `Returns:` / `Raises:` / `Args:` sections checked against the body, signature and annotation |
+| `claims` | step 2b | sentences that promise something testable, by `category` |
+| `suppressions` | step 3 | `# nosec` / `# noqa` / `# type: ignore` / `# pragma: no cover` comments, with rule ids and reason |
+
+Test files are skipped unless you pass `--include-tests`. `skipped.unparseable` lists files the
+survey could not read; name them in the report.
+
 ### 1. Docstring Coverage
+
+Take the numbers from `coverage.totals` and `coverage.per_file` rather than counting by hand.
+`undocumented` and `trivial` (a docstring that only restates the name) are the candidate lists.
 
 Survey public API documentation:
 - **Module docstrings**: Does each module explain its purpose?
@@ -30,6 +49,22 @@ Classify coverage:
 Calculate coverage percentages by module and overall.
 
 ### 2. Documentation Accuracy
+
+Start from `contract_issues`. Each entry has a `kind`, a `confidence` and the `documented` text:
+
+- `returns-type-mismatch`: the documented return type contradicts the annotation (`high`) or a
+  `return` statement whose type is certain (`medium`; `evidence` lists the lines).
+- `returns-parameter-unchanged`: a path returns an argument as-is, and the signature doesn't
+  restrict that argument to the documented type. On that path the function returns whatever
+  the caller passed, whatever the docstring says.
+- `returns-documented-no-value`: a `Returns:` section on a function that never returns a value.
+- `raises-documented-not-raised`: neither the function nor any project function it calls by name
+  raises the documented exception. `low` means a library call might; check those calls before
+  you report it. A class-level entry comes from a class docstring that says the class raises it.
+- `raises-undocumented`: a `raise` outside any `try`, missing from an existing `Raises:` section.
+- `args-documented-not-in-signature`: a documented parameter the signature no longer has.
+
+For each one, read the function and confirm or dismiss it. Then cover what the survey can't see:
 
 For documented code, verify accuracy:
 - Do parameter descriptions match actual parameters (names, types, optionality)?
@@ -50,6 +85,23 @@ claim and, in practice, one of the most productive places to look:
 - For "does not block" / "keeps serving": follow the call to any lock or blocking call it reaches,
   and ask who else holds that lock and for how long.
 - For "thread-safe": find the shared state and check every access is guarded.
+
+The survey's `claims` with `category: "concurrency"` are the list to work through. Join them by
+hand with `scan_concurrency.py`'s output for the same scope (run it, or reuse the
+concurrency-auditor's). The keys line up: a claim's `function` and `file` use the scanner's
+qualified names and paths, and `function_key` / `class_key` use its `module:qualname` form.
+
+1. `acquires_directly` lists the locks the function's own body enters. A non-empty list under
+   "lock-free" or "does not block" is already a contradiction. `null` means a class or module
+   docstring, where no body was measured.
+2. Scanner `findings` whose `function` equals the claim's `function`, or whose `chain` passes
+   through it: the scanner has already traced this function to a lock or a blocking call.
+3. Scanner `guards` whose `state` or `lock` starts with the claim's `class_key`: the locks that
+   guard this class's state. A "called with X held" claim should name one of them; compare with
+   `locks_named`.
+4. Scanner `summary.slow_locks`: locks held across slow work. A "does not block" or "keeps
+   serving" claim on a function that reaches one of these (directly, or through a callee that
+   takes it) is the typical broken promise.
 
 A claim the code doesn't keep is a FIX when callers rely on it. Where you can, force the
 interleaving to check it (see `docs/reproduction-convention.md`).
@@ -129,3 +181,34 @@ Check whether docstrings follow a consistent style:
 - **CONSIDER**: Missing documentation on important public APIs, stale comments that should be updated or removed
 - **POLICY**: Documentation strategy decisions (e.g., adopt a docstring style, set documentation coverage targets, establish comment conventions)
 - **ACCEPTABLE**: Undocumented private functions with clear names, trivial documentation gaps on obvious code
+
+## Running the script
+
+These rules apply to every script call this agent makes.
+
+- **Timeout.** Give the Bash call `timeout: 300000` (5 min). The 120 s default kills the script on
+  large projects. If it may run longer still, use `run_in_background` and wait for the completion
+  notification rather than polling.
+- **A private output location.** Other agents run the toolkit's scripts concurrently in `parallel`
+  mode, so never write to a fixed path. Create a directory of your own and keep stdout and stderr
+  apart, in one Bash call:
+
+  ```bash
+  d=$(mktemp -d "${TMPDIR:-/tmp}/crt-documentation-auditor.XXXXXX") && echo "$d" &&
+  python3 <plugin_root>/scripts/survey_docstrings.py [scope] [options] > "$d/out.json" 2> "$d/out.err"; echo "exit=$?"
+  ```
+
+  Each Bash call is a fresh shell: a `$$` suffix or a shell variable does not survive into the next
+  call. Reuse the literal path `echo` printed. Put your own scratch files (reproducers, notes) in the
+  same directory, never in a shared fixed path.
+- **Running the project's own code** (an example from a docstring, a reproducer, a linter with and
+  without a suppression comment): do it in an exported copy, never in the checkout, and set
+  `TMPDIR` to your private directory so the project's own temp files land there instead of a
+  shared `/tmp`.
+- **Forward `--max-files N`** when the caller gave one, and say so in the report whenever the
+  envelope's `files_capped` is true.
+- **Check before you read.** A non-zero `exit` or an empty `out.json` means the run did not
+  succeed. Read `out.err`, and any `error` field in `out.json`.
+- **Do not retry a script that timed out or failed.** Answer the same question with Grep and Read,
+  and state in the report that the script did not complete. A run that failed is never "no
+  findings".
