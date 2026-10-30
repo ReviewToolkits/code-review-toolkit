@@ -79,10 +79,30 @@ The script provides the raw data; apply your judgment to assess significance:
 - The script's `cycles` field lists detected cycles. For each, assess:
 - Is the cycle import-time or runtime-only? (Check `type_checking_only` on the edges.)
 - Does it cause actual import failures or just indicate poor layering? **Test it, don't guess**:
-  import each cycle member first, in a fresh interpreter, from an exported copy of the project
-  (`python3 -I -c "import pkg.mod"` with `PYTHONPATH` pointing at the copy). Import order decides
-  whether a cycle crashes, so a cycle that's harmless via the package's usual entry point can still
-  raise `ImportError: cannot import name ...` when a tool or test imports a member first.
+  import each cycle member first, in a fresh interpreter, from an exported copy of the project.
+  Import order decides whether a cycle crashes, so a cycle that's harmless via the package's usual
+  entry point can still raise `ImportError: cannot import name ...` when a tool or test imports a
+  member first.
+  - **Put the copy on `sys.path` inside the command, and assert you got it.** `-I` ignores
+    `PYTHONPATH`, and a venv with an editable install resolves `pkg` to the real checkout, so
+    `PYTHONPATH=<copy> python3 -I ...` silently tests the wrong tree. Use:
+
+    ```bash
+    cd "$d" && PYTHONDONTWRITEBYTECODE=1 python3 -I -c "import sys; sys.path.insert(0, '<copy>'); import pkg.mod, pkg; assert pkg.__file__.startswith('<copy>'), pkg.__file__"
+    ```
+
+  - **Simulate a bare parent package.** When the top-level `pkg/__init__.py` eagerly imports
+    submodules, it fixes the import order, so every member passes the test above even though the
+    cycle is real: it fires as soon as that `__init__` changes, or when an embedding loads one
+    module directly. Register an empty package object first, so only the cycle's own modules (and
+    the subpackage `__init__` files they pass through) run:
+
+    ```bash
+    cd "$d" && PYTHONDONTWRITEBYTECODE=1 python3 -I -c "import sys, types; sys.path.insert(0, '<copy>'); p = types.ModuleType('pkg'); p.__path__ = ['<copy>/pkg']; sys.modules['pkg'] = p; import pkg.sub.mod"
+    ```
+
+    A cycle that fails only this way is real but latent: rate it **CONSIDER**, not FIX, and name
+    the `__init__` import that masks it.
 - Function-level (lazy) imports and `importlib.import_module` break or hide cycles; note which edges
   are lazy before rating a cycle.
 - Rate severity accordingly.
