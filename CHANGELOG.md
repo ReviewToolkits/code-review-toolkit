@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — ruff and external-tool runs (#55)
+
+- `run_lint_rules.py` and `run_external_tools.py` no longer leave `.ruff_cache/` or `.mypy_cache/`
+  in the reviewed project (`--no-cache`; mypy gets a private `--cache-dir`, removed afterwards).
+- ruff's "Failed to lint" (a sandboxed ruff that can't read the path exits 0 with no findings) is
+  an `error` with the `unlinted` paths, not a clean result.
+- `RULE_TO_SHAPE` maps B905 → `zip-truncates-on-length-mismatch` and DTZ005/DTZ006 →
+  `naive-datetime-in-a-persisted-artifact`.
+- B008 on FastAPI dependency markers (`Depends`, `Query`, `Body`, ...) is dismissed with a recorded
+  reason instead of flooding tier 1 (95 → 0 on a FastAPI service, all counted in `dismissed`).
+- F821/F841 on an `except ... as exc` name read by a closure are labelled a known ruff false
+  positive (ruff#6878), and that F841's autofix is flagged `autofix_unsafe`.
+- `findings_capped` is reported honestly for mypy and vulture.
+
+### Enhanced
+
+- **`run_external_tools.py` runs a labelled toolkit ruff pass** when the project's own selection is
+  narrow, so the bug-risk, security, simplification, performance and deprecated (UP) feeds are no
+  longer empty on a project that selects only E/F/W/I. Every finding carries `selection`.
+- **vulture runs at confidence 60**, with confidence buckets, so unused methods are reported.
+
 ### Enhanced — agent prompts, from a full review of a threaded application
 
 - **silent-failure-hunter**: correct ruff codes (`S110`/`SIM105` are try-except-pass, `B025` is a
