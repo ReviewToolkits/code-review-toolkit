@@ -42,8 +42,10 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -190,7 +192,11 @@ def parse_output(stdout: str) -> tuple[list[dict], dict]:
 
 
 def _run_mypy(
-    mypy_bin: str, target: Path, config: str | None, extra: list[str]
+    mypy_bin: str,
+    target: Path,
+    config: str | None,
+    extra: list[str],
+    cache_dir: str,
 ) -> tuple[str, str, int | None]:
     # --no-color-output is load-bearing, not cosmetic. mypy honours FORCE_COLOR
     # even when stdout is a pipe, and the ANSI codes it injects sit between the
@@ -199,7 +205,19 @@ def _run_mypy(
     # regex only needs the digits. The result is a confident "0 type errors" on
     # any machine with FORCE_COLOR set. Found on coverage.py, where mypy reported
     # 3 errors and this script reported none.
-    cmd = [mypy_bin, "--show-error-codes", "--no-color-output"]
+    #
+    # --cache-dir is load-bearing too. Without it mypy writes `.mypy_cache/` into
+    # whatever directory the caller happens to run from -- the reviewed checkout,
+    # if the agent's shell is there, which a read-only review must never touch,
+    # and a directory concurrent `parallel` agents share. The caller passes a
+    # private temporary directory and removes it afterwards.
+    cmd = [
+        mypy_bin,
+        "--show-error-codes",
+        "--no-color-output",
+        "--cache-dir",
+        cache_dir,
+    ]
     if config:
         cmd.extend(["--config-file", config])
     cmd.extend(extra)
@@ -272,7 +290,36 @@ def analyze(
         }
 
     config = find_mypy_config(project_root)
-    stdout, stderr, returncode = _run_mypy(mypy_bin, scan_root, config, [])
+    # mypy's cache goes to a private temporary directory, never the reviewed
+    # project or the caller's cwd, and is removed however the run ends.
+    cache_root = tempfile.mkdtemp(prefix="crt-mypy-cache-")
+    try:
+        return _analyze_with_cache(
+            mypy_bin=mypy_bin,
+            scan_root=scan_root,
+            project_root=project_root,
+            version=version,
+            config=config,
+            strict_pass=strict_pass,
+            cache_root=cache_root,
+        )
+    finally:
+        shutil.rmtree(cache_root, ignore_errors=True)
+
+
+def _analyze_with_cache(
+    *,
+    mypy_bin: str,
+    scan_root: Path,
+    project_root: Path,
+    version: str,
+    config: str | None,
+    strict_pass: bool,
+    cache_root: str,
+) -> dict:
+    stdout, stderr, returncode = _run_mypy(
+        mypy_bin, scan_root, config, [], os.path.join(cache_root, "baseline")
+    )
     findings, stats = parse_output(stdout)
 
     # A checker that analyzed nothing is a FAILED run, not a clean one. This is
@@ -291,7 +338,11 @@ def analyze(
     strict_stats: dict = {}
     if strict_pass and status == "OK":
         s_out, _, _s_rc = _run_mypy(
-            mypy_bin, scan_root, config, ["--disallow-any-unimported"]
+            mypy_bin,
+            scan_root,
+            config,
+            ["--disallow-any-unimported"],
+            os.path.join(cache_root, "disallow-any-unimported"),
         )
         strict_findings, strict_stats = parse_output(s_out)
         baseline = {(f["file"], f["line"], f["code"], f["message"]) for f in findings}

@@ -1,10 +1,90 @@
 """Tests for check_typing.py -- mypy integrity, not mypy coverage."""
 
+import json
+import os
+import stat
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 
-from helpers import import_script
+from helpers import TempProject, import_script
 
 mod = import_script("check_typing")
+
+# A stand-in for mypy, so the orchestration (cache, passes, capping) is tested
+# without mypy installed. It logs its argv and cwd, mimics mypy's cache
+# behaviour (`.mypy_cache` in the cwd unless --cache-dir says otherwise), and
+# prints the canned output registered for the labelled pass it was run as.
+_FAKE_MYPY = """#!{python}
+import json, os, sys
+args = sys.argv[1:]
+if args == ["--version"]:
+    print("mypy 9.9.9 (compiled: no)")
+    sys.exit(0)
+with open(os.environ["FAKE_MYPY_LOG"], "a") as log:
+    log.write(json.dumps({{"argv": args, "cwd": os.getcwd()}}) + "\\n")
+cache = args[args.index("--cache-dir") + 1] if "--cache-dir" in args else ".mypy_cache"
+os.makedirs(cache, exist_ok=True)
+with open(os.path.join(cache, "marker"), "w") as fh:
+    fh.write("x")
+with open(os.environ["FAKE_MYPY_RESPONSES"]) as fh:
+    responses = json.load(fh)
+key = ""
+for flag in ("--disallow-any-unimported", "--warn-unreachable", "--warn-unused-ignores"):
+    if flag in args:
+        key = flag
+out = responses.get(key, responses.get("", ""))
+sys.stdout.write(out)
+sys.exit(1 if ": error:" in out else 0)
+"""
+
+
+class FakeMypy:
+    """Context manager: a fake mypy binary plus a log of its invocations."""
+
+    def __init__(self, responses: dict[str, str]):
+        self.responses = responses
+
+    def __enter__(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="crt_fake_mypy_")
+        d = Path(self._tmp.name)
+        self.bin = d / "mypy"
+        self.bin.write_text(_FAKE_MYPY.format(python=sys.executable))
+        self.bin.chmod(self.bin.stat().st_mode | stat.S_IXUSR)
+        self.log = d / "log.jsonl"
+        self.log.write_text("")
+        responses = d / "responses.json"
+        responses.write_text(json.dumps(self.responses))
+        self._old = {
+            k: os.environ.get(k) for k in ("FAKE_MYPY_LOG", "FAKE_MYPY_RESPONSES")
+        }
+        os.environ["FAKE_MYPY_LOG"] = str(self.log)
+        os.environ["FAKE_MYPY_RESPONSES"] = str(responses)
+        return self
+
+    def calls(self) -> list[dict]:
+        return [json.loads(x) for x in self.log.read_text().splitlines() if x]
+
+    def __exit__(self, *exc):
+        for k, v in self._old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self._tmp.cleanup()
+
+
+def run_in(cwd: str, fn, *args, **kwargs):
+    old = os.getcwd()
+    os.chdir(cwd)
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        os.chdir(old)
+
+
+_CLEAN_RUN = {"": "Success: no issues found in 1 source file\n"}
 
 
 class TestParseOutput(unittest.TestCase):
@@ -106,6 +186,29 @@ class TestMissingMypy(unittest.TestCase):
         result = mod.analyze(".", mypy_bin="definitely-not-a-real-mypy-binary")
         self.assertEqual(result["status"], "FAILED")
         self.assertEqual(result["findings"], [])
+
+
+class TestCacheDirectory(unittest.TestCase):
+    """#29/#60: mypy's cache must land in neither the reviewed project nor the
+    caller's cwd. Before the fix `.mypy_cache/` appeared in the cwd."""
+
+    def test_cache_goes_to_a_private_dir_that_is_removed(self):
+        with TempProject({"pkg/__init__.py": "", "pkg/m.py": "x = 1\n"}) as root:
+            with FakeMypy(_CLEAN_RUN) as fake, tempfile.TemporaryDirectory() as cwd:
+                result = run_in(
+                    cwd, mod.analyze, str(root / "pkg"), mypy_bin=str(fake.bin)
+                )
+                calls = fake.calls()
+                self.assertEqual(result["status"], "OK")
+                self.assertTrue(calls)
+                for call in calls:
+                    self.assertIn("--cache-dir", call["argv"])
+                    cache = Path(call["argv"][call["argv"].index("--cache-dir") + 1])
+                    self.assertFalse(cache.resolve().is_relative_to(root))
+                    self.assertFalse(cache.exists(), "cache dir not removed")
+                self.assertEqual(os.listdir(cwd), [])
+            self.assertFalse((root / ".mypy_cache").exists())
+            self.assertFalse((root / "pkg" / ".mypy_cache").exists())
 
 
 class TestConfigDiscovery(unittest.TestCase):
