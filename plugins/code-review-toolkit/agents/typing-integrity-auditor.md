@@ -31,6 +31,15 @@ candidate list of a `call-overload`): read them before re-running mypy by hand.
 overridden**: reporting errors a project has deliberately configured away is reporting your
 preferences, not their defects. If it is false, say so — the baseline is your judgement, not theirs.
 
+Two more fields qualify every number that follows; put both in the report header.
+
+- **`effective_flags`** — what the baseline ran with (`source: mypy-defaults` when there is no
+  config). With `check_untyped_defs: false`, `summary.unchecked_untyped_bodies` functions had their
+  bodies skipped entirely: "0 errors across N files" then means "0 errors in the annotated part".
+- **`mypy_python`** — the interpreter (and `site_packages`) mypy resolved third-party imports
+  against. Every import-related result, and every finding against a dependency's API, depends on
+  it. If it is not the project's own environment, say so; if it is null, `reason` says why.
+
 ## Phase 2 — Separate wrong typing from missing typing
 
 `summary` splits findings three ways, and the split is the whole point:
@@ -40,7 +49,21 @@ preferences, not their defects. If it is false, say so — the baseline is your 
 - **`missing_annotations`** — the code is unannotated: `no-untyped-def`, `var-annotated`. This is a
   *migration estimate*, not a defect list. An unannotated codebase produces thousands of these and
   zero of the above; conflating them makes every legacy project look broken.
-- **`other`** — everything else. Read before classifying.
+- **`other`** — everything else. Read before classifying. (`name-defined`, `return` and
+  `method-assign` are counted as defects: an unresolved quoted forward reference, a path that falls
+  off a function declared to return a value, a method replaced on an instance.)
+
+**Count root causes, not findings.** One inferred type can produce a cluster of errors on one line.
+`summary.distinct_lines` / `defect_lines` are the honest headline, and `line_groups` lists every line
+with more than one finding: read those first, and report each group as one item.
+
+**Dependency drift.** A finding in `dependency_drift_findings` (it carries `dependency`) is rejected
+by an *installed* third-party callee or base class: `call-arg` against a constructor, `override`
+against a base class from a library. It is either a project bug or the library changing under the
+project. When `dependency.upper_bounded` is false (or the dependency is undeclared), check the
+library's changelog between the version the code was written against and `installed_version`
+before calling it a project bug: that is the "dependency changed under you" finding, and usually the
+most valuable one in the run. Keep these apart from stub-imprecision noise.
 
 ## Phase 3 — Annotations that stopped checking (the signature findings)
 
@@ -61,6 +84,24 @@ On coverage.py this found exactly 3 errors in 1 file — every one caused by
 Three annotations that had stopped checking anything. The same flag on `_pyrepl` added **zero**,
 which is what makes it a real finding rather than a flag that fires everywhere.
 
+Read the pass in light of `effective_flags.ignore_missing_imports`. When it is null (the option is
+off), a missing module already fails the baseline as `import-not-found`, and a 0 from this pass is
+uninformative rather than reassuring — say so. An unresolved **quoted** forward reference
+(`-> "NoSuchName"`) is the same silent failure; it surfaces as a `name-defined` defect, not here.
+
+### Silenced imports
+
+`silenced_import_findings` comes from a labelled pass that re-runs mypy on a copy of the config with
+`ignore_missing_imports` turned off everywhere. Each entry is an import the project's config made
+`Any`: every name imported from that `module` is unchecked, in every annotation that uses it. The
+phantom-import pass only fires where an annotation names such a type, so it can add 0 while whole
+packages are silently `Any` — this pass is the inventory.
+
+`summary.silenced_imports` counts distinct modules. `silenced_imports_source: not-configured` (count
+0) means the config never sets the option, so nothing was silenced; null means not measured, and
+`silenced_imports_reason` says why. For each module, say whether stubs exist (`types-<name>`), so
+the fix is "install stubs", not "stop ignoring".
+
 For each phantom import: resolve the name against the actual package tree, propose the correction,
 and **verify the correction introduces no new errors** before proposing it.
 
@@ -74,6 +115,10 @@ code: a module-level `x = None` with no annotation narrows every `if x is not No
 the branch impossible, and check whether fixing it exposes new errors — the wrong annotation is
 often hiding some.
 
+`summary.unreachable_source` says where the count comes from: `project-config` (the config already
+enables `warn_unreachable`, so the baseline reports it and no extra pass ran) or
+`warn-unreachable-pass`. Never describe a `project-config` count as "the labelled pass added N".
+
 Not every hit is a wrong annotation. Known false-positive shapes:
 - **Attribute narrowing across `yield`/`await` or concurrent mutation.** `if self._closing: raise`
   early in a context manager makes a later `self._closing and ...` in `finally` "unreachable", though
@@ -82,6 +127,31 @@ Not every hit is a wrong annotation. Known false-positive shapes:
 - **Defensive `isinstance` checks** on input, monkeypatchable state, or a third-party stub that is
   narrower than the runtime (an attribute typed `str` that can also hold a `dict`). Usually
   ACCEPTABLE.
+
+### Unchecked untyped bodies
+
+When the config does not enable `check_untyped_defs` (mypy's default), a labelled
+`--check-untyped-defs` pass reports the errors inside the bodies the baseline skipped
+(`untyped_body_findings`, `summary.untyped_body_errors`; null when it did not run, including when
+the config already checks them). These are real errors in code the project's own run never looks
+at. Classify them like baseline defects, but report them in their own section: the project has not
+opted in to them.
+
+### Annotate the untyped boundary, then re-run
+
+When the code at a boundary is unannotated, mypy cannot prove anything about it, and the defects
+behind it stay invisible to every pass above. `count_types.py` lists the boundaries:
+`untyped_boundaries` (bare parameters that typed code passes arguments to, with
+`arg_annotations` when the caller's names give the type) and `inconsistent_parameters` (a name
+typed in some functions and bare in others). For the top few:
+
+1. Export a copy; never edit the checkout: `git -C <project> archive HEAD | tar -x -C "$d/copy"`.
+2. Annotate the callee's parameter with the caller's type. Change nothing else.
+3. Re-run `check_typing.py` on the copy with the same `--mypy-bin`, and diff `findings` against a
+   run on the unmodified copy.
+4. New errors inside the callee are defects the missing annotation was hiding. Read each one.
+
+Report each experiment as `callee(param: T)` → N new errors. One that adds nothing is one line.
 
 ## Phase 4 — Stale ignores, correctly measured
 
@@ -102,17 +172,36 @@ evidence behind it, and repeating it will cost you the report's credibility.
 ```markdown
 ## Type integrity ([status], [N] files checked, mypy [version])
 
+Config: [project config / mypy defaults] · check_untyped_defs [on/off: N bodies unchecked] ·
+ignore_missing_imports [global / per-module / off] · interpreter [mypy_python.executable]
+
 [If FAILED: the failure_reason and what to do about it. Nothing else. Stop here.]
 
-### Type defects ([N])
+### Type defects ([N] findings on [defect_lines] lines; [M] root causes after reading line_groups)
 | File:line | Code | What is actually wrong |
+|---|---|---|
+
+### Dependency drift ([N], [M] against an unbounded dependency)
+| File:line | Dependency (declared → installed) | What changed |
+|---|---|---|
+
+### Silenced imports ([N] modules, or "not configured" / "not measured: reason")
+| Module | Imported in | Stubs available? |
+|---|---|---|
+
+### Errors in unchecked untyped bodies ([N], labelled --check-untyped-defs pass)
+| File:line | Code | What is actually wrong |
+|---|---|---|
+
+### Annotate-and-re-run experiments ([N] run)
+| Annotation added | New errors | Verdict |
 |---|---|---|
 
 ### Phantom imports ([N]) — annotations that stopped checking
 | File:line | Import | Correct name | Annotations affected |
 |---|---|---|---|
 
-### Unreachable code ([N], labelled --warn-unreachable pass)
+### Unreachable code ([N], from [unreachable_source])
 | File:line | Annotation that makes it unreachable | Classification |
 |---|---|---|
 
