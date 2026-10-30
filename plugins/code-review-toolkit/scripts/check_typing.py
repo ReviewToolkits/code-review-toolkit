@@ -381,6 +381,28 @@ def _diagnose_failure(stderr: str, stdout: str, returncode: int | None) -> str:
     )
 
 
+def _line_groups(findings: list[dict]) -> list[dict]:
+    """Lines that produced more than one finding, most findings first.
+
+    One inferred type or one misused name can produce many errors on a single
+    line, so the finding count
+    overstates the number of problems; `summary.distinct_lines` is the
+    honest headline and these groups are the place to start.
+    """
+    groups: dict[tuple[str, int], dict] = {}
+    for f in findings:
+        g = groups.setdefault(
+            (f["file"], f["line"]),
+            {"file": f["file"], "line": f["line"], "count": 0, "codes": {}},
+        )
+        g["count"] += 1
+        code = f["code"] or "(none)"
+        g["codes"][code] = g["codes"].get(code, 0) + 1
+    multi = [g for g in groups.values() if g["count"] > 1]
+    multi.sort(key=lambda g: (-g["count"], g["file"], g["line"]))
+    return multi
+
+
 def _finding_key(f: dict) -> tuple:
     return (f["file"], f["line"], f["code"], f["message"])
 
@@ -629,6 +651,11 @@ def _analyze_with_cache(
                 1 for f in findings if f["kind"] == "missing-annotation"
             ),
             "other": sum(1 for f in findings if f["kind"] == "other"),
+            # Root causes are closer to lines than to findings: see line_groups.
+            "distinct_lines": len({(f["file"], f["line"]) for f in findings}),
+            "defect_lines": len(
+                {(f["file"], f["line"]) for f in findings if f["kind"] == "defect"}
+            ),
             "by_code": dict(sorted(by_code.items(), key=lambda kv: -kv[1])),
             # Only mypy's own unused-ignore counts. A grep for `# type: ignore`
             # measures how many ignores EXIST, not how many are stale. null when
@@ -661,6 +688,7 @@ def _analyze_with_cache(
             },
         },
         "findings": findings,
+        "line_groups": _line_groups(findings),
         "phantom_import_findings": phantom_imports or [],
         "unreachable_findings": unreachable or [],
         "stale_ignore_findings": stale_ignores or [],

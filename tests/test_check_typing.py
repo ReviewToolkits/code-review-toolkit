@@ -498,6 +498,32 @@ class TestUnreachableSource(unittest.TestCase):
         self.assertIsNone(result["summary"]["unreachable_source"])
 
 
+class TestLineGroups(unittest.TestCase):
+    """Several findings on one line are usually one root cause."""
+
+    def test_findings_are_grouped_by_line(self):
+        out = (
+            "pkg/m.py:4: error: a  [arg-type]\n"
+            "pkg/m.py:4: error: b  [arg-type]\n"
+            "pkg/m.py:4: error: c  [no-untyped-call]\n"
+            "pkg/m.py:9: error: d  [union-attr]\n"
+            "Found 4 errors in 1 file (checked 2 source files)\n"
+        )
+        result, _ = _run(_PKG, {"": out})
+        summary = result["summary"]
+        self.assertEqual(summary["total"], 4)
+        self.assertEqual(summary["distinct_lines"], 2)
+        self.assertEqual(summary["defect_lines"], 2)
+        (group,) = result["line_groups"]
+        self.assertEqual((group["line"], group["count"]), (4, 3))
+        self.assertEqual(group["codes"], {"arg-type": 2, "no-untyped-call": 1})
+
+    def test_one_finding_per_line_has_no_groups(self):
+        result, _ = _run(_PKG, {"": _BASE_ERR + _ONE_ERROR})
+        self.assertEqual(result["line_groups"], [])
+        self.assertEqual(result["summary"]["distinct_lines"], 1)
+
+
 class TestConfigDiscovery(unittest.TestCase):
     def test_pyproject_without_a_mypy_section_is_not_a_config(self):
         import tempfile
