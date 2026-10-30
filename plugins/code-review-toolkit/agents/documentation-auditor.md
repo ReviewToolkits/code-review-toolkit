@@ -52,7 +52,7 @@ claim and, in practice, one of the most productive places to look:
 - For "thread-safe": find the shared state and check every access is guarded.
 
 A claim the code doesn't keep is a FIX when callers rely on it. Where you can, force the
-interleaving to check it (see `docs/reproduction-convention.md`).
+interleaving to check it (see `<plugin_root>/docs/reproduction-convention.md`).
 
 ### 3. Comment Quality
 

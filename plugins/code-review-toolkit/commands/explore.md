@@ -162,7 +162,7 @@ Based on the requested aspects (default: all), launch the appropriate agents. Ea
 - Any relevant CLAUDE.md content
 - Its report path and artifacts directory in the run directory, and the run-directory rules
 - This requirement, whatever the agent's own template says: **every finding carries a `status`**
-  (`reproduced`, `confirmed` or `candidate`, per `docs/reproduction-convention.md`) **and a
+  (`reproduced`, `confirmed` or `candidate`, per `<plugin_root>/docs/reproduction-convention.md`) **and a
   concrete failure scenario** (inputs or interleaving → wrong outcome). A finding without one is a
   candidate, and the consolidation step treats it as such.
 
@@ -232,7 +232,7 @@ already fixed on a branch is reported as "fixed on `<branch>`, not merged", not 
 
 #### Step 3: Reproduce
 
-Promote what you can from `confirmed` to `reproduced`, following `docs/reproduction-convention.md`
+Promote what you can from `confirmed` to `reproduced`, following `<plugin_root>/docs/reproduction-convention.md`
 (minimal, deterministic reproducers with a shared harness; races forced with Events, never timed).
 A reproducer that fails to show the defect makes the finding `refuted` (or narrows it): keep it in
 the report with the evidence.

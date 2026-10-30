@@ -208,7 +208,7 @@ For each finding, consider:
 
 For each:
 - **Location**: file:line
-- **Status**: reproduced | confirmed | candidate (see `docs/reproduction-convention.md`)
+- **Status**: reproduced | confirmed | candidate (see `<plugin_root>/docs/reproduction-convention.md`)
 - **Pattern**: [What the code does]
 - **Problem**: [Why this is dangerous]
 - **Hidden errors**: [Specific exception types that could be silently caught]

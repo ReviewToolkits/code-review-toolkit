@@ -110,7 +110,7 @@ locks it found:
 ## Phase 5 — Reproduce what you can
 
 A race you have forced is a fact; a race you've argued is a hypothesis. Follow
-`docs/reproduction-convention.md` (and never patch the checkout under review):
+`<plugin_root>/docs/reproduction-convention.md` (and never patch the checkout under review):
 
 - **Force the interleaving.** Monkeypatch a function on one path to block on a
   `threading.Event` at the critical point, run the other path, then release. Never loop over random

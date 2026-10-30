@@ -182,6 +182,32 @@ class TestCatalogReferencesResolve(unittest.TestCase):
                     )
 
 
+class TestPromptReferencesShip(unittest.TestCase):
+    """Every plugin file a prompt cites must be inside the plugin.
+
+    1.15.0 shipped six prompts citing `docs/reproduction-convention.md`, which
+    lived at the repo root: the installed plugin had no such file, and agents
+    reported the reference as broken.
+    """
+
+    # `<plugin_root>/x` anywhere, and bare `docs/x`, `data/x`, `scripts/x` in
+    # backticks. Bare paths under other roots name the reviewed project's files.
+    _REF = re.compile(
+        r"<plugin_root>/([A-Za-z0-9_./-]+)|`((?:docs|data|scripts)/[A-Za-z0-9_./-]+)`"
+    )
+
+    def test_every_cited_plugin_path_exists(self):
+        for prompt in sorted([*_AGENTS.glob("*.md"), *_COMMANDS.glob("*.md")]):
+            text = prompt.read_text(encoding="utf-8")
+            for match in self._REF.finditer(text):
+                rel = (match.group(1) or match.group(2)).rstrip(".")
+                with self.subTest(prompt=prompt.name, path=rel):
+                    self.assertTrue(
+                        (_PLUGIN / rel).exists(),
+                        f"{prompt.name} cites {rel}, which the plugin does not ship",
+                    )
+
+
 class TestChangelog(unittest.TestCase):
     """The changelog is how a release gets cut; it has to be well-formed."""
 

@@ -23,8 +23,8 @@ all three observed on a single corpus:
 
 ## The recipe
 
-Read [`docs/searching-trackers.md`](../../../docs/searching-trackers.md) — it is vendored into this
-repo and is the authority. The essentials, because getting them wrong returns a *silent* empty
+Read [`<plugin_root>/docs/searching-trackers.md`](../docs/searching-trackers.md) — it ships with the plugin
+and is the authority. The essentials, because getting them wrong returns a *silent* empty
 result that reads exactly like "not reported":
 
 ```bash
