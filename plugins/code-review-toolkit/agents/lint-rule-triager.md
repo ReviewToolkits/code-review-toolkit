@@ -51,11 +51,26 @@ Every finding carries `shape_id`.
 
 **Tier-1 precision is 50-70%, not 100%.** Treat every finding as a candidate.
 
-`has_suppression_comment` is the strongest measured dismissal signal. When it is true, the author has
-already considered this exact class and written down that they meant it. On coverage.py, 6 of 19
-tier-1 findings carried one and **every one was a deliberate idiom** — `open = open  # pylint:
-disable=redefined-builtin`, which captures the builtin at import time so later mocking cannot break
-the module. Dismiss those *with the author's stated reason*, do not re-litigate them.
+`has_suppression_comment` is the strongest measured dismissal signal **where
+`suppression_is_dismissal_signal` is true**. Then the author has already considered this exact class
+and written down that they meant it. On coverage.py, 6 of 19 tier-1 findings carried one and **every
+one was a deliberate idiom** — `open = open  # pylint: disable=redefined-builtin`, which captures the
+builtin at import time so later mocking cannot break the module. Dismiss those *with the author's
+stated reason*, do not re-litigate them.
+
+**A suppression on a security rule (`S…`) or any `# nosec` is a claim to check, not a dismissal.**
+The calibration above was all `redefined-builtin`; it does not transfer. A `# nosec` asserts that a
+guard makes the code safe, and when the guard does not hold, the comment hides exactly the finding
+the rule exists for. For these hits `suppression_is_dismissal_signal` is false. For each one:
+
+1. Read `suppression_comment`. If it gives a reason that names a guard (a sandbox, an allow-list, an
+   escaping step, "input is trusted"), find that guard in the code and try to get around it.
+   Dismiss only when the guard holds, and cite where it is.
+2. `suppression_names_rule: false` means the comment names a *different* rule (`# nosec B301` over
+   an `eval`). It suppresses nothing that is firing here: report it as a stale suppression next to
+   the live finding.
+3. `summary.suppression_needs_verification` is how many hits need this. Say in the report how many
+   you checked.
 
 **The script has already dismissed one mechanical class.** `dismissed` holds hits moved out of
 `findings`, each with a `dismissal_reason` that `dismissal_reasons` explains. `summary.total`

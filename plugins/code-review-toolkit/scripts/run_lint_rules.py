@@ -38,6 +38,8 @@ Two fields carry the design:
 ``has_suppression_comment``
     Measured to be the strongest dismissal signal. Tier-1 precision is 50-70%,
     not 100%, and an existing suppression naming the rule class is usually why.
+    Not for security rules or ``nosec``: ``suppression_is_dismissal_signal``
+    is False there, and the comment's claim is checked instead.
 
 Usage:
     python run_lint_rules.py [path] [--tier 1|2] [--ruff-bin PATH]
@@ -198,6 +200,56 @@ _SUPPRESSION = re.compile(
     r"#\s*(noqa|type:\s*ignore|pylint:\s*disable|ruff:\s*noqa|nosec|pragma)",
     re.IGNORECASE,
 )
+
+# A suppression comment from `#` to the end of the line, and the codes it
+# names. ruff's `S<nnn>` rules are flake8-bandit's `B<nnn>`, so `# nosec B307`
+# names S307.
+_SUPPRESSION_TAIL = re.compile(
+    r"#\s*(?:noqa|type:\s*ignore|pylint:\s*disable|ruff:\s*noqa|nosec|pragma).*$",
+    re.IGNORECASE,
+)
+_SUPPRESSION_CODES = re.compile(r"\b([A-Z]{1,4}\d{2,4})\b")
+_SECURITY_RULE = re.compile(r"^S\d{3}$")
+
+
+def suppression_details(code: str, text: str) -> dict:
+    """What a suppression comment on a finding's line says about that finding.
+
+    ``has_suppression_comment`` was the agent's strongest dismissal signal,
+    calibrated on `redefined-builtin` idioms. It does not transfer to security
+    rules: a `# nosec` asserts a guard, and when the guard does not hold the
+    comment hides the very finding. So the comment is reported, with whether it names
+    this rule, and ``suppression_is_dismissal_signal`` is False for security
+    rules and for every ``nosec``: those claims are checked, not trusted.
+    """
+    match = _SUPPRESSION_TAIL.search(text or "")
+    if not match:
+        return {
+            "suppression_comment": None,
+            "suppression_names_rule": None,
+            "suppression_is_dismissal_signal": False,
+        }
+    comment = match.group(0).strip()
+    head = comment.lower()
+    named = set(_SUPPRESSION_CODES.findall(comment))
+    aliases = {code}
+    if _SECURITY_RULE.match(code):
+        aliases.add("B" + code[1:])
+    if "type:" in head or "pragma" in head or "pylint" in head:
+        names_rule = None  # cannot name a ruff code
+    elif not named:
+        names_rule = None  # a blanket suppression
+    else:
+        names_rule = bool(named & aliases)
+    exempt = bool(_SECURITY_RULE.match(code)) or "nosec" in head
+    return {
+        "suppression_comment": comment,
+        # True: it names this rule; False: it names only other rules (stale or
+        # misdirected); None: blanket, or a kind that cannot name a ruff code.
+        "suppression_names_rule": names_rule,
+        "suppression_is_dismissal_signal": not exempt and names_rule is not False,
+    }
+
 
 # FastAPI's dependency-injection markers. `def route(db=Depends(get_db))` is the
 # framework's documented idiom: the call builds an immutable marker object that
@@ -1141,6 +1193,7 @@ def normalize(
         "shape_id": RULE_TO_SHAPE.get(code),
         # The strongest measured dismissal signal.
         "has_suppression_comment": bool(_SUPPRESSION.search(text)),
+        **suppression_details(code, text),
     }
 
 
@@ -1340,6 +1393,11 @@ def analyze(
                 }
             ),
             "has_suppression_comment": len(suppressed),
+            # Suppressed hits whose comment must be VERIFIED, not trusted: a
+            # security rule, a `nosec`, or a comment naming a different rule.
+            "suppression_needs_verification": sum(
+                1 for f in suppressed if not f["suppression_is_dismissal_signal"]
+            ),
             # Hits matching a known ruff false-positive mode (see each hit's
             # `known_tool_issue` and `tool_bug_note`). Flagged, not dismissed.
             "suspect_tool_bug": sum(1 for f in findings if f.get("suspect_tool_bug")),

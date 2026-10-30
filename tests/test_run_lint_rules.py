@@ -85,6 +85,58 @@ class TestSuppressionDetection(unittest.TestCase):
         self.assertIsNone(mod._SUPPRESSION.search("x = 1  # this is fine"))
 
 
+class TestSuppressionDetails(unittest.TestCase):
+    """A suppression is a dismissal signal only where it was calibrated."""
+
+    def test_a_security_rule_under_nosec_is_not_a_dismissal_signal(self):
+        out = mod.suppression_details(
+            "S307", "result = eval(code, ctx)  # nosec B307 - sandboxed"
+        )
+        self.assertEqual(out["suppression_comment"], "# nosec B307 - sandboxed")
+        # B307 is bandit's name for S307.
+        self.assertTrue(out["suppression_names_rule"])
+        self.assertFalse(out["suppression_is_dismissal_signal"])
+
+    def test_a_security_rule_under_noqa_is_not_a_dismissal_signal(self):
+        out = mod.suppression_details("S608", "q = f'...{t}'  # noqa: S608")
+        self.assertTrue(out["suppression_names_rule"])
+        self.assertFalse(out["suppression_is_dismissal_signal"])
+
+    def test_a_suppression_naming_another_rule_is_flagged(self):
+        out = mod.suppression_details("S307", "x = eval(s)  # nosec B301")
+        self.assertFalse(out["suppression_names_rule"])
+        out = mod.suppression_details("E722", "except:  # noqa: E501")
+        self.assertFalse(out["suppression_names_rule"])
+        self.assertFalse(out["suppression_is_dismissal_signal"])
+
+    def test_a_non_security_suppression_stays_a_signal(self):
+        out = mod.suppression_details(
+            "PLW0127", "open = open  # pylint: disable=redefined-builtin"
+        )
+        self.assertIsNone(out["suppression_names_rule"])
+        self.assertTrue(out["suppression_is_dismissal_signal"])
+        out = mod.suppression_details("E722", "except:  # noqa: E722")
+        self.assertTrue(out["suppression_is_dismissal_signal"])
+
+    def test_no_comment(self):
+        out = mod.suppression_details("S307", "x = eval(s)")
+        self.assertIsNone(out["suppression_comment"])
+        self.assertFalse(out["suppression_is_dismissal_signal"])
+
+    def test_summary_counts_the_claims_to_verify(self):
+        from helpers import TempProject
+
+        source = "x = eval(s)  # nosec B307\ntry:\n    f()\nexcept:  # noqa: E722\n    pass\n"
+        with TempProject({"m.py": source}) as root:
+            hits = [
+                _fake_hit(root, "m.py", 1, "eval", code="S307"),
+                _fake_hit(root, "m.py", 4, "except", code="E722"),
+            ]
+            result = _analyze_with_fake_ruff(root, hits)
+        self.assertEqual(result["summary"]["has_suppression_comment"], 2)
+        self.assertEqual(result["summary"]["suppression_needs_verification"], 1)
+
+
 class TestNormalize(unittest.TestCase):
     def test_null_filename_and_location_are_tolerated(self):
         # ruff 0.16.0's JSON notes that filename and location "may now be null".
