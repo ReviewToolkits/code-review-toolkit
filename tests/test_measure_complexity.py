@@ -708,6 +708,55 @@ class TestHistoryCrossingAttribution(unittest.TestCase):
         self.assertEqual(mod.verdict_for(0, 9.0, recent_share=0.2), "settled")
         self.assertEqual(mod.verdict_for(0, 5.0, recent_share=0.6), "recent-churn")
 
+    def test_fixes_outside_hotspot_files_are_ranked(self):
+        simple = "def run(x):\n    return x\n"
+        other = "def other():\n    return 0\n"
+        with GitTempProject(
+            [
+                {
+                    "files": {"pkg/a.py": simple, "pkg/b.py": other},
+                    "message": "Add a and b",
+                },
+                {
+                    "files": {"pkg/a.py": simple.replace("x\n", "x or 0\n")},
+                    "message": "fix: default run",
+                },
+                {
+                    "files": {"pkg/a.py": simple.replace("x\n", "x or 1\n")},
+                    "message": "fix: default run again",
+                },
+                {"files": {"pkg/b.py": other.replace("0", "2")}, "message": "Tweak b"},
+            ]
+        ) as root:
+            funcs = [
+                f
+                for name in ("pkg/a.py", "pkg/b.py")
+                for f in mod.analyze_file(root / name, root)["functions"]
+            ]
+            top = mod.top_fixed_functions(funcs, root, root / "pkg", since="2000-01-01")
+        self.assertTrue(top["available"])
+        self.assertEqual(top["fix_commits_seen"], 2)
+        self.assertEqual(
+            [(f["qualified_name"], f["fix_commits_2y"]) for f in top["functions"]],
+            [("pkg/a.py::run", 2)],
+        )
+        self.assertFalse(top["functions"][0]["is_hotspot"])
+
+    def test_no_hotspots_is_not_missing_history(self):
+        with GitTempProject([{"files": {"m.py": "x = 1\n"}, "message": "Add"}]) as root:
+            meta = mod.cross_with_history([], root, since="2000-01-01")
+        self.assertTrue(meta["history_available"])
+        self.assertEqual(meta["fix_commits_seen_scope"], "hotspot files only")
+
+    def test_top_fixed_without_history_is_unavailable(self):
+        from pathlib import Path
+
+        funcs = _functions("def f():\n    return 1\n").values()
+        top = mod.top_fixed_functions(
+            list(funcs), Path("/definitely/not/a/repo"), Path("/definitely/not/a/repo")
+        )
+        self.assertFalse(top["available"])
+
     def test_project_in_a_repo_subdirectory(self):
         v1 = "def f():\n    return 1\n"
         with GitTempProject(

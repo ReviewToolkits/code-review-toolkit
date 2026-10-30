@@ -764,6 +764,14 @@ def cross_with_history(
         recent_since = datetime.now().astimezone() - timedelta(days=RECENT_DAYS)
     prefix = _git_prefix(project_root)
     paths = sorted({h["qualified_name"].split("::")[0] for h in hotspots})
+    if prefix is not None and not paths:
+        return {
+            "history_available": True,
+            "since": since,
+            "fix_commits_seen": None,
+            "fix_commits_seen_scope": "hotspot files only",
+            "note": "no hotspots, so nothing to cross; see top_fixed_functions",
+        }
     history = (
         _history_commits(project_root, since, paths, key_types, recent_since)
         if prefix is not None and paths
@@ -870,7 +878,10 @@ def cross_with_history(
     return {
         "history_available": True,
         "since": since,
+        # Fix commits touching the HOTSPOTS' files only; for the whole scan
+        # root see top_fixed_functions.
         "fix_commits_seen": sum(1 for c in history if c["is_fix"]),
+        "fix_commits_seen_scope": "hotspot files only",
         "median_fix_commits_per_hotspot": median,
         "active_risk_threshold": ACTIVE_RISK_FIXES,
         "attribution": (
@@ -896,6 +907,89 @@ def cross_with_history(
             "recent window: a low fix count there says the code is young, not "
             "that it is safe."
         ),
+    }
+
+
+# Parse budget for the scope-wide fix count (every source file, not only the
+# hotspots' files).
+MAX_SCOPE_PARSES = 3000
+TOP_FIXED = 15
+
+
+def top_fixed_functions(
+    functions: list[dict],
+    project_root: Path,
+    scan_root: Path,
+    since: str = "2 years ago",
+    key_types: dict[str, str] | None = None,
+    limit: int = TOP_FIXED,
+) -> dict:
+    """The source functions with the most fix commits, whatever their score.
+
+    The hotspot crossing only reads the hotspots' files, so on a structurally
+    simple codebase -- where the fix-dense functions all score below the
+    hotspot threshold -- it reported no fix commits although the window held
+    fixes to functions in other files. This counts over every source file in
+    the scan root.
+    """
+    prefix = _git_prefix(project_root)
+    try:
+        scope = scan_root.resolve().relative_to(project_root.resolve()).as_posix()
+    except ValueError:
+        scope = "."
+    history = (
+        _history_commits(project_root, since, [scope or "."], key_types)
+        if prefix is not None and functions
+        else None
+    )
+    if history is None:
+        return {
+            "available": False,
+            "reason": "no usable git history",
+            "functions": [],
+        }
+    by_key = {(f["file"], f["name"]): f for f in functions}
+    wanted = {prefix + rel: rel for rel in {f["file"] for f in functions}}
+    fixes: dict[tuple[str, str], set[str]] = {}
+    unattributed: set[str] = set()
+    with BlobFunctionIndex(project_root, max_parses=MAX_SCOPE_PARSES) as index:
+        for commit in history:
+            for file_diff in commit["diffs"]:
+                rel = wanted.get(file_diff["path"])
+                if rel is None:
+                    continue
+                touched = attribute_file_diff(file_diff, index)
+                if touched is None:
+                    unattributed.add(commit["sha"])
+                    continue
+                for qual in touched:
+                    if (rel, qual) in by_key:
+                        fixes.setdefault((rel, qual), set()).add(commit["sha"])
+        cap_reached = index.exhausted
+    ranked = sorted(
+        fixes.items(),
+        key=lambda item: (-len(item[1]), -by_key[item[0]]["score"], item[0]),
+    )
+    return {
+        "available": True,
+        "scope": "every source function under the scan root",
+        "since": since,
+        "fix_commits_seen": len(history),
+        "fix_commits_unattributed": len(unattributed),
+        "parse_cap_reached": cap_reached,
+        "functions_with_fixes": len(fixes),
+        "functions": [
+            {
+                "qualified_name": by_key[key]["qualified_name"],
+                "file": key[0],
+                "name": key[1],
+                "line_start": by_key[key]["line_start"],
+                "fix_commits_2y": len(shas),
+                "score": by_key[key]["score"],
+                "is_hotspot": by_key[key]["score"] >= 5.0,
+            }
+            for key, shas in ranked[:limit]
+        ],
     }
 
 
@@ -952,6 +1046,9 @@ def main() -> None:
 
     hotspots = [f for f in source_funcs if f["score"] >= 5.0]
     history_meta = cross_with_history(hotspots[:30], project_root, key_types=key_types)
+    history_meta["top_fixed_functions"] = top_fixed_functions(
+        source_funcs, project_root, scan_root, key_types=key_types
+    )
 
     output = {
         "project_root": str(project_root),
