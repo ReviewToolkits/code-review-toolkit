@@ -36,7 +36,7 @@ Before starting analysis, discover and list all documentation that exists in the
 - `Dockerfile`, `docker-compose.yml` / `compose.yaml`: exposed ports, env vars, entry commands, health checks, volumes — compare each with what the code actually reads and serves
 - `*.example` / `*.sample` / `dotenv.example` / `config.yml.example`: every key must exist in the code with the documented meaning and default
 - `Makefile` / `justfile` / `noxfile.py` / `tox.ini`: targets that reference scripts, paths or flags that no longer exist
-- CI configuration (`.github/workflows/`, `.gitlab-ci.yml` or a variant name, `.circleci/`): commands, Python versions, and whether what CI tests matches what the docs promise
+- CI configuration (`.github/workflows/`, `.gitlab-ci.yml` or a variant name, `.circleci/`): commands, Python versions, whether what CI tests matches what the docs promise, and whether each step actually runs (see "CI Steps That Pass Without Running")
 
 In practice these files hold more contradictions than the README: nobody reads them until a
 deployment fails.
@@ -148,6 +148,30 @@ Check that documentation files don't contradict each other or project metadata.
 - Does CLAUDE.md's coding conventions match what CONTRIBUTING.md says?
 - Do different docs files agree on project structure, installation steps, supported platforms?
 - Are there contradictory instructions? (e.g., README says "run `pip install .`" but CONTRIBUTING.md says "run `pip install -e .[dev]`" for the same purpose)
+
+### CI Steps That Pass Without Running
+
+A green CI step is a claim that the check ran. The README badge, CONTRIBUTING.md and the job's
+own name all repeat that claim. Some steps are green whatever happens:
+
+- `continue-on-error: true`, `|| true`, `set +e`, `exit 0` after the tool, or a tool flag that
+  turns failures into warnings (`--exit-zero`, `-f`/`--force`)
+- an `if:` that never holds for the triggers the workflow has, or a `paths:` filter that excludes
+  the code the job claims to check
+- a job named for an artifact it doesn't use, such as "test the wheel" that installs from the
+  source tree, or "scan the package" pointed at a path that doesn't exist
+
+For each such step, read one recent log and confirm the tool ran against the intended target
+(files scanned > 0, tests collected > 0, the scanned path exists):
+
+```bash
+gh run list --workflow <file>.yml -L 5 --json databaseId,conclusion,headBranch
+gh run view <id> --log | grep -n -A15 "<step name>"
+```
+
+A step that has been green for months while checking nothing is a FIX when the docs, a badge or
+a release checklist cite it. Name the run id you read as evidence. Without `gh` or network
+access, report the step as "not verified" from the workflow file alone.
 
 ### Documentation ↔ Code Conventions Consistency
 
