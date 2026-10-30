@@ -68,7 +68,13 @@ The script provides the raw data; apply your judgment to assess significance:
 **Circular dependencies:**
 - The script's `cycles` field lists detected cycles. For each, assess:
 - Is the cycle import-time or runtime-only? (Check `type_checking_only` on the edges.)
-- Does it cause actual import failures or just indicate poor layering?
+- Does it cause actual import failures or just indicate poor layering? **Test it, don't guess**:
+  import each cycle member first, in a fresh interpreter, from an exported copy of the project
+  (`python3 -I -c "import pkg.mod"` with `PYTHONPATH` pointing at the copy). Import order decides
+  whether a cycle crashes, so a cycle that's harmless via the package's usual entry point can still
+  raise `ImportError: cannot import name ...` when a tool or test imports a member first.
+- Function-level (lazy) imports and `importlib.import_module` break or hide cycles; note which edges
+  are lazy before rating a cycle.
 - Rate severity accordingly.
 
 **Layering violations:**

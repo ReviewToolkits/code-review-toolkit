@@ -88,6 +88,26 @@ Before flagging divergence, verify that the different approaches actually solve 
 - Should the minority approach be migrated to the majority approach?
 - Is this a case where a protocol/base class would help?
 
+### Phase 2b: Did the fix reach every sibling?
+
+The highest-value divergence is a **fix that reached one implementation and not its siblings**: two
+code paths solved the same problem the same way, a bug was found in one, and only that one was
+fixed. The divergence you see today *is* the unfixed bug.
+
+- Start from the fix list (git-history-context's output, or
+  `git log --oneline -i -E --grep 'fix|race|leak|guard|harden'`). For each fix that changed one
+  implementation of a pattern you're tracking, check every other implementation of that pattern.
+- Typical siblings: the sync and async variants, the embedded client and the server, search vs
+  ingest vs delete paths through the same gate, each transport of one API, each backend of one
+  interface, the error path and the success path.
+- Report these as FIX with the fixing commit as the guarded twin: "commit abc123 added X to path A;
+  paths B and C still lack it."
+
+When the pattern is a mapping (error codes and the statuses or messages they map to, config keys
+and their readers, event names and their handlers), extract the producer and consumer sides with a
+short AST or grep pass and diff them: a code produced but never mapped, or mapped but never
+produced, is a concrete finding.
+
 ### Phase 3: Missing Abstraction Detection
 
 The most valuable finding is often a **missing abstraction**. When the same concern is handled N different ways, it often means the codebase needs a shared utility, base class, protocol, or convention that doesn't exist yet. Look for:
@@ -120,6 +140,8 @@ The most valuable finding is often a **missing abstraction**. When the same conc
 - [File B, line N]: [Brief description of approach B]
 
 **Assessment**: [Intentional vs. accidental, impact level]
+**Status**: reproduced | confirmed | candidate — and, for a correctness divergence, the **failure scenario** (input → wrong outcome on the divergent path)
+**Fix propagation**: [If one approach is a later fix, the commit, and which siblings it missed]
 **Recommendation**: [Unify on approach X / extract shared abstraction / document the intentional variation]
 
 ### [Pattern Category 2]

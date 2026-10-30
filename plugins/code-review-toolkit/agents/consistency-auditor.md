@@ -80,6 +80,22 @@ For each pattern category, report:
    - **Low (style)**: Cosmetic inconsistency. Example: mixed quote styles, assertTrue(len(x) > 0) vs assertGreater(len(x), 0).
 4. Whether the divergence looks **intentional** (e.g., a different pattern in test code vs. source code is often intentional)
 
+### Phase 2b: Compare siblings' behavior, not just their style
+
+The correctness divergences that matter most are between **sibling functions that do the same job**:
+two periodic tasks, two route handlers for the same resource, the read and write variants of an
+operation, the methods of one class that all wrap the same helper. Line them up and compare what
+they *do*:
+
+- Does one offload blocking work (`run_in_executor`, `to_thread`) while its twin calls it inline?
+- Does one take the lock, retry wrapper or gate that every other sibling takes?
+- Does one validate, normalize or check permissions where its siblings do?
+- Does one clean up on the error path where its siblings do?
+
+The majority behavior is the project's own standard; the outlier is the candidate bug. Leave
+general "same concern, different approach" analysis across modules to pattern-consistency-checker:
+this agent's job is the side-by-side comparison of close siblings, within a module or class.
+
 ### Phase 3: Check Against Explicit Rules
 
 If CLAUDE.md (or equivalent project configuration) exists, compare the discovered conventions against the documented rules:

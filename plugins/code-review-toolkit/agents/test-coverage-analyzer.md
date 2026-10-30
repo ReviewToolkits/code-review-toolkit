@@ -208,7 +208,8 @@ Note: Simple functions with obvious correctness are ACCEPTABLE even without test
 - **Structural analysis only**: You're analyzing code, not running tests. Focus on what you can determine by reading source and test files.
 - **Behavioral over line coverage**: A function can have 100% line coverage and still be poorly tested if only the happy path is exercised. Assess whether tests verify meaningful behavior.
 - **Don't demand 100%**: Some code is inherently hard to test (I/O, CLI parsing, display formatting). Acknowledge this and focus on code where tests provide the most value.
-- **unittest conventions**: labeille uses unittest, not pytest. Assess against unittest idioms (TestCase subclasses, self.assert* methods, setUp/tearDown).
+- **Match the project's test framework**: check whether it uses `unittest` (TestCase subclasses, `self.assert*`, setUp/tearDown) or pytest (plain `test_*` functions, fixtures, `pytest.raises`, parametrize), and assess against that framework's idioms.
+- **Measured coverage beats structural correlation** when you can get it. If the project's test suite runs in the environment (in an exported copy, never the checkout), `coverage run -m pytest` (or `-m unittest`) plus `coverage json` gives executed lines; then check, for each FIX finding other agents reported, whether its lines ever ran. "The defective path is never executed by the suite" is the most actionable coverage statement you can make.
 - **Cap output**: Report at most 10 critical gaps and 10 important gaps in the summary. Offer to drill deeper on specific modules.
 - **Consider architecture**: If architecture-mapper output is available, prioritize coverage gaps in high fan-in modules (foundational code used by many others) over leaf modules.
 

@@ -46,7 +46,7 @@ These are actual type errors — places where the type checker determined that t
 
 1. **Type errors validate your design assessment**: If your qualitative analysis rated a type's Invariant Enforcement at 8/10 but mypy found 3 type errors in its constructor, the enforcement is weaker than it appeared. Adjust your rating.
 
-2. **Type errors reveal annotation accuracy**: Your coverage analysis from count_types.py counts how many functions are annotated. mypy reveals how many of those annotations are *correct*. A function with 100% annotation coverage that has type errors is worse than an unannotated function.
+2. **Type errors reveal annotation accuracy**: Your coverage analysis from count_types.py counts how many functions are annotated. mypy reveals how many of those annotations are *correct*. A function with 100% annotation coverage that has type errors is worse than an unannotated function. **The annotation-accuracy line in the template needs mypy data** (here, or from typing-integrity-auditor's `check_typing.py` run). Without it, write "not measured" — never derive it from coverage alone.
 
 3. **Severity mapping**:
    - mypy `error` → classify as FIX (actual type error)

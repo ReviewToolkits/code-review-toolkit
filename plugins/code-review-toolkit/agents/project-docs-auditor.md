@@ -28,9 +28,18 @@ Before starting analysis, discover and list all documentation that exists in the
 
 **Project metadata files (machine-readable, but document the project):**
 - pyproject.toml: project name, version, description, python-requires, dependencies, entry points (console_scripts), classifiers
-- setup.cfg / setup.py (if present)
+- setup.cfg / setup.py: many projects keep their real metadata here (`setup.py` with `install_requires`, `python_requires`, `entry_points`), with a `pyproject.toml` that only configures tools. Find out which file is authoritative before comparing anything against it
 - tox.ini / noxfile.py (test/CI configuration)
 - .pre-commit-config.yaml
+
+**Deployment and operations files (they document how to run the project, and drift silently):**
+- `Dockerfile`, `docker-compose.yml` / `compose.yaml`: exposed ports, env vars, entry commands, health checks, volumes — compare each with what the code actually reads and serves
+- `*.example` / `*.sample` / `dotenv.example` / `config.yml.example`: every key must exist in the code with the documented meaning and default
+- `Makefile` / `justfile` / `noxfile.py` / `tox.ini`: targets that reference scripts, paths or flags that no longer exist
+- CI configuration (`.github/workflows/`, `.gitlab-ci.yml` or a variant name, `.circleci/`): commands, Python versions, and whether what CI tests matches what the docs promise
+
+In practice these files hold more contradictions than the README: nobody reads them until a
+deployment fails.
 
 **Configuration documentation:**
 - Any YAML/TOML/JSON files that users are expected to create or edit
@@ -211,7 +220,7 @@ For each:
 - **New-user perspective**: Frame every finding as "would a new user be misled by this?" If the answer is no, it's ACCEPTABLE even if technically imprecise.
 - **Don't demand comprehensive docs**: Not every project needs extensive documentation. A small project with a clear README and good docstrings is fine. Focus on what IS documented being accurate, not on what ISN'T documented existing.
 - **Respect intentional brevity**: Some projects deliberately keep docs minimal. Don't flag the absence of a CONTRIBUTING.md as a problem unless the user specifically asks about documentation completeness.
-- **pyproject.toml is ground truth**: When documentation and project metadata disagree, pyproject.toml is usually the source of truth (since it's machine-read and affects actual behavior).
+- **Machine-read metadata is ground truth**: When documentation and project metadata disagree, the metadata file the build actually reads (`pyproject.toml`'s `[project]` table, or `setup.py`/`setup.cfg` when that's where it lives) is usually the source of truth, since it affects actual behavior.
 - **CLAUDE.md is special**: It guides Claude Code's behavior, so accuracy is critical. Contradictions between CLAUDE.md and actual code patterns are POLICY findings — one of them needs to change, but which one is a decision for the user.
 - **Cap output**: Report at most 15 broken references, 10 contradictions, and 10 completeness gaps. If there are more, note the total count.
 - **Use the finding classification system**: Every finding must be tagged FIX / CONSIDER / POLICY / ACCEPTABLE.
