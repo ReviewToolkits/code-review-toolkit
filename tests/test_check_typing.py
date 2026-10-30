@@ -32,6 +32,8 @@ with open(os.path.join(cache, "marker"), "w") as fh:
 with open(os.environ["FAKE_MYPY_RESPONSES"]) as fh:
     responses = json.load(fh)
 key = ""
+if "--config-file" in args and "ignore-missing-imports-off" in args[args.index("--config-file") + 1]:
+    key = "silenced"
 for flag in ("--disallow-any-unimported", "--warn-unreachable", "--warn-unused-ignores",
              "--check-untyped-defs"):
     if flag in args:
@@ -211,7 +213,6 @@ class TestParseOutput(unittest.TestCase):
             [f["kind"] for f in findings],
             ["defect", "missing-annotation", "other"],
         )
-
 
     def test_root_cause_codes_are_defects(self):
         """`name-defined`, `return` and `method-assign` used to land in `other`."""
@@ -487,12 +488,16 @@ class TestUnreachableSource(unittest.TestCase):
     def test_strict_does_not_imply_warn_unreachable(self):
         files = {**_PKG, "mypy.ini": "[mypy]\nstrict = True\n"}
         result, flags_seen = _run(files, {"": _BASE_ERR + _ONE_ERROR})
-        self.assertEqual(result["summary"]["unreachable_source"], "warn-unreachable-pass")
+        self.assertEqual(
+            result["summary"]["unreachable_source"], "warn-unreachable-pass"
+        )
         self.assertTrue(any("--warn-unreachable" in f for f in flags_seen))
 
     def test_without_it_the_labelled_pass_is_the_source(self):
         result, _ = _run(_PKG, {"": _BASE_ERR + _ONE_ERROR})
-        self.assertEqual(result["summary"]["unreachable_source"], "warn-unreachable-pass")
+        self.assertEqual(
+            result["summary"]["unreachable_source"], "warn-unreachable-pass"
+        )
 
     def test_skipped_pass_has_no_source(self):
         result, _ = _run(_PKG, {"": _BASE_ERR + _ONE_ERROR}, unreachable_pass=False)
@@ -583,6 +588,134 @@ class TestUntypedBodies(unittest.TestCase):
         )
         self.assertIsNone(result["summary"]["untyped_body_errors"])
         self.assertEqual(result["summary"]["unchecked_untyped_bodies"], 3)
+
+
+_STUBS = 'pkg/m.py:1: error: Library stubs not installed for "yaml"  [import-untyped]\n'
+_NOT_FOUND = (
+    "pkg/m.py:3: error: Cannot find implementation or library stub for module "
+    'named "nowhere.sub"  [import-not-found]\n'
+)
+_THREE_ERRORS = "Found 3 errors in 1 file (checked 2 source files)\n"
+
+
+class TestSilencedImports(unittest.TestCase):
+    """Which imports did ignore_missing_imports turn into Any? A labelled pass
+    on a copy of the config with the option off answers it; the
+    --disallow-any-unimported pass only fires where an annotation names one."""
+
+    def test_global_option_is_measured_by_a_derived_config(self):
+        files = {**_PKG, "mypy.ini": "[mypy]\nignore_missing_imports = True\n"}
+        with (
+            TempProject(files) as root,
+            FakeMypy(
+                {
+                    "": _BASE_ERR + _ONE_ERROR,
+                    "silenced": _STUBS + _BASE_ERR + _NOT_FOUND + _THREE_ERRORS,
+                }
+            ) as fake,
+        ):
+            result = mod.analyze(str(root / "pkg"), mypy_bin=str(fake.bin))
+            configs = [
+                c["argv"][c["argv"].index("--config-file") + 1] for c in fake.calls()
+            ]
+        derived = [c for c in configs if "ignore-missing-imports-off" in c]
+        self.assertEqual(len(derived), 1)
+        summary = result["summary"]
+        self.assertEqual(summary["silenced_imports"], 2)
+        self.assertEqual(
+            summary["silenced_imports_source"], "ignore-missing-imports-off-pass"
+        )
+        self.assertEqual(
+            sorted(f["module"] for f in result["silenced_import_findings"]),
+            ["nowhere.sub", "yaml"],
+        )
+        self.assertEqual(result["effective_flags"]["ignore_missing_imports"], "global")
+        # The baseline stays the project's own.
+        self.assertEqual(summary["total"], 1)
+
+    def test_without_the_option_there_is_nothing_to_silence(self):
+        result, _ = _run(_PKG, {"": _BASE_ERR + _ONE_ERROR})
+        summary = result["summary"]
+        self.assertEqual(summary["silenced_imports"], 0)
+        self.assertEqual(summary["silenced_imports_source"], "not-configured")
+        self.assertIsNone(result["effective_flags"]["ignore_missing_imports"])
+        self.assertNotIn("ignore-missing-imports-off", summary["labelled_passes"])
+
+    def test_skipped_pass_is_null_with_a_reason(self):
+        files = {**_PKG, "mypy.ini": "[mypy]\nignore_missing_imports = True\n"}
+        result, _ = _run(
+            files, {"": _BASE_ERR + _ONE_ERROR}, silenced_imports_pass=False
+        )
+        self.assertIsNone(result["summary"]["silenced_imports"])
+        self.assertIn("not measured", result["summary"]["silenced_imports_reason"])
+
+    def test_mypy_python_is_recorded(self):
+        result, _ = _run(_PKG, {"": _BASE_ERR + _ONE_ERROR})
+        info = result["mypy_python"]
+        self.assertEqual(info["source"], "mypy-launcher")
+        self.assertEqual(
+            Path(info["executable"]).resolve(), Path(sys.executable).resolve()
+        )
+        self.assertTrue(info["site_packages"])
+
+
+class TestDeriveConfig(unittest.TestCase):
+    def test_ini_copy_turns_every_section_off_and_keeps_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "setup.cfg"
+            src.write_text(
+                "[metadata]\nname = x\n"
+                "[mypy]\nignore_missing_imports = True\n"
+                "plugins = tools/plug.py, some.module\n"
+                "mypy_path = $MYPY_CONFIG_FILE_DIR/stubs\n"
+                "[mypy-vendor.*]\nignore_missing_imports = True\n"
+            )
+            self.assertEqual(mod.ignore_missing_imports_scope(str(src)), "global")
+            out, why = mod.derive_config_without_ignores(str(src), tmp + "/out")
+            self.assertIsNone(why)
+            import configparser
+
+            parser = configparser.RawConfigParser()
+            parser.read(out)
+        self.assertEqual(parser.sections(), ["mypy", "mypy-vendor.*"])
+        for section in parser.sections():
+            self.assertEqual(parser.get(section, "ignore_missing_imports"), "False")
+        self.assertEqual(
+            parser.get("mypy", "plugins"),
+            f"{Path(tmp).resolve()}/tools/plug.py, some.module",
+        )
+        self.assertEqual(
+            parser.get("mypy", "mypy_path"), f"{Path(tmp).resolve()}/stubs"
+        )
+
+    @unittest.skipIf(sys.version_info < (3, 11), "tomllib is 3.11+")
+    def test_toml_per_module_override_is_turned_off(self):
+        import tomllib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "pyproject.toml"
+            src.write_text(
+                "[tool.mypy]\nstrict = true\nexclude = ['build/']\n"
+                "[[tool.mypy.overrides]]\nmodule = ['a.*', 'b']\n"
+                "ignore_missing_imports = true\n"
+            )
+            self.assertEqual(mod.ignore_missing_imports_scope(str(src)), "per-module")
+            out, why = mod.derive_config_without_ignores(str(src), tmp + "/out")
+            self.assertIsNone(why)
+            data = tomllib.loads(Path(out).read_text())["tool"]["mypy"]
+        self.assertIs(data["strict"], True)
+        self.assertEqual(data["exclude"], ["build/"])
+        self.assertIs(data["ignore_missing_imports"], False)
+        (override,) = data["overrides"]
+        self.assertEqual(override["module"], ["a.*", "b"])
+        self.assertIs(override["ignore_missing_imports"], False)
+
+    def test_no_option_means_no_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "mypy.ini"
+            src.write_text("[mypy]\nstrict = True\n")
+            self.assertIsNone(mod.ignore_missing_imports_scope(str(src)))
+        self.assertIsNone(mod.ignore_missing_imports_scope(None))
 
 
 class TestConfigDiscovery(unittest.TestCase):

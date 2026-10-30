@@ -42,12 +42,18 @@ mean "not measured", so an unmeasured count is reported as null with a reason.
 ``--check-untyped-defs`` runs when the config leaves the bodies of unannotated
 functions unchecked (mypy's default): ``unchecked_untyped_bodies`` says how many
 bodies a clean baseline never looked at, and the pass says what is in them.
+When the config sets ``ignore_missing_imports`` (globally or per module), a
+pass on a derived copy of the config with it off lists ``silenced_imports``:
+the modules that silently became ``Any``. ``--disallow-any-unimported`` only
+fires where an annotation names such a type, so it can add 0 while whole
+packages are unchecked. ``mypy_python`` records the interpreter whose
+site-packages mypy resolved against, since every import result depends on it.
 The passes are independent and run concurrently.
 
 Usage:
     python check_typing.py [path] [--mypy-bin PATH] [--max-files N]
         [--no-strict-pass] [--no-unreachable-pass] [--no-unused-ignores-pass]
-        [--no-untyped-defs-pass]
+        [--no-untyped-defs-pass] [--no-silenced-imports-pass]
 """
 
 from __future__ import annotations
@@ -55,6 +61,7 @@ from __future__ import annotations
 import argparse
 import ast
 import configparser
+import json
 import os
 import re
 import shutil
@@ -141,7 +148,11 @@ _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\([A-Za-z]")
 def mypy_version(mypy_bin: str) -> str | None:
     try:
         out = subprocess.run(
-            [mypy_bin, "--version"], capture_output=True, text=True, timeout=60
+            [mypy_bin, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -343,13 +354,239 @@ def _run_mypy(
     env = {**os.environ, "FORCE_COLOR": "0", "MYPY_FORCE_COLOR": "0", "NO_COLOR": "1"}
     try:
         out = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=_MYPY_TIMEOUT, env=env
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=_MYPY_TIMEOUT,
+            env=env,
+            check=False,
         )
     except subprocess.TimeoutExpired:
         return "", f"mypy timed out after {_MYPY_TIMEOUT}s", None
     except OSError as exc:
         return "", f"could not run mypy: {exc}", None
     return out.stdout, out.stderr, out.returncode
+
+
+_SILENCED_PASS = "ignore-missing-imports-off"
+_IMPORT_CODES = frozenset({"import-untyped", "import-not-found", "import"})
+_QUOTED = re.compile(r'"([^"]+)"')
+
+
+def ignore_missing_imports_scope(config: str | None) -> str | None:
+    """`"global"`, `"per-module"` or None: where the config sets the option."""
+    if not config:
+        return None
+    path = Path(config)
+    if path.suffix == ".toml":
+        data = _load_toml(path)
+        if data is None:
+            return None
+        mypy = data.get("tool", {}).get("mypy", {})
+        if mypy.get("ignore_missing_imports") is True:
+            return "global"
+        overrides = mypy.get("overrides", [])
+        if isinstance(overrides, list) and any(
+            isinstance(o, dict) and o.get("ignore_missing_imports") is True
+            for o in overrides
+        ):
+            return "per-module"
+        return None
+    parser = configparser.RawConfigParser()
+    try:
+        parser.read(path, encoding="utf-8")
+    except (OSError, configparser.Error):
+        return None
+    scope = None
+    for section in parser.sections():
+        if section != "mypy" and not section.startswith("mypy-"):
+            continue
+        try:
+            on = parser.getboolean(section, "ignore_missing_imports", fallback=False)
+        except ValueError:
+            continue
+        if on and section == "mypy":
+            return "global"
+        if on:
+            scope = "per-module"
+    return scope
+
+
+def _load_toml(path: Path) -> dict | None:
+    try:
+        import tomllib
+    except ImportError:  # Python 3.10
+        return None
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _absolutize(value: str, base: Path, *, plugin: bool = False) -> str:
+    """A config value as it reads from *base*, for a copy that lives elsewhere."""
+    value = value.replace("$MYPY_CONFIG_FILE_DIR", str(base))
+    if plugin:
+        parts = []
+        for item in value.split(","):
+            item = item.strip()
+            if (
+                item
+                and ("/" in item or item.endswith(".py"))
+                and not os.path.isabs(item)
+            ):
+                item = str(base / item)
+            parts.append(item)
+        value = ", ".join(parts)
+    return value
+
+
+def _toml_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
+    raise ValueError(f"cannot copy a {type(value).__name__} value")
+
+
+def derive_config_without_ignores(
+    config: str | None, out_dir: str
+) -> tuple[str | None, str | None]:
+    """Write a copy of *config* with every ignore_missing_imports turned off.
+
+    Returns `(path, None)`, or `(None, reason)` when the config cannot be
+    copied faithfully -- an unmeasured result, never a silently different run.
+    Paths the copy would resolve differently ($MYPY_CONFIG_FILE_DIR, relative
+    plugin paths) are made absolute against the original's directory.
+    """
+    if not config:
+        return None, "no config"
+    src = Path(config)
+    base = src.resolve().parent
+    os.makedirs(out_dir, exist_ok=True)
+    if src.suffix == ".toml":
+        data = _load_toml(src)
+        if data is None:
+            return None, "could not read the project's TOML config"
+        mypy = dict(data.get("tool", {}).get("mypy", {}))
+        overrides = mypy.pop("overrides", [])
+        lines = ["[tool.mypy]"]
+        try:
+            for key, value in mypy.items():
+                if key == "ignore_missing_imports":
+                    continue
+                if isinstance(value, str):
+                    value = _absolutize(value, base, plugin=key == "plugins")
+                elif key == "plugins" and isinstance(value, list):
+                    value = [_absolutize(v, base, plugin=True) for v in value]
+                lines.append(f"{key} = {_toml_value(value)}")
+            lines.append("ignore_missing_imports = false")
+            for override in overrides:
+                lines += ["", "[[tool.mypy.overrides]]"]
+                for key, value in override.items():
+                    if key != "ignore_missing_imports":
+                        lines.append(f"{key} = {_toml_value(value)}")
+                lines.append("ignore_missing_imports = false")
+        except ValueError as exc:
+            return None, f"could not copy the project's config ({exc})"
+        out = Path(out_dir) / "pyproject.toml"
+        out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return str(out), None
+    parser = configparser.RawConfigParser()
+    try:
+        parser.read(src, encoding="utf-8")
+    except (OSError, configparser.Error) as exc:
+        return None, f"could not read the project's config ({exc})"
+    copy = configparser.RawConfigParser()
+    copy.add_section("mypy")
+    for section in parser.sections():
+        if section != "mypy" and not section.startswith("mypy-"):
+            continue
+        if not copy.has_section(section):
+            copy.add_section(section)
+        for key, value in parser.items(section):
+            copy.set(section, key, _absolutize(value, base, plugin=key == "plugins"))
+        copy.set(section, "ignore_missing_imports", "False")
+    copy.set("mypy", "ignore_missing_imports", "False")
+    out = Path(out_dir) / "mypy.ini"
+    with open(out, "w", encoding="utf-8") as fh:
+        copy.write(fh)
+    return str(out), None
+
+
+_PYTHON_PROBE = (
+    "import json, sys, sysconfig; print(json.dumps({"
+    "'executable': sys.executable, "
+    "'version': '.'.join(map(str, sys.version_info[:3])), "
+    "'prefix': sys.prefix, "
+    "'site_packages': sysconfig.get_paths()['purelib']}))"
+)
+
+
+def mypy_python_info(mypy_bin: str, config: str | None) -> dict:
+    """The interpreter mypy resolves imports against, and its site-packages.
+
+    mypy uses ``python_executable`` from the config if set, else the
+    interpreter it runs under -- found from the launcher's ``#!`` line. The
+    interpreter is asked with ``-I -B``, so nothing is imported from or
+    written to the caller's directory.
+    """
+    exe = None
+    source = None
+    if config:
+        path = Path(config)
+        if path.suffix == ".toml":
+            data = _load_toml(path) or {}
+            exe = data.get("tool", {}).get("mypy", {}).get("python_executable")
+        else:
+            parser = configparser.RawConfigParser()
+            try:
+                parser.read(path, encoding="utf-8")
+                exe = parser.get("mypy", "python_executable", fallback=None)
+            except (OSError, configparser.Error):
+                exe = None
+        if exe:
+            source = "config"
+    if not exe:
+        launcher = shutil.which(mypy_bin) or mypy_bin
+        try:
+            with open(launcher, "rb") as fh:
+                first = fh.readline(512).decode("utf-8", "replace").strip()
+        except OSError:
+            first = ""
+        if first.startswith("#!"):
+            parts = first[2:].split()
+            if parts and os.path.basename(parts[0]) == "env" and len(parts) > 1:
+                exe = shutil.which(parts[1])
+            elif parts:
+                exe = parts[0]
+            source = "mypy-launcher"
+    if not exe:
+        return {
+            "executable": None,
+            "source": None,
+            "reason": "could not tell which interpreter mypy runs under",
+        }
+    try:
+        out = subprocess.run(
+            [exe, "-I", "-B", "-c", _PYTHON_PROBE],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        info = json.loads(out.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {
+            "executable": exe,
+            "source": source,
+            "reason": "the interpreter could not be queried",
+        }
+    return {**info, "source": source, "reason": None}
 
 
 def _count_untyped_defs(files: list[Path]) -> int:
@@ -477,6 +714,7 @@ def analyze(
     unreachable_pass: bool = True,
     unused_ignores_pass: bool = True,
     untyped_defs_pass: bool = True,
+    silenced_imports_pass: bool = True,
 ) -> dict:
     """Run mypy over *target*, plus labelled extra passes.
 
@@ -531,10 +769,10 @@ def analyze(
                 "warn-unreachable": unreachable_pass,
                 "warn-unused-ignores": unused_ignores_pass,
                 "check-untyped-defs": untyped_defs_pass,
+                _SILENCED_PASS: silenced_imports_pass,
             },
-            untyped_defs=_count_untyped_defs(
-                files[:max_files] if capped else files
-            ),
+            mypy_python=mypy_python_info(mypy_bin, config),
+            untyped_defs=_count_untyped_defs(files[:max_files] if capped else files),
             cache_root=cache_root,
         )
     finally:
@@ -552,6 +790,7 @@ def _analyze_with_cache(
     passes: dict[str, bool],
     cache_root: str,
     untyped_defs: int | None = None,
+    mypy_python: dict | None = None,
 ) -> dict:
     stdout, stderr, returncode = _run_mypy(
         mypy_bin, targets, config, cap_flags, os.path.join(cache_root, "baseline")
@@ -580,11 +819,28 @@ def _analyze_with_cache(
     # LABELLED passes. Kept separate so the baseline count stays honest:
     # folding them in would make every project look worse by a flag change.
     # They are independent, so they run concurrently, each with its own cache.
-    wanted = {
-        name: ["--" + name]
+    wanted: dict[str, tuple[list[str], str | None]] = {
+        name: (["--" + name], config)
         for name, enabled in passes.items()
-        if enabled and status == "OK"
+        if enabled and status == "OK" and name != _SILENCED_PASS
     }
+    # Imports that ignore_missing_imports turned into Any: re-run with that
+    # option off everywhere (a derived copy of the config) and see which
+    # import errors appear. Without the option set there is nothing to find.
+    ignore_scope = ignore_missing_imports_scope(config)
+    silenced_reason = None
+    if not passes.get(_SILENCED_PASS):
+        silenced_reason = "not measured: the pass was skipped"
+    elif status != "OK":
+        silenced_reason = "not measured: the baseline run failed"
+    elif ignore_scope is not None:
+        derived, why = derive_config_without_ignores(
+            config, os.path.join(cache_root, _SILENCED_PASS + "-config")
+        )
+        if derived is None:
+            silenced_reason = f"not measured: {why}"
+        else:
+            wanted[_SILENCED_PASS] = ([], derived)
     if ignores_in_config:
         wanted.pop("warn-unused-ignores", None)
     # Same for unreachable code: when the project's config already enables
@@ -607,13 +863,13 @@ def _analyze_with_cache(
                     _labelled_pass,
                     mypy_bin,
                     targets,
-                    config,
+                    pass_config,
                     [*cap_flags, *flags],
                     name,
                     os.path.join(cache_root, name),
                     baseline,
                 )
-                for name, flags in wanted.items()
+                for name, (flags, pass_config) in wanted.items()
             }
             labelled = {name: fut.result() for name, fut in futures.items()}
 
@@ -633,6 +889,27 @@ def _analyze_with_cache(
         unreachable_source = None if unreachable is None else "warn-unreachable-pass"
 
     untyped_body = pass_findings("check-untyped-defs")
+
+    silenced: list[dict] | None
+    if ignore_scope is None and silenced_reason is None:
+        silenced, silenced_source = [], "not-configured"
+    else:
+        silenced = pass_findings(_SILENCED_PASS)
+        if silenced is not None:
+            silenced = [f for f in silenced if f["code"] in _IMPORT_CODES]
+            for f in silenced:
+                m = _QUOTED.search(f["message"])
+                f["module"] = m.group(1) if m else None
+            silenced_source = "ignore-missing-imports-off-pass"
+        else:
+            silenced_source = None
+            if silenced_reason is None:
+                ran = labelled.get(_SILENCED_PASS)
+                silenced_reason = (
+                    f"not measured: the pass failed ({ran['error']})"
+                    if ran
+                    else "not measured: the pass did not run"
+                )
 
     stale_reason = None
     stale_ignores: list[dict] | None
@@ -687,7 +964,13 @@ def _analyze_with_cache(
             "check_untyped_defs": untyped_checked,
             "warn_unreachable": unreachable_in_config,
             "warn_unused_ignores": config_enables(config, "warn_unused_ignores"),
+            # "global", "per-module" or null: where the config makes missing
+            # imports silently Any.
+            "ignore_missing_imports": ignore_scope,
         },
+        # The interpreter mypy resolved third-party imports against. Every
+        # import-related result depends on it; null with a reason if unknown.
+        "mypy_python": mypy_python,
         "returncode": returncode,
         "stderr": stderr.strip(),
         "files_checked": checked,
@@ -728,11 +1011,7 @@ def _analyze_with_cache(
             # files handed to mypy (a config `exclude` is not applied).
             "untyped_defs": untyped_defs,
             "unchecked_untyped_bodies": (
-                None
-                if untyped_defs is None
-                else 0
-                if untyped_checked
-                else untyped_defs
+                None if untyped_defs is None else 0 if untyped_checked else untyped_defs
             ),
             # Errors inside those bodies, from the labelled
             # --check-untyped-defs pass; null if it did not run (including
@@ -740,6 +1019,17 @@ def _analyze_with_cache(
             "untyped_body_errors": (
                 None if untyped_body is None else len(untyped_body)
             ),
+            # Distinct modules that ignore_missing_imports turned into Any
+            # (every name imported from one is unchecked). [] when the config
+            # does not set the option; null when not measured -- see
+            # silenced_imports_reason.
+            "silenced_imports": (
+                None
+                if silenced is None
+                else len({f["module"] or f["message"] for f in silenced})
+            ),
+            "silenced_imports_source": silenced_source,
+            "silenced_imports_reason": silenced_reason,
             "parse_mismatch": parse_mismatch,
             "strict_pass_ran": phantom_imports is not None,
             "labelled_passes": {
@@ -757,6 +1047,7 @@ def _analyze_with_cache(
         "unreachable_findings": unreachable or [],
         "stale_ignore_findings": stale_ignores or [],
         "untyped_body_findings": untyped_body or [],
+        "silenced_import_findings": silenced or [],
         # Notes that belong to no error: `annotation-unchecked` (an annotated
         # variable inside an untyped function body mypy skips), reveal_type.
         "standalone_notes": standalone_notes,
@@ -789,6 +1080,11 @@ def main() -> None:
         help="skip the labelled --check-untyped-defs pass",
     )
     parser.add_argument(
+        "--no-silenced-imports-pass",
+        action="store_true",
+        help="skip the labelled pass that turns ignore_missing_imports off",
+    )
+    parser.add_argument(
         "--max-files",
         type=int,
         default=0,
@@ -804,6 +1100,7 @@ def main() -> None:
             unreachable_pass=not args.no_unreachable_pass,
             unused_ignores_pass=not args.no_unused_ignores_pass,
             untyped_defs_pass=not args.no_untyped_defs_pass,
+            silenced_imports_pass=not args.no_silenced_imports_pass,
         )
         emit(result)
         sys.exit(1 if result["status"] == "FAILED" else 0)
