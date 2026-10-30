@@ -17,6 +17,7 @@ class GitTempProject(TempProject):
       - files: dict of {path: content} to create/modify
       - message: commit message
       - date: optional ISO date string (defaults to sequential dates)
+      - committer_date: optional, when it should differ from `date`
       - author: optional author name (defaults to "Test Author")
     """
 
@@ -61,7 +62,7 @@ class GitTempProject(TempProject):
             )
             env = os.environ.copy()
             env["GIT_AUTHOR_DATE"] = date
-            env["GIT_COMMITTER_DATE"] = date
+            env["GIT_COMMITTER_DATE"] = commit.get("committer_date", date)
             env["GIT_AUTHOR_NAME"] = author
             env["GIT_COMMITTER_NAME"] = author
             env["GIT_AUTHOR_EMAIL"] = "test@test.com"
@@ -266,9 +267,12 @@ class TestCoChangeDetection(unittest.TestCase):
         # Create many co-changing pairs.
         commits = []
         for i in range(5):
-            commits.append({"files": [f"f{j}.py" for j in range(10)],
-                            "type": "fix", "message": ""})
-        clusters = mod.compute_co_change_clusters(commits, min_co_changes=3, max_pairs=5)
+            commits.append(
+                {"files": [f"f{j}.py" for j in range(10)], "type": "fix", "message": ""}
+            )
+        clusters = mod.compute_co_change_clusters(
+            commits, min_co_changes=3, max_pairs=5
+        )
         self.assertLessEqual(len(clusters), 5)
 
     def test_sorted_by_count(self):
@@ -298,40 +302,54 @@ class TestGitIntegration(unittest.TestCase):
             self.assertIn("Not a git repository", result["error"])
 
     def test_empty_repo_no_commits(self):
-        with GitTempProject([
-            {"files": {"mod.py": "x = 1\n"}, "message": "init"},
-        ]) as root:
+        with GitTempProject(
+            [
+                {"files": {"mod.py": "x = 1\n"}, "message": "init"},
+            ]
+        ) as root:
             # Analyze with a time range that excludes the commit.
-            result = mod.analyze([
-                str(root),
-                "--since", "2030-01-01",
-                "--until", "2030-02-01",
-            ])
+            result = mod.analyze(
+                [
+                    str(root),
+                    "--since",
+                    "2030-01-01",
+                    "--until",
+                    "2030-02-01",
+                ]
+            )
             self.assertNotIn("error", result)
             self.assertEqual(result["summary"]["total_commits"], 0)
             self.assertEqual(result["file_churn"], [])
 
     def test_file_churn_basic(self):
-        with GitTempProject([
-            {
-                "files": {"a.py": "x = 1\n"},
-                "message": "Add a",
-                "date": "2025-01-01T12:00:00+00:00",
-            },
-            {
-                "files": {"a.py": "x = 2\n"},
-                "message": "Fix a",
-                "date": "2025-01-02T12:00:00+00:00",
-            },
-            {
-                "files": {"b.py": "y = 1\n"},
-                "message": "Add b",
-                "date": "2025-01-03T12:00:00+00:00",
-            },
-        ]) as root:
-            result = mod.analyze([
-                str(root), "--since", "2024-12-01", "--until", "2025-02-01",
-            ])
+        with GitTempProject(
+            [
+                {
+                    "files": {"a.py": "x = 1\n"},
+                    "message": "Add a",
+                    "date": "2025-01-01T12:00:00+00:00",
+                },
+                {
+                    "files": {"a.py": "x = 2\n"},
+                    "message": "Fix a",
+                    "date": "2025-01-02T12:00:00+00:00",
+                },
+                {
+                    "files": {"b.py": "y = 1\n"},
+                    "message": "Add b",
+                    "date": "2025-01-03T12:00:00+00:00",
+                },
+            ]
+        ) as root:
+            result = mod.analyze(
+                [
+                    str(root),
+                    "--since",
+                    "2024-12-01",
+                    "--until",
+                    "2025-02-01",
+                ]
+            )
             self.assertNotIn("error", result)
             self.assertEqual(result["summary"]["total_commits"], 3)
             # a.py should have 2 commits, b.py should have 1.
@@ -342,142 +360,197 @@ class TestGitIntegration(unittest.TestCase):
             self.assertEqual(churn_map["b.py"]["commits"], 1)
 
     def test_commit_classification_in_analysis(self):
-        with GitTempProject([
-            {
-                "files": {"a.py": "x = 1\n"},
-                "message": "Fix crash in parser",
-                "date": "2025-01-01T12:00:00+00:00",
-            },
-            {
-                "files": {"a.py": "x = 2\n"},
-                "message": "Add new feature",
-                "date": "2025-01-02T12:00:00+00:00",
-            },
-        ]) as root:
-            result = mod.analyze([
-                str(root), "--since", "2024-12-01", "--until", "2025-02-01",
-            ])
+        with GitTempProject(
+            [
+                {
+                    "files": {"a.py": "x = 1\n"},
+                    "message": "Fix crash in parser",
+                    "date": "2025-01-01T12:00:00+00:00",
+                },
+                {
+                    "files": {"a.py": "x = 2\n"},
+                    "message": "Add new feature",
+                    "date": "2025-01-02T12:00:00+00:00",
+                },
+            ]
+        ) as root:
+            result = mod.analyze(
+                [
+                    str(root),
+                    "--since",
+                    "2024-12-01",
+                    "--until",
+                    "2025-02-01",
+                ]
+            )
             by_type = result["summary"]["commits_by_type"]
             self.assertEqual(by_type.get("fix", 0), 1)
             self.assertEqual(by_type.get("feature", 0), 1)
 
     def test_recent_fixes_populated(self):
-        with GitTempProject([
-            {
-                "files": {"a.py": "x = 1\n"},
-                "message": "Fix null check",
-                "date": "2025-01-01T12:00:00+00:00",
-            },
-        ]) as root:
-            result = mod.analyze([
-                str(root), "--since", "2024-12-01", "--until", "2025-02-01",
-            ])
+        with GitTempProject(
+            [
+                {
+                    "files": {"a.py": "x = 1\n"},
+                    "message": "Fix null check",
+                    "date": "2025-01-01T12:00:00+00:00",
+                },
+            ]
+        ) as root:
+            result = mod.analyze(
+                [
+                    str(root),
+                    "--since",
+                    "2024-12-01",
+                    "--until",
+                    "2025-02-01",
+                ]
+            )
             self.assertEqual(len(result["recent_fixes"]), 1)
             self.assertEqual(result["recent_fixes"][0]["message"], "Fix null check")
 
     def test_no_function_flag(self):
-        with GitTempProject([
-            {
-                "files": {"a.py": "def foo():\n    return 1\n"},
-                "message": "init",
-                "date": "2025-01-01T12:00:00+00:00",
-            },
-        ]) as root:
-            result = mod.analyze([
-                str(root),
-                "--since", "2024-12-01",
-                "--until", "2025-02-01",
-                "--no-function",
-            ])
+        with GitTempProject(
+            [
+                {
+                    "files": {"a.py": "def foo():\n    return 1\n"},
+                    "message": "init",
+                    "date": "2025-01-01T12:00:00+00:00",
+                },
+            ]
+        ) as root:
+            result = mod.analyze(
+                [
+                    str(root),
+                    "--since",
+                    "2024-12-01",
+                    "--until",
+                    "2025-02-01",
+                    "--no-function",
+                ]
+            )
             self.assertEqual(result["function_churn"], [])
             self.assertIn("function_churn_note", result)
 
     def test_last_n_commits(self):
-        with GitTempProject([
-            {
-                "files": {"a.py": f"x = {i}\n"},
-                "message": f"Commit {i}",
-                "date": f"2025-01-{i + 1:02d}T12:00:00+00:00",
-            }
-            for i in range(10)
-        ]) as root:
+        with GitTempProject(
+            [
+                {
+                    "files": {"a.py": f"x = {i}\n"},
+                    "message": f"Commit {i}",
+                    "date": f"2025-01-{i + 1:02d}T12:00:00+00:00",
+                }
+                for i in range(10)
+            ]
+        ) as root:
             result = mod.analyze([str(root), "--last", "3"])
             # Should process exactly 3 most recent commits.
             self.assertEqual(result["summary"]["total_commits"], 3)
 
     def test_max_commits_cap(self):
-        with GitTempProject([
-            {
-                "files": {"a.py": f"x = {i}\n"},
-                "message": f"Commit {i}",
-                "date": f"2025-01-{i + 1:02d}T12:00:00+00:00",
-            }
-            for i in range(10)
-        ]) as root:
-            result = mod.analyze([
-                str(root),
-                "--since", "2024-12-01",
-                "--until", "2025-02-01",
-                "--max-commits", "5",
-            ])
+        with GitTempProject(
+            [
+                {
+                    "files": {"a.py": f"x = {i}\n"},
+                    "message": f"Commit {i}",
+                    "date": f"2025-01-{i + 1:02d}T12:00:00+00:00",
+                }
+                for i in range(10)
+            ]
+        ) as root:
+            result = mod.analyze(
+                [
+                    str(root),
+                    "--since",
+                    "2024-12-01",
+                    "--until",
+                    "2025-02-01",
+                    "--max-commits",
+                    "5",
+                ]
+            )
             self.assertLessEqual(result["summary"]["total_commits"], 5)
             self.assertTrue(result["time_range"]["commit_cap_applied"])
 
     def test_author_count(self):
-        with GitTempProject([
-            {
-                "files": {"a.py": "x = 1\n"},
-                "message": "Commit 1",
-                "author": "Alice",
-                "date": "2025-01-01T12:00:00+00:00",
-            },
-            {
-                "files": {"a.py": "x = 2\n"},
-                "message": "Commit 2",
-                "author": "Bob",
-                "date": "2025-01-02T12:00:00+00:00",
-            },
-        ]) as root:
-            result = mod.analyze([
-                str(root), "--since", "2024-12-01", "--until", "2025-02-01",
-            ])
+        with GitTempProject(
+            [
+                {
+                    "files": {"a.py": "x = 1\n"},
+                    "message": "Commit 1",
+                    "author": "Alice",
+                    "date": "2025-01-01T12:00:00+00:00",
+                },
+                {
+                    "files": {"a.py": "x = 2\n"},
+                    "message": "Commit 2",
+                    "author": "Bob",
+                    "date": "2025-01-02T12:00:00+00:00",
+                },
+            ]
+        ) as root:
+            result = mod.analyze(
+                [
+                    str(root),
+                    "--since",
+                    "2024-12-01",
+                    "--until",
+                    "2025-02-01",
+                ]
+            )
             self.assertEqual(result["summary"]["authors"], 2)
 
     def test_function_churn_detected(self):
-        with GitTempProject([
-            {
-                "files": {"a.py": "def foo():\n    return 1\n"},
-                "message": "Add foo",
-                "date": "2025-01-01T12:00:00+00:00",
-            },
-            {
-                "files": {"a.py": "def foo():\n    return 2\n"},
-                "message": "Update foo",
-                "date": "2025-01-02T12:00:00+00:00",
-            },
-        ]) as root:
-            result = mod.analyze([
-                str(root), "--since", "2024-12-01", "--until", "2025-02-01",
-            ])
+        with GitTempProject(
+            [
+                {
+                    "files": {"a.py": "def foo():\n    return 1\n"},
+                    "message": "Add foo",
+                    "date": "2025-01-01T12:00:00+00:00",
+                },
+                {
+                    "files": {"a.py": "def foo():\n    return 2\n"},
+                    "message": "Update foo",
+                    "date": "2025-01-02T12:00:00+00:00",
+                },
+            ]
+        ) as root:
+            result = mod.analyze(
+                [
+                    str(root),
+                    "--since",
+                    "2024-12-01",
+                    "--until",
+                    "2025-02-01",
+                ]
+            )
             func_names = [f["function"] for f in result["function_churn"]]
             self.assertIn("foo", func_names)
 
     def test_churn_rate_calculation(self):
-        with GitTempProject([
-            {
-                "files": {"a.py": "line1\nline2\nline3\nline4\nline5\n"},
-                "message": "Add a",
-                "date": "2025-01-01T12:00:00+00:00",
-            },
-            {
-                "files": {"a.py": "line1\nmodified\nline3\nline4\nline5\n"},
-                "message": "Fix a",
-                "date": "2025-01-02T12:00:00+00:00",
-            },
-        ]) as root:
-            result = mod.analyze([
-                str(root), "--since", "2024-12-01", "--until", "2025-02-01",
-            ])
+        with GitTempProject(
+            [
+                {
+                    "files": {"a.py": "line1\nline2\nline3\nline4\nline5\n"},
+                    "message": "Add a",
+                    "date": "2025-01-01T12:00:00+00:00",
+                },
+                {
+                    "files": {"a.py": "line1\nmodified\nline3\nline4\nline5\n"},
+                    "message": "Fix a",
+                    "date": "2025-01-02T12:00:00+00:00",
+                },
+            ]
+        ) as root:
+            result = mod.analyze(
+                [
+                    str(root),
+                    "--since",
+                    "2024-12-01",
+                    "--until",
+                    "2025-02-01",
+                ]
+            )
             churn_map = {f["file"]: f for f in result["file_churn"]}
             self.assertIn("a.py", churn_map)
             # Churn rate should be > 0.
@@ -507,8 +580,7 @@ class TestParseGitLogStreaming(unittest.TestCase):
 
     def test_parse_respects_max_commits(self):
         lines = [
-            f"COMMIT:hash{i}|2025-01-{i+1:02d}T12:00:00+00:00"
-            f"|Author|Commit {i}\n"
+            f"COMMIT:hash{i}|2025-01-{i + 1:02d}T12:00:00+00:00|Author|Commit {i}\n"
             for i in range(10)
         ]
         commits, _ = mod.parse_git_log(lines, max_commits=3)
@@ -549,8 +621,12 @@ def _latin1_repo(testcase) -> Path:
         ["commit", "-q", "-m", "gh-1: Fix segfault in listsort"],
     ):
         subprocess.run(
-            ["git", *args], cwd=tmpdir, check=True,
-            capture_output=True, text=True, errors="replace",
+            ["git", *args],
+            cwd=tmpdir,
+            check=True,
+            capture_output=True,
+            text=True,
+            errors="replace",
         )
     return root
 
@@ -570,7 +646,10 @@ class TestNonUtf8History(unittest.TestCase):
         with self.assertRaises(UnicodeDecodeError):
             subprocess.run(
                 ["git", "show", "--format=", "--patch", "HEAD"],
-                cwd=str(root), capture_output=True, text=True, check=False,
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                check=False,
             )
 
     def test_run_git_survives_non_utf8_diff(self):
@@ -620,6 +699,402 @@ class TestUnknownArgumentsAndCommitCap(unittest.TestCase):
             any("COMMIT CAP APPLIED" in n for n in result["notes"]),
             result.get("notes"),
         )
+
+
+def _git(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+_WINDOW = ["--since", "2024-12-01", "--until", "2025-02-01"]
+
+
+class TestTaggedAndKeyedClassification(unittest.TestCase):
+    """Tags, Conventional Commits types and tracker keys are parsed,
+    and keywords match on word boundaries."""
+
+    def test_bracketed_fix_tag(self):
+        detail = mod.classify_commit_detail(
+            "[fix][cli] Accept -q as a short --quiet alias (K7)"
+        )
+        self.assertEqual(detail["type"], "fix")
+        self.assertEqual(detail["source"], "tag")
+        self.assertEqual(detail["tags"], ["fix", "cli"])
+        self.assertEqual(detail["keys"], ["K7"])
+
+    def test_fix_inside_a_word_is_not_a_fix(self):
+        # "prefixes" contains "fix"; the substring classifier called it a fix.
+        self.assertNotEqual(
+            mod.classify_commit("[parser] Strip URL prefixes before matching (T1-30)"),
+            "fix",
+        )
+
+    def test_ci_inside_a_word_is_not_a_chore(self):
+        # "policies" contains "ci"; the substring classifier called it a chore.
+        self.assertEqual(
+            mod.classify_commit("[core] Add retry and backoff policies (T1-31)"),
+            "feature",
+        )
+
+    def test_conventional_type_beats_keywords(self):
+        # "correct" is a fix keyword, but the commit says it is a chore.
+        detail = mod.classify_commit_detail("chore(docs): correct the install guide")
+        self.assertEqual((detail["type"], detail["source"]), ("chore", "conventional"))
+        self.assertEqual(mod.classify_commit("feat(api)!: drop v1 routes"), "feature")
+
+    def test_area_tag_falls_through_to_keywords(self):
+        # [store] names an area, not a type.
+        detail = mod.classify_commit_detail("[db] Add schema migrations (T1-32)")
+        self.assertEqual((detail["type"], detail["source"]), ("feature", "keyword"))
+
+    def test_unmapped_key_stays_unknown(self):
+        subject = "[db] Validate column types (T1-33)"
+        self.assertEqual(mod.classify_commit(subject), "unknown")
+
+    def test_mapped_key_decides(self):
+        key_types = mod.parse_key_types("K=fix,T=feature")
+        self.assertEqual(
+            mod.classify_commit("[db] Validate column types (T1-33)", key_types),
+            "feature",
+        )
+        detail = mod.classify_commit_detail(
+            "[api] Keep query options on redirect (K12)", key_types
+        )
+        self.assertEqual((detail["type"], detail["source"]), ("fix", "key"))
+
+    def test_tag_beats_key(self):
+        # A [fix] commit on plan work is still a fix.
+        self.assertEqual(
+            mod.classify_commit(
+                "[fix] Reject duplicate column names (T1-33)", {"T": "feature"}
+            ),
+            "fix",
+        )
+
+    def test_inflections_still_match(self):
+        self.assertEqual(mod.classify_commit("Fixed a race in the pool"), "fix")
+        self.assertEqual(mod.classify_commit("Fixes #12"), "fix")
+        self.assertEqual(mod.classify_commit("Refactored the loader"), "refactor")
+
+    def test_tracker_key_extraction(self):
+        self.assertEqual(
+            mod.classify_commit_detail("Close two leaks (K41, K42)")["keys"],
+            ["K41", "K42"],
+        )
+        self.assertEqual(
+            mod.classify_commit_detail("JIRA-123 and T2-8")["keys"],
+            ["JIRA-123", "T2-8"],
+        )
+        # Words with digits that are not a key shape.
+        self.assertEqual(
+            mod.classify_commit_detail("Use SHA256 for UTF8 names")["keys"], []
+        )
+
+    def test_parse_key_types_rejects_bad_specs(self):
+        for spec in ("B", "b=fix", "B=whatever"):
+            with self.assertRaises(ValueError, msg=spec):
+                mod.parse_key_types(spec)
+        self.assertEqual(
+            mod.parse_key_types("B=bug, P=feat"), {"B": "fix", "P": "feature"}
+        )
+
+    def test_key_type_flag(self):
+        args = mod.parse_args(["--key-type", "B=fix", "--key-type", "P=feature"])
+        self.assertEqual(args["key_types"], {"B": "fix", "P": "feature"})
+
+    def test_repeated_keys_are_flagged(self):
+        commits = [
+            {"hash": "a" * 40, "type": "fix", "keys": ["K33"]},
+            {"hash": "b" * 40, "type": "fix", "keys": ["K33", "K34"]},
+            {"hash": "c" * 40, "type": "unknown", "keys": ["T1-50"]},
+        ]
+        summary = mod.summarize_tracker_keys(commits)
+        self.assertEqual(summary["keys_seen"], 3)
+        self.assertEqual([r["key"] for r in summary["repeated"]], ["K33"])
+        self.assertEqual(summary["by_prefix"], {"K": {"fix": 3}, "T": {"unknown": 1}})
+
+    def test_key_types_reach_the_analysis(self):
+        with GitTempProject(
+            [
+                {"files": {"a.py": "x = 1\n"}, "message": "[db] Validate rows (T1-65)"},
+                {
+                    "files": {"a.py": "x = 2\n"},
+                    "message": "[api] Keep query options (K24)",
+                },
+            ]
+        ) as root:
+            plain = mod.analyze([str(root), *_WINDOW])
+            keyed = mod.analyze(
+                [
+                    str(root),
+                    *_WINDOW,
+                    "--key-type",
+                    "K=fix,T=feature",
+                ]
+            )
+        self.assertEqual(plain["summary"]["commits_by_type"], {"unknown": 2})
+        self.assertTrue(any("--key-type" in n for n in plain["notes"]))
+        self.assertEqual(keyed["summary"]["commits_by_type"], {"feature": 1, "fix": 1})
+        self.assertEqual(keyed["summary"]["classified_by"], {"key": 2})
+
+
+class TestCommitterDateWindow(unittest.TestCase):
+    """The window selects on the committer date, so the reported
+    first/last dates must be committer dates too."""
+
+    def test_first_commit_in_range_is_inside_the_window(self):
+        with GitTempProject(
+            [
+                {
+                    "files": {"a.py": "x = 1\n"},
+                    "message": "Add a",
+                    # Authored before the window, committed inside it (a rebase).
+                    "date": "2024-11-01T12:00:00+00:00",
+                    "committer_date": "2025-01-10T12:00:00+00:00",
+                },
+            ]
+        ) as root:
+            result = mod.analyze([str(root), *_WINDOW])
+        churn = {f["file"]: f for f in result["file_churn"]}["a.py"]
+        self.assertTrue(churn["first_commit_in_range"].startswith("2025-01-10"))
+        self.assertTrue(churn["last_modified"].startswith("2025-01-10"))
+        self.assertEqual(result["time_range"]["date_basis"], "committer")
+        feature = result["recent_features"][0]
+        self.assertTrue(feature["date"].startswith("2024-11-01"))
+        self.assertTrue(feature["committer_date"].startswith("2025-01-10"))
+
+    def test_old_four_field_header_still_parses(self):
+        commits, _ = mod.parse_git_log(
+            ["COMMIT:abc|2025-01-01T12:00:00+00:00|Alice|Add a | b\n"],
+            10,
+        )
+        self.assertEqual(commits[0]["message"], "Add a | b")
+        self.assertEqual(commits[0]["committer_date"], "2025-01-01T12:00:00+00:00")
+
+
+# Three versions of one file. v2 changes b(); v3 prepends three lines, so v2's
+# hunk (post-image line 5) sits inside a() at HEAD.
+_V1 = "def a():\n    return 1\n\ndef b():\n    return 2\n"
+_V2 = "def a():\n    return 1\n\ndef b():\n    return 3\n"
+_V3 = "def z():\n    return 0\n\n" + _V2
+_GROWING = [
+    {"files": {"m.py": _V1}, "message": "Add a and b"},
+    {"files": {"m.py": _V2}, "message": "Fix b"},
+    {"files": {"m.py": _V3}, "message": "Add z"},
+]
+
+
+class TestFunctionAttributionAtCommit(unittest.TestCase):
+    """Hunks are attributed to the function that held those
+    lines AT THAT COMMIT, keyed by qualified name; lines_changed counts lines."""
+
+    def _churn(self, commits):
+        with GitTempProject(commits) as root:
+            result = mod.analyze([str(root), *_WINDOW])
+        churn = {(f["file"], f["function"]): f for f in result["function_churn"]}
+        return result, churn
+
+    def test_old_hunk_is_not_credited_to_whatever_sits_there_now(self):
+        result, churn = self._churn(_GROWING)
+        # HEAD-line mapping credited "Fix b" to a().
+        self.assertEqual(churn[("m.py", "a")]["commits"], 1)
+        self.assertEqual(churn[("m.py", "b")]["commits"], 2)
+        self.assertEqual(churn[("m.py", "z")]["commits"], 1)
+        fix = result["recent_fixes"][0]
+        self.assertEqual(fix["functions_modified"], [{"function": "b", "file": "m.py"}])
+        self.assertTrue(fix["functions_modified_complete"])
+
+    def test_lines_changed_counts_lines_not_length(self):
+        _, churn = self._churn(_GROWING)
+        b = churn[("m.py", "b")]
+        # Created (2 lines added), then one line replaced (+1 -1).
+        self.assertEqual((b["lines_added"], b["lines_removed"]), (3, 1))
+        self.assertEqual(b["lines_changed"], 4)
+        self.assertEqual(b["current_length"], 2)
+        self.assertEqual((b["line_start"], b["line_end"]), (7, 8))
+
+    def test_pure_deletion_is_attributed(self):
+        before = "def f():\n    x = 1\n    y = 2\n    return x\n"
+        after = "def f():\n    x = 1\n    return x\n"
+        _, churn = self._churn(
+            [
+                {"files": {"m.py": before}, "message": "Add f"},
+                {"files": {"m.py": after}, "message": "Drop y"},
+            ]
+        )
+        f = churn[("m.py", "f")]
+        self.assertEqual(f["commits"], 2)
+        self.assertEqual(f["lines_removed"], 1)
+
+    def test_nested_handler_is_credited_not_its_factory(self):
+        v1 = (
+            "def build_router():\n"
+            "    def handler():\n"
+            "        return 1\n"
+            "    return handler\n"
+        )
+        v2 = v1.replace("return 1", "return 2")
+        _, churn = self._churn(
+            [
+                {"files": {"r.py": v1}, "message": "Add router"},
+                {"files": {"r.py": v2}, "message": "Change handler"},
+            ]
+        )
+        self.assertEqual(churn[("r.py", "build_router.handler")]["commits"], 2)
+        self.assertEqual(churn[("r.py", "build_router")]["commits"], 1)
+
+    def test_same_method_name_in_two_classes_is_two_entries(self):
+        v1 = (
+            "class A:\n    def run(self):\n        return 1\n\n"
+            "class B:\n    def run(self):\n        return 1\n"
+        )
+        v2 = v1[: v1.rindex("return 1")] + "return 2\n"
+        _, churn = self._churn(
+            [
+                {"files": {"m.py": v1}, "message": "Add A and B"},
+                {"files": {"m.py": v2}, "message": "Change B.run"},
+            ]
+        )
+        self.assertEqual(churn[("m.py", "A.run")]["commits"], 1)
+        self.assertEqual(churn[("m.py", "B.run")]["commits"], 2)
+
+    def test_deleted_function_is_reported_as_gone(self):
+        _, churn = self._churn(
+            [
+                {"files": {"m.py": _V1}, "message": "Add a and b"},
+                {"files": {"m.py": "def a():\n    return 1\n"}, "message": "Remove b"},
+            ]
+        )
+        b = churn[("m.py", "b")]
+        self.assertFalse(b["exists_at_head"])
+        self.assertIsNone(b["line_start"])
+        self.assertTrue(churn[("m.py", "a")]["exists_at_head"])
+
+    def test_unparseable_version_is_counted_not_hidden(self):
+        result, _ = self._churn(
+            [
+                {"files": {"m.py": _V1}, "message": "Add a and b"},
+                {"files": {"m.py": "def a(:\n"}, "message": "Break it"},
+            ]
+        )
+        meta = result["function_attribution"]
+        self.assertEqual(meta["file_versions_unparseable"], 1)
+        self.assertEqual(meta["files_unattributed"], 1)
+        self.assertTrue(any("INCOMPLETE" in n for n in result["notes"]))
+
+    def test_parse_cap_leaves_commits_unattributed(self):
+        old_cap = mod._MAX_BLOB_PARSES
+        mod._MAX_BLOB_PARSES = 1
+        try:
+            result, _ = self._churn(_GROWING)
+        finally:
+            mod._MAX_BLOB_PARSES = old_cap
+        meta = result["function_attribution"]
+        self.assertTrue(meta["parse_cap_reached"])
+        self.assertGreater(meta["commits_unattributed"] + meta["files_unattributed"], 0)
+        self.assertTrue(any("INCOMPLETE" in n for n in result["notes"]))
+
+    def test_diff_parser_reads_blobs_and_hunks(self):
+        diff = [
+            "diff --git a/m.py b/m.py",
+            "index " + "1" * 40 + ".." + "2" * 40 + " 100644",
+            "--- a/m.py",
+            "+++ b/m.py",
+            "@@ -3,0 +4,2 @@ def f():",
+            "+    x = 1",
+            "+++ b/not-a-header",
+            "@@ -9 +10 @@",
+        ]
+        (entry,) = mod.parse_unified_diff(diff)
+        self.assertEqual(entry["path"], "m.py")
+        self.assertEqual(entry["old_blob"], "1" * 40)
+        self.assertEqual(entry["hunks"], [(3, 0, 4, 2), (9, 1, 10, 1)])
+
+    def test_qualified_boundaries(self):
+        source = (
+            "class C:\n    def m(self):\n        def inner():\n            pass\n"
+            "if True:\n    def guarded():\n        pass\n"
+        )
+        with TempProject({"mod.py": source}) as root:
+            quals = [
+                b["qualname"] for b in mod.get_function_boundaries(root / "mod.py")
+            ]
+        self.assertEqual(sorted(quals), ["C.m", "C.m.inner", "guarded"])
+
+
+class TestUnmergedBranches(unittest.TestCase):
+    """Commits on remote branches that the default branch lacks."""
+
+    def _repo(self) -> Path:
+        project = GitTempProject(
+            [
+                {"files": {"src/a.py": "x = 1\n"}, "message": "Add a"},
+                {"files": {"src/a.py": "x = 2\n"}, "message": "Change a"},
+            ]
+        )
+        root = project.__enter__()
+        self.addCleanup(project.__exit__, None, None, None)
+        main_sha = _git(root, "rev-parse", "HEAD")
+        _git(root, "checkout", "-q", "-b", "work")
+        (root / "src" / "a.py").write_text("x = 3\n", encoding="utf-8")
+        _git(root, "commit", "-qam", "[fix] Guard a (K7)")
+        (root / "docs.md").write_text("notes\n", encoding="utf-8")
+        _git(root, "add", "docs.md")
+        _git(root, "commit", "-qm", "[doc] Notes")
+        work_sha = _git(root, "rev-parse", "HEAD")
+        _git(root, "checkout", "-q", "main")
+        merged_sha = _git(root, "rev-parse", "HEAD~1")
+        _git(root, "update-ref", "refs/remotes/origin/main", main_sha)
+        _git(root, "update-ref", "refs/remotes/origin/work", work_sha)
+        _git(root, "update-ref", "refs/remotes/origin/merged", merged_sha)
+        _git(
+            root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"
+        )
+        return root
+
+    def test_unmerged_branch_is_listed_with_its_commits(self):
+        root = self._repo()
+        result = mod.analyze([str(root), *_WINDOW, "--no-function"])
+        unmerged = result["unmerged_branches"]
+        self.assertTrue(unmerged["available"])
+        self.assertEqual(unmerged["base"], "origin/main")
+        self.assertEqual([b["branch"] for b in unmerged["branches"]], ["origin/work"])
+        work = unmerged["branches"][0]
+        self.assertEqual((work["ahead"], work["behind"]), (2, 0))
+        self.assertEqual(
+            [(c["message"], c["type"]) for c in work["commits"]],
+            [("[doc] Notes", "docs"), ("[fix] Guard a (K7)", "fix")],
+        )
+        self.assertEqual(work["commits"][1]["keys"], ["K7"])
+        self.assertEqual(work["fix_commits_shown"], 1)
+        self.assertEqual(work["files_in_scope"], ["docs.md", "src/a.py"])
+
+    def test_scope_limits_the_files_listed(self):
+        root = self._repo()
+        result = mod.analyze([str(root / "src"), *_WINDOW, "--no-function"])
+        work = result["unmerged_branches"]["branches"][0]
+        self.assertEqual(work["files_in_scope"], ["src/a.py"])
+        # The ahead count is about the branch, not the scope.
+        self.assertEqual(work["ahead"], 2)
+
+    def test_merged_branch_and_symref_are_not_listed(self):
+        root = self._repo()
+        result = mod.analyze([str(root), *_WINDOW, "--no-function"])
+        unmerged = result["unmerged_branches"]
+        names = {b["branch"] for b in unmerged["branches"]}
+        self.assertEqual(names, {"origin/work"})
+        self.assertEqual(unmerged["remote_branches_total"], 2)  # work, merged
+
+    def test_no_branches_flag_skips(self):
+        root = self._repo()
+        result = mod.analyze([str(root), *_WINDOW, "--no-function", "--no-branches"])
+        self.assertFalse(result["unmerged_branches"]["available"])
+        self.assertIn("--no-branches", result["unmerged_branches"]["reason"])
 
 
 if __name__ == "__main__":

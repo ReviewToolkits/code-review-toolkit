@@ -99,8 +99,9 @@ candidates, and prints JSON to stdout.
 | `diff_findings.py` | Diffs two report directories — the false-positive regression gate |
 | `build_informed_briefing.py` | Assembles the informed-explore briefing from `data/` |
 
-**Dependency graph:** `scan_common.py` is at the center; every other script imports from it. No
-circular dependencies.
+**Dependency graph:** `scan_common.py` is at the center; every other script imports from it.
+`measure_complexity.py` also imports `analyze_history.py` (to attribute fixes to functions as they
+were at each commit). No circular dependencies.
 
 **Script calling convention:** each analysis script exposes `analyze(target: str, *, max_files: int
 = 0) -> dict` and a `main()` that prints JSON. Exceptions: `analyze_history.py` takes `argv`;

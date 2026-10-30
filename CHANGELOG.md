@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — history attribution (#53)
+
+- `analyze_history.py` classifies commits by bracketed tags, Conventional Commits types and
+  tracker keys, on word boundaries ("prefixes" is no longer a fix, "policies" no longer a chore);
+  `--key-type B=fix,P=feature` maps a project's key prefixes when they can't be inferred.
+- Function churn attributes each historical hunk to the function as it was **at that commit**,
+  keyed by full path and qualified name, instead of mapping old line numbers onto HEAD.
+  `measure_complexity.py`'s fix crossing uses the same attribution, so a function with recent
+  security fixes is no longer reported "quiet, 0 fixes".
+- `lines_changed` counts lines changed; the function's length moved to `current_length`.
+- File first/last dates are committer dates, matching the committer-date window.
+- `measure_complexity.py` measures nested functions (closures, route handlers inside a router
+  factory) as their own entries, and a factory that only defines them no longer ranks as a hotspot.
+
+### Enhanced
+
+- **`analyze_history.py` reports `unmerged_branches`** (ahead count, last commit date, subjects) and
+  `tracker_keys`, so the history agents treat unmerged fixes as prior art.
+
 ### Fixed — unmeasured values no longer reported as clean (#56)
 
 - `check_typing.py` keeps mypy's cache out of the reviewed project and the cwd, honours

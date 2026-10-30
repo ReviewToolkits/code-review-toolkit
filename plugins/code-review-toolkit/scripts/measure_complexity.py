@@ -17,17 +17,48 @@ Usage:
 
 import ast
 import json
-import re
 import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from analyze_history import (  # noqa: E402
+    DIFF_OPTIONS,
+    BlobFunctionIndex,
+    attribute_file_diff,
+    classify_commit,
+    def_start_line,
+    iter_qualified_defs,
+    parse_key_types,
+    parse_unified_diff,
+)
 from scan_common import (  # noqa: E402
     discover_python_files,
     find_project_root,
 )
+
+_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _iter_own_nodes(func_node: ast.AST):
+    """Walk a function's own body, NOT descending into nested defs or classes.
+
+    `ast.walk` plus `continue` does not prune: the nested def's children are
+    still queued. That is how a router factory whose body is nothing but
+    nested route handlers came out with `return_count: 46` and a hotspot score.
+    """
+    todo = list(ast.iter_child_nodes(func_node))
+    while todo:
+        node = todo.pop()
+        yield node
+        if not isinstance(node, _SCOPE_NODES):
+            todo.extend(ast.iter_child_nodes(node))
+
+
+def _nested_scopes(func_node: ast.AST) -> list[ast.AST]:
+    """Defs and classes directly inside this function's own scope."""
+    return [n for n in _iter_own_nodes(func_node) if isinstance(n, _SCOPE_NODES)]
 
 
 def _is_always_false(test: ast.expr) -> bool:
@@ -205,10 +236,7 @@ class _CognitiveVisitor(ast.NodeVisitor):
 def _count_branches(func_node: ast.AST) -> int:
     """Count if/elif/else/match-case/except branches in a function body."""
     count = 0
-    for node in ast.walk(func_node):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if node is not func_node:
-                continue
+    for node in _iter_own_nodes(func_node):
         if isinstance(node, ast.If):
             count += 1  # if
             if node.orelse:
@@ -224,10 +252,7 @@ def _count_branches(func_node: ast.AST) -> int:
 def _count_loops(func_node: ast.AST) -> int:
     """Count for/while loops (including nested)."""
     count = 0
-    for node in ast.walk(func_node):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if node is not func_node:
-                continue
+    for node in _iter_own_nodes(func_node):
         if isinstance(node, (ast.For, ast.While, ast.AsyncFor)):
             count += 1
     return count
@@ -236,10 +261,7 @@ def _count_loops(func_node: ast.AST) -> int:
 def _count_returns(func_node: ast.AST) -> int:
     """Count return statements."""
     count = 0
-    for node in ast.walk(func_node):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if node is not func_node:
-                continue
+    for node in _iter_own_nodes(func_node):
         if isinstance(node, ast.Return):
             count += 1
     return count
@@ -248,10 +270,7 @@ def _count_returns(func_node: ast.AST) -> int:
 def _count_local_variables(func_node: ast.AST) -> int:
     """Count unique variable names assigned in the function body."""
     names: set[str] = set()
-    for node in ast.walk(func_node):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if node is not func_node:
-                continue
+    for node in _iter_own_nodes(func_node):
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name):
@@ -387,11 +406,24 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
 
     def _process_func(
         node: ast.FunctionDef | ast.AsyncFunctionDef,
-        class_name: str | None = None,
+        qualname: str,
+        kinds: tuple[str, ...],
     ) -> dict:
         start = node.lineno
         end = node.end_lineno or node.lineno
-        func_lines = source_lines[start - 1 : end]
+        # A nested def or class is measured as its own entry, so its lines
+        # are not this function's lines.
+        nested = _nested_scopes(node)
+        excluded: set[int] = set()
+        for child in nested:
+            excluded.update(
+                range(def_start_line(child), (child.end_lineno or child.lineno) + 1)
+            )
+        func_lines = [
+            source_lines[i - 1]
+            for i in range(start, end + 1)
+            if i not in excluded and i - 1 < len(source_lines)
+        ]
         effective_lines = _effective_line_count(func_lines)
 
         nesting_v = _NestingVisitor()
@@ -401,8 +433,6 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
         cognitive_v = _CognitiveVisitor()
         for child in ast.iter_child_nodes(node):
             cognitive_v.visit(child)
-
-        name = f"{class_name}.{node.name}" if class_name else node.name
 
         metrics = {
             "line_count": effective_lines,
@@ -416,72 +446,98 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
             "cognitive_complexity": cognitive_v.score,
         }
 
+        segments = qualname.split(".")[:-1]
+        enclosing = list(zip(segments, kinds))
+        in_test_class = any(k == "class" and n.startswith("Test") for n, k in enclosing)
+        in_test_func = any(
+            k == "function" and n.startswith("test") for n, k in enclosing
+        )
         return {
-            "name": name,
-            "qualified_name": f"{rel}::{name}",
+            "name": qualname,
+            "qualified_name": f"{rel}::{qualname}",
             "line_start": start,
             "line_end": end,
-            "is_method": class_name is not None,
+            "is_method": bool(kinds) and kinds[-1] == "class",
+            # Defined inside another function: a closure, or a route handler
+            # inside a router factory.
+            "is_nested": "function" in kinds,
+            "parent": ".".join(segments) or None,
+            "nested_def_count": sum(
+                1
+                for n in nested
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ),
             "is_async": isinstance(node, ast.AsyncFunctionDef),
-            "is_test": node.name.startswith("test")
-            or (class_name is not None and class_name.startswith("Test")),
+            "is_test": node.name.startswith("test") or in_test_class or in_test_func,
             "has_decorators": len(node.decorator_list) > 0,
             "decorator_count": len(node.decorator_list),
             "metrics": metrics,
             "score": round(_compute_score(metrics), 1),
         }
 
-    # Walk top-level and class-level definitions.
-    for node in ast.iter_child_nodes(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            result["functions"].append(_process_func(node))
-        elif isinstance(node, ast.ClassDef):
-            for child in ast.iter_child_nodes(node):
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    result["functions"].append(_process_func(child, node.name))
+    # Every function at any depth: module level, methods, nested classes, and
+    # functions defined inside other functions (each measured on its own).
+    for qualname, node, kinds in iter_qualified_defs(tree):
+        result["functions"].append(_process_func(node, qualname, kinds))
+    result["functions"].sort(key=lambda f: f["line_start"])
 
     return result
 
 
-# Commit-subject keywords that mean "this commit repaired a defect". Kept local
-# rather than imported so a history pass cannot be broken by a refactor of
-# analyze_history.py's classification table.
-_FIX_KEYWORDS = (
-    "fix",
-    "bug",
-    "crash",
-    "regression",
-    "broken",
-    "incorrect",
-    "wrong",
-    "fail",
-    "error",
-    "leak",
-    "race",
-    "segfault",
-    "traceback",
-    "revert",
-)
+# Each historical version of a hotspot's file is parsed to find which function
+# a fix touched at that commit. This caps the parses; past it the remaining
+# fix commits are counted as unattributed and the affected verdicts say so.
+MAX_HISTORY_PARSES = 1500
 
 
-def _fix_commits_by_file(
-    project_root: Path, since: str, timeout: int = 120
-) -> dict[str, list[tuple[str, list[int]]]] | None:
-    """Per file, the fix commits touching it and the lines each one changed.
+def _git_prefix(project_root: Path, timeout: int = 10) -> str | None:
+    """project_root's path inside its repository ("" at the top), or None."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--show-prefix"],
+            cwd=str(project_root),
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip()
 
-    Returns None when history is unavailable (not a repo, git missing, shallow
-    clone with nothing in the window) so the caller can say so rather than
-    reporting zero fix commits everywhere -- which would mark every hotspot
-    `settled` and invert the ranking exactly as the plain complexity score does.
+
+def _fix_commit_diffs(
+    project_root: Path,
+    since: str,
+    paths: list[str],
+    key_types: dict[str, str] | None = None,
+    timeout: int = 120,
+) -> list[tuple[str, list[dict]]] | None:
+    """The fix commits since `since` that touch `paths`, with their parsed diffs.
+
+    Returns None when history is unavailable (not a repo, git missing, a
+    timeout) so the caller can say so rather than reporting zero fix commits
+    everywhere -- which would mark every hotspot `settled` and invert the
+    ranking exactly as the plain complexity score does.
+
+    A commit is a fix by analyze_history's classifier (bracketed tags,
+    Conventional Commits types, word-boundary keywords). The substring test
+    used before counted "prefixes" as a fix.
     """
     cmd = [
         "git",
+        "-c",
+        "core.quotepath=off",
         "log",
         f"--since={since}",
         "--no-merges",
         "--format=%x00%H%x00%s",
-        "--unified=0",
         "-p",
+        *DIFF_OPTIONS,
+        "--",
+        *paths,
     ]
     try:
         out = subprocess.run(
@@ -497,36 +553,27 @@ def _fix_commits_by_file(
     if out.returncode != 0:
         return None
 
-    by_file: dict[str, list[tuple[str, list[int]]]] = {}
+    commits: list[tuple[str, list[dict]]] = []
     sha = ""
     is_fix = False
-    current: str | None = None
-    lines_touched: list[int] = []
+    body: list[str] = []
 
     def flush() -> None:
-        if current and is_fix and lines_touched:
-            by_file.setdefault(current, []).append((sha, list(lines_touched)))
+        if sha and is_fix:
+            commits.append((sha, parse_unified_diff(body)))
 
     for line in out.stdout.splitlines():
         if line.startswith("\x00"):
             flush()
-            current, lines_touched = None, []
             parts = line.split("\x00")
             sha = parts[1] if len(parts) > 1 else ""
             subject = parts[2] if len(parts) > 2 else ""
-            is_fix = any(k in subject.lower() for k in _FIX_KEYWORDS)
-        elif line.startswith("+++ b/"):
-            flush()
-            current, lines_touched = line[6:], []
-        elif line.startswith("@@") and current:
-            # @@ -old,n +new,m @@
-            match = re.search(r"\+(\d+)(?:,(\d+))?", line)
-            if match:
-                start = int(match.group(1))
-                count = int(match.group(2) or 1)
-                lines_touched.extend(range(start, start + max(count, 1)))
+            is_fix = classify_commit(subject, key_types) == "fix"
+            body = []
+        elif is_fix:
+            body.append(line)
     flush()
-    return by_file
+    return commits
 
 
 # Two independent fix commits to the same function inside two years is a real
@@ -558,7 +605,10 @@ def verdict_for(fix_commits: int, score: float) -> str:
 
 
 def cross_with_history(
-    hotspots: list[dict], project_root: Path, since: str = "2 years ago"
+    hotspots: list[dict],
+    project_root: Path,
+    since: str = "2 years ago",
+    key_types: dict[str, str] | None = None,
 ) -> dict:
     """Annotate hotspots with fix density and a verdict.
 
@@ -568,8 +618,20 @@ def cross_with_history(
     complexity marked *settled* code, so complexity-driven triage pointed at
     exactly the wrong files. Crossing the two is emitted as a first-class output
     rather than left to the reader, so the crossing cannot be forgotten.
+
+    A fix is credited to a hotspot when its hunks fell inside the function OF
+    THE SAME QUALIFIED NAME in that commit's own version of the file, matched
+    by full path. Intersecting old line numbers with today's spans, keyed by
+    basename, reported a function with two fix commits as `quiet` with 0
+    fixes on a validation project.
     """
-    history = _fix_commits_by_file(project_root, since)
+    prefix = _git_prefix(project_root)
+    paths = sorted({h["qualified_name"].split("::")[0] for h in hotspots})
+    history = (
+        _fix_commit_diffs(project_root, since, paths, key_types)
+        if prefix is not None and paths
+        else None
+    )
     if history is None:
         for h in hotspots:
             h["fix_commits_2y"] = None
@@ -586,38 +648,70 @@ def cross_with_history(
             ),
         }
 
-    # Index fix-touched lines by file basename; the diff paths are repo-relative
-    # and the hotspot paths are project-relative, which usually but not always
-    # agree.
-    touched: dict[str, list[tuple[str, set[int]]]] = {}
-    for path, commits in history.items():
-        touched.setdefault(Path(path).name, []).extend(
-            (sha, set(lines)) for sha, lines in commits
-        )
+    wanted = {prefix + p: p for p in paths}
+    fixes: dict[tuple[str, str], set[str]] = {}
+    unattributed: dict[str, set[str]] = {}
+    with BlobFunctionIndex(project_root, max_parses=MAX_HISTORY_PARSES) as index:
+        for sha, file_diffs in history:
+            for file_diff in file_diffs:
+                rel = wanted.get(file_diff["path"])
+                if rel is None:
+                    continue
+                touched = attribute_file_diff(file_diff, index)
+                if touched is None:
+                    unattributed.setdefault(rel, set()).add(sha)
+                    continue
+                for qual in touched:
+                    fixes.setdefault((rel, qual), set()).add(sha)
+        parses, cap_reached = index.parses, index.exhausted
 
     for h in hotspots:
-        rel = h["qualified_name"].split("::")[0]
-        span = set(range(h["line_start"], h["line_end"] + 1))
-        shas = {sha for sha, lines in touched.get(Path(rel).name, []) if lines & span}
+        rel, _, name = h["qualified_name"].partition("::")
+        shas = fixes.get((rel, name), set())
         length = max(h["line_end"] - h["line_start"] + 1, 1)
         h["fix_commits_2y"] = len(shas)
         h["fix_density"] = round(len(shas) / length, 4)
+        missing = len(unattributed.get(rel, ()))
+        if missing:
+            h["fix_commits_unattributed"] = missing
 
     ranked = sorted(hotspots, key=lambda h: -(h["fix_commits_2y"] or 0))
     for rank, h in enumerate(ranked, 1):
         h["risk_rank"] = rank
 
-    fixes = sorted(h["fix_commits_2y"] for h in hotspots)
-    median = fixes[len(fixes) // 2] if fixes else 0
+    fix_counts = sorted(h["fix_commits_2y"] for h in hotspots)
+    median = fix_counts[len(fix_counts) // 2] if fix_counts else 0
     for h in hotspots:
-        h["verdict"] = verdict_for(h["fix_commits_2y"], h["score"])
+        missing = h.get("fix_commits_unattributed", 0)
+        if h["fix_commits_2y"] < ACTIVE_RISK_FIXES <= h["fix_commits_2y"] + missing:
+            # The unattributed fixes could tip it into active-risk: `quiet` or
+            # `settled` here would be an unmeasured value posing as a clean one.
+            h["verdict"] = "unknown"
+            h["verdict_reason"] = (
+                f"{missing} fix commit(s) to this file could not be attributed "
+                "to a function"
+            )
+        else:
+            h["verdict"] = verdict_for(h["fix_commits_2y"], h["score"])
 
+    all_unattributed: set[str] = set()
+    for shas in unattributed.values():
+        all_unattributed |= shas
     return {
         "history_available": True,
         "since": since,
-        "fix_commits_seen": sum(len(v) for v in history.values()),
+        "fix_commits_seen": len(history),
         "median_fix_commits_per_hotspot": median,
         "active_risk_threshold": ACTIVE_RISK_FIXES,
+        "attribution": (
+            "per commit: each fix's hunks are mapped onto the functions of "
+            "that commit's own version of the file and matched by qualified "
+            "name and full path. A function renamed, or moved to another "
+            "file, within the window loses its earlier fixes."
+        ),
+        "file_versions_parsed": parses,
+        "fix_commits_unattributed": len(all_unattributed),
+        "parse_cap_reached": cap_reached,
         "note": (
             "`settled` means high complexity and low fix density -- deprioritize "
             "it, and say so. Complexity alone ranked coverage.py's files in "
@@ -631,9 +725,19 @@ def main() -> None:
     positional: list[str] = []
     argv = sys.argv[1:]
     i = 0
+    key_types: dict[str, str] = {}
     while i < len(argv):
         if argv[i] == "--max-files" and i + 1 < len(argv):
             max_files = int(argv[i + 1])
+            i += 2
+        elif argv[i] == "--key-type" and i + 1 < len(argv):
+            # Same meaning as analyze_history's flag: tracker-key prefixes
+            # that mark a commit's type, e.g. B=fix.
+            try:
+                key_types.update(parse_key_types(argv[i + 1]))
+            except ValueError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(2)
             i += 2
         elif argv[i].startswith("--"):
             i += 1
@@ -665,7 +769,7 @@ def main() -> None:
     test_funcs = [f for f in all_functions if f["is_test"]]
 
     hotspots = [f for f in source_funcs if f["score"] >= 5.0]
-    history_meta = cross_with_history(hotspots[:30], project_root)
+    history_meta = cross_with_history(hotspots[:30], project_root, key_types=key_types)
 
     output = {
         "project_root": str(project_root),
