@@ -93,6 +93,11 @@ The script output provides all structural metrics per function. Review the data,
 - **Coupling**: How many other modules/functions does this function depend on?
 - **Side effects**: Does it modify global state, write files, make network calls?
 - **Implicit contracts**: Does it depend on specific call ordering, global state, or undocumented preconditions?
+- **Reads that write**: a `@property`, or a function named like a read (`get_*`, `*_for_*`, `load_*`), that mutates `self.<x>`, a cache or a registry, or creates a file or row as a side effect. A caller cannot tell from the name that calling it changes state, so it gets called on paths that must not change anything. Each one scores 1.0 and is still a frequent source of real defects.
+- **Work moved out of a `try` by laziness**: a `try` whose body only builds a generator, a `map()` or another lazy iterator, or returns one. The work runs later, outside the handler, so the `except` never sees its errors. The same goes for a `with` block that returns a lazy iterator over a resource it then closes.
+- **Re-evaluation fan-out**: a property or helper that recomputes, re-reads or re-renders on every access, called from several places in one operation, so that a mid-operation change produces inconsistent results.
+
+These three never raise a function's score. Look for them in the code around the hotspots, and in the low-scoring functions other agents flagged.
 
 ### Step 2: Refine Hotspot Rankings
 
@@ -108,7 +113,17 @@ The score scale:
 - 6-7: High — should be simplified proactively
 - 8-10: Critical — this code is a maintenance hazard
 
-**Only report hotspots scoring 5 or above** in the summary. Cap at 15 hotspots.
+**Only report hotspots scoring 5 or above.** Give the full write-up (the template below) to at most 15. Every other hotspot the script returned still appears, in a compact table after the write-ups: location, score, verdict, and a one-line primary strategy. Never drop one silently; the report must account for every entry in `hotspots`. If the caller or the orchestrator asks about specific functions that score below 5, answer in a separate section ("Requested below-threshold functions"). The threshold limits what you rank, not what you are allowed to discuss.
+
+### Step 2b: Cross Hotspots with Other Agents' Findings
+
+Per-function metrics can't see the complexity that produced most defects. When other agents' reports are available (in an `explore` run, the run directory's other reports), build a small table: for each function named in a finding, the finding ids (`PS 3`, `SFH 7`, …), its score and its verdict. Then report:
+
+- hotspots that also carry findings (complexity and defects agree: highest priority);
+- functions scoring below 5 that carry two or more findings, or that `history_crossing.top_fixed_functions` lists (defects without measured complexity: say which hidden complexity explains them, from the list under Maintenance Complexity);
+- hotspots with no finding and a `settled` verdict (deprioritize, as the crossing says).
+
+Cite finding ids as the other agents wrote them, so consolidation can merge them. When no other reports are available, say so and skip this step.
 
 ### Step 3: Analyze Simplification Strategies
 
@@ -206,6 +221,21 @@ For each:
 
 ### Moderate Complexity (score 5)
 [Brief list format: location, score, one-line description, primary simplification strategy]
+
+### Remaining Hotspots
+| Location | Score | Verdict | Primary strategy |
+|----------|-------|---------|------------------|
+[Every hotspot past the 15 full write-ups. Omit the section only when there are none]
+
+### Most-Fixed Functions (from `top_fixed_functions`)
+| Location | Fix commits | Score | Hotspot? |
+|----------|-------------|-------|----------|
+
+### Near-Duplicate Blocks (from `clones`)
+For each group worth reporting: the copies (file:lines, function), `exact`/`renamed`, whether they drifted and how, and FIX/CONSIDER/ACCEPTABLE.
+
+### Hotspots × Findings
+[The Step 2b table, or "no other agents' reports available"]
 
 ## Cross-Cutting Observations
 
