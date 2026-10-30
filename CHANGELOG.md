@@ -6,160 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Fixed — test-side scripts (#54)
+## [1.15.0] - 2026-10-30
 
-- **`correlate_tests.py` correlates tests with the modules they import**, not just by file name
-  (`match_method` says which matched), honours pytest `testpaths`, and counts pytest-style test
-  functions in `total_test_methods`. On a real service: reported coverage 25.6% → 86%, close to
-  the measured 85%.
-- **`extract_test_invariants.py` finds the project's tests when the scope has none** (a sibling
-  `tests/`), and says so; with no tests at all it reports `status: no_tests_found` instead of a
-  clean run. Tests map to the code they exercise through imports, fixtures and routes; selection
-  is round-robin across files with fix attribution per test (race, cancel, rollback, lock, timeout
-  and thread now count as bug-fix keywords); "similar functions" require a name relation.
-- **`count_types.py`**: every `unannotated_public_functions` entry names its file, `any_usages`
-  has one schema, and per-file coverage counts methods.
-- `.claude/` is excluded from file discovery (agent worktrees nested there multiplied scans).
+The first threading-aware release, and the fixes from the toolkit's first full review of a
+threaded/async application: 72 of the 78 problems logged during that run are fixed here.
 
-### Fixed
-
-- **Agents and commands invoke `python3`**, not `python`, which some hosts don't have. Every
-  script-backed agent's *Running the script* section also says to run the project's own code in an
-  exported copy with `TMPDIR` pointing at the agent's private directory.
-
-### Fixed — scan_common, pitfall precision, imports, debt (#57)
-
-- **`--help`/`-h` prints usage and exits 0 in every script**, instead of silently running a full
-  scan of the current directory (12 of 16 scripts did); a test runs every script with both flags.
-- **`except-exception-too-broad` is graded by what the handler does with the failure**, not by the
-  size of the `try` body. Handlers that re-raise, report loudly, or return a sentinel the caller
-  checks move to `suppressed` (listed, with `summary.suppressed_by_differential`); on a real
-  service the high-confidence findings went 47 → 5 while the confirmed true positives stayed.
-- `flag-not-reset-on-early-exit` skips completion markers and `duplicated-guard-wrong-operand`
-  skips poll calls (both false positives on a real project).
-- `summary.by_directory` buckets by each file's own directory; `by_top_directory` keeps the old
-  roll-up.
-
-### Enhanced
-
-- **`analyze_imports.py`** marks each import's `scope` and `lazy` flag, detects
-  `importlib.import_module`/`__import__` sites, reports `import_time_cycles` separately, and never
-  leaves `names` null.
-- **`collect_debt.py --key-regex`** inventories tracker keys cited in code and planning docs, with a
-  resolution signal per key.
-
-### Fixed — history attribution (#53)
-
-- `analyze_history.py` classifies commits by bracketed tags, Conventional Commits types and
-  tracker keys, on word boundaries ("prefixes" is no longer a fix, "policies" no longer a chore);
-  `--key-type B=fix,P=feature` maps a project's key prefixes when they can't be inferred.
-- Function churn attributes each historical hunk to the function as it was **at that commit**,
-  keyed by full path and qualified name, instead of mapping old line numbers onto HEAD.
-  `measure_complexity.py`'s fix crossing uses the same attribution, so a function with recent
-  security fixes is no longer reported "quiet, 0 fixes".
-- `lines_changed` counts lines changed; the function's length moved to `current_length`.
-- File first/last dates are committer dates, matching the committer-date window.
-- `measure_complexity.py` measures nested functions (closures, route handlers inside a router
-  factory) as their own entries, and a factory that only defines them no longer ranks as a hotspot.
-
-### Enhanced
-
-- **`analyze_history.py` reports `unmerged_branches`** (ahead count, last commit date, subjects) and
-  `tracker_keys`, so the history agents treat unmerged fixes as prior art.
-
-### Fixed — unmeasured values no longer reported as clean (#56)
-
-- `check_typing.py` keeps mypy's cache out of the reviewed project and the cwd, honours
-  `--max-files` (with `files_capped`), reports `stale_ignores` as `null` with a reason when
-  `warn_unused_ignores` wasn't in effect, and keeps mypy's `note:` lines with the error they
-  explain.
-- `find_dead_symbols.py` reports the imported name's line for multi-line imports, as ruff does, so
-  findings match by `file:line`.
-
-### Enhanced
-
-- **`check_typing.py` has a labelled `--warn-unreachable` pass**: code that a wrong annotation
-  made unreachable (and so unchecked) shows up there. Labelled passes run in parallel.
-- **`find_dead_symbols.py` checks methods**, with confidence levels and exclusion counts by reason
-  (dunders, overrides, framework hooks), instead of skipping them silently, and reports production
-  code **referenced only from tests** as its own list.
-
-### Fixed — ruff and external-tool runs (#55)
-
-- `run_lint_rules.py` and `run_external_tools.py` no longer leave `.ruff_cache/` or `.mypy_cache/`
-  in the reviewed project (`--no-cache`; mypy gets a private `--cache-dir`, removed afterwards).
-- ruff's "Failed to lint" (a sandboxed ruff that can't read the path exits 0 with no findings) is
-  an `error` with the `unlinted` paths, not a clean result.
-- `RULE_TO_SHAPE` maps B905 → `zip-truncates-on-length-mismatch` and DTZ005/DTZ006 →
-  `naive-datetime-in-a-persisted-artifact`.
-- B008 on FastAPI dependency markers (`Depends`, `Query`, `Body`, ...) is dismissed with a recorded
-  reason instead of flooding tier 1 (95 → 0 on a FastAPI service, all counted in `dismissed`).
-- F821/F841 on an `except ... as exc` name read by a closure are labelled a known ruff false
-  positive (ruff#6878), and that F841's autofix is flagged `autofix_unsafe`.
-- `findings_capped` is reported honestly for mypy and vulture.
-
-### Enhanced
-
-- **`run_external_tools.py` runs a labelled toolkit ruff pass** when the project's own selection is
-  narrow, so the bug-risk, security, simplification, performance and deprecated (UP) feeds are no
-  longer empty on a project that selects only E/F/W/I. Every finding carries `selection`.
-- **vulture runs at confidence 60**, with confidence buckets, so unused methods are reported.
-
-### Enhanced — agent prompts, from a full review of a threaded application
-
-- **silent-failure-hunter**: correct ruff codes (`S110`/`SIM105` are try-except-pass, `B025` is a
-  duplicate handler, `S101` is `assert` and not a FIX), a note that the rules it can see depend on
-  the selection that ran, a new step for handlers and `finally` blocks that *raise* (cleanup that
-  triggers a rollback, side channels in `finally`, `CancelledError` bypassing `except Exception`),
-  plain-text severity labels, and `Status` / `Failure scenario` / `Guarded twin` fields.
-- **dead-code-finder** and **silent-failure-hunter** never recommend the F841 autofix on an
-  `except ... as NAME` used by a closure.
-- **architecture-mapper** tests each cycle member's import in a fresh interpreter instead of
-  guessing whether a cycle crashes.
-- **pattern-consistency-checker** checks whether a fix reached every sibling implementation, and
-  diffs producer/consumer maps; **consistency-auditor** compares close siblings' *behavior*
-  (offloading, locking, validation, cleanup).
-- **documentation-auditor** treats concurrency and availability claims in docstrings as testable.
-- **api-surface-reviewer** runs one operation through every transport and diffs the results, audits
-  the REST/OpenAPI surface, and has a `breaks-generated-clients` change class.
-- **project-docs-auditor** audits Dockerfiles, compose files, `*.example`, Makefiles and CI
-  configuration, and no longer assumes `pyproject.toml` holds the metadata.
-- **tech-debt-inventory** covers dependency debt (no upper bound plus reliance on internals,
-  runtime deprecations, tracker keys).
-- **test-coverage-analyzer** no longer assumes `unittest` (a leftover from an earlier target) and
-  recommends measured coverage of other agents' FIX paths; **type-design-analyzer** reports
-  annotation accuracy as "not measured" without mypy data; **git-history-analyzer** annotates every
-  FIX in explore runs and checks unmerged branches.
-- **explore** requires a `status` and a failure scenario on every finding, from every agent.
-
-### Enhanced
-
-- **`explore` runs into a run directory, and its synthesis consolidates, re-anchors and
-  reproduces** (feedback from a full review of a threaded application). Phase 0 creates
-  `<run_dir>/` outside the reviewed checkout (agent reports, kept artifacts, `findings.json`) and
-  hands every agent the same rules: the checkout is read-only and left without tool caches, scratch
-  work goes in a private `mktemp -d` with `TMPDIR` pointing there, and reproducers worth keeping go
-  in `artifacts/<agent>/`. Phase 3 gains three steps: a consolidation agent writes a deduplicated
-  `findings.json` with a fixed schema (in-context synthesis of a full run doesn't fit), every FIX
-  finding is re-anchored against the project's unmerged branches, and findings are promoted to
-  `reproduced` or `refuted`. The summary template gains a Concurrency line.
-- **`informed-explore` no longer writes `.code-review/findings.json` into the reviewed checkout** by
-  default: the memory goes into the run directory and comes back with `--catalog`.
-- **`prior-art` covers trackers that aren't GitHub**: GitLab (`glab`, or the anonymous REST API),
-  local tracker keys in commits and roadmap files, and unmerged branches, with two new verdicts,
-  `fixed-unmerged` and `tracked-locally`.
-- **`docs/reproduction-convention.md` covers races and stalls**: forced interleavings with
-  `Event`s and `Barrier`s, timing a trivial coroutine to prove an event-loop stall, `faulthandler`
-  for deadlocks, being honest about injected cancellation, and a shared harness whose reproducers
-  each end in one `BUG:`/`OK:` line, runnable against any git ref.
-
-### Added
-
-- **Three shapes**: `cleanup-inside-try-triggers-rollback` and `side-channel-raise-in-finally`
-  (silent-failure-hunter), and `linter-autofix-breaks-closure-capture` (lint-rule-triager: ruff's
-  F841 "safe" fix deletes an `except ... as exc` binding that a lambda still uses).
-
-### Added
+### Added — concurrency-auditor (#58)
 
 - **`concurrency-auditor` agent and `scan_concurrency.py`: the catalog's first threading shapes** —
   ports three ideas from ft-review-toolkit's C-extension scanners to Python's `ast`, as 12
@@ -195,10 +47,163 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `request-reply-channel-desync-after-timeout` (a pipe reused after a timeout returns the previous
   caller's reply). All 13 are `documented` for now.
 
-### Fixed
+### Fixed — test helpers (#58)
 
 - **`tests/helpers.import_script` registers the module while it executes**, so a script using
   `@dataclass` with `from __future__ import annotations` can be imported by the tests.
+
+### Fixed — test-side scripts (#54)
+
+- **`correlate_tests.py` correlates tests with the modules they import**, not just by file name
+  (`match_method` says which matched), honours pytest `testpaths`, and counts pytest-style test
+  functions in `total_test_methods`. On a real service: reported coverage 25.6% → 86%, close to
+  the measured 85%.
+- **`extract_test_invariants.py` finds the project's tests when the scope has none** (a sibling
+  `tests/`), and says so; with no tests at all it reports `status: no_tests_found` instead of a
+  clean run. Tests map to the code they exercise through imports, fixtures and routes; selection
+  is round-robin across files with fix attribution per test (race, cancel, rollback, lock, timeout
+  and thread now count as bug-fix keywords); "similar functions" require a name relation.
+- **`count_types.py`**: every `unannotated_public_functions` entry names its file, `any_usages`
+  has one schema, and per-file coverage counts methods.
+- `.claude/` is excluded from file discovery (agent worktrees nested there multiplied scans).
+
+### Fixed — `python3` and `TMPDIR` in agent prompts (#68)
+
+- **Agents and commands invoke `python3`**, not `python`, which some hosts don't have. Every
+  script-backed agent's *Running the script* section also says to run the project's own code in an
+  exported copy with `TMPDIR` pointing at the agent's private directory.
+
+### Fixed — scan_common, pitfall precision, imports, debt (#57)
+
+- **`--help`/`-h` prints usage and exits 0 in every script**, instead of silently running a full
+  scan of the current directory (12 of 16 scripts did); a test runs every script with both flags.
+- **`except-exception-too-broad` is graded by what the handler does with the failure**, not by the
+  size of the `try` body. Handlers that re-raise, report loudly, or return a sentinel the caller
+  checks move to `suppressed` (listed, with `summary.suppressed_by_differential`); on a real
+  service the high-confidence findings went 47 → 5 while the confirmed true positives stayed.
+- `flag-not-reset-on-early-exit` skips completion markers and `duplicated-guard-wrong-operand`
+  skips poll calls (both false positives on a real project).
+- `summary.by_directory` buckets by each file's own directory; `by_top_directory` keeps the old
+  roll-up.
+
+### Enhanced — imports and debt (#57)
+
+- **`analyze_imports.py`** marks each import's `scope` and `lazy` flag, detects
+  `importlib.import_module`/`__import__` sites, reports `import_time_cycles` separately, and never
+  leaves `names` null.
+- **`collect_debt.py --key-regex`** inventories tracker keys cited in code and planning docs, with a
+  resolution signal per key.
+
+### Fixed — history attribution (#53)
+
+- `analyze_history.py` classifies commits by bracketed tags, Conventional Commits types and
+  tracker keys, on word boundaries ("prefixes" is no longer a fix, "policies" no longer a chore);
+  `--key-type B=fix,P=feature` maps a project's key prefixes when they can't be inferred.
+- Function churn attributes each historical hunk to the function as it was **at that commit**,
+  keyed by full path and qualified name, instead of mapping old line numbers onto HEAD.
+  `measure_complexity.py`'s fix crossing uses the same attribution, so a function with recent
+  security fixes is no longer reported "quiet, 0 fixes".
+- `lines_changed` counts lines changed; the function's length moved to `current_length`.
+- File first/last dates are committer dates, matching the committer-date window.
+- `measure_complexity.py` measures nested functions (closures, route handlers inside a router
+  factory) as their own entries, and a factory that only defines them no longer ranks as a hotspot.
+
+### Enhanced — history (#53)
+
+- **`analyze_history.py` reports `unmerged_branches`** (ahead count, last commit date, subjects) and
+  `tracker_keys`, so the history agents treat unmerged fixes as prior art.
+
+### Fixed — unmeasured values no longer reported as clean (#56)
+
+- `check_typing.py` keeps mypy's cache out of the reviewed project and the cwd, honours
+  `--max-files` (with `files_capped`), reports `stale_ignores` as `null` with a reason when
+  `warn_unused_ignores` wasn't in effect, and keeps mypy's `note:` lines with the error they
+  explain.
+- `find_dead_symbols.py` reports the imported name's line for multi-line imports, as ruff does, so
+  findings match by `file:line`.
+
+### Enhanced — typing and dead code (#56)
+
+- **`check_typing.py` has a labelled `--warn-unreachable` pass**: code that a wrong annotation
+  made unreachable (and so unchecked) shows up there. Labelled passes run in parallel.
+- **`find_dead_symbols.py` checks methods**, with confidence levels and exclusion counts by reason
+  (dunders, overrides, framework hooks), instead of skipping them silently, and reports production
+  code **referenced only from tests** as its own list.
+
+### Fixed — ruff and external-tool runs (#55)
+
+- `run_lint_rules.py` and `run_external_tools.py` no longer leave `.ruff_cache/` or `.mypy_cache/`
+  in the reviewed project (`--no-cache`; mypy gets a private `--cache-dir`, removed afterwards).
+- ruff's "Failed to lint" (a sandboxed ruff that can't read the path exits 0 with no findings) is
+  an `error` with the `unlinted` paths, not a clean result.
+- `RULE_TO_SHAPE` maps B905 → `zip-truncates-on-length-mismatch` and DTZ005/DTZ006 →
+  `naive-datetime-in-a-persisted-artifact`.
+- B008 on FastAPI dependency markers (`Depends`, `Query`, `Body`, ...) is dismissed with a recorded
+  reason instead of flooding tier 1 (95 → 0 on a FastAPI service, all counted in `dismissed`).
+- F821/F841 on an `except ... as exc` name read by a closure are labelled a known ruff false
+  positive (ruff#6878), and that F841's autofix is flagged `autofix_unsafe`.
+- `findings_capped` is reported honestly for mypy and vulture.
+
+### Enhanced — external tools (#55)
+
+- **`run_external_tools.py` runs a labelled toolkit ruff pass** when the project's own selection is
+  narrow, so the bug-risk, security, simplification, performance and deprecated (UP) feeds are no
+  longer empty on a project that selects only E/F/W/I. Every finding carries `selection`.
+- **vulture runs at confidence 60**, with confidence buckets, so unused methods are reported.
+
+### Enhanced — agent prompts, from a full review of a threaded application
+
+- **silent-failure-hunter**: correct ruff codes (`S110`/`SIM105` are try-except-pass, `B025` is a
+  duplicate handler, `S101` is `assert` and not a FIX), a note that the rules it can see depend on
+  the selection that ran, a new step for handlers and `finally` blocks that *raise* (cleanup that
+  triggers a rollback, side channels in `finally`, `CancelledError` bypassing `except Exception`),
+  plain-text severity labels, and `Status` / `Failure scenario` / `Guarded twin` fields.
+- **dead-code-finder** and **silent-failure-hunter** never recommend the F841 autofix on an
+  `except ... as NAME` used by a closure.
+- **architecture-mapper** tests each cycle member's import in a fresh interpreter instead of
+  guessing whether a cycle crashes.
+- **pattern-consistency-checker** checks whether a fix reached every sibling implementation, and
+  diffs producer/consumer maps; **consistency-auditor** compares close siblings' *behavior*
+  (offloading, locking, validation, cleanup).
+- **documentation-auditor** treats concurrency and availability claims in docstrings as testable.
+- **api-surface-reviewer** runs one operation through every transport and diffs the results, audits
+  the REST/OpenAPI surface, and has a `breaks-generated-clients` change class.
+- **project-docs-auditor** audits Dockerfiles, compose files, `*.example`, Makefiles and CI
+  configuration, and no longer assumes `pyproject.toml` holds the metadata.
+- **tech-debt-inventory** covers dependency debt (no upper bound plus reliance on internals,
+  runtime deprecations, tracker keys).
+- **test-coverage-analyzer** no longer assumes `unittest` (a leftover from an earlier target) and
+  recommends measured coverage of other agents' FIX paths; **type-design-analyzer** reports
+  annotation accuracy as "not measured" without mypy data; **git-history-analyzer** annotates every
+  FIX in explore runs and checks unmerged branches.
+- **explore** requires a `status` and a failure scenario on every finding, from every agent.
+
+### Enhanced — explore, informed-explore, prior-art, reproduction (#60)
+
+- **`explore` runs into a run directory, and its synthesis consolidates, re-anchors and
+  reproduces** (feedback from a full review of a threaded application). Phase 0 creates
+  `<run_dir>/` outside the reviewed checkout (agent reports, kept artifacts, `findings.json`) and
+  hands every agent the same rules: the checkout is read-only and left without tool caches, scratch
+  work goes in a private `mktemp -d` with `TMPDIR` pointing there, and reproducers worth keeping go
+  in `artifacts/<agent>/`. Phase 3 gains three steps: a consolidation agent writes a deduplicated
+  `findings.json` with a fixed schema (in-context synthesis of a full run doesn't fit), every FIX
+  finding is re-anchored against the project's unmerged branches, and findings are promoted to
+  `reproduced` or `refuted`. The summary template gains a Concurrency line.
+- **`informed-explore` no longer writes `.code-review/findings.json` into the reviewed checkout** by
+  default: the memory goes into the run directory and comes back with `--catalog`.
+- **`prior-art` covers trackers that aren't GitHub**: GitLab (`glab`, or the anonymous REST API),
+  local tracker keys in commits and roadmap files, and unmerged branches, with two new verdicts,
+  `fixed-unmerged` and `tracked-locally`.
+- **`docs/reproduction-convention.md` covers races and stalls**: forced interleavings with
+  `Event`s and `Barrier`s, timing a trivial coroutine to prove an event-loop stall, `faulthandler`
+  for deadlocks, being honest about injected cancellation, and a shared harness whose reproducers
+  each end in one `BUG:`/`OK:` line, runnable against any git ref.
+
+### Added — three shapes (#60)
+
+- **Three shapes**: `cleanup-inside-try-triggers-rollback` and `side-channel-raise-in-finally`
+  (silent-failure-hunter), and `linter-autofix-breaks-closure-capture` (lint-rule-triager: ruff's
+  F841 "safe" fix deletes an `except ... as exc` binding that a lambda still uses).
 
 ## [1.14.0] - 2026-10-29
 

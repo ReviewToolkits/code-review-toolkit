@@ -1,7 +1,7 @@
 {
   "name": "code-review-toolkit",
-  "version": "1.14.0",
-  "description": "Codebase exploration and analysis agents for existing code: architecture mapping, git history analysis, fix propagation detection, churn-based risk assessment, consistency auditing, complexity analysis, test coverage, error handling, documentation, project documentation accuracy, type design, dead code detection, tech debt inventory, pattern consistency, and API surface review",
+  "version": "1.15.0",
+  "description": "Codebase exploration and analysis agents for existing code: architecture mapping, git history analysis, fix propagation detection, churn-based risk assessment, consistency auditing, complexity analysis, test coverage, error handling, concurrency (lock discipline, races, event-loop stalls), documentation, project documentation accuracy, type design, dead code detection, tech debt inventory, pattern consistency, and API surface review",
   "author": {
     "name": "Danzin"
   }
