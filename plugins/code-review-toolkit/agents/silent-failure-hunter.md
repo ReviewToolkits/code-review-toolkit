@@ -46,7 +46,32 @@ If external tool output is not available, proceed with your standard analysis un
 
 ### Step 1: Find All Error Handling Sites
 
-Systematically locate every error handling site in scope:
+Start from the inventory: run `survey_error_handling.py` on the scope (see
+[Running the script](#running-the-script)). It lists every site; you judge them.
+
+- `handlers`: every `except` clause, with `caught`, `broad`/`bare`, `function`, `in_loop`, its
+  `outcome` (`reraise`, `raise-chained`, `raise-unchained`, `raise-from-none`, `exit`, `return`,
+  `continue`, `break`, `report-and-continue`, `pass`, `fall-through`), all its `actions`, its `logs`
+  (level, traceback or not) and a `body` preview. `outcome` is the strongest action anywhere in the
+  body; `outcome_conditional: true` means it happens only on some branch.
+- `suppress`: every `with suppress(...)`, with its size. A broad one around many statements
+  (`summary.broad_suppress_multi_statement`) is invisible to every lint rule.
+- `exit_methods`: `__exit__`/`__aexit__` that can return a true value and so swallow the exception.
+- `finally`: each block's `unguarded_calls` and any `control_flow_exit` (feeds Step 3b).
+- `implicit`: `getattr` with a default, `hasattr`, `.get(key, {})`-style empty defaults, and
+  `subprocess.run`/`call` without `check=`.
+- Leads for Step 3b on each handler: `maybe_unbound` (names the handler reads that only the `try`
+  assigns) and the `cleanup-last-in-try` flag.
+
+Triage in this order: `broad_not_propagating`, `neither_raise_nor_report`, the Step 3b leads,
+`exception_exposed` (the exception's text reaches a return value or response), then
+`logs_without_traceback`. The script does not judge intent: a `pass` handler for an optional import
+is fine. It also cannot see missing error handling or false success (Step 3c). Find those by reading.
+
+If the script fails, fall back to grep for `try`, `except`, `suppress(`, `finally` and `__exit__`,
+and say in the report that the inventory is hand-built.
+
+The site kinds to cover:
 
 **Explicit exception handling:**
 - All `try/except` blocks
@@ -236,7 +261,7 @@ For each:
 
 ## Important Guidelines
 
-- **Systematic coverage**: Don't sample — find every error handling site in scope. Use grep/search for `try`, `except`, `raise`, `finally`, `__exit__`, `subprocess`, `open(`, etc.
+- **Systematic coverage**: Don't sample. The survey lists every explicit site in scope; account for each one, even if only as ACCEPTABLE in bulk. Use grep for what it can't list: `raise`, `subprocess`, `open(` and the like.
 - **Context matters**: A broad except in a CLI entry point (catching and displaying errors) is very different from a broad except in a library function (hiding bugs). Use architecture-mapper output to calibrate severity.
 - **Not all catching is bad**: Sometimes catching broadly and logging is the right thing — in top-level handlers, cleanup code, and logging utilities. Assess intent, not just pattern.
 - **Python-specific**: Python's exception model has unique pitfalls (bare except catching SystemExit, StopIteration semantics, exception chaining). Flag these specifically.
@@ -248,3 +273,35 @@ For each:
 - **CONSIDER**: Error handling that works but could be improved — overly broad catches, missing traceback in logs, generic error messages
 - **POLICY**: Project-wide error handling strategy decisions (e.g., adopt a custom exception hierarchy, standardize logging levels for errors)
 - **ACCEPTABLE**: Intentional broad catches in appropriate contexts — top-level CLI handlers, cleanup code, logging utilities where suppression is the correct behavior
+
+## Running the script
+
+These rules apply to every script call this agent makes.
+
+- **Timeout.** Give the Bash call `timeout: 300000` (5 min). The 120 s default kills the script on
+  large projects. If it may run longer still, use `run_in_background` and wait for the completion
+  notification rather than polling.
+- **A private output location.** Other agents run the toolkit's scripts concurrently in `parallel`
+  mode, so never write to a fixed path. Create a directory of your own and keep stdout and stderr
+  apart, in one Bash call:
+
+  ```bash
+  d=$(mktemp -d "${TMPDIR:-/tmp}/crt-silent-failure-hunter.XXXXXX") && echo "$d" &&
+  python3 <plugin_root>/scripts/survey_error_handling.py [scope] [options] > "$d/out.json" 2> "$d/out.err"; echo "exit=$?"
+  ```
+
+  Options: `--max-files N`, and `--no-implicit` to skip the implicit-site list on a very large
+  scope (the summary then reports `implicit_sites: null`, not 0).
+
+  Each Bash call is a fresh shell: a `$$` suffix or a shell variable does not survive into the next
+  call. Reuse the literal path `echo` printed.
+- **Running the project's own code** (its tests, a reproducer, an import check): do it in an
+  exported copy, never in the checkout, and set `TMPDIR` to your private directory so the project's
+  own temp files land there instead of a shared `/tmp`.
+- **Forward `--max-files N`** when the caller gave one, and say so in the report whenever the
+  envelope's `files_capped` is true. List `files_unparsed` too: those files were not surveyed.
+- **Check before you read.** A non-zero `exit` or an empty `out.json` means the run did not
+  succeed. Read `out.err`, and any `error` field in `out.json`.
+- **Do not retry a script that timed out or failed.** Answer the same question with Grep and Read,
+  and state in the report that the script did not complete. A run that failed is never "no
+  findings".
