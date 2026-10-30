@@ -14,6 +14,8 @@ Options:
     --last N          Analyze exactly the last N commits (overrides time range)
     --max-commits N   Cap total commits analyzed (default: 2000)
     --no-function     Skip function-level churn (file-level only, faster)
+    --key-type SPEC   Map tracker-key prefixes to commit types, e.g.
+                      B=fix,F=feature (repeatable)
 """
 
 import ast
@@ -33,53 +35,86 @@ from scan_common import (  # noqa: E402
     find_project_root,
 )
 
-# Commit classification rules — first match wins.
+# Keyword fallback for commit classification -- first CATEGORY wins. Each entry
+# is a regex fragment matched on word boundaries with its inflections spelled
+# out. Plain substring matching was wrong in both directions on a validation
+# project:
+# "prefixes" counted as a fix, "policies" as a chore (it contains "ci").
 CLASSIFICATION_RULES: list[tuple[str, list[str]]] = [
     (
         "fix",
         [
-            "fix",
-            "bug",
-            "patch",
-            "resolve",
-            "issue",
-            "crash",
-            "error",
+            "fix(?:es|ed|ing)?",
+            "bugs?",
+            "bugfix(?:es)?",
+            "hotfix(?:es)?",
+            "patch(?:es|ed)?",
+            "resolve[sd]?",
+            "issues?",
+            "crash(?:es|ed|ing)?",
+            "errors?",
             "broken",
-            "repair",
-            "correct",
-            "regression",
-            "workaround",
-            "hotfix",
+            "repair(?:s|ed)?",
+            "correct(?:s|ed|ion)?",
+            "regressions?",
+            "workarounds?",
+            "wrong(?:ly)?",
+            "incorrect(?:ly)?",
+            "leak(?:s|ed|ing)?",
+            "races?",
+            "segfaults?",
+            "fail(?:s|ed|ing|ure|ures)?",
         ],
     ),
     (
         "docs",
-        ["doc", "readme", "comment", "typo", "spelling", "changelog", "documentation"],
+        [
+            "docs?",
+            "readme",
+            "comments?",
+            "typos?",
+            "spelling",
+            "changelog",
+            "documentation",
+            "document(?:s|ed)?",
+        ],
     ),
-    ("test", ["test", "coverage", "assert", "mock", "fixture", "unittest", "pytest"]),
+    (
+        "test",
+        [
+            "tests?",
+            "testing",
+            "coverage",
+            "asserts?",
+            "mocks?",
+            "fixtures?",
+            "unittests?",
+            "pytest",
+        ],
+    ),
     (
         "refactor",
         [
-            "refactor",
-            "clean",
-            "simplify",
-            "reorganize",
-            "restructure",
-            "rename",
-            "move",
-            "extract",
-            "deduplicate",
-            "inline",
+            "refactor(?:s|ed|ing)?",
+            "clean(?:s|ed|up)?",
+            "cleanups?",
+            "simplif(?:y|ies|ied)",
+            "reorgani[sz](?:e|es|ed)",
+            "restructur(?:e|es|ed)",
+            "renam(?:e|es|ed)",
+            "mov(?:e|es|ed)",
+            "extract(?:s|ed)?",
+            "deduplicat(?:e|es|ed)",
+            "inline[sd]?",
         ],
     ),
     (
         "chore",
         [
-            "bump",
-            "dependency",
-            "update",
-            "upgrade",
+            "bump(?:s|ed)?",
+            "dependenc(?:y|ies)",
+            "update[sd]?",
+            "upgrade[sd]?",
             "ci",
             "config",
             "lint",
@@ -87,23 +122,78 @@ CLASSIFICATION_RULES: list[tuple[str, list[str]]] = [
             "version",
             "release",
             "merge",
-            "revert",
+            "revert(?:s|ed)?",
         ],
     ),
     (
         "feature",
         [
-            "add",
-            "implement",
+            "add(?:s|ed)?",
+            "implement(?:s|ed)?",
             "new",
-            "feature",
-            "introduce",
-            "support",
-            "enable",
-            "create",
+            "features?",
+            "introduc(?:e|es|ed)",
+            "support(?:s|ed)?",
+            "enable[sd]?",
+            "create[sd]?",
         ],
     ),
 ]
+
+_KEYWORD_RES: list[tuple[str, re.Pattern[str]]] = [
+    (category, re.compile(r"\b(?:" + "|".join(words) + r")\b", re.IGNORECASE))
+    for category, words in CLASSIFICATION_RULES
+]
+
+COMMIT_TYPES = ("fix", "feature", "refactor", "docs", "test", "chore")
+
+# A Conventional Commits type, or a leading bracketed tag, states the type
+# outright. Only tags that NAME a type are mapped; area tags such as `[store]`
+# or `[api]` carry no type and fall through to the next signal. `perf` is left
+# unmapped on purpose: a performance commit is as often new capability as it
+# is a rewrite, so the remaining signals decide.
+_TYPE_WORDS: dict[str, str] = {
+    "fix": "fix",
+    "fixes": "fix",
+    "bug": "fix",
+    "bugfix": "fix",
+    "hotfix": "fix",
+    "security": "fix",
+    "sec": "fix",
+    "regression": "fix",
+    "feat": "feature",
+    "feature": "feature",
+    "doc": "docs",
+    "docs": "docs",
+    "documentation": "docs",
+    "test": "test",
+    "tests": "test",
+    "testing": "test",
+    "bench": "test",
+    "refactor": "refactor",
+    "cleanup": "refactor",
+    "chore": "chore",
+    "build": "chore",
+    "ci": "chore",
+    "deps": "chore",
+    "release": "chore",
+    "style": "chore",
+    "revert": "chore",
+    "infra": "chore",
+    "pkg": "chore",
+}
+
+_CONVENTIONAL_RE = re.compile(r"^\s*([A-Za-z]+)(?:\([^)]*\))?!?:\s")
+_LEADING_TAGS_RE = re.compile(r"^\s*((?:\[[^\[\]\n]+\]\s*)+)")
+_TAG_RE = re.compile(r"\[([^\[\]]+)\]")
+# Tracker keys: `ABC-123` (Jira style) or a single capital followed by digits,
+# optionally dash-separated (`K7`, `T1-20`).
+_TRACKER_KEY_RE = re.compile(
+    r"(?<![\w-])([A-Z][A-Z0-9]*-\d+(?:-\d+)*|[A-Z]\d+(?:-\d+)*)(?![\w-])"
+)
+
+# Precedence when one commit carries several typed signals of equal rank.
+_TYPE_PRIORITY = {t: i for i, t in enumerate(COMMIT_TYPES)}
 
 _GIT_TIMEOUT = 30
 _SCRIPT_START: float = 0.0
@@ -113,14 +203,80 @@ _MAX_DIFF_LINES_REFACTOR = 80
 _FUNCTION_COUNT_THRESHOLD = 500
 
 
-def classify_commit(message: str) -> str:
-    """Classify a commit message using keyword matching. First match wins."""
-    msg_lower = message.lower()
-    for category, keywords in CLASSIFICATION_RULES:
-        for keyword in keywords:
-            if keyword in msg_lower:
-                return category
-    return "unknown"
+def tracker_key_prefix(key: str) -> str:
+    """`T1-20` -> `T`, `ABC-12` -> `ABC`."""
+    match = re.match(r"[A-Z]+", key)
+    return match.group(0) if match else key
+
+
+def parse_key_types(spec: str) -> dict[str, str]:
+    """Parse `B=fix,F=feature` into {prefix: type}. Raises ValueError."""
+    result: dict[str, str] = {}
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        prefix, sep, ctype = item.partition("=")
+        prefix, ctype = prefix.strip(), ctype.strip().lower()
+        ctype = _TYPE_WORDS.get(ctype, ctype)
+        if not sep or not re.fullmatch(r"[A-Z]+", prefix) or ctype not in COMMIT_TYPES:
+            raise ValueError(
+                f"bad --key-type entry {item!r}: expected PREFIX=TYPE with an "
+                f"uppercase prefix and TYPE one of {', '.join(COMMIT_TYPES)}"
+            )
+        result[prefix] = ctype
+    return result
+
+
+def _best_type(types: Iterable[str]) -> str | None:
+    found = [t for t in types if t in _TYPE_PRIORITY]
+    return min(found, key=_TYPE_PRIORITY.__getitem__) if found else None
+
+
+def classify_commit_detail(
+    message: str,
+    key_types: dict[str, str] | None = None,
+) -> dict:
+    """Classify a commit subject and say which signal decided it.
+
+    Signals, strongest first: a Conventional Commits type (`fix(cli): ...`), a
+    leading bracketed tag that names a type (`[fix][cli] ...`), a tracker key
+    whose prefix is mapped by `key_types` (`... (K7)` with `K=fix`), and last
+    a word-boundary keyword match. Returns
+    {"type", "source", "tags", "keys"}; source is one of conventional / tag /
+    key / keyword / None.
+    """
+    tags: list[str] = []
+    tag_match = _LEADING_TAGS_RE.match(message)
+    if tag_match:
+        for raw in _TAG_RE.findall(tag_match.group(1)):
+            tags.extend(t for t in re.split(r"[\s,/|]+", raw.strip().lower()) if t)
+    keys = list(dict.fromkeys(_TRACKER_KEY_RE.findall(message)))
+    detail: dict = {"type": "unknown", "source": None, "tags": tags, "keys": keys}
+
+    conv = _CONVENTIONAL_RE.match(message)
+    if conv and conv.group(1).lower() in _TYPE_WORDS:
+        detail.update(type=_TYPE_WORDS[conv.group(1).lower()], source="conventional")
+        return detail
+    tag_type = _best_type(_TYPE_WORDS.get(t, "") for t in tags)
+    if tag_type:
+        detail.update(type=tag_type, source="tag")
+        return detail
+    if key_types:
+        key_type = _best_type(key_types.get(tracker_key_prefix(k), "") for k in keys)
+        if key_type:
+            detail.update(type=key_type, source="key")
+            return detail
+    for category, pattern in _KEYWORD_RES:
+        if pattern.search(message):
+            detail.update(type=category, source="keyword")
+            return detail
+    return detail
+
+
+def classify_commit(message: str, key_types: dict[str, str] | None = None) -> str:
+    """Classify a commit message. See classify_commit_detail for the rules."""
+    return classify_commit_detail(message, key_types)["type"]
 
 
 def _run_git(
@@ -183,6 +339,7 @@ def parse_git_log(
     lines: Iterable[str],
     max_commits: int,
     project_root: Path | None = None,
+    key_types: dict[str, str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Parse git log with numstat from an iterable of lines.
 
@@ -207,12 +364,15 @@ def parse_git_log(
                 current_commit = None
                 continue
             commit_hash, date_str, author, message = parts
+            detail = classify_commit_detail(message, key_types)
             current_commit = {
                 "hash": commit_hash,
                 "date": date_str,
                 "author": author,
                 "message": message,
-                "type": classify_commit(message),
+                "type": detail["type"],
+                "type_source": detail["source"],
+                "keys": detail["keys"],
                 "files": [],
                 "stats": [],
             }
@@ -565,6 +725,42 @@ def compute_co_change_clusters(
     return results[:max_pairs]
 
 
+def summarize_tracker_keys(commits: list[dict], max_repeated: int = 30) -> dict:
+    """Group commits by tracker key; flag keys that recur across commits.
+
+    A bug key on several commits is either a multi-part fix or a fix that had
+    to be redone -- both worth a look when checking fix completeness.
+    """
+    by_key: dict[str, list[dict]] = defaultdict(list)
+    for commit in commits:
+        for key in commit.get("keys", []):
+            by_key[key].append(commit)
+    by_prefix: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for key, key_commits in by_key.items():
+        for commit in key_commits:
+            by_prefix[tracker_key_prefix(key)][commit["type"]] += 1
+    repeated = [
+        {
+            "key": key,
+            "commits": len(key_commits),
+            "types": sorted({c["type"] for c in key_commits}),
+            "commit_shorts": [c["hash"][:7] for c in key_commits],
+        }
+        for key, key_commits in by_key.items()
+        if len(key_commits) > 1
+    ]
+    repeated.sort(key=lambda r: (-r["commits"], r["key"]))
+    return {
+        "keys_seen": len(by_key),
+        "commits_with_keys": sum(1 for c in commits if c.get("keys")),
+        # Per key prefix, how the carrying commits were classified. A prefix
+        # whose commits are mostly `unknown` is a candidate for --key-type.
+        "by_prefix": {p: dict(t) for p, t in sorted(by_prefix.items())},
+        "repeated": repeated[:max_repeated],
+        "repeated_total": len(repeated),
+    }
+
+
 def parse_args(argv: list[str]) -> dict:
     """Parse command-line arguments."""
     args: dict = {
@@ -576,6 +772,7 @@ def parse_args(argv: list[str]) -> dict:
         "max_commits": 2000,
         "max_files": 0,
         "no_function": False,
+        "key_types": {},
         "unknown_args": [],
     }
 
@@ -631,6 +828,13 @@ def parse_args(argv: list[str]) -> dict:
         elif arg == "--no-function":
             args["no_function"] = True
             i += 1
+        elif arg == "--key-type" and i + 1 < len(argv):
+            try:
+                args["key_types"].update(parse_key_types(argv[i + 1]))
+            except ValueError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(2)
+            i += 2
         elif not arg.startswith("-"):
             args["path"] = arg
             i += 1
@@ -672,6 +876,8 @@ def analyze(argv: list[str] | None = None) -> dict:
     last_n = args["last"]
     max_commits = args["max_commits"]
 
+    key_types = args["key_types"]
+
     # Parse git log.
     git_args = [
         "log",
@@ -696,6 +902,7 @@ def analyze(argv: list[str] | None = None) -> dict:
             proc.stdout or [],
             max_commits,
             project_root,
+            key_types,
         )
 
     # If using --last, derive time range from actual commits.
@@ -715,9 +922,11 @@ def analyze(argv: list[str] | None = None) -> dict:
 
     # Classify commits.
     commits_by_type: dict[str, int] = defaultdict(int)
+    classified_by: dict[str, int] = defaultdict(int)
     authors: set[str] = set()
     for commit in commits:
         commits_by_type[commit["type"]] += 1
+        classified_by[commit.get("type_source") or "none"] += 1
         authors.add(commit["author"])
 
     # Function-level churn.
@@ -767,10 +976,15 @@ def analyze(argv: list[str] | None = None) -> dict:
         "summary": {
             "total_commits": len(commits),
             "commits_by_type": dict(commits_by_type),
+            # Which signal decided each commit's type: conventional / tag /
+            # key / keyword / none (= unknown).
+            "classified_by": dict(classified_by),
+            "key_types": key_types,
             "files_changed": len(file_churn),
             "functions_changed": len(function_churn),
             "authors": len(authors),
         },
+        "tracker_keys": summarize_tracker_keys(commits),
         "file_churn": file_churn,
         "function_churn": function_churn,
         "recent_fixes": recent_fixes,
@@ -779,6 +993,15 @@ def analyze(argv: list[str] | None = None) -> dict:
         "co_change_clusters": co_change_clusters,
         "notes": [],
     }
+
+    unknown = commits_by_type.get("unknown", 0)
+    if commits and unknown / len(commits) > 0.15:
+        result["notes"].append(
+            f"{unknown} of {len(commits)} commits are `unknown`. If the project "
+            "marks commits with tracker keys (see tracker_keys.by_prefix), "
+            "re-run with --key-type PREFIX=TYPE (e.g. --key-type B=fix,F=feature) "
+            "before quoting a fix:feature ratio."
+        )
 
     if function_churn_note:
         result["function_churn_note"] = function_churn_note

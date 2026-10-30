@@ -700,5 +700,137 @@ class TestUnknownArgumentsAndCommitCap(unittest.TestCase):
         )
 
 
+_WINDOW = ["--since", "2024-12-01", "--until", "2025-02-01"]
+
+
+class TestTaggedAndKeyedClassification(unittest.TestCase):
+    """Tags, Conventional Commits types and tracker keys are parsed,
+    and keywords match on word boundaries."""
+
+    def test_bracketed_fix_tag(self):
+        detail = mod.classify_commit_detail(
+            "[fix][cli] Accept -q as a short --quiet alias (K7)"
+        )
+        self.assertEqual(detail["type"], "fix")
+        self.assertEqual(detail["source"], "tag")
+        self.assertEqual(detail["tags"], ["fix", "cli"])
+        self.assertEqual(detail["keys"], ["K7"])
+
+    def test_fix_inside_a_word_is_not_a_fix(self):
+        # "prefixes" contains "fix"; the substring classifier called it a fix.
+        self.assertNotEqual(
+            mod.classify_commit("[parser] Strip URL prefixes before matching (T1-30)"),
+            "fix",
+        )
+
+    def test_ci_inside_a_word_is_not_a_chore(self):
+        # "policies" contains "ci"; the substring classifier called it a chore.
+        self.assertEqual(
+            mod.classify_commit("[core] Add retry and backoff policies (T1-31)"),
+            "feature",
+        )
+
+    def test_conventional_type_beats_keywords(self):
+        # "correct" is a fix keyword, but the commit says it is a chore.
+        detail = mod.classify_commit_detail("chore(docs): correct the install guide")
+        self.assertEqual((detail["type"], detail["source"]), ("chore", "conventional"))
+        self.assertEqual(mod.classify_commit("feat(api)!: drop v1 routes"), "feature")
+
+    def test_area_tag_falls_through_to_keywords(self):
+        # [store] names an area, not a type.
+        detail = mod.classify_commit_detail("[db] Add schema migrations (T1-32)")
+        self.assertEqual((detail["type"], detail["source"]), ("feature", "keyword"))
+
+    def test_unmapped_key_stays_unknown(self):
+        subject = "[db] Validate column types (T1-33)"
+        self.assertEqual(mod.classify_commit(subject), "unknown")
+
+    def test_mapped_key_decides(self):
+        key_types = mod.parse_key_types("K=fix,T=feature")
+        self.assertEqual(
+            mod.classify_commit("[db] Validate column types (T1-33)", key_types),
+            "feature",
+        )
+        detail = mod.classify_commit_detail(
+            "[api] Keep query options on redirect (K12)", key_types
+        )
+        self.assertEqual((detail["type"], detail["source"]), ("fix", "key"))
+
+    def test_tag_beats_key(self):
+        # A [fix] commit on plan work is still a fix.
+        self.assertEqual(
+            mod.classify_commit(
+                "[fix] Reject duplicate column names (T1-33)", {"T": "feature"}
+            ),
+            "fix",
+        )
+
+    def test_inflections_still_match(self):
+        self.assertEqual(mod.classify_commit("Fixed a race in the pool"), "fix")
+        self.assertEqual(mod.classify_commit("Fixes #12"), "fix")
+        self.assertEqual(mod.classify_commit("Refactored the loader"), "refactor")
+
+    def test_tracker_key_extraction(self):
+        self.assertEqual(
+            mod.classify_commit_detail("Close two leaks (K41, K42)")["keys"],
+            ["K41", "K42"],
+        )
+        self.assertEqual(
+            mod.classify_commit_detail("JIRA-123 and T2-8")["keys"],
+            ["JIRA-123", "T2-8"],
+        )
+        # Words with digits that are not a key shape.
+        self.assertEqual(
+            mod.classify_commit_detail("Use SHA256 for UTF8 names")["keys"], []
+        )
+
+    def test_parse_key_types_rejects_bad_specs(self):
+        for spec in ("B", "b=fix", "B=whatever"):
+            with self.assertRaises(ValueError, msg=spec):
+                mod.parse_key_types(spec)
+        self.assertEqual(
+            mod.parse_key_types("B=bug, P=feat"), {"B": "fix", "P": "feature"}
+        )
+
+    def test_key_type_flag(self):
+        args = mod.parse_args(["--key-type", "B=fix", "--key-type", "P=feature"])
+        self.assertEqual(args["key_types"], {"B": "fix", "P": "feature"})
+
+    def test_repeated_keys_are_flagged(self):
+        commits = [
+            {"hash": "a" * 40, "type": "fix", "keys": ["K33"]},
+            {"hash": "b" * 40, "type": "fix", "keys": ["K33", "K34"]},
+            {"hash": "c" * 40, "type": "unknown", "keys": ["T1-50"]},
+        ]
+        summary = mod.summarize_tracker_keys(commits)
+        self.assertEqual(summary["keys_seen"], 3)
+        self.assertEqual([r["key"] for r in summary["repeated"]], ["K33"])
+        self.assertEqual(summary["by_prefix"], {"K": {"fix": 3}, "T": {"unknown": 1}})
+
+    def test_key_types_reach_the_analysis(self):
+        with GitTempProject(
+            [
+                {"files": {"a.py": "x = 1\n"}, "message": "[db] Validate rows (T1-65)"},
+                {
+                    "files": {"a.py": "x = 2\n"},
+                    "message": "[api] Keep query options (K24)",
+                },
+            ]
+        ) as root:
+            plain = mod.analyze([str(root), *_WINDOW])
+            keyed = mod.analyze(
+                [
+                    str(root),
+                    *_WINDOW,
+                    "--key-type",
+                    "K=fix,T=feature",
+                ]
+            )
+        self.assertEqual(plain["summary"]["commits_by_type"], {"unknown": 2})
+        self.assertTrue(any("--key-type" in n for n in plain["notes"]))
+        self.assertEqual(keyed["summary"]["commits_by_type"], {"feature": 1, "fix": 1})
+        self.assertEqual(keyed["summary"]["classified_by"], {"key": 2})
+
+
 if __name__ == "__main__":
     unittest.main()
