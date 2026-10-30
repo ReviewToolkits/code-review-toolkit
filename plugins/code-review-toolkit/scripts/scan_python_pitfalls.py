@@ -3445,6 +3445,230 @@ def _check_narrow_parse_except(tree: ast.AST) -> list[dict]:
     return out
 
 
+# Removing something after the fact: the post-success cleanup.
+_REMOVAL_VERBS = (
+    "rmtree",
+    "unlink",
+    "remove",
+    "rmdir",
+    "cleanup",
+    "delete",
+    "discard",
+    "purge",
+)
+# Undoing an operation: what a rollback handler calls.
+_ROLLBACK_VERBS = ("rollback", "restore", "revert", "undo", "move", "rename", "replace")
+
+
+def _tail_cleanups(stmts: list[ast.stmt], is_body: bool) -> list[ast.Call]:
+    """Removal calls that are the last action of a path through *stmts*.
+
+    A removal followed only by `return`/`pass` in its block counts when the
+    block is the try body itself or ends by returning (the path leaves the try
+    right after it).
+    """
+    out: list[ast.Call] = []
+    exits = bool(stmts) and isinstance(stmts[-1], ast.Return)
+    for index, stmt in enumerate(stmts):
+        if isinstance(stmt, ast.If):
+            out.extend(_tail_cleanups(stmt.body, False))
+            out.extend(_tail_cleanups(stmt.orelse, False))
+            continue
+        if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)):
+            continue
+        if not _verb_match(_call_tail(stmt.value), _REMOVAL_VERBS):
+            continue
+        after = stmts[index + 1 :]
+        if all(isinstance(a, (ast.Return, ast.Pass)) for a in after) and (
+            is_body or exits
+        ):
+            out.append(stmt.value)
+    return out
+
+
+def _check_cleanup_inside_try_triggers_rollback(tree: ast.AST) -> list[dict]:
+    """`try: install(); remove_backup() / except: rollback()`.
+
+    The cleanup after a successful operation sits inside the try, so a
+    cleanup failure runs the rollback: the success is undone, and a partial
+    cleanup (rmtree deletes as it goes) may already have destroyed the backup
+    the rollback needs.
+    """
+    out: list[dict] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try) or not node.handlers or len(node.body) < 2:
+            continue
+        undo_tails = {
+            _call_tail(n)
+            for h in node.handlers
+            for n in ast.walk(h)
+            if isinstance(n, ast.Call)
+        }
+        rollback = any(_verb_match(t, _ROLLBACK_VERBS) for t in undo_tails)
+        removal = any(_verb_match(t, _REMOVAL_VERBS) for t in undo_tails)
+        if not (rollback or removal):
+            continue
+        for call in _tail_cleanups(node.body, True):
+            out.append(
+                _finding(
+                    "cleanup-inside-try-triggers-rollback",
+                    "FIX",
+                    "high" if rollback else "medium",
+                    call,
+                    f"`{ast.unparse(call.func)}(...)` cleans up after the operation "
+                    f"succeeded, but inside the try: if it fails, the handler at line "
+                    f"{node.handlers[0].lineno} undoes the successful operation",
+                    "move the cleanup after the try/except, in its own try that only "
+                    "warns; check what a half-done cleanup leaves for the rollback",
+                )
+            )
+    return out
+
+
+# Calls that feed a side channel (audit, metrics, events): they should never
+# change the data plane's result.
+_SIDE_CHANNEL_VERBS = (
+    "emit",
+    "audit",
+    "record",
+    "track",
+    "publish",
+    "report",
+    "observe",
+    "inc",
+    "increment",
+    "gauge",
+    "histogram",
+    "timing",
+    "send_event",
+    "log_event",
+    "write_event",
+)
+_SIDE_CHANNEL_RECEIVERS = ("audit", "metric", "stats", "telemetry", "event", "ops_log")
+
+
+def _side_channel_call(call: ast.Call) -> bool:
+    tail = _call_tail(call)
+    if _logger_level(call) is not None:
+        return False  # stdlib logging handlers swallow their own errors
+    if _verb_match(tail, _SIDE_CHANNEL_VERBS):
+        return True
+    if isinstance(call.func, ast.Attribute) and not _verb_match(tail, _CLEANUP_VERBS):
+        receiver = _dotted_name(call.func.value).lower()
+        return any(hint in receiver for hint in _SIDE_CHANNEL_RECEIVERS)
+    return False
+
+
+def _unguarded_calls(stmts: list[ast.stmt]):
+    """Calls in *stmts* that no inner try with a broad handler protects."""
+    for stmt in stmts:
+        if isinstance(stmt, ast.Try):
+            broad = any(
+                h.type is None
+                or _dotted_name(h.type).split(".")[-1] in ("Exception", "BaseException")
+                for h in stmt.handlers
+            )
+            if not broad:
+                yield from _unguarded_calls(stmt.body)
+            yield from _unguarded_calls(stmt.finalbody)
+            continue
+        if isinstance(stmt, (ast.With, ast.AsyncWith)) and any(
+            _call_name(i.context_expr) in ("suppress", "contextlib.suppress")
+            for i in stmt.items
+            if isinstance(i.context_expr, ast.Call)
+        ):
+            continue
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for node in [stmt, *_walk_same_scope(stmt)]:
+            if isinstance(node, ast.Call):
+                yield node
+
+
+def _check_side_channel_raise_in_finally(tree: ast.AST) -> list[dict]:
+    """`try: return do_write() finally: audit.emit(event)`.
+
+    If the side-channel call raises (disk full, a closed handle), its
+    exception replaces the function's result -- or the original exception.
+    """
+    out: list[dict] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try) or not node.finalbody:
+            continue
+        for call in _unguarded_calls(node.finalbody):
+            if not _side_channel_call(call):
+                continue
+            out.append(
+                _finding(
+                    "side-channel-raise-in-finally",
+                    "FIX",
+                    "medium",
+                    call,
+                    f"`{ast.unparse(call.func)}(...)` in `finally` can raise, and its "
+                    f"exception replaces the result (or the real error) of the try",
+                    "make the side channel total: wrap it in its own try/except "
+                    "Exception that counts or warns once",
+                )
+            )
+            break  # one per finally block
+    return out
+
+
+def _simple_statements(stmts: list[ast.stmt]) -> int:
+    count = 0
+    for stmt in stmts:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            count += 1
+            continue
+        nested = [
+            sub
+            for name in ("body", "orelse", "finalbody")
+            for sub in getattr(stmt, name, []) or []
+            if isinstance(sub, ast.stmt)
+        ] + [sub for h in getattr(stmt, "handlers", []) for sub in h.body]
+        count += 1 + _simple_statements(nested) if nested else 1
+    return count
+
+
+def _check_wide_suppress_exception(tree: ast.AST) -> list[dict]:
+    """`with suppress(Exception):` around a block, not a single best-effort call.
+
+    The first failing statement silently skips every statement after it, and
+    no linter rule fires on the block form.
+    """
+    out: list[dict] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.With, ast.AsyncWith)):
+            continue
+        for item in node.items:
+            expr = item.context_expr
+            if not (
+                isinstance(expr, ast.Call)
+                and _call_name(expr).split(".")[-1] == "suppress"
+                and any(
+                    _dotted_name(a).split(".")[-1] in ("Exception", "BaseException")
+                    for a in expr.args
+                )
+            ):
+                continue
+            size = _simple_statements(node.body)
+            if size < 4:
+                continue
+            out.append(
+                _finding(
+                    "wide-suppress-exception-block",
+                    "FIX" if size >= 10 else "CONSIDER",
+                    "high" if size >= 10 else "medium",
+                    node,
+                    f"`with {ast.unparse(expr)}:` covers {size} statements: the first "
+                    f"one that fails silently skips all the rest",
+                    "suppress around the single best-effort call, or catch narrowly and "
+                    "log; decide per statement which failures are acceptable",
+                )
+            )
+    return out
+
+
 # Accessor-pair verbs: (decode side, encode side).
 _PAIR_VERBS = (
     ("get", "set"),
@@ -4711,6 +4935,9 @@ _CHECKS = {
     "unformatted-format-string-literal": _check_unformatted_format_string,
     "parsed-json-assumed-object": _check_parsed_json_assumed_object,
     "narrow-parse-except-misses-decode-error": _check_narrow_parse_except,
+    "cleanup-inside-try-triggers-rollback": _check_cleanup_inside_try_triggers_rollback,
+    "side-channel-raise-in-finally": _check_side_channel_raise_in_finally,
+    "wide-suppress-exception-block": _check_wide_suppress_exception,
 }
 
 

@@ -1533,6 +1533,94 @@ class TestNarrowParseExcept(unittest.TestCase):
         self.assertEqual(self._found(src), [])
 
 
+class TestCleanupInsideTryTriggersRollback(unittest.TestCase):
+    shape = "cleanup-inside-try-triggers-rollback"
+
+    def _found(self, src: str) -> list[dict]:
+        return [f for f in scan(src) if f["shape"] == self.shape]
+
+    def test_backup_removal_inside_rollback_try(self):
+        src = (
+            "import shutil\n"
+            "def swap(new, live, backup):\n    shutil.move(live, backup)\n    try:\n"
+            "        shutil.move(new, live)\n        shutil.rmtree(backup)\n"
+            "    except Exception:\n        shutil.rmtree(live, ignore_errors=True)\n"
+            "        shutil.move(backup, live)\n        raise\n"
+        )
+        found = self._found(src)
+        self.assertEqual([(f["line"], f["confidence"]) for f in found], [(6, "high")])
+
+    def test_cleanup_before_an_early_return_inside_the_try(self):
+        src = (
+            "def export(self, out):\n    try:\n        staged = self.stage()\n"
+            "        if out is not None:\n            self.write(staged, out)\n"
+            "            self._remove_path(staged)\n            return out\n"
+            "        return staged\n    except Exception:\n"
+            "        self._remove_path(staged)\n        raise\n"
+        )
+        self.assertEqual([f["confidence"] for f in self._found(src)], ["medium"])
+
+    def test_cleanup_after_the_try_is_silent(self):
+        src = (
+            "import shutil\n"
+            "def swap(new, live, backup):\n    try:\n        shutil.move(new, live)\n"
+            "    except Exception:\n        shutil.move(backup, live)\n        raise\n"
+            "    try:\n        shutil.rmtree(backup)\n    except OSError:\n        pass\n"
+        )
+        self.assertEqual(self._found(src), [])
+
+
+class TestSideChannelRaiseInFinally(unittest.TestCase):
+    shape = "side-channel-raise-in-finally"
+
+    def _found(self, src: str) -> list[dict]:
+        return [f for f in scan(src) if f["shape"] == self.shape]
+
+    def test_audit_emit_in_finally(self):
+        src = (
+            "def wrapper(fn, audit):\n    status = 'error'\n    try:\n"
+            "        result = fn()\n        status = 'ok'\n        return result\n"
+            "    finally:\n        audit.emit(op='write', status=status)\n"
+        )
+        self.assertEqual(len(self._found(src)), 1)
+
+    def test_logging_close_and_guarded_emit_are_silent(self):
+        src = (
+            "import logging\nlog = logging.getLogger(__name__)\n"
+            "def a(fn, fh):\n    try:\n        return fn()\n    finally:\n"
+            "        log.info('done')\n        fh.close()\n"
+            "def b(fn, audit):\n    try:\n        return fn()\n    finally:\n"
+            "        try:\n            audit.emit(op='x')\n"
+            "        except Exception:\n            pass\n"
+        )
+        self.assertEqual(self._found(src), [])
+
+
+class TestWideSuppressException(unittest.TestCase):
+    shape = "wide-suppress-exception-block"
+
+    def _found(self, src: str) -> list[dict]:
+        return [f for f in scan(src) if f["shape"] == self.shape]
+
+    def test_block_of_bookkeeping(self):
+        body = "".join(f"        state.step{i}()\n" for i in range(5))
+        src = (
+            "from contextlib import suppress\ndef finish(state):\n"
+            "    with suppress(Exception):\n" + body
+        )
+        found = self._found(src)
+        self.assertEqual([f["confidence"] for f in found], ["medium"])
+
+    def test_single_best_effort_call_and_narrow_suppress_are_silent(self):
+        src = (
+            "import contextlib, os\ndef cleanup(p, q):\n"
+            "    with contextlib.suppress(Exception):\n        os.unlink(p)\n"
+            "    with contextlib.suppress(OSError):\n"
+            "        os.unlink(p)\n        os.unlink(q)\n        os.rmdir(p)\n        os.rmdir(q)\n"
+        )
+        self.assertEqual(self._found(src), [])
+
+
 class TestAsymmetricEncodeDecode(unittest.TestCase):
     """_pyrepl readline.py:443 vs :460 -- lenient read, strict write-back."""
 

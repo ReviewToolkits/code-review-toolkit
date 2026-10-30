@@ -2380,8 +2380,8 @@
         "shutil.rmtree docs (deletes as it walks; a failure leaves a partial tree)"
       ],
       "differential": "Cleanup that is itself part of the operation's atomicity (removing a lock file that other processes check) may belong inside. Check whether the rollback can survive a half-done cleanup.",
-      "detected_by": null,
-      "detectability": "implementable"
+      "detected_by": "scan_python_pitfalls.py",
+      "detectability": "implemented"
     },
     {
       "id": "side-channel-raise-in-finally",
@@ -2399,8 +2399,27 @@
         "Python docs, 'try statement' (an exception in finally replaces the pending one)"
       ],
       "differential": "Standard `logging` handlers already catch their own errors (`Handler.handleError`); the shape is about project-owned writers, metrics clients and audit logs that don't.",
-      "detected_by": null,
-      "detectability": "implementable"
+      "detected_by": "scan_python_pitfalls.py",
+      "detectability": "implemented"
+    },
+    {
+      "id": "wide-suppress-exception-block",
+      "title": "`with suppress(Exception):` around a block of statements, not one best-effort call",
+      "agent": "silent-failure-hunter",
+      "severity": "FIX",
+      "pattern": "`with contextlib.suppress(Exception):` wrapping several statements of bookkeeping. The first statement that fails silently skips every statement after it, so the block ends half-applied with no trace. No linter rule (S110, SIM105, BLE001) fires on the block form.",
+      "guarded_twin": "`suppress(...)` around the single best-effort call it is meant for, with the narrowest exception type; or a try/except that logs, per step whose failure is acceptable.",
+      "hunt": "Every `suppress(Exception)` / `suppress(BaseException)` block longer than one call: list what each later statement does, and what state is left when an earlier one fails.",
+      "expected": "a failure in one best-effort step neither hides itself nor skips unrelated steps.",
+      "caught_as": "SILENT: state that is updated only partly (a counter bumped but its index not, a cache cleared but its marker not), surfacing much later as inconsistent data.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "Python docs, contextlib.suppress: 'execution resumes with the next statement following the with statement'"
+      ],
+      "differential": "Fine when every statement in the block is genuinely optional and independent of the others failing, e.g. a teardown sequence where any failure means the rest is moot. One or two statements are not flagged.",
+      "detected_by": "scan_python_pitfalls.py",
+      "detectability": "implemented"
     },
     {
       "id": "linter-autofix-breaks-closure-capture",
