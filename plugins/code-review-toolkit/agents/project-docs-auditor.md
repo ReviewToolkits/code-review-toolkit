@@ -81,6 +81,50 @@ Don't execute the examples — just verify they're structurally valid against th
 - Internal links (relative paths in markdown) → do the targets exist?
 - Don't validate external URLs (that's a different tool)
 
+### The Built Documentation Site
+
+Some defects exist only in the rendered site: template tags the engine didn't expand, links that
+work on GitHub but not under the site's URL prefix, and API pages left empty because the
+docstring extractor couldn't import a module. If the project configures a site generator
+(`mkdocs.yml`, `docs/conf.py`, `_config.yml`), build it in an exported copy into your private
+directory and scan the output:
+
+```bash
+cd "$export" && mkdocs build -d "$d/site" 2> "$d/site.err"              # or:
+cd "$export" && sphinx-build -b html docs "$d/site" 2> "$d/site.err"
+```
+
+```bash
+python3 - "$d/site" <<'EOF'
+import html, pathlib, re, sys
+root = pathlib.Path(sys.argv[1])
+for page in sorted(root.rglob("*.html")):
+    text = page.read_text(errors="replace")
+    rel = page.relative_to(root)
+    # Another engine's tags (Jekyll/Liquid) are wrong anywhere, code blocks included: a reader
+    # copies them. Generic {{ }} / {% %} count only in prose, since docs may show templates.
+    foreign = r"\{%-?\s*(?:raw|endraw|include|highlight|endhighlight|post_url)\b[^%]*%\}"
+    for m in re.finditer(foreign, text):
+        print(rel, "FOREIGN-TEMPLATE-TAG", m.group(0)[:80])
+    prose = re.sub(r"<(script|style|pre|code)\b.*?</\1>", "", text, flags=re.S)
+    for m in re.finditer(r"\{%.*?%\}|\{\{.*?\}\}", re.sub(r"<[^>]+>", "", prose)):
+        if not re.fullmatch(foreign, m.group(0)):
+            print(rel, "TEMPLATE-LEFTOVER", m.group(0)[:80])
+    for m in re.finditer(r'(?:href|src)="(/[^"#?]*)', text):
+        if rel.name != "404.html":  # generators make the 404 page root-absolute on purpose
+            print(rel, "ROOT-ABSOLUTE", m.group(1))  # breaks under a URL prefix
+    for m in re.finditer(r'(?:href|src)="(?![a-z]+:|#|/)([^"#?]+)', text):
+        target = (page.parent / html.unescape(m.group(1))).resolve()
+        if not target.exists() and not (target / "index.html").exists():
+            print(rel, "MISSING-TARGET", m.group(1))
+EOF
+```
+
+Also read `site.err`: a docstring extractor's "could not import" or "failed to collect" warning
+means an API page rendered empty. Report a failed build as a finding when CI or the docs say the
+site is built from this tree. If the generator or its plugins aren't installed, say the site was
+not checked. Don't report that as "no site defects".
+
 ### Classification Guidance
 
 - **FIX**: A reference to a renamed/removed entity (will mislead users)
