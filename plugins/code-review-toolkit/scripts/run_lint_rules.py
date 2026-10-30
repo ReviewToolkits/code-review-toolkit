@@ -209,16 +209,6 @@ FASTAPI_DEPENDENCY_MARKERS = frozenset(
     {"Depends", "Query", "Body", "File", "Form", "Header", "Path", "Security", "Cookie"}
 )
 
-# Why a hit was moved from `findings` to `dismissed`. Every dismissal is
-# counted and kept, never silently dropped.
-DISMISSAL_REASONS = {
-    "fastapi-dependency-marker": (
-        "B008 on a FastAPI dependency marker (Depends/Query/Body/...) imported from "
-        "fastapi: the default is the framework's injection idiom, not a shared "
-        "mutable value."
-    ),
-}
-
 
 def _fastapi_bindings(tree: ast.Module) -> tuple[dict[str, str], set[str]]:
     """Names this module binds from fastapi.
@@ -271,6 +261,116 @@ def _default_calls(tree: ast.Module) -> dict[tuple[int, int], ast.Call]:
     return calls
 
 
+# Why a hit was moved from `findings` to `dismissed`. Every dismissal is
+# counted and kept, never silently dropped.
+DISMISSAL_REASONS = {
+    "fastapi-dependency-marker": (
+        "B008 on a FastAPI dependency marker (Depends/Query/Body/...) imported from "
+        "fastapi: the default is the framework's injection idiom, not a shared "
+        "mutable value."
+    ),
+    "raise-systemexit-in-except": (
+        "B904 on `raise SystemExit(...)`: the interpreter exits without printing "
+        "a traceback, so an explicit cause would never be shown. Chaining adds "
+        "nothing; this is a CLI's normal exit path."
+    ),
+}
+
+
+class _FileContext:
+    """One parsed file, with the lookups the mechanical dismissals share."""
+
+    def __init__(self, tree: ast.Module) -> None:
+        self.tree = tree
+        self.parents: dict[ast.AST, ast.AST] = {}
+        # (line, byte column) -> nodes starting there, outermost first.
+        self.starts: dict[tuple[int, int], list[ast.AST]] = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                self.parents[child] = node
+            if isinstance(node, (ast.expr, ast.stmt)):
+                key = (node.lineno, node.col_offset)
+                self.starts.setdefault(key, []).append(node)
+        self.default_calls = _default_calls(tree)
+        self.fastapi_markers, self.fastapi_modules = _fastapi_bindings(tree)
+
+    def at(self, line: int, byte_col: int, kind: type | tuple) -> list:
+        return [n for n in self.starts.get((line, byte_col), []) if isinstance(n, kind)]
+
+    def scope_of(self, node: ast.AST) -> ast.AST:
+        """The innermost function, lambda or module enclosing *node*."""
+        cur = self.parents.get(node)
+        while cur is not None and not isinstance(
+            cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.Module)
+        ):
+            cur = self.parents.get(cur)
+        return cur if cur is not None else self.tree
+
+
+def _file_context(path: Path, trees: dict) -> _FileContext | None:
+    if path not in trees:
+        tree = parse_source(path)
+        trees[path] = _FileContext(tree) if tree else None
+    return trees[path]
+
+
+def _byte_col(path: Path, line: int, column: int, cache: dict) -> int:
+    """ruff's 1-based character column as ast's 0-based UTF-8 byte offset."""
+    text = _source_line(path, line, cache)
+    return len(text[: max(column - 1, 0)].encode("utf-8"))
+
+
+def _shadows(tree: ast.Module, name: str) -> bool:
+    """Does the module bind *name* anywhere (def, class, import, assignment)?"""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name == name:
+                return True
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            if any((a.asname or a.name.split(".")[0]) == name for a in node.names):
+                return True
+        elif (
+            isinstance(node, ast.Name)
+            and node.id == name
+            and not isinstance(node.ctx, ast.Load)
+        ):
+            return True
+    return False
+
+
+def _raises_systemexit(ctx: _FileContext, line: int, col: int) -> bool:
+    for node in ctx.at(line, col, ast.Raise):
+        exc = node.exc.func if isinstance(node.exc, ast.Call) else node.exc
+        if isinstance(exc, ast.Name) and exc.id == "SystemExit":
+            return not _shadows(ctx.tree, "SystemExit")
+    return False
+
+
+def _fastapi_marker(ctx: _FileContext, line: int, col: int, end) -> str | None:
+    if not ctx.fastapi_markers and not ctx.fastapi_modules:
+        return None
+    call = ctx.default_calls.get((line, col))
+    if call is not None and _is_fastapi_marker_call(
+        call, ctx.fastapi_markers, ctx.fastapi_modules
+    ):
+        return "fastapi-dependency-marker"
+    return None
+
+
+def _systemexit(ctx: _FileContext, line: int, col: int, end) -> str | None:
+    if _raises_systemexit(ctx, line, col):
+        return "raise-systemexit-in-except"
+    return None
+
+
+# One mechanical dismissal per rule. Each resolves the flagged node in the
+# same file and dismisses only what it can prove.
+_DISMISSERS = {
+    "B008": _fastapi_marker,
+    "B904": _systemexit,
+}
+
+
 def dismissal_reason(
     finding: dict, path: Path | None, trees: dict, cache: dict
 ) -> str | None:
@@ -278,28 +378,23 @@ def dismissal_reason(
 
     B008 is dismissed only when the flagged call resolves to a fastapi import
     in that same file: a local ``Depends`` class, or a ``Query()`` from
-    another library, is still reported.
+    another library, is still reported. B904 only for the builtin
+    ``SystemExit``. *finding* may carry ruff's
+    ``end`` location, which pins the flagged node exactly.
     """
-    if finding["code"] != "B008" or path is None:
+    check = _DISMISSERS.get(finding["code"])
+    if check is None or path is None:
         return None
-    if path not in trees:
-        tree = parse_source(path)
-        trees[path] = (
-            (tree, _default_calls(tree), *_fastapi_bindings(tree)) if tree else None
-        )
-    entry = trees[path]
-    if entry is None:
+    ctx = _file_context(path, trees)
+    if ctx is None:
         return None
-    _, calls, markers, modules = entry
-    if not markers and not modules:
-        return None
-    # ruff's column is 1-based characters; ast's col_offset is 0-based UTF-8 bytes.
-    text = _source_line(path, finding["line"], cache)
-    byte_col = len(text[: max(finding["column"] - 1, 0)].encode("utf-8"))
-    call = calls.get((finding["line"], byte_col))
-    if call is not None and _is_fastapi_marker_call(call, markers, modules):
-        return "fastapi-dependency-marker"
-    return None
+    line = finding["line"]
+    col = _byte_col(path, line, finding["column"], cache)
+    end = finding.get("end")
+    end_key = None
+    if end and end.get("row"):
+        end_key = (end["row"], _byte_col(path, end["row"], end.get("column", 0), cache))
+    return check(ctx, line, col, end_key)
 
 
 # ---------------------------------------------------------------------------
@@ -637,7 +732,8 @@ def analyze(
                 finding["code"], finding["message"], finding["line"], path, closures
             )
         )
-        reason = dismissal_reason(finding, path, trees, cache)
+        located = {**finding, "end": raw_finding.get("end_location")}
+        reason = dismissal_reason(located, path, trees, cache)
         if reason:
             dismissed.append({**finding, "dismissal_reason": reason})
         else:
@@ -654,8 +750,7 @@ def analyze(
             target_version=target_version,
         )
         preview_findings = [
-            normalize(f, project_root, cache, preview=True)
-            for f in praw[:max_findings]
+            normalize(f, project_root, cache, preview=True) for f in praw[:max_findings]
         ]
 
     # by_code counts every hit ruff returned, dismissed ones included, so it

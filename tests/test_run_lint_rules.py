@@ -401,3 +401,52 @@ class TestUnlintedPaths(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _dismissed_lines(result):
+    return {f["line"]: f["dismissal_reason"] for f in result["dismissed"]}
+
+
+def _kept_lines(result):
+    return {f["line"] for f in result["findings"]}
+
+
+class TestSystemExitDismissal(unittest.TestCase):
+    """B904 on `raise SystemExit(...)`: no traceback is ever shown."""
+
+    SOURCE = (
+        "def main(run):\n"
+        "    try:\n"
+        "        run()\n"
+        "    except KeyError:\n"
+        "        raise SystemExit(2)\n"
+        "    except OSError:\n"
+        "        raise SystemExit\n"
+        "    except ValueError as e:\n"
+        "        raise RuntimeError(str(e))\n"
+    )
+
+    def test_systemexit_is_dismissed_and_other_raises_kept(self):
+        from helpers import TempProject
+
+        with TempProject({"cli.py": self.SOURCE}) as root:
+            hits = [
+                _fake_hit(root, "cli.py", n, "raise", code="B904") for n in (5, 7, 9)
+            ]
+            result = _analyze_with_fake_ruff(root, hits, tier=2)
+        self.assertEqual(
+            _dismissed_lines(result),
+            {5: "raise-systemexit-in-except", 7: "raise-systemexit-in-except"},
+        )
+        self.assertEqual(_kept_lines(result), {9})
+        self.assertIn("raise-systemexit-in-except", result["dismissal_reasons"])
+
+    def test_a_shadowed_systemexit_is_not_the_builtin(self):
+        from helpers import TempProject
+
+        source = "class SystemExit(Exception):\n    pass\n\n" + self.SOURCE
+        with TempProject({"cli.py": source}) as root:
+            result = _analyze_with_fake_ruff(
+                root, [_fake_hit(root, "cli.py", 8, "raise", code="B904")], tier=2
+            )
+        self.assertEqual(result["dismissed"], [])
