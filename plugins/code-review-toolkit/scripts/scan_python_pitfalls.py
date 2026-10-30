@@ -1752,12 +1752,75 @@ def _check_except_exception_too_broad(tree: ast.AST) -> list[dict]:
     return out
 
 
+def _tries_in_scope(tree: ast.AST):
+    """Yield ``(try, enclosing_scope, in_finally)`` for every `try`.
+
+    *enclosing_scope* is the innermost function (or the module); *in_finally*
+    is true when the `try` sits anywhere inside a `finally:` block of that
+    scope, i.e. it already is the cleanup path.
+    """
+
+    def visit(stmts: list[ast.stmt], scope: ast.AST, in_finally: bool):
+        for stmt in stmts:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                yield from visit(stmt.body, stmt, False)
+                continue
+            if isinstance(stmt, ast.Try):
+                yield stmt, scope, in_finally
+            for name in ("body", "orelse"):
+                sub = getattr(stmt, name, None)
+                if isinstance(sub, list) and sub and isinstance(sub[0], ast.stmt):
+                    yield from visit(sub, scope, in_finally)
+            for handler in getattr(stmt, "handlers", []):
+                yield from visit(handler.body, scope, in_finally)
+            for case in getattr(stmt, "cases", []):
+                yield from visit(case.body, scope, in_finally)
+            finalbody = getattr(stmt, "finalbody", None)
+            if finalbody:
+                yield from visit(finalbody, scope, True)
+
+    yield from visit(getattr(tree, "body", []), tree, False)
+
+
+def _bound_targets(node: ast.AST) -> list[ast.AST]:
+    """The names *node* itself binds (`x = ...`, `with ... as x`, `for x in`)."""
+    if isinstance(node, ast.Assign):
+        bound = list(node.targets)
+    elif isinstance(node, (ast.AnnAssign, ast.NamedExpr, ast.For, ast.AsyncFor)):
+        bound = [node.target]
+    elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+        bound = [node.optional_vars]
+    else:
+        return []
+    out: list[ast.AST] = []
+    for tgt in bound:
+        out.extend(tgt.elts if isinstance(tgt, (ast.Tuple, ast.List)) else [tgt])
+    return out
+
+
+def _acquired_in_scope(scope: ast.AST, target: str, before: int) -> bool:
+    """Is *target* a parameter of *scope*, or bound in it before line *before*?
+
+    A resource the function never binds (`self._handle.close()` on a handle
+    opened elsewhere) is not this function's acquire.
+    """
+    args = getattr(scope, "args", None)
+    if args is not None:
+        root = target.split(".")[0]
+        params = {a.arg for a in [*args.posonlyargs, *args.args, *args.kwonlyargs]}
+        if root in params and root not in ("self", "cls"):
+            return True
+    return any(
+        tgt.lineno < before and _dotted_name(tgt) == target
+        for node in _walk_same_scope(scope)
+        for tgt in _bound_targets(node)
+    )
+
+
 def _check_cleanup_only_on_success(tree: ast.AST) -> list[dict]:
     out: list[dict] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Try) or not node.handlers or node.finalbody:
-            continue
-        if not node.body:
+    for node, scope, in_finally in _tries_in_scope(tree):
+        if not node.handlers or node.finalbody or not node.body:
             continue
         last = node.body[-1]
         if not (isinstance(last, ast.Expr) and isinstance(last.value, ast.Call)):
@@ -1779,17 +1842,26 @@ def _check_cleanup_only_on_success(tree: ast.AST) -> list[dict]:
         )
         if released_in_handler:
             continue
-        out.append(
-            _finding(
-                "cleanup-only-on-success-path",
-                "FIX",
-                "high" if len(node.body) > 1 else "medium",
-                last,
-                f"`{target}.{verb}()` runs only when the try body succeeds; an "
-                f"exception above it leaks the resource",
-                "move it to a `finally:` block, or use a `with` statement",
-            )
+        finding = _finding(
+            "cleanup-only-on-success-path",
+            "FIX",
+            "high" if len(node.body) > 1 else "medium",
+            last,
+            f"`{target}.{verb}()` runs only when the try body succeeds; an "
+            f"exception above it leaks the resource",
+            "move it to a `finally:` block, or use a `with` statement",
         )
+        # Differentials: the release is already on the cleanup path, nothing
+        # above it can raise, or the resource was not acquired here.
+        if in_finally:
+            finding["suppressed"] = "inside-finally"
+        elif len(node.body) == 1:
+            finding["suppressed"] = "release-is-the-whole-try"
+        elif isinstance(call.func.value, ast.Call):
+            finding["suppressed"] = "release-chained-on-acquire"
+        elif not _acquired_in_scope(scope, target, last.lineno):
+            finding["suppressed"] = "not-acquired-here"
+        out.append(finding)
     return out
 
 

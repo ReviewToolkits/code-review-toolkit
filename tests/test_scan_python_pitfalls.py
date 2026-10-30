@@ -754,6 +754,62 @@ class TestCleanupOnlyOnSuccess(unittest.TestCase):
         self.assertNotIn("cleanup-only-on-success-path", shapes(src))
 
 
+class TestCleanupOnlyOnSuccessDifferentials(unittest.TestCase):
+    shape = "cleanup-only-on-success-path"
+
+    def _suppressed(self, src: str) -> list[str]:
+        with TempProject({"mod.py": src}) as root:
+            result = mod.analyze(str(root / "mod.py"))
+        self.assertNotIn(self.shape, [f["shape"] for f in result["findings"]])
+        return [e["reason"] for e in result["suppressed"] if e["shape"] == self.shape]
+
+    def test_acquired_in_the_try_is_flagged(self):
+        src = (
+            "def f(host, msg):\n    try:\n        conn = connect(host)\n"
+            "        conn.send(msg)\n        conn.close()\n    except OSError:\n        pass\n"
+        )
+        self.assertIn(self.shape, shapes(src))
+
+    def test_acquired_just_before_the_try_is_flagged(self):
+        src = (
+            "def f(p):\n    fh = open(p)\n    try:\n        data = fh.read()\n"
+            "        fh.close()\n    except OSError:\n        return None\n    return data\n"
+        )
+        self.assertIn(self.shape, shapes(src))
+
+    def test_close_inside_finally_is_suppressed(self):
+        src = (
+            "def f(fallback, op):\n    try:\n        return op()\n    finally:\n"
+            "        try:\n            fallback.flush()\n            fallback.close()\n"
+            "        except Exception:\n            pass\n"
+        )
+        self.assertEqual(self._suppressed(src), ["inside-finally"])
+
+    def test_close_all_loop_is_suppressed(self):
+        src = (
+            "def close_all(dbs):\n    for db in dbs:\n        try:\n"
+            "            db.close()\n        except Exception:\n            pass\n"
+        )
+        self.assertEqual(self._suppressed(src), ["release-is-the-whole-try"])
+
+    def test_release_chained_on_acquire_is_suppressed(self):
+        src = (
+            "import urllib.request\ndef probe(url):\n    try:\n        check(url)\n"
+            "        urllib.request.urlopen(url, timeout=2).close()\n"
+            "    except OSError:\n        return False\n    return True\n"
+        )
+        self.assertEqual(self._suppressed(src), ["release-chained-on-acquire"])
+
+    def test_handle_opened_elsewhere_is_suppressed(self):
+        src = (
+            "class Store:\n    def reopen(self, path):\n        try:\n"
+            "            self._handle.flush()\n            self._handle.close()\n"
+            "        except Exception:\n            pass\n"
+            "        self._handle = open(path)\n"
+        )
+        self.assertEqual(self._suppressed(src), ["not-acquired-here"])
+
+
 class TestErrorReportedBelowWarning(unittest.TestCase):
     def test_debug_only_is_flagged(self):
         src = (
