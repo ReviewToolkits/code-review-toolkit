@@ -65,6 +65,27 @@ class TestUnusedImports(unittest.TestCase):
         names = {u["name"] for u in unused}
         self.assertNotIn("helper", names)
 
+    def test_multiline_from_import_reports_the_name_line_like_ruff(self):
+        """#43: ruff F401 reports the line of the name; the statement line made
+        findings unmatchable by file:line."""
+        unused = self._find_unused(
+            "from os.path import (\n"
+            "    join,\n"
+            "    split,\n"
+            ")\n"
+            "\n"
+            "join('a', 'b')\n"
+        )
+        self.assertEqual(len(unused), 1)
+        self.assertEqual(unused[0]["name"], "split")
+        self.assertEqual(unused[0]["line"], 3)
+        self.assertEqual(unused[0]["statement_line"], 1)
+
+    def test_single_line_import_line_is_unchanged(self):
+        unused = self._find_unused("x = 1\nimport os, json\n\nos.getcwd()\n")
+        self.assertEqual([(u["name"], u["line"]) for u in unused], [("json", 2)])
+        self.assertEqual(unused[0]["statement_line"], 2)
+
     def test_aliased_import_used(self):
         unused = self._find_unused(
             "import numpy as np\n"

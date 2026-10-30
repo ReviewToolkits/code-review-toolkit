@@ -50,6 +50,16 @@ _MAGIC_METHODS = frozenset({
 })
 
 
+def _alias_line(alias: ast.alias, node: ast.stmt) -> int:
+    """The line of the imported NAME, which is the line ruff (F401) reports.
+
+    For `from x import (\n    a,\n    b,\n)` the statement starts on the `from`
+    line while each name sits on its own; reporting the statement line made
+    findings impossible to match against ruff by `file:line`.
+    """
+    return getattr(alias, "lineno", None) or node.lineno
+
+
 def analyze_file(filepath: Path, project_root: Path) -> dict:
     """Analyze a file for defined symbols and their usage."""
     rel = str(filepath.relative_to(project_root))
@@ -111,7 +121,8 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
                 result["imports"].append({
                     "local_name": local_name,
                     "module": alias.name,
-                    "line": node.lineno,
+                    "line": _alias_line(alias, node),
+                    "statement_line": node.lineno,
                     "is_from": False,
                 })
         elif isinstance(node, ast.ImportFrom):
@@ -122,7 +133,8 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
                 result["imports"].append({
                     "local_name": local_name,
                     "module": f"{node.module or ''}.{alias.name}",
-                    "line": node.lineno,
+                    "line": _alias_line(alias, node),
+                    "statement_line": node.lineno,
                     "is_from": True,
                 })
 
@@ -216,6 +228,7 @@ def find_unused_imports(file_analysis: dict) -> list[dict]:
         unused.append({
             "file": file_analysis["file"],
             "line": imp["line"],
+            "statement_line": imp["statement_line"],
             "name": local_name,
             "module": imp["module"],
             "confidence": "high",
