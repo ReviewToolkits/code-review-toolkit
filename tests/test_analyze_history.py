@@ -266,9 +266,12 @@ class TestCoChangeDetection(unittest.TestCase):
         # Create many co-changing pairs.
         commits = []
         for i in range(5):
-            commits.append({"files": [f"f{j}.py" for j in range(10)],
-                            "type": "fix", "message": ""})
-        clusters = mod.compute_co_change_clusters(commits, min_co_changes=3, max_pairs=5)
+            commits.append(
+                {"files": [f"f{j}.py" for j in range(10)], "type": "fix", "message": ""}
+            )
+        clusters = mod.compute_co_change_clusters(
+            commits, min_co_changes=3, max_pairs=5
+        )
         self.assertLessEqual(len(clusters), 5)
 
     def test_sorted_by_count(self):
@@ -298,40 +301,54 @@ class TestGitIntegration(unittest.TestCase):
             self.assertIn("Not a git repository", result["error"])
 
     def test_empty_repo_no_commits(self):
-        with GitTempProject([
-            {"files": {"mod.py": "x = 1\n"}, "message": "init"},
-        ]) as root:
+        with GitTempProject(
+            [
+                {"files": {"mod.py": "x = 1\n"}, "message": "init"},
+            ]
+        ) as root:
             # Analyze with a time range that excludes the commit.
-            result = mod.analyze([
-                str(root),
-                "--since", "2030-01-01",
-                "--until", "2030-02-01",
-            ])
+            result = mod.analyze(
+                [
+                    str(root),
+                    "--since",
+                    "2030-01-01",
+                    "--until",
+                    "2030-02-01",
+                ]
+            )
             self.assertNotIn("error", result)
             self.assertEqual(result["summary"]["total_commits"], 0)
             self.assertEqual(result["file_churn"], [])
 
     def test_file_churn_basic(self):
-        with GitTempProject([
-            {
-                "files": {"a.py": "x = 1\n"},
-                "message": "Add a",
-                "date": "2025-01-01T12:00:00+00:00",
-            },
-            {
-                "files": {"a.py": "x = 2\n"},
-                "message": "Fix a",
-                "date": "2025-01-02T12:00:00+00:00",
-            },
-            {
-                "files": {"b.py": "y = 1\n"},
-                "message": "Add b",
-                "date": "2025-01-03T12:00:00+00:00",
-            },
-        ]) as root:
-            result = mod.analyze([
-                str(root), "--since", "2024-12-01", "--until", "2025-02-01",
-            ])
+        with GitTempProject(
+            [
+                {
+                    "files": {"a.py": "x = 1\n"},
+                    "message": "Add a",
+                    "date": "2025-01-01T12:00:00+00:00",
+                },
+                {
+                    "files": {"a.py": "x = 2\n"},
+                    "message": "Fix a",
+                    "date": "2025-01-02T12:00:00+00:00",
+                },
+                {
+                    "files": {"b.py": "y = 1\n"},
+                    "message": "Add b",
+                    "date": "2025-01-03T12:00:00+00:00",
+                },
+            ]
+        ) as root:
+            result = mod.analyze(
+                [
+                    str(root),
+                    "--since",
+                    "2024-12-01",
+                    "--until",
+                    "2025-02-01",
+                ]
+            )
             self.assertNotIn("error", result)
             self.assertEqual(result["summary"]["total_commits"], 3)
             # a.py should have 2 commits, b.py should have 1.
@@ -342,142 +359,197 @@ class TestGitIntegration(unittest.TestCase):
             self.assertEqual(churn_map["b.py"]["commits"], 1)
 
     def test_commit_classification_in_analysis(self):
-        with GitTempProject([
-            {
-                "files": {"a.py": "x = 1\n"},
-                "message": "Fix crash in parser",
-                "date": "2025-01-01T12:00:00+00:00",
-            },
-            {
-                "files": {"a.py": "x = 2\n"},
-                "message": "Add new feature",
-                "date": "2025-01-02T12:00:00+00:00",
-            },
-        ]) as root:
-            result = mod.analyze([
-                str(root), "--since", "2024-12-01", "--until", "2025-02-01",
-            ])
+        with GitTempProject(
+            [
+                {
+                    "files": {"a.py": "x = 1\n"},
+                    "message": "Fix crash in parser",
+                    "date": "2025-01-01T12:00:00+00:00",
+                },
+                {
+                    "files": {"a.py": "x = 2\n"},
+                    "message": "Add new feature",
+                    "date": "2025-01-02T12:00:00+00:00",
+                },
+            ]
+        ) as root:
+            result = mod.analyze(
+                [
+                    str(root),
+                    "--since",
+                    "2024-12-01",
+                    "--until",
+                    "2025-02-01",
+                ]
+            )
             by_type = result["summary"]["commits_by_type"]
             self.assertEqual(by_type.get("fix", 0), 1)
             self.assertEqual(by_type.get("feature", 0), 1)
 
     def test_recent_fixes_populated(self):
-        with GitTempProject([
-            {
-                "files": {"a.py": "x = 1\n"},
-                "message": "Fix null check",
-                "date": "2025-01-01T12:00:00+00:00",
-            },
-        ]) as root:
-            result = mod.analyze([
-                str(root), "--since", "2024-12-01", "--until", "2025-02-01",
-            ])
+        with GitTempProject(
+            [
+                {
+                    "files": {"a.py": "x = 1\n"},
+                    "message": "Fix null check",
+                    "date": "2025-01-01T12:00:00+00:00",
+                },
+            ]
+        ) as root:
+            result = mod.analyze(
+                [
+                    str(root),
+                    "--since",
+                    "2024-12-01",
+                    "--until",
+                    "2025-02-01",
+                ]
+            )
             self.assertEqual(len(result["recent_fixes"]), 1)
             self.assertEqual(result["recent_fixes"][0]["message"], "Fix null check")
 
     def test_no_function_flag(self):
-        with GitTempProject([
-            {
-                "files": {"a.py": "def foo():\n    return 1\n"},
-                "message": "init",
-                "date": "2025-01-01T12:00:00+00:00",
-            },
-        ]) as root:
-            result = mod.analyze([
-                str(root),
-                "--since", "2024-12-01",
-                "--until", "2025-02-01",
-                "--no-function",
-            ])
+        with GitTempProject(
+            [
+                {
+                    "files": {"a.py": "def foo():\n    return 1\n"},
+                    "message": "init",
+                    "date": "2025-01-01T12:00:00+00:00",
+                },
+            ]
+        ) as root:
+            result = mod.analyze(
+                [
+                    str(root),
+                    "--since",
+                    "2024-12-01",
+                    "--until",
+                    "2025-02-01",
+                    "--no-function",
+                ]
+            )
             self.assertEqual(result["function_churn"], [])
             self.assertIn("function_churn_note", result)
 
     def test_last_n_commits(self):
-        with GitTempProject([
-            {
-                "files": {"a.py": f"x = {i}\n"},
-                "message": f"Commit {i}",
-                "date": f"2025-01-{i + 1:02d}T12:00:00+00:00",
-            }
-            for i in range(10)
-        ]) as root:
+        with GitTempProject(
+            [
+                {
+                    "files": {"a.py": f"x = {i}\n"},
+                    "message": f"Commit {i}",
+                    "date": f"2025-01-{i + 1:02d}T12:00:00+00:00",
+                }
+                for i in range(10)
+            ]
+        ) as root:
             result = mod.analyze([str(root), "--last", "3"])
             # Should process exactly 3 most recent commits.
             self.assertEqual(result["summary"]["total_commits"], 3)
 
     def test_max_commits_cap(self):
-        with GitTempProject([
-            {
-                "files": {"a.py": f"x = {i}\n"},
-                "message": f"Commit {i}",
-                "date": f"2025-01-{i + 1:02d}T12:00:00+00:00",
-            }
-            for i in range(10)
-        ]) as root:
-            result = mod.analyze([
-                str(root),
-                "--since", "2024-12-01",
-                "--until", "2025-02-01",
-                "--max-commits", "5",
-            ])
+        with GitTempProject(
+            [
+                {
+                    "files": {"a.py": f"x = {i}\n"},
+                    "message": f"Commit {i}",
+                    "date": f"2025-01-{i + 1:02d}T12:00:00+00:00",
+                }
+                for i in range(10)
+            ]
+        ) as root:
+            result = mod.analyze(
+                [
+                    str(root),
+                    "--since",
+                    "2024-12-01",
+                    "--until",
+                    "2025-02-01",
+                    "--max-commits",
+                    "5",
+                ]
+            )
             self.assertLessEqual(result["summary"]["total_commits"], 5)
             self.assertTrue(result["time_range"]["commit_cap_applied"])
 
     def test_author_count(self):
-        with GitTempProject([
-            {
-                "files": {"a.py": "x = 1\n"},
-                "message": "Commit 1",
-                "author": "Alice",
-                "date": "2025-01-01T12:00:00+00:00",
-            },
-            {
-                "files": {"a.py": "x = 2\n"},
-                "message": "Commit 2",
-                "author": "Bob",
-                "date": "2025-01-02T12:00:00+00:00",
-            },
-        ]) as root:
-            result = mod.analyze([
-                str(root), "--since", "2024-12-01", "--until", "2025-02-01",
-            ])
+        with GitTempProject(
+            [
+                {
+                    "files": {"a.py": "x = 1\n"},
+                    "message": "Commit 1",
+                    "author": "Alice",
+                    "date": "2025-01-01T12:00:00+00:00",
+                },
+                {
+                    "files": {"a.py": "x = 2\n"},
+                    "message": "Commit 2",
+                    "author": "Bob",
+                    "date": "2025-01-02T12:00:00+00:00",
+                },
+            ]
+        ) as root:
+            result = mod.analyze(
+                [
+                    str(root),
+                    "--since",
+                    "2024-12-01",
+                    "--until",
+                    "2025-02-01",
+                ]
+            )
             self.assertEqual(result["summary"]["authors"], 2)
 
     def test_function_churn_detected(self):
-        with GitTempProject([
-            {
-                "files": {"a.py": "def foo():\n    return 1\n"},
-                "message": "Add foo",
-                "date": "2025-01-01T12:00:00+00:00",
-            },
-            {
-                "files": {"a.py": "def foo():\n    return 2\n"},
-                "message": "Update foo",
-                "date": "2025-01-02T12:00:00+00:00",
-            },
-        ]) as root:
-            result = mod.analyze([
-                str(root), "--since", "2024-12-01", "--until", "2025-02-01",
-            ])
+        with GitTempProject(
+            [
+                {
+                    "files": {"a.py": "def foo():\n    return 1\n"},
+                    "message": "Add foo",
+                    "date": "2025-01-01T12:00:00+00:00",
+                },
+                {
+                    "files": {"a.py": "def foo():\n    return 2\n"},
+                    "message": "Update foo",
+                    "date": "2025-01-02T12:00:00+00:00",
+                },
+            ]
+        ) as root:
+            result = mod.analyze(
+                [
+                    str(root),
+                    "--since",
+                    "2024-12-01",
+                    "--until",
+                    "2025-02-01",
+                ]
+            )
             func_names = [f["function"] for f in result["function_churn"]]
             self.assertIn("foo", func_names)
 
     def test_churn_rate_calculation(self):
-        with GitTempProject([
-            {
-                "files": {"a.py": "line1\nline2\nline3\nline4\nline5\n"},
-                "message": "Add a",
-                "date": "2025-01-01T12:00:00+00:00",
-            },
-            {
-                "files": {"a.py": "line1\nmodified\nline3\nline4\nline5\n"},
-                "message": "Fix a",
-                "date": "2025-01-02T12:00:00+00:00",
-            },
-        ]) as root:
-            result = mod.analyze([
-                str(root), "--since", "2024-12-01", "--until", "2025-02-01",
-            ])
+        with GitTempProject(
+            [
+                {
+                    "files": {"a.py": "line1\nline2\nline3\nline4\nline5\n"},
+                    "message": "Add a",
+                    "date": "2025-01-01T12:00:00+00:00",
+                },
+                {
+                    "files": {"a.py": "line1\nmodified\nline3\nline4\nline5\n"},
+                    "message": "Fix a",
+                    "date": "2025-01-02T12:00:00+00:00",
+                },
+            ]
+        ) as root:
+            result = mod.analyze(
+                [
+                    str(root),
+                    "--since",
+                    "2024-12-01",
+                    "--until",
+                    "2025-02-01",
+                ]
+            )
             churn_map = {f["file"]: f for f in result["file_churn"]}
             self.assertIn("a.py", churn_map)
             # Churn rate should be > 0.
@@ -507,8 +579,7 @@ class TestParseGitLogStreaming(unittest.TestCase):
 
     def test_parse_respects_max_commits(self):
         lines = [
-            f"COMMIT:hash{i}|2025-01-{i+1:02d}T12:00:00+00:00"
-            f"|Author|Commit {i}\n"
+            f"COMMIT:hash{i}|2025-01-{i + 1:02d}T12:00:00+00:00|Author|Commit {i}\n"
             for i in range(10)
         ]
         commits, _ = mod.parse_git_log(lines, max_commits=3)
@@ -549,8 +620,12 @@ def _latin1_repo(testcase) -> Path:
         ["commit", "-q", "-m", "gh-1: Fix segfault in listsort"],
     ):
         subprocess.run(
-            ["git", *args], cwd=tmpdir, check=True,
-            capture_output=True, text=True, errors="replace",
+            ["git", *args],
+            cwd=tmpdir,
+            check=True,
+            capture_output=True,
+            text=True,
+            errors="replace",
         )
     return root
 
@@ -570,7 +645,10 @@ class TestNonUtf8History(unittest.TestCase):
         with self.assertRaises(UnicodeDecodeError):
             subprocess.run(
                 ["git", "show", "--format=", "--patch", "HEAD"],
-                cwd=str(root), capture_output=True, text=True, check=False,
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                check=False,
             )
 
     def test_run_git_survives_non_utf8_diff(self):

@@ -35,21 +35,74 @@ from scan_common import (  # noqa: E402
 
 # Commit classification rules — first match wins.
 CLASSIFICATION_RULES: list[tuple[str, list[str]]] = [
-    ("fix", ["fix", "bug", "patch", "resolve", "issue", "crash",
-             "error", "broken", "repair", "correct", "regression",
-             "workaround", "hotfix"]),
-    ("docs", ["doc", "readme", "comment", "typo", "spelling",
-              "changelog", "documentation"]),
-    ("test", ["test", "coverage", "assert", "mock", "fixture",
-              "unittest", "pytest"]),
-    ("refactor", ["refactor", "clean", "simplify", "reorganize",
-                  "restructure", "rename", "move", "extract",
-                  "deduplicate", "inline"]),
-    ("chore", ["bump", "dependency", "update", "upgrade", "ci",
-               "config", "lint", "format", "version", "release",
-               "merge", "revert"]),
-    ("feature", ["add", "implement", "new", "feature", "introduce",
-                 "support", "enable", "create"]),
+    (
+        "fix",
+        [
+            "fix",
+            "bug",
+            "patch",
+            "resolve",
+            "issue",
+            "crash",
+            "error",
+            "broken",
+            "repair",
+            "correct",
+            "regression",
+            "workaround",
+            "hotfix",
+        ],
+    ),
+    (
+        "docs",
+        ["doc", "readme", "comment", "typo", "spelling", "changelog", "documentation"],
+    ),
+    ("test", ["test", "coverage", "assert", "mock", "fixture", "unittest", "pytest"]),
+    (
+        "refactor",
+        [
+            "refactor",
+            "clean",
+            "simplify",
+            "reorganize",
+            "restructure",
+            "rename",
+            "move",
+            "extract",
+            "deduplicate",
+            "inline",
+        ],
+    ),
+    (
+        "chore",
+        [
+            "bump",
+            "dependency",
+            "update",
+            "upgrade",
+            "ci",
+            "config",
+            "lint",
+            "format",
+            "version",
+            "release",
+            "merge",
+            "revert",
+        ],
+    ),
+    (
+        "feature",
+        [
+            "add",
+            "implement",
+            "new",
+            "feature",
+            "introduce",
+            "support",
+            "enable",
+            "create",
+        ],
+    ),
 ]
 
 _GIT_TIMEOUT = 30
@@ -92,7 +145,8 @@ def _run_git(
 
 
 def _run_git_streaming(
-    args: list[str], cwd: Path,
+    args: list[str],
+    cwd: Path,
 ) -> subprocess.Popen[str]:
     """Run a git command with streaming stdout.
 
@@ -172,11 +226,13 @@ def parse_git_log(
                 except ValueError:
                     continue
                 current_commit["files"].append(filepath)
-                current_commit["stats"].append({
-                    "file": filepath,
-                    "added": added,
-                    "removed": removed,
-                })
+                current_commit["stats"].append(
+                    {
+                        "file": filepath,
+                        "added": added,
+                        "removed": removed,
+                    }
+                )
                 if filepath not in file_changes:
                     file_changes[filepath] = {
                         "commits": 0,
@@ -212,16 +268,18 @@ def parse_git_log(
             if line_count > 0
             else 0.0
         )
-        file_stats.append({
-            "file": filepath,
-            "commits": fc["commits"],
-            "lines_added": fc["lines_added"],
-            "lines_removed": fc["lines_removed"],
-            "churn_rate": churn_rate,
-            "authors": len(fc["authors"]),
-            "first_commit_in_range": fc["first_date"],
-            "last_modified": fc["last_date"],
-        })
+        file_stats.append(
+            {
+                "file": filepath,
+                "commits": fc["commits"],
+                "lines_added": fc["lines_added"],
+                "lines_removed": fc["lines_removed"],
+                "churn_rate": churn_rate,
+                "authors": len(fc["authors"]),
+                "first_commit_in_range": fc["first_date"],
+                "last_modified": fc["last_date"],
+            }
+        )
 
     # Sort by commits descending.
     file_stats.sort(key=lambda x: x["commits"], reverse=True)
@@ -257,11 +315,13 @@ def get_function_boundaries(filepath: Path) -> list[dict]:
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             end_lineno = getattr(node, "end_lineno", node.lineno)
-            functions.append({
-                "name": node.name,
-                "line_start": node.lineno,
-                "line_end": end_lineno,
-            })
+            functions.append(
+                {
+                    "name": node.name,
+                    "line_start": node.lineno,
+                    "line_end": end_lineno,
+                }
+            )
     return functions
 
 
@@ -282,8 +342,17 @@ def compute_function_churn_level2(
     else:
         py_files = sorted(scan_root.rglob("*.py"))
 
-    exclude = {".git", ".tox", ".venv", "venv", "__pycache__",
-               "node_modules", ".eggs", "build", "dist"}
+    exclude = {
+        ".git",
+        ".tox",
+        ".venv",
+        "venv",
+        "__pycache__",
+        "node_modules",
+        ".eggs",
+        "build",
+        "dist",
+    }
     filtered_py: list[Path] = []
     for pf in py_files:
         try:
@@ -293,8 +362,7 @@ def compute_function_churn_level2(
         if rel_parts & exclude:
             continue
         if any(
-            part.endswith(".egg-info")
-            for part in pf.relative_to(project_root).parts
+            part.endswith(".egg-info") for part in pf.relative_to(project_root).parts
         ):
             continue
         filtered_py.append(pf)
@@ -355,14 +423,16 @@ def compute_function_churn_level2(
         lines_changed = 0
         if func_info:
             lines_changed = func_info["line_end"] - func_info["line_start"] + 1
-        results.append({
-            "function": func_name,
-            "file": file_path,
-            "line_start": func_info["line_start"] if func_info else 0,
-            "line_end": func_info["line_end"] if func_info else 0,
-            "commits": len(commit_hashes),
-            "lines_changed": lines_changed,
-        })
+        results.append(
+            {
+                "function": func_name,
+                "file": file_path,
+                "line_start": func_info["line_start"] if func_info else 0,
+                "line_end": func_info["line_end"] if func_info else 0,
+                "commits": len(commit_hashes),
+                "lines_changed": lines_changed,
+            }
+        )
 
     results.sort(key=lambda x: x["commits"], reverse=True)
     return results
@@ -432,23 +502,27 @@ def get_commit_details(
                                 range(func["line_start"], func["line_end"] + 1)
                             )
                             if changed_lines & func_range:
-                                functions_modified.append({
-                                    "function": func["name"],
-                                    "file": file_path,
-                                })
+                                functions_modified.append(
+                                    {
+                                        "function": func["name"],
+                                        "file": file_path,
+                                    }
+                                )
                 except subprocess.TimeoutExpired:
                     pass
 
-        results.append({
-            "commit": commit["hash"],
-            "commit_short": commit["hash"][:7],
-            "message": commit["message"],
-            "date": commit["date"],
-            "author": commit["author"],
-            "files": commit["files"],
-            "functions_modified": functions_modified,
-            "diff": diff_text,
-        })
+        results.append(
+            {
+                "commit": commit["hash"],
+                "commit_short": commit["hash"][:7],
+                "message": commit["message"],
+                "date": commit["date"],
+                "author": commit["author"],
+                "files": commit["files"],
+                "functions_modified": functions_modified,
+                "diff": diff_text,
+            }
+        )
 
     return results
 
@@ -477,13 +551,15 @@ def compute_co_change_clusters(
     results: list[dict] = []
     for (file_a, file_b), count in co_changes.items():
         if count >= min_co_changes:
-            results.append({
-                "file_a": file_a,
-                "file_b": file_b,
-                "co_change_count": count,
-                "total_commits_a": file_commit_counts[file_a],
-                "total_commits_b": file_commit_counts[file_b],
-            })
+            results.append(
+                {
+                    "file_a": file_a,
+                    "file_b": file_b,
+                    "co_change_count": count,
+                    "total_commits_a": file_commit_counts[file_a],
+                    "total_commits_b": file_commit_counts[file_b],
+                }
+            )
 
     results.sort(key=lambda x: x["co_change_count"], reverse=True)
     return results[:max_pairs]
@@ -510,8 +586,10 @@ def parse_args(argv: list[str]) -> dict:
             try:
                 args["days"] = int(argv[i + 1])
             except ValueError:
-                print(f"Error: --days requires an integer, got '{argv[i + 1]}'",
-                      file=sys.stderr)
+                print(
+                    f"Error: --days requires an integer, got '{argv[i + 1]}'",
+                    file=sys.stderr,
+                )
                 sys.exit(2)
             i += 2
         elif arg == "--since" and i + 1 < len(argv):
@@ -524,8 +602,10 @@ def parse_args(argv: list[str]) -> dict:
             try:
                 args["last"] = int(argv[i + 1])
             except ValueError:
-                print(f"Error: --last requires an integer, got '{argv[i + 1]}'",
-                      file=sys.stderr)
+                print(
+                    f"Error: --last requires an integer, got '{argv[i + 1]}'",
+                    file=sys.stderr,
+                )
                 sys.exit(2)
             i += 2
         elif arg == "--max-commits" and i + 1 < len(argv):
@@ -543,8 +623,7 @@ def parse_args(argv: list[str]) -> dict:
                 args["max_files"] = int(argv[i + 1])
             except ValueError:
                 print(
-                    f"Error: --max-files requires an integer, "
-                    f"got '{argv[i + 1]}'",
+                    f"Error: --max-files requires an integer, got '{argv[i + 1]}'",
                     file=sys.stderr,
                 )
                 sys.exit(2)
@@ -595,7 +674,9 @@ def analyze(argv: list[str] | None = None) -> dict:
 
     # Parse git log.
     git_args = [
-        "log", "--numstat", "--format=COMMIT:%H|%aI|%an|%s",
+        "log",
+        "--numstat",
+        "--format=COMMIT:%H|%aI|%an|%s",
     ]
     if last_n is not None:
         git_args.append(f"-{last_n}")
@@ -612,7 +693,9 @@ def analyze(argv: list[str] | None = None) -> dict:
     # is after the JSON has been dumped.
     with _run_git_streaming(git_args, project_root) as proc:
         commits, file_churn = parse_git_log(
-            proc.stdout or [], max_commits, project_root,
+            proc.stdout or [],
+            max_commits,
+            project_root,
         )
 
     # If using --last, derive time range from actual commits.
@@ -647,7 +730,9 @@ def analyze(argv: list[str] | None = None) -> dict:
     else:
         # Count total functions to decide strategy.
         function_churn = compute_function_churn_level2(
-            commits, scan_root, project_root,
+            commits,
+            scan_root,
+            project_root,
             max_files=args["max_files"],
         )
         if _check_script_timeout():
