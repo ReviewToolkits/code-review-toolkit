@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 from collections import defaultdict
+from http import HTTPStatus
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -106,6 +107,98 @@ def _get_call_name(node: ast.expr) -> str | None:
     return None
 
 
+_STATUS_ATTRS = frozenset({"status_code", "status"})
+_HTTP_CONSTANT_RE = re.compile(r"^HTTP_(\d{3})(?:_|$)")
+
+
+def _status_value(node: ast.expr) -> int | None:
+    """The integer an HTTP status expression stands for, if it is static.
+
+    `409`, `HTTPStatus.CONFLICT`, `status.HTTP_409_CONFLICT`.
+    """
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return node.value
+    name = node.attr if isinstance(node, ast.Attribute) else (
+        node.id if isinstance(node, ast.Name) else None
+    )
+    if name is None:
+        return None
+    match = _HTTP_CONSTANT_RE.match(name)
+    if match:
+        return int(match.group(1))
+    if isinstance(node, ast.Attribute):
+        chain = _dotted_chain(node)
+        if chain and len(chain) >= 2 and chain[-2] == "HTTPStatus":
+            try:
+                return HTTPStatus[name].value
+            except KeyError:
+                return None
+    return None
+
+
+def _is_status(node: ast.expr) -> bool:
+    return (isinstance(node, ast.Attribute) and node.attr in _STATUS_ATTRS) or (
+        isinstance(node, ast.Name) and node.id == "status_code"
+    )
+
+
+def _error_statuses(op: ast.cmpop, value: ast.expr) -> list[int]:
+    """The 4xx/5xx statuses `<status> <op> <value>` asserts; [] when none."""
+    if isinstance(op, ast.Eq):
+        code = _status_value(value)
+        return [code] if code is not None and 400 <= code <= 599 else []
+    if isinstance(op, ast.In) and isinstance(value, (ast.Tuple, ast.List, ast.Set)):
+        codes = [_status_value(e) for e in value.elts]
+        if codes and all(c is not None and 400 <= c <= 599 for c in codes):
+            return sorted(codes)
+        return []
+    if isinstance(op, (ast.GtE, ast.Gt)):
+        code = _status_value(value)
+        if code is not None and code + isinstance(op, ast.Gt) >= 400:
+            return [code]
+    return []
+
+
+_FLIPPED = {ast.Lt: ast.Gt, ast.LtE: ast.GtE, ast.Eq: ast.Eq}
+_STATUS_ASSERT_OPS = {
+    "assertEqual": ast.Eq, "assertIn": ast.In,
+    "assertGreaterEqual": ast.GtE, "assertGreater": ast.Gt,
+}
+
+
+def http_error_status(node: ast.AST) -> str | None:
+    """`"HTTP 409"` when *node* asserts an HTTP error status; None otherwise.
+
+    A web API's error-condition test asserts the response status, not an
+    exception: `assert r.status_code == 400`, `in (401, 403)`, `>= 400`,
+    `self.assertEqual(r.status_code, HTTPStatus.CONFLICT)`.
+    """
+    pairs: list[tuple[ast.cmpop, ast.expr]] = []
+    if isinstance(node, ast.Assert) and isinstance(node.test, ast.Compare):
+        cmp = node.test
+        if len(cmp.ops) == 1:
+            left, op, right = cmp.left, cmp.ops[0], cmp.comparators[0]
+            if _is_status(left):
+                pairs.append((op, right))
+            elif _is_status(right) and type(op) in _FLIPPED:
+                pairs.append((_FLIPPED[type(op)](), left))
+    elif isinstance(node, ast.Call) and len(node.args) >= 2:
+        name = _get_call_name(node.func)
+        op_type = _STATUS_ASSERT_OPS.get(name or "")
+        if op_type is not None:
+            first, second = node.args[0], node.args[1]
+            if _is_status(first):
+                pairs.append((op_type(), second))
+            elif _is_status(second) and op_type is ast.Eq:
+                pairs.append((op_type(), first))
+    for op, value in pairs:
+        codes = _error_statuses(op, value)
+        if codes:
+            prefix = ">=" if isinstance(op, (ast.GtE, ast.Gt)) else ""
+            return "HTTP " + prefix + "/".join(str(c) for c in codes)
+    return None
+
+
 def extract_assertions(func_node: ast.FunctionDef) -> list[dict]:
     """Extract assertion calls and classify them from a test function AST."""
     assertions: list[dict] = []
@@ -123,6 +216,9 @@ def extract_assertions(func_node: ast.FunctionDef) -> list[dict]:
             inv_type = _ASSERT_INVARIANT_MAP[call_name]
             # For assertRaises, extract the exception type
             detail = ""
+            status = http_error_status(node)
+            if status:
+                inv_type, detail = "error_condition", status
             if call_name in ("assertRaises", "assertRaisesRegex") and node.args:
                 exc_arg = node.args[0]
                 if isinstance(exc_arg, ast.Name):
@@ -172,11 +268,12 @@ def extract_assertions(func_node: ast.FunctionDef) -> list[dict]:
     # Also capture bare assert statements
     for node in ast.walk(func_node):
         if isinstance(node, ast.Assert):
+            status = http_error_status(node)
             assertions.append({
                 "method": "assert",
-                "invariant_type": "general",
+                "invariant_type": "error_condition" if status else "general",
                 "line": node.lineno,
-                "detail": "",
+                "detail": status or "",
                 "is_implementation_detail": False,
             })
 

@@ -143,6 +143,52 @@ def test_just_exercise():
         self.assertEqual(len(assertions), 0)
 
 
+class TestHttpErrorStatusAssertions(unittest.TestCase):
+    """Asserting a 4xx/5xx response status is an error-condition invariant."""
+
+    def _types(self, body: str) -> list[str]:
+        import ast
+        tree = ast.parse(body)
+        func = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
+        return [a["invariant_type"] for a in mod.extract_assertions(func)]
+
+    def test_status_code_comparisons(self):
+        for check in (
+            "assert r.status_code == 400",
+            "assert 404 == r.status_code",
+            "assert r.status_code in (400, 422)",
+            "assert r.status_code >= 400",
+            "assert r.status_code == HTTPStatus.CONFLICT",
+            "assert r.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE",
+            "assert r.status == 503",
+            "self.assertEqual(r.status_code, 403)",
+            "self.assertIn(r.status_code, {401, 403})",
+        ):
+            with self.subTest(check=check):
+                body = f"def test_x(self, r):\n    {check}\n"
+                self.assertIn("error_condition", self._types(body))
+
+    def test_success_statuses_are_not_errors(self):
+        for check in (
+            "assert r.status_code == 200",
+            "assert r.status_code in (200, 201)",
+            "assert r.status_code < 400",
+            "assert r.status_code != 500",
+            "self.assertEqual(r.status_code, 204)",
+            "assert r.json()['count'] == 404",
+        ):
+            with self.subTest(check=check):
+                body = f"def test_x(self, r):\n    {check}\n"
+                self.assertNotIn("error_condition", self._types(body))
+
+    def test_detail_names_the_status(self):
+        import ast
+        tree = ast.parse("def test_x(r):\n    assert r.status_code == 409\n")
+        func = tree.body[0]
+        (assertion,) = mod.extract_assertions(func)
+        self.assertEqual(assertion["detail"], "HTTP 409")
+
+
 class TestSimilarFunctions(unittest.TestCase):
     """Test similar function discovery."""
 
