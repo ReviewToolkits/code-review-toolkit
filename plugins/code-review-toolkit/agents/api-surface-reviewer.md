@@ -204,6 +204,22 @@ For an HTTP API, compare the documented contract (OpenAPI schema, docs) with beh
 - Response-model changes that only break **generated clients** (a field becoming optional, an enum
   gaining a value): a breaking-change category of its own.
 
+### 6d. A client contract that lives in another package
+
+Sometimes the client is a separate distribution outside the scope and the repository: an SDK, a
+generated client, or a CLI wrapper. Its interface is still part of what users experience:
+
+- Record the version that is installed (`python -m pip show <dist>` in the project's
+  environment) next to the project's pin (`pyproject.toml`, `setup.py`, requirements, lockfile).
+  A pin range that admits client versions whose methods the server lacks, or the reverse, is a
+  finding against **this** project's pin.
+- Treat the installed client's public interface as the contract. Drive it through §6b against
+  this project's server or local implementation. Report operations the client exposes that the
+  server doesn't serve, and server operations the client can't reach.
+- Don't file findings against the other package's code. Report the defect where this project
+  can fix it (its pin, its server, its docs). If the bug really is in the client, add it as an
+  upstream note.
+
 ### 7. Breaking Change Classification
 
 When recommending API changes, classify each as:
