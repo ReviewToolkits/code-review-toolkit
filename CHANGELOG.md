@@ -6,6 +6,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`concurrency-auditor` agent and `scan_concurrency.py`: the catalog's first threading shapes** —
+  ports three ideas from ft-review-toolkit's C-extension scanners to Python's `ast`, as 12
+  project-level checks, each a new shape (#52):
+  - *Lock-guard inference.* For each attribute and module global written after construction, the
+    lock held at most of its sites is its guard; writes, mutations and iterations without it are
+    `unguarded-access-to-lock-guarded-state`. A private helper called only with the lock held
+    inherits it (an entry lockset over its callers), so `_foo_locked` helpers are not flagged. The
+    same inference runs on calls: a private helper that three-quarters of its callers invoke under
+    one lock, called bare by another. `check-then-act-without-lock` covers lazy init and
+    check-then-insert outside the lock.
+  - *Lock discipline.* `acquire-without-finally-release`, `lock-acquire-result-ignored`,
+    `lock-order-inversion` (cycles in a graph built from nested `with` blocks and from calls made
+    while holding a lock), `non-reentrant-lock-reacquired` (including a read-to-write upgrade on a
+    project's own reader/writer lock; owner-tracking locks are recognized as reentrant), and the
+    `Condition` pair `condition-wait-outside-predicate-loop` / `condition-notify-without-lock`.
+  - *Forbidden work in critical regions, through the call graph.* `blocking-call-under-lock`,
+    `await-while-holding-thread-lock`, `transitive-blocking-call-in-async` and
+    `signal-handler-does-real-work`. Locks held somewhere across blocking work are *slow locks*;
+    an `async def` that reaches one through sync helpers is reported with a `chain` that includes
+    the other thread's path (`meanwhile, another thread holds X here`), and at high confidence when
+    a sibling coroutine in the same module already offloads its sync call (the guarded twin).
+  - Locks are recognized from `threading`/`multiprocessing`/`asyncio` factories, dataclass
+    `field(default_factory=Lock)` fields, lock-like names, and the project's own context managers
+    that hold a lock at `yield`. Calls resolve through `self.`, module functions, import aliases,
+    constructor-typed attributes and annotations; a method name defined by at most three project
+    classes resolves to all of them as *weak* edges, which lower confidence by one level.
+  - Validated on a private threaded/async FastAPI application (~930 functions, ~1 s): it finds,
+    unprompted, the event-loop stalls and the lock-skipping helper call that the earlier review of
+    that project had to find by hand (and that the direct `blocking-call-in-async-function` check
+    missed).
+- **13 shapes in `python_bug_shapes.json`** — the 12 above plus the agent-only
+  `request-reply-channel-desync-after-timeout` (a pipe reused after a timeout returns the previous
+  caller's reply). All 13 are `documented` for now.
+
+### Fixed
+
+- **`tests/helpers.import_script` registers the module while it executes**, so a script using
+  `@dataclass` with `from __future__ import annotations` can be imported by the tests.
+
 ## [1.14.0] - 2026-10-29
 
 ### Documentation

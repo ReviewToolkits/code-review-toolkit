@@ -39,7 +39,7 @@ Terminal state is one of:
 ### 1. Run every scanner, and record whether each one completed
 
 ```bash
-for s in scan_python_pitfalls analyze_imports find_dead_symbols measure_complexity \
+for s in scan_python_pitfalls scan_concurrency analyze_imports find_dead_symbols measure_complexity \
          collect_debt correlate_tests count_types extract_test_invariants; do
   python <plugin_root>/scripts/$s.py [scope] > reports/audit/$s.json 2>reports/audit/$s.err
   echo "$s exit=$?"

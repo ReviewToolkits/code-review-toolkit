@@ -27,6 +27,7 @@ Parse arguments into three categories:
 - `tests` → test-coverage-analyzer
 - `errors` → silent-failure-hunter
 - `pitfalls` → python-pitfall-scanner (concrete correctness defects)
+- `concurrency` → concurrency-auditor (lock discipline, races, deadlocks, event-loop stalls)
 - `lint` → lint-rule-triager (defect-grade linter rules, tiered)
 - `docs` → documentation-auditor
 - `types` → type-design-analyzer
@@ -140,25 +141,26 @@ Based on the requested aspects (default: all), launch the appropriate agents. Ea
 
 **Group B — Correctness and code quality** (highest-value findings):
 3. **python-pitfall-scanner** — concrete correctness defects (runs first in this group: its findings are behavioural bugs, not smells)
-4. **lint-rule-triager** — defect-grade lint rules; merges with the scanner's findings where a rule overlaps a catalogued shape
-5. silent-failure-hunter
-6. complexity-simplifier
-7. dead-code-finder
+4. **concurrency-auditor** — lock discipline, races, deadlocks and event-loop stalls, followed through the call graph
+5. **lint-rule-triager** — defect-grade lint rules; merges with the scanner's findings where a rule overlaps a catalogued shape
+6. silent-failure-hunter
+7. complexity-simplifier
+8. dead-code-finder
 
 **Group C — Interface and documentation**:
-8. test-coverage-analyzer
-9. documentation-auditor
-10. project-docs-auditor
-11. type-design-analyzer
-12. **typing-integrity-auditor** — mypy-provable defects and phantom imports
-13. api-surface-reviewer
+9. test-coverage-analyzer
+10. documentation-auditor
+11. project-docs-auditor
+12. type-design-analyzer
+13. **typing-integrity-auditor** — mypy-provable defects and phantom imports
+14. api-surface-reviewer
 
 **Group D — Inventory and investigation**:
-14. tech-debt-inventory
-15. test-investigation-agent
+15. tech-debt-inventory
+16. test-investigation-agent
 
 **Group E — Temporal analysis (runs last)**:
-16. git-history-analyzer
+17. git-history-analyzer
 
 If `parallel` is specified, run agents within each group concurrently. Run at most `--max-parallel` agents concurrently within each group (default: 2). On memory-constrained systems, use `--max-parallel 1` to run agents sequentially. Groups still execute sequentially because later groups may benefit from earlier findings. Group E runs last because it cross-references all other agents' output.
 

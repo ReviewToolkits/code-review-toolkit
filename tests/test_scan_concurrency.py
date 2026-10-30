@@ -1,0 +1,901 @@
+"""Tests for scan_concurrency.py.
+
+Each shape gets a true positive and its guarded twin, which must stay silent:
+the twin is the documented fix, and a scanner that fires on the fix is worse than
+none. Several shapes need a call chain, so fixtures span functions and modules.
+"""
+
+import unittest
+from textwrap import dedent
+
+from helpers import TempProject, import_script
+
+mod = import_script("scan_concurrency")
+
+
+def scan_project(files: dict[str, str], **kw) -> dict:
+    with TempProject({k: dedent(v) for k, v in files.items()}) as root:
+        return mod.analyze(str(root), **kw)
+
+
+def scan(source: str, **kw) -> list[dict]:
+    return scan_project({"pkg/mod.py": source}, **kw)["findings"]
+
+
+def of(findings: list[dict], shape: str) -> list[dict]:
+    return [f for f in findings if f["shape"] == shape]
+
+
+_GUARDED_CLASS = """
+import threading
+
+class Cache:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._items = {{}}
+
+    def put(self, k, v):
+        with self._lock:
+            self._items[k] = v
+
+    def drop(self, k):
+        with self._lock:
+            self._items.pop(k, None)
+
+    def get(self, k):
+        with self._lock:
+            return self._items.get(k)
+
+    def clear_all(self):
+        {body}
+"""
+
+
+class TestUnguardedAccess(unittest.TestCase):
+    shape = "unguarded-access-to-lock-guarded-state"
+
+    def test_mutation_without_the_guarding_lock(self):
+        found = of(scan(_GUARDED_CLASS.format(body="self._items.clear()")), self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["function"], "Cache.clear_all")
+        self.assertIn("Cache._lock", found[0]["message"])
+
+    def test_guarded_twin_is_silent(self):
+        src = _GUARDED_CLASS.format(
+            body="with self._lock:\n            self._items.clear()"
+        )
+        self.assertEqual(of(scan(src), self.shape), [])
+
+    def test_iteration_without_lock_is_reported(self):
+        src = _GUARDED_CLASS.format(body="for k in self._items:\n            print(k)")
+        found = of(scan(src), self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertIn("iterates", found[0]["message"])
+
+    def test_private_helper_called_only_under_lock_inherits_it(self):
+        src = _GUARDED_CLASS.format(
+            body="with self._lock:\n            self._clear_locked()\n\n"
+            "    def _clear_locked(self):\n        self._items.clear()"
+        )
+        self.assertEqual(of(scan(src), self.shape), [])
+
+    def test_helper_also_called_without_lock_is_reported(self):
+        src = dedent(
+            """
+            import threading
+
+            class Cache:
+                def __init__(self):
+                    self._lock = threading.Lock()
+                    self._items = {}
+
+                def put(self, k, v):
+                    with self._lock:
+                        self._items[k] = v
+
+                def drop(self, k):
+                    with self._lock:
+                        self._items.pop(k, None)
+
+                def locked_clear(self):
+                    with self._lock:
+                        self._clear()
+
+                def fast_clear(self):
+                    self._clear()
+
+                def _clear(self):
+                    self._items.clear()
+            """
+        )
+        found = of(scan(src), self.shape)
+        self.assertEqual([f["function"] for f in found], ["Cache._clear"])
+
+    def test_init_writes_do_not_count(self):
+        # __init__ runs before the object is shared; it is not an unguarded site.
+        result = scan_project({"pkg/mod.py": _GUARDED_CLASS.format(body="pass")})
+        self.assertEqual(of(result["findings"], self.shape), [])
+        guards = {g["state"]: g["lock"] for g in result["guards"]}
+        self.assertEqual(guards.get("pkg.mod:Cache._items"), "pkg.mod:Cache._lock")
+
+    def test_module_global_guarded_by_module_lock(self):
+        src = """
+        import threading
+        _lock = threading.Lock()
+        _counts = {}
+
+        def inc(k):
+            with _lock:
+                _counts[k] = _counts.get(k, 0) + 1
+
+        def snapshot():
+            with _lock:
+                return dict(_counts)
+
+        def reset():
+            _counts.clear()
+        """
+        found = of(scan(src), self.shape)
+        self.assertEqual([f["function"] for f in found], ["reset"])
+
+    def test_unguarded_reads_are_not_reported(self):
+        src = _GUARDED_CLASS.format(body="return len(self._items)")
+        self.assertEqual(of(scan(src), self.shape), [])
+
+
+class TestUnguardedHelperCall(unittest.TestCase):
+    shape = "unguarded-access-to-lock-guarded-state"
+
+    # Every public method goes through the lock before calling the helper,
+    # the state lock, except one that calls the helper bare.
+    _SRC = """
+    import threading
+
+    class Store:
+        def __init__(self):
+            self._state = threading.RLock()
+            self._index = None
+
+        def _ensure_index(self):
+            return self._index
+
+        def a(self):
+            with self._state:
+                return self._ensure_index()
+
+        def b(self):
+            with self._state:
+                return self._ensure_index()
+
+        def c(self):
+            with self._state:
+                return self._ensure_index()
+
+        def charge(self):
+            return self._ensure_index()
+    """
+
+    def test_one_bare_caller_among_locked_ones(self):
+        found = of(scan(self._SRC), self.shape)
+        self.assertEqual([f["function"] for f in found], ["Store.charge"])
+        self.assertIn("3 of its 4 call sites", found[0]["message"])
+
+    def test_static_helper_needs_no_lock(self):
+        src = self._SRC.replace(
+            "def _ensure_index(self):\n            return self._index",
+            "@staticmethod\n        def _ensure_index():\n            return 1",
+        )
+        self.assertEqual(of(scan(src), self.shape), [])
+
+
+class TestCheckThenAct(unittest.TestCase):
+    shape = "check-then-act-without-lock"
+
+    _SRC = """
+    import threading
+
+    class Pool:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self._conn = None
+
+        def close(self):
+            with self._lock:
+                self._conn = None
+
+        def reset(self):
+            with self._lock:
+                self._conn = None
+
+        def conn(self):
+            {body}
+            return self._conn
+    """
+
+    def test_lazy_init_outside_lock(self):
+        body = "if self._conn is None:\n                self._conn = object()"
+        found = of(scan(self._SRC.format(body=body)), self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["confidence"], "medium")
+
+    def test_double_checked_locking_is_silent(self):
+        body = (
+            "if self._conn is None:\n"
+            "                with self._lock:\n"
+            "                    if self._conn is None:\n"
+            "                        self._conn = object()"
+        )
+        self.assertEqual(of(scan(self._SRC.format(body=body)), self.shape), [])
+
+    def test_check_then_insert(self):
+        src = """
+        import threading
+        _lock = threading.Lock()
+        _cache = {}
+
+        def put(k, v):
+            with _lock:
+                _cache[k] = v
+
+        def drop(k):
+            with _lock:
+                _cache.pop(k, None)
+
+        def get_or_build(k):
+            if k not in _cache:
+                _cache[k] = object()
+            return _cache[k]
+        """
+        found = of(scan(src), self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertIn("check-then-insert", found[0]["message"])
+
+    def test_class_without_any_lock_is_silent(self):
+        src = """
+        class Lazy:
+            def __init__(self):
+                self._x = None
+
+            def x(self):
+                if self._x is None:
+                    self._x = 1
+                return self._x
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+
+class TestAcquireDiscipline(unittest.TestCase):
+    def test_release_only_on_success_path(self):
+        src = """
+        import threading
+        lock = threading.Lock()
+
+        def work():
+            lock.acquire()
+            do_something()
+            lock.release()
+        """
+        found = of(scan(src), "acquire-without-finally-release")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["confidence"], "high")
+
+    def test_try_finally_release_is_silent(self):
+        src = """
+        import threading
+        lock = threading.Lock()
+
+        def work():
+            lock.acquire()
+            try:
+                do_something()
+            finally:
+                lock.release()
+        """
+        self.assertEqual(of(scan(src), "acquire-without-finally-release"), [])
+
+    def test_enter_exit_protocol_is_silent(self):
+        src = """
+        import threading
+
+        class Guard:
+            def __init__(self):
+                self._lock = threading.Lock()
+
+            def __enter__(self):
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, *exc):
+                self._lock.release()
+        """
+        self.assertEqual(of(scan(src), "acquire-without-finally-release"), [])
+
+    def test_timeout_result_ignored(self):
+        src = """
+        import threading
+        lock = threading.Lock()
+
+        def work():
+            lock.acquire(timeout=5)
+            try:
+                do_something()
+            finally:
+                lock.release()
+        """
+        found = of(scan(src), "lock-acquire-result-ignored")
+        self.assertEqual(len(found), 1)
+
+    def test_timeout_result_checked_is_silent(self):
+        src = """
+        import threading
+        lock = threading.Lock()
+
+        def work():
+            if not lock.acquire(timeout=5):
+                raise TimeoutError
+            try:
+                do_something()
+            finally:
+                lock.release()
+        """
+        self.assertEqual(of(scan(src), "lock-acquire-result-ignored"), [])
+
+    def test_blocking_true_is_not_a_timeout(self):
+        src = """
+        import threading
+        lock = threading.Lock()
+
+        def work():
+            lock.acquire(True)
+            try:
+                do_something()
+            finally:
+                lock.release()
+        """
+        self.assertEqual(of(scan(src), "lock-acquire-result-ignored"), [])
+
+
+class TestLockOrder(unittest.TestCase):
+    shape = "lock-order-inversion"
+
+    def test_opposite_nesting_orders(self):
+        src = """
+        import threading
+        a = threading.Lock()
+        b = threading.Lock()
+
+        def one():
+            with a:
+                with b:
+                    pass
+
+        def two():
+            with b:
+                with a:
+                    pass
+        """
+        found = of(scan(src), self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertIn("a -> b -> a", found[0]["message"])
+
+    def test_cycle_through_a_call(self):
+        src = """
+        import threading
+
+        class Store:
+            def __init__(self):
+                self._meta = threading.Lock()
+                self._data = threading.Lock()
+
+            def write(self):
+                with self._meta:
+                    self._touch_data()
+
+            def _touch_data(self):
+                with self._data:
+                    pass
+
+            def compact(self):
+                with self._data:
+                    with self._meta:
+                        pass
+        """
+        found = of(scan(src), self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertTrue(any("_touch_data" in step for step in found[0]["chain"]))
+
+    def test_consistent_order_is_silent(self):
+        src = """
+        import threading
+        a = threading.Lock()
+        b = threading.Lock()
+
+        def one():
+            with a:
+                with b:
+                    pass
+
+        def two():
+            with a, b:
+                pass
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+
+class TestReentry(unittest.TestCase):
+    shape = "non-reentrant-lock-reacquired"
+
+    _SRC = """
+    import threading
+
+    class Counter:
+        def __init__(self):
+            self._lock = threading.{kind}()
+            self._n = 0
+
+        def add(self):
+            with self._lock:
+                self._n += 1
+                self._log()
+
+        def _log(self):
+            with self._lock:
+                print(self._n)
+    """
+
+    def test_plain_lock_reacquired_through_call(self):
+        found = of(scan(self._SRC.format(kind="Lock")), self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["confidence"], "high")
+
+    def test_rlock_is_silent(self):
+        self.assertEqual(of(scan(self._SRC.format(kind="RLock")), self.shape), [])
+
+    def test_read_to_write_upgrade_on_project_rw_lock(self):
+        src = """
+        import threading
+        from contextlib import contextmanager
+        from threading import get_ident
+
+        class RWLock:
+            def __init__(self):
+                self._cond = threading.Condition(threading.Lock())
+                self._readers = {}
+
+            @contextmanager
+            def read_lock(self):
+                tid = get_ident()
+                with self._cond:
+                    self._readers[tid] = 1
+                try:
+                    yield
+                finally:
+                    with self._cond:
+                        self._readers.pop(tid)
+                        self._cond.notify_all()
+
+            @contextmanager
+            def write_lock(self):
+                with self._cond:
+                    while self._readers:
+                        self._cond.wait()
+                yield
+
+        class Store:
+            def __init__(self):
+                self._state = RWLock()
+
+            def query(self):
+                with self._state.read_lock():
+                    self._repair()
+
+            def _repair(self):
+                with self._state.write_lock():
+                    pass
+
+            def nested_read(self):
+                with self._state.read_lock():
+                    with self._state.read_lock():
+                        pass
+        """
+        found = of(scan(src), self.shape)
+        # The upgrade is flagged; read-inside-read on an owner-tracking
+        # (reentrant) lock is not.
+        self.assertEqual([f["function"] for f in found], ["Store.query"])
+        self.assertIn("upgrade", found[0]["message"])
+
+    def test_other_instance_is_not_reentry(self):
+        src = """
+        import threading
+
+        class Node:
+            def __init__(self, parent=None):
+                self._lock = threading.Lock()
+                self.parent: "Node | None" = parent
+
+            def bump(self):
+                with self._lock:
+                    if self.parent is not None:
+                        self.parent.bump_one()
+
+            def bump_one(self):
+                with self._lock:
+                    pass
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+
+class TestConditions(unittest.TestCase):
+    def test_wait_without_predicate_loop(self):
+        src = """
+        import threading
+
+        class Q:
+            def __init__(self):
+                self._cv = threading.Condition()
+                self._items = []
+
+            def take(self):
+                with self._cv:
+                    if not self._items:
+                        self._cv.wait()
+                    return self._items.pop()
+        """
+        self.assertEqual(len(of(scan(src), "condition-wait-outside-predicate-loop")), 1)
+
+    def test_wait_in_while_is_silent(self):
+        src = """
+        import threading
+
+        class Q:
+            def __init__(self):
+                self._cv = threading.Condition()
+                self._items = []
+
+            def take(self):
+                with self._cv:
+                    while not self._items:
+                        self._cv.wait()
+                    return self._items.pop()
+        """
+        self.assertEqual(of(scan(src), "condition-wait-outside-predicate-loop"), [])
+
+    def test_event_wait_is_not_a_condition(self):
+        src = """
+        import threading
+
+        def go(evt: threading.Event):
+            evt.wait()
+        """
+        self.assertEqual(of(scan(src), "condition-wait-outside-predicate-loop"), [])
+
+    def test_notify_without_lock(self):
+        src = """
+        import threading
+
+        class Q:
+            def __init__(self):
+                self._cv = threading.Condition()
+
+            def poke(self):
+                self._cv.notify_all()
+
+            def poke_ok(self):
+                with self._cv:
+                    self._cv.notify_all()
+        """
+        found = of(scan(src), "condition-notify-without-lock")
+        self.assertEqual([f["function"] for f in found], ["Q.poke"])
+
+
+class TestBlockingUnderLock(unittest.TestCase):
+    shape = "blocking-call-under-lock"
+
+    def test_sleep_under_lock(self):
+        src = """
+        import threading, time
+        lock = threading.Lock()
+
+        def retry():
+            with lock:
+                time.sleep(1)
+        """
+        found = of(scan(src), self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(
+            (found[0]["severity"], found[0]["confidence"]), ("FIX", "high")
+        )
+
+    def test_through_a_call_chain_across_modules(self):
+        files = {
+            "pkg/net.py": """
+            import requests
+
+            def fetch(url):
+                return requests.get(url)
+            """,
+            "pkg/svc.py": """
+            import threading
+            from pkg.net import fetch
+
+            _lock = threading.Lock()
+
+            def refresh():
+                with _lock:
+                    return fetch("http://x")
+            """,
+        }
+        found = of(scan_project(files)["findings"], self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["file"], "pkg/svc.py")
+        self.assertEqual(len(found[0]["chain"]), 2)
+
+    def test_work_outside_the_lock_is_silent(self):
+        src = """
+        import threading, time
+        lock = threading.Lock()
+        state = {}
+
+        def refresh():
+            time.sleep(1)
+            with lock:
+                state["x"] = 1
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+    def test_condition_wait_on_the_held_condition_is_silent(self):
+        src = """
+        import threading
+
+        class Q:
+            def __init__(self):
+                self._cv = threading.Condition()
+
+            def take(self):
+                with self._cv:
+                    while True:
+                        self._cv.wait()
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+    def test_str_join_is_not_a_thread_join(self):
+        src = """
+        import threading
+        lock = threading.Lock()
+
+        def render(parts):
+            with lock:
+                return ", ".join(parts)
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+    def test_extra_blocking_names(self):
+        src = """
+        import threading
+        lock = threading.Lock()
+
+        def go(model):
+            with lock:
+                model.encode_batch([])
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+        found = of(scan(src, blocking=["encode_batch"]), self.shape)
+        self.assertEqual(len(found), 1)
+
+
+class TestAwaitUnderLock(unittest.TestCase):
+    shape = "await-while-holding-thread-lock"
+
+    def test_await_inside_sync_with(self):
+        src = """
+        import asyncio, threading
+        lock = threading.Lock()
+
+        async def handler():
+            with lock:
+                await asyncio.sleep(0)
+        """
+        found = of(scan(src), self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["confidence"], "high")
+
+    def test_async_with_asyncio_lock_is_silent(self):
+        src = """
+        import asyncio
+        lock = asyncio.Lock()
+
+        async def handler():
+            async with lock:
+                await asyncio.sleep(0)
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+
+class TestTransitiveBlockingInAsync(unittest.TestCase):
+    shape = "transitive-blocking-call-in-async"
+
+    # Two periodic tasks; one offloads its sync call, the
+    # other calls a sync function that waits for a lock held across slow work.
+    _FILES = {
+        "pkg/store.py": """
+            import threading, time
+
+            class Store:
+                def __init__(self):
+                    self._state = threading.Lock()
+
+                def rebuild(self):
+                    with self._state:
+                        time.sleep(30)  # stands for a long index rebuild
+
+                def flush_metrics(self):
+                    with self._state:
+                        pass
+
+                def refresh(self):
+                    return 1
+            """,
+        "pkg/app.py": """
+            import asyncio
+            from pkg.store import Store
+
+            async def flush_periodically(store: Store):
+                while True:
+                    await asyncio.sleep(10)
+                    {flush}
+
+            async def refresh_periodically(store: Store):
+                loop = asyncio.get_running_loop()
+                while True:
+                    await loop.run_in_executor(None, store.refresh)
+            """,
+    }
+
+    def _scan(self, flush: str) -> list[dict]:
+        files = dict(self._FILES)
+        files["pkg/app.py"] = files["pkg/app.py"].replace("{flush}", flush)
+        return of(scan_project(files)["findings"], self.shape)
+
+    def test_unguarded_twin_is_high(self):
+        found = self._scan("store.flush_metrics()")
+        self.assertEqual(len(found), 1)
+        f = found[0]
+        self.assertEqual(f["function"], "flush_periodically")
+        self.assertEqual(f["confidence"], "high")
+        self.assertIn("unguarded twin", f["detail"])
+        self.assertTrue(
+            any("meanwhile" in step and "rebuild" in step for step in f["chain"])
+        )
+
+    def test_offloaded_twin_is_silent(self):
+        self.assertEqual(
+            self._scan("await loop.run_in_executor(None, store.flush_metrics)"), []
+        )
+
+    def test_direct_blocking_call_through_helper(self):
+        src = """
+        import asyncio, subprocess
+
+        def build():
+            subprocess.run(["make"])
+
+        async def handler():
+            build()
+        """
+        found = of(scan(src), self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["confidence"], "medium")
+
+    def test_closure_run_in_executor_is_not_on_the_loop(self):
+        src = """
+        import asyncio, time
+
+        async def handler():
+            def work():
+                time.sleep(1)
+            await asyncio.to_thread(work)
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+    def test_quick_lock_is_low(self):
+        src = """
+        import threading
+        _lock = threading.Lock()
+        _n = 0
+
+        def inc():
+            global _n
+            with _lock:
+                _n += 1
+
+        async def handler():
+            inc()
+        """
+        found = of(scan(src), self.shape)
+        self.assertEqual([f["confidence"] for f in found], ["low"])
+
+
+class TestSignalHandlers(unittest.TestCase):
+    shape = "signal-handler-does-real-work"
+
+    def test_handler_that_logs_and_locks(self):
+        src = """
+        import logging, signal, threading
+        log = logging.getLogger(__name__)
+        _lock = threading.Lock()
+
+        def on_term(signum, frame):
+            with _lock:
+                log.info("stopping")
+
+        def install():
+            signal.signal(signal.SIGTERM, on_term)
+        """
+        found = of(scan(src), self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["severity"], "FIX")
+
+    def test_flag_only_handler_is_silent(self):
+        src = """
+        import signal
+        stop = False
+
+        def on_term(signum, frame):
+            global stop
+            stop = True
+
+        def install():
+            signal.signal(signal.SIGTERM, on_term)
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+
+class TestEnvelopeAndOptions(unittest.TestCase):
+    def test_envelope_and_summary(self):
+        result = scan_project({"pkg/mod.py": "x = 1\n"})
+        for key in (
+            "project_root",
+            "scan_root",
+            "files_total",
+            "files_analyzed",
+            "files_capped",
+        ):
+            self.assertIn(key, result)
+        self.assertEqual(result["summary"]["total_findings"], 0)
+        self.assertEqual(set(result["summary"]["checks_run"]), set(mod._CHECKS))
+
+    def test_check_filter(self):
+        src = """
+        import threading, time
+        lock = threading.Lock()
+
+        def a():
+            with lock:
+                time.sleep(1)
+            lock.acquire()
+            lock.release()
+        """
+        only = scan(src, checks=["acquire-without-finally-release"])
+        self.assertEqual(
+            {f["shape"] for f in only}, {"acquire-without-finally-release"}
+        )
+
+    def test_unparseable_file_is_skipped(self):
+        result = scan_project({"pkg/bad.py": "def (:\n", "pkg/ok.py": "x = 1\n"})
+        self.assertEqual(result["files_analyzed"], 2)
+        self.assertEqual(result["findings"], [])
+
+    def test_every_check_is_a_catalogued_shape(self):
+        shapes = import_script("scan_common").load_data("python_bug_shapes.json")[
+            "shapes"
+        ]
+        catalog = {s["id"]: s for s in shapes}
+        for check in mod._CHECKS:
+            with self.subTest(check=check):
+                self.assertIn(check, catalog)
+                self.assertEqual(catalog[check]["agent"], "concurrency-auditor")
+                self.assertEqual(catalog[check]["detected_by"], "scan_concurrency.py")
+
+
+if __name__ == "__main__":
+    unittest.main()
