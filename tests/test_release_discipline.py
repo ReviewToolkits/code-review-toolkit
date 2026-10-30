@@ -31,7 +31,7 @@ _DATA = _PLUGIN / "data"
 _CHANGELOG = Path(__file__).resolve().parent.parent / "CHANGELOG.md"
 
 # Update these WITH a version bump in plugin.json. See the module docstring.
-_EXPECTED = {"agents": 19, "commands": 8, "scripts": 19}
+_EXPECTED = {"agents": 19, "commands": 8, "scripts": 23}
 
 
 def _frontmatter(path: Path) -> dict[str, str]:
@@ -190,10 +190,11 @@ class TestPromptReferencesShip(unittest.TestCase):
     reported the reference as broken.
     """
 
-    # `<plugin_root>/x` anywhere, and bare `docs/x`, `data/x`, `scripts/x` in
-    # backticks. Bare paths under other roots name the reviewed project's files.
+    # `<plugin_root>/x` anywhere, and bare `data/x` or `scripts/x` in backticks.
+    # A bare `docs/x` usually names the reviewed project's docs (`docs/conf.py`),
+    # so plugin docs must be cited with the `<plugin_root>/` prefix.
     _REF = re.compile(
-        r"<plugin_root>/([A-Za-z0-9_./-]+)|`((?:docs|data|scripts)/[A-Za-z0-9_./-]+)`"
+        r"<plugin_root>/([A-Za-z0-9_./-]+)|`((?:data|scripts)/[A-Za-z0-9_./-]+)`"
     )
 
     def test_every_cited_plugin_path_exists(self):
@@ -205,6 +206,22 @@ class TestPromptReferencesShip(unittest.TestCase):
                     self.assertTrue(
                         (_PLUGIN / rel).exists(),
                         f"{prompt.name} cites {rel}, which the plugin does not ship",
+                    )
+
+    def test_toolkit_docs_are_cited_through_plugin_root(self):
+        # A bare `docs/<name>` naming one of the toolkit's own docs is how 1.15.0
+        # broke: it resolves in this repo and nowhere in an installed plugin.
+        own = {p.name for p in (_PLUGIN / "docs").glob("*")}
+        own |= {p.name for p in (_PLUGIN.parent.parent / "docs").glob("*")}
+        bare = re.compile(r"(?<![/\w])docs/([A-Za-z0-9_.-]+)")
+        for prompt in sorted([*_AGENTS.glob("*.md"), *_COMMANDS.glob("*.md")]):
+            text = prompt.read_text(encoding="utf-8").replace("<plugin_root>/docs/", "")
+            for match in bare.finditer(text):
+                with self.subTest(prompt=prompt.name, path=match.group(0)):
+                    self.assertNotIn(
+                        match.group(1),
+                        own,
+                        f"{prompt.name} cites {match.group(0)} without <plugin_root>/",
                     )
 
 
