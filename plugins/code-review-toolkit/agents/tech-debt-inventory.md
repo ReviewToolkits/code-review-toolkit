@@ -174,7 +174,7 @@ Look for patterns that indicate debt without explicit markers:
   `leaks.json` lists `leaked` connections (collected without `close()`) by creation site, and
   `open_at_session_end`. `with sqlite3.connect(...) as conn:` does not close the connection, so it
   is a leak. A leak that only tests create is test debt; one in production code is a FIX candidate.
-- **Tracker keys as debt**: projects that track work by keys (`ABC-123`, `B92`) in a roadmap file
+- **Tracker keys as debt**: projects that track work by keys (`ABC-123`, `B12`) in a roadmap file
   and cite them in code comments carry debt in that form; resolve each cited key's status rather
   than counting only TODO markers.
 
