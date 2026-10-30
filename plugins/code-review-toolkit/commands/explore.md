@@ -175,6 +175,10 @@ If `parallel` is specified, run both concurrently since they are independent.
 
 Store both outputs for injection into Phase 2 agents.
 
+Tell git-history-context to save the raw `analyze_history.py` JSON as
+`artifacts/git-history-context/analyze_history.json`: git-history-analyzer (Group E) and
+`annotate_findings.py` reuse its fix lists and branch data instead of rebuilding them.
+
 ### Phase 2: Targeted Analysis
 
 Based on the requested aspects (default: all), launch the appropriate agents. Each agent receives:

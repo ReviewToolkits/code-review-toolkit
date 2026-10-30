@@ -19,7 +19,7 @@ If external tool output is available (from `run_external_tools.py`), incorporate
 
 ### Ruff Bug-Risk Findings
 
-Each ruff finding carries `selection`. `project` (or `ruff-default` / `explicit`) marks the project's own ruff pass. `toolkit` marks the second pass described in `ruff.toolkit_pass`, which fills this feed even when the project's config selects none of these rules. A `toolkit` hit is a rule the project did not opt into: judge it on its own merits, never as a breach of the project's conventions.
+Each ruff finding carries `selection`. `project` (or `ruff-default` / `explicit`) marks the project's own ruff pass. `toolkit` marks the second pass described in `ruff.toolkit_pass`, which fills this feed even when the project's config selects none of these rules. A `toolkit` hit is a rule the project did not opt into: judge it on its own merits, never as a breach of the project's conventions. If `ruff.warnings` is non-empty, the ruff that ran is not the project's pin: hits the pinned ruff would not report are upgrade debt, not current lint.
 
 Filter the ruff output for `category: "bug-risk"` and `category: "security"` findings:
 

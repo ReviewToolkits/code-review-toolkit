@@ -377,7 +377,7 @@
         "Derived from a 40-bug audit of CPython's pure-Python stdlib (gist 3198710e3c0128fda5e0a7b4e0768e5f), where this family accounted for the pickle.py instance, where a traceback object is passed as a constructor argument instead of being chained.",
         "ruff B904 raise-without-from-inside-except"
       ],
-      "differential": "Not a defect when the new exception is genuinely unrelated to the caught one and `from None` would be noise, or in code targeting Python 2 compatibility. Judge by whether the original would help someone debugging.",
+      "differential": "Not a defect when the new exception is genuinely unrelated to the caught one and `from None` would be noise, or in code targeting Python 2 compatibility. Judge by whether the original would help someone debugging. Also not a defect for `raise SystemExit(...)`: the interpreter exits without printing a traceback, so there is no chain to preserve.",
       "detected_by": "scan_python_pitfalls.py",
       "detectability": "implemented"
     },
@@ -553,7 +553,7 @@
       "severity": "FIX",
       "pattern": "One path opened for reading and for writing with different `encoding=`/`errors=`. The destructive form is a LENIENT read (`errors='replace'`/`'ignore'`) paired with a strict write: the read substitutes replacement characters for bytes it cannot decode, and the write persists those substitutions, so the original bytes are gone. The binary variant hides the codec in a hand-written `.decode(enc, errors='replace')` next to an `open(p, 'rb')`.",
       "guarded_twin": "The same `errors=` on both sides -- `surrogateescape` is the round-trip-safe choice and is what `Modules/readline.c` uses for exactly this file. Any codec is acceptable as long as decode and encode agree.",
-      "hunt": "For every path the module opens for writing, find every read of the same path and diff `encoding=`/`errors=`. Then widen past `open`: the same asymmetry appears as escape-at-one-granularity/unescape-globally, and as a format marker the reader understands but the writer never emits. Property-test `unescape(escape(x)) == x` over a corpus containing the escape characters themselves.",
+      "hunt": "For every path the module opens for writing, find every read of the same path and diff `encoding=`/`errors=`. Then widen past `open`: the same asymmetry appears as escape-at-one-granularity/unescape-globally, and as a format marker the reader understands but the writer never emits. Property-test `unescape(escape(x)) == x` over a corpus containing the escape characters themselves. Include accessor pairs (`_get_X`/`_set_X`, `parse_X`/`format_X`) that serialize the same field, not only codec functions.",
       "expected": "reading a file and writing it back leaves it byte-identical.",
       "caught_as": "SILENT and IRREVERSIBLE. Nothing raises -- that is what `errors='replace'` bought. The data is destroyed on the first write-back, so by the time anyone notices, the original is gone.",
       "confirmed_examples": [
@@ -2438,8 +2438,8 @@
         "pyflakes issue #265"
       ],
       "differential": "An `except ... as NAME` whose NAME is really unused anywhere (no closure) is a genuine F841; the fix is safe there.",
-      "detected_by": null,
-      "detectability": "implementable"
+      "detected_by": "run_lint_rules.py",
+      "detectability": "implemented"
     },
     {
       "id": "duration-measured-with-wall-clock",

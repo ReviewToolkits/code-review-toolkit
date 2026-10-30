@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.16.0] - 2026-10-30
+
+This release fixes the feedback from two review runs on 1.15.0, consolidated into one ledger of 128
+items: a second pass over the threaded/async service, and a first pass over a small HTTP API-testing
+CLI. Both projects were reviewed privately. It fixes the five regressions 1.15.0 introduced and adds
+six scripts that agents had been writing by hand in run after run.
+
 ### Fixed — regressions from 1.15.0 (#72)
 
 - **The docs that prompts cite now ship with the plugin.** `reproduction-convention.md` (cited by
@@ -13,6 +20,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   installed plugin had neither. Both moved to `plugins/code-review-toolkit/docs/`. Prompts cite them
   as `<plugin_root>/docs/...`, and a release-discipline test checks that every plugin path a prompt
   cites exists.
+- **architecture-mapper's fresh-interpreter import check** no longer runs `python3 -I` with
+  `PYTHONPATH` (`-I` ignores it, so the check could import an editable install instead of the
+  export). It also simulates a bare parent package, which exposes cycles that an eager `__init__`
+  masks.
+- **`analyze_history` unmerged-branch counts exclude cherry-picked commits** (by patch id): one
+  branch went from 54 "ahead" to 2 unique. `find_unmerged_branches` works as a library call again.
+- **`measure_complexity` no longer marks a recently rewritten nested function `settled`.**
+- **silent-failure-hunter states the F821 closure guidance once.**
 
 ### Enhanced — orchestration (#73)
 
@@ -43,6 +58,151 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   durations.
 - The differentials of `except-exception-too-broad`, `flag-not-reset-on-early-exit` and
   `duplicated-guard-wrong-operand` now state the discriminators the scanner already applies.
+
+### Added — new scripts
+
+- **`survey_error_handling.py`** (silent-failure-hunter): every `except`, `suppress`, `__exit__` and
+  `finally` site, plus implicit sites. It gives leads for the handler-raises pass: cleanup last in a
+  `try`, names possibly unbound in a handler, wide `suppress` blocks (#80).
+- **`map_exceptions.py`** (pattern-consistency-checker): exceptions raised vs caught through the
+  class hierarchy, and error codes produced vs mapped per module, for producer/consumer diffs (#80).
+- **`survey_docstrings.py`** (documentation-auditor): coverage, including HTTP route handlers.
+  `Returns:`/`Raises:`/`Args:` sections are checked against the code. Testable claims ("lock-free",
+  "called with the lock held") are keyed for joining with `scan_concurrency.py`, and suppression
+  comments are listed as claims (#81).
+- **`survey_conventions.py`** (consistency-auditor): variant counts, the majority variant, mixing
+  files and minority sites for nine convention categories (#81).
+- **`map_findings_coverage.py`** (test-coverage-analyzer): findings' `file:line` ranges joined to a
+  coverage report, with a verdict per range. A mutation mode separates covered-and-checked code from
+  covered-and-blind code (#75).
+- **`annotate_findings.py`** (git-history-analyzer): per finding, the introducing commit (whitespace
+  insensitive), the first release, related fixes and presence on each unmerged branch. It never
+  falls back to HEAD on an empty result (#74).
+- **`scripts/pytest_plugins/crt_leaktrack.py`**: a pytest plugin that attributes unclosed sqlite3
+  connections at normal suite speed (#78).
+
+### Fixed and enhanced — scanners (#79)
+
+- **`scan_concurrency`:**
+  - Nested lock context managers are recognized: a context manager whose `with` item is another
+    project lock context manager. They inherit the kind (Lock/RLock) of the lock they wrap. On one
+    service, recognized lock sites went 0/26 → 26/26, and false "re-acquired" findings 2 → 0.
+  - Name-only hops are marked `[weak: …]` in chains and resolve to the receiver's likely class.
+    This removed a false lock-order cycle.
+  - File-I/O and pipe waits under a lock are summarized per lock (`summary.blocking_low_signal`;
+    `--all-blocking` lists them). Blocking findings went 49 → 25, none lost.
+  - New check `slot-acquired-before-the-try-that-releases-it`. New outputs: `module_state`,
+    `possible_lock_cms_missed`, `lock_context_manager_kinds`.
+- **`scan_python_pitfalls`:**
+  - New checks: `falsy-or-inheritance`, `parsed-json-assumed-object`,
+    `narrow-parse-except-misses-decode-error`, `cleanup-inside-try-triggers-rollback`,
+    `side-channel-raise-in-finally`, `wide-suppress-exception-block`.
+  - `asymmetric-encode-decode-pair` covers accessor pairs.
+  - Precision: `cleanup-only-on-success-path` skips cleanup already in `finally` (7 → 1).
+    `error-reported-below-warning` skips returned error results (6 → 0). `raise-without-from` skips
+    `raise SystemExit(...)` and a raise its own handler catches.
+- **Prompts:** concurrency-auditor covers projects without concurrency. python-pitfall-scanner
+  points at the transitive event-loop check and treats the manual hunt as the deliverable.
+
+### Fixed and enhanced — lint and external tools (#77)
+
+- **`run_external_tools`:**
+  - coverage with no artifacts reports that, not "not installed";
+  - tool versions parse (mypy was `"yes)"`);
+  - mypy reads the project config by explicit path, whatever the cwd. On one project its config had
+    been silently skipped;
+  - records the project's ruff pin and warns on a mismatch or on the 0.16 default-set change.
+- **`run_lint_rules`:**
+  - each finding carries its rule's tier;
+  - new dismissals: B904 on `raise SystemExit(...)`, S506 on a `SafeLoader` subclass, B023 on a
+    lambda its callee calls synchronously, S608 on SQL built from literals;
+  - suppressions on security rules or `nosec` are claims to verify, not dismissals;
+  - closure F821/F841 hits carry `linter-autofix-breaks-closure-capture` and a project-config
+    autofix check.
+  - Tier-1 hits to triage went 32 → 8 on one project.
+
+### Fixed and enhanced — typing (#76)
+
+- **`count_types`:**
+  - instance attributes, nested functions, and `Any` reached through type aliases;
+  - Enum members are no longer "unannotated attributes", and a bare `-> tuple` is caught;
+  - pseudo-enum and dict-subclass categories;
+  - new outputs: `inconsistent_parameters` and `untyped_boundaries`.
+- **`check_typing`:**
+  - `silenced_imports`, plus the interpreter and site-packages mypy resolved against;
+  - `unreachable_source: project-config` instead of a no-op pass reporting `added: 0`;
+  - findings grouped by line, and dependency-drift tags;
+  - unchecked untyped bodies, with a labelled `--check-untyped-defs` pass;
+  - `name-defined`, `return` and `method-assign` classified as defects.
+- **Prompts:** both agents cite only fields the scripts emit, and add an "annotate the boundary in
+  an export, re-run mypy" step.
+
+### Fixed and enhanced — test side (#75)
+
+- **`correlate_tests`:**
+  - a source module named `test_*.py` is no longer taken for the only test file (both scripts
+    reported a clean 0%);
+  - `__init__` files are no longer name-matched to every test package;
+  - directory-per-class layouts are understood;
+  - HTTP route handlers are correlated by URL;
+  - support files are kept separate from tests, and pytest marks are counted.
+- **`extract_test_invariants`:**
+  - HTTP error-status asserts are typed `error_condition`;
+  - `chore:`/`ci:`/`test:`/bench commits no longer count as bug fixes;
+  - abstract declarations and bare-verb prefix pairs are dropped from `similar_functions`;
+  - new `entry_point_siblings`.
+- **Prompts:** test-coverage-analyzer measures FIX paths and has a mutation recipe.
+  test-investigation-agent checks fixtures the real producer can never generate.
+
+### Fixed and enhanced — history and complexity (#74)
+
+- **`analyze_history`:**
+  - commit classification handles domain nouns, lint sweeps, pre-conventional subjects, and `fix`
+    inside `chore:`/`ci:`;
+  - per-key `--key-type`;
+  - notes for an empty window and for rebased dates;
+  - renames are followed and deleted files flagged;
+  - co-change counts without sweep commits;
+  - `behavioural_non_code_commits`.
+- **`measure_complexity`:** `is_test` is decided by path; new `file` field, `top_fixed_functions`
+  and `clones` (near-duplicate statement blocks).
+- **Prompts:** window-aware stability thresholds; the raw history JSON saved as an artifact; broader
+  fix-propagation sources; live-since through dependency pins; open PRs; finding density per file.
+
+### Fixed and enhanced — imports, dead code, debt (#78)
+
+- **`analyze_imports`:**
+  - follows imports through a parent package's `__init__`;
+  - new `dynamic_cycles`, `import_time_side_effects` and `string_imports`;
+  - a declared-vs-imported `dependency_check`.
+- **`find_dead_symbols`:** decorated top-level functions (`singledispatch` `.register`), template
+  references, and class-aware matching of shared method names.
+- **`collect_debt`:**
+  - pytest skip/xfail spellings, plus NOSEC and pylint-disable categories;
+  - `config_debt`: pins, routine caps, config-level suppressions and CI;
+  - tracker keys: struck task cells, `conflicting_signals`, `branch_only`, and CHANGELOG-only noise.
+- **`diff_findings` / `check_known_findings`:** the newer finding lists are registered, and a move
+  into `suppressed` is reported as suppressed, not absent (`known-issues` documents the verdict).
+- **Prompts:** dead-code-finder checks unmerged branches before recommending a removal, and has a
+  coverage-diff recipe. tech-debt-inventory gets deprecation and leak recipes.
+
+### Fixed and enhanced — error handling, docs and API surface (#80, #81)
+
+- **silent-failure-hunter:** Step 3b (handlers that raise) is required; new Step 3c lists
+  false-success shapes; site counts are separate from finding counts.
+- **Migration drift** belongs to consistency-auditor.
+- **documentation-auditor:** safety claims, OpenAPI/Pydantic descriptions as public docs,
+  whether docs are published, and suppression comments as claims.
+- **api-surface-reviewer:** a transport-diff harness template, the flag/config/env/default diff,
+  declarative surfaces, and a client contract that lives in another package.
+- **project-docs-auditor:**
+  - builds and scans the docs site;
+  - checks that CI steps actually ran;
+  - catches `make` targets that are paths;
+  - runs examples and doc-drift checks in an export;
+  - reports code bugs found through the docs.
+- **Ruff-pin warnings:** silent-failure-hunter, tech-debt-inventory and complexity-simplifier treat
+  hits from an off-pin ruff as upgrade debt.
 
 ## [1.15.0] - 2026-10-30
 

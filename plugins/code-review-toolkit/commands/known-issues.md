@@ -31,6 +31,7 @@ names, so a finding whose line moved is still `present` — there is no "drifted
 | `present_elsewhere` | The shape is in the file but the qualname is gone | Medium — read it |
 | `absent_in_qualname` | The qualname still exists and carries no finding, while the file has others | Weak — *possibly* fixed here |
 | `absent` | The file was scanned and has no finding of that shape anywhere | Weak — read the file |
+| `suppressed` | The scanner still finds it, but a differential settles it (listed under `suppressed`) | **Not evidence of a fix** — the code is unchanged |
 | `out_of_scope` | The file exists but sits outside the scanned scope | **Not checked.** Widen the scope |
 | `file_missing` | The path no longer exists | Read the history; renamed or deleted |
 | `not_scannable` | The shape is `agent-only` — no scanner check exists | **Not checked.** Cannot be automated |

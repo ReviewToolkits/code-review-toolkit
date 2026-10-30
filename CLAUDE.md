@@ -67,7 +67,7 @@ code-review-toolkit/
 │   ├── .claude-plugin/plugin.json
 │   ├── agents/                      # 19 agent prompt definitions (markdown)
 │   ├── commands/                    # 8 command definitions (markdown)
-│   ├── scripts/                     # 17 Python scripts (the core code)
+│   ├── scripts/                     # 23 Python scripts (the core code) + a pytest plugin
 │   ├── data/                        # bug-shape catalog + FP taxonomy
 │   └── docs/                        # docs the prompts cite (shipped with the plugin)
 └── tests/                           # unittest suite
@@ -83,8 +83,8 @@ candidates, and prints JSON to stdout.
 | Script | Purpose |
 |---|---|
 | `scan_common.py` | **Shared utilities — every other script imports from here** |
-| `scan_python_pitfalls.py` | Correctness defects; 39 checks mapping 1:1 to `data/python_bug_shapes.json` (2 of them project-level) |
-| `scan_concurrency.py` | Concurrency defects; 12 project-level checks (lock-guard inference, lock discipline, blocking under locks and in `async def`, through the call graph) |
+| `scan_python_pitfalls.py` | Correctness defects; 45 checks mapping 1:1 to `data/python_bug_shapes.json` (2 of them project-level) |
+| `scan_concurrency.py` | Concurrency defects; 13 project-level checks (lock-guard inference, lock discipline, slot lifecycle, blocking under locks and in `async def`, through the call graph), plus a `module_state` inventory |
 | `analyze_imports.py` | Import graph, module boundaries, circular dependencies |
 | `analyze_history.py` | Git history: churn, co-change, fix density |
 | `measure_complexity.py` | Per-function complexity metrics |
@@ -99,6 +99,13 @@ candidates, and prints JSON to stdout.
 | `check_known_findings.py` | Cross-references a catalog of known findings against a fresh scan (`known-issues`) |
 | `diff_findings.py` | Diffs two report directories — the false-positive regression gate |
 | `build_informed_briefing.py` | Assembles the informed-explore briefing from `data/` |
+| `annotate_findings.py` | Per finding: introducing commit (whitespace-insensitive), first release, related fixes, presence on each unmerged branch |
+| `map_findings_coverage.py` | Findings' `file:line` ranges → coverage verdicts; mutation-probe mode (covered-and-checked vs covered-and-blind) |
+| `survey_error_handling.py` | Every error-handling site (except/suppress/`__exit__`/finally, implicit sites), with handler-raises leads |
+| `map_exceptions.py` | Exceptions raised vs caught through the hierarchy; error codes produced vs mapped per module |
+| `survey_docstrings.py` | Docstring coverage, Returns/Raises/Args contract checks, testable claims, suppression comments |
+| `survey_conventions.py` | Convention variants, majority and minority sites (formatting, logging, typing generics, exits, prints) |
+| `pytest_plugins/crt_leaktrack.py` | pytest plugin (not counted as a script): attributes unclosed sqlite3 connections |
 
 **Dependency graph:** `scan_common.py` is at the center; every other script imports from it.
 `measure_complexity.py` also imports `analyze_history.py` (to attribute fixes to functions as they
@@ -142,9 +149,8 @@ is the calibration loop.**
 no analysis logic — they run a script, read the JSON, then do the qualitative review the script
 cannot. Scripts find candidates (with a real false-positive rate); agents confirm or dismiss them.
 
-Seven agents are **qualitative** (no backing script — they use Grep/Read directly):
-api-surface-reviewer, consistency-auditor, documentation-auditor, git-history-analyzer,
-pattern-consistency-checker, project-docs-auditor, silent-failure-hunter. The other twelve are
+Two agents are **qualitative** (no backing script — they use Grep/Read directly):
+api-surface-reviewer and project-docs-auditor. The other seventeen are
 script-backed, and each ends with a `## Running the script` section (timeout, private `mktemp -d`
 output, no retry after a failure); `test_release_discipline` fails if a new one omits it.
 
@@ -218,10 +224,10 @@ Tracked honestly so the next session does not have to re-derive them:
    is young and takes chances, coverage.py is a large third-party project. A threaded/async
    application has since been reviewed privately for its maintainer; its report stays outside this
    repo, so the threading shapes it motivated are `documented` until its findings can be cited.
-2. **82 of 117 shapes are `confirmed`; 35 remain `documented`**, including all 13 threading
+2. **82 of 125 shapes are `confirmed`; 43 remain `documented`**, including all 14 threading
    shapes.
-3. **51 of 117 shapes are executable.** `scan_python_pitfalls.py` implements 39 (37 per-file, 2
-   project-level) and `scan_concurrency.py` 12 (all project-level). The rest are `implementable` or
+3. **59 of 125 shapes are executable.** `scan_python_pitfalls.py` implements 45 (43 per-file, 2
+   project-level), `scan_concurrency.py` 13 (all project-level) and `run_lint_rules.py` 1. The rest are `implementable` or
    `agent-only` — `detectability` in the catalog says which.
 4. **The companion findings repository is `devdanzin/code-review-findings`** (`coveragepy/`,
    `cpython-idlelib/`, `cpython-pyrepl/`). The `.code-review/findings.json` schema written by
