@@ -2289,6 +2289,64 @@
       "differential": "Channels recreated on every failure, or protocols that carry and check a correlation id, are the guarded twin.",
       "detected_by": null,
       "detectability": "agent-only"
+    },
+    {
+      "id": "cleanup-inside-try-triggers-rollback",
+      "title": "Post-success cleanup inside the `try` whose `except` rolls the operation back",
+      "agent": "silent-failure-hunter",
+      "severity": "FIX",
+      "pattern": "`try: move_old_aside(); install_new(); remove_backup()` / `except: rollback()`. The last statement is cleanup after a fully successful operation, but it sits inside the `try`, so a cleanup failure (an undeletable file, EBUSY on NFS) runs the rollback: the new state is removed, and a partly-completed cleanup (rmtree deletes as it goes) has already destroyed part of the backup the rollback needs.",
+      "guarded_twin": "Cleanup after the `try`/`except`, in its own `try` that only logs: `try: remove_backup() except OSError: log.warning(...)`. A sibling operation in the same codebase that already does this is the twin.",
+      "hunt": "In every `try` whose `except` performs rollback (restore, rename back, delete what was installed), read the last statements of the `try` body: `rmtree`, `unlink`, temp-file or backup removal belongs after it.",
+      "expected": "a cleanup failure after success leaves the success in place and is reported as a warning.",
+      "caught_as": "SILENT until the environment refuses the cleanup; then a successful operation is reported as failed, and both the old and new state can be lost.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "shutil.rmtree docs (deletes as it walks; a failure leaves a partial tree)"
+      ],
+      "differential": "Cleanup that is itself part of the operation's atomicity (removing a lock file that other processes check) may belong inside. Check whether the rollback can survive a half-done cleanup.",
+      "detected_by": null,
+      "detectability": "implementable"
+    },
+    {
+      "id": "side-channel-raise-in-finally",
+      "title": "Logging, metrics or audit I/O in a `finally` (or after the commit) that can raise",
+      "agent": "silent-failure-hunter",
+      "severity": "FIX",
+      "pattern": "`try: result = do_write() finally: audit_log.write(event)`. If the side-channel call raises (disk full, closed handle, a metrics backend error), the exception replaces the function's return value -- or the original exception -- so a committed write answers as a failure, or the real error is lost.",
+      "guarded_twin": "Side-channel calls are total: wrapped in their own `try/except Exception` that counts or logs at most once, or routed through a helper that never raises. The project's other observability helpers that already swallow their own errors are the twin.",
+      "hunt": "List every `finally:` block and every statement after a commit point; for each logging/metrics/audit call there, ask what happens if it raises. Then check the side channel's own configure/flush/close paths.",
+      "expected": "observability failures never change the data plane's result or mask its exception.",
+      "caught_as": "SILENT in tests (the side channel works there); in production a full log volume turns successful requests into 500s and hides the original exception.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "Python docs, 'try statement' (an exception in finally replaces the pending one)"
+      ],
+      "differential": "Standard `logging` handlers already catch their own errors (`Handler.handleError`); the shape is about project-owned writers, metrics clients and audit logs that don't.",
+      "detected_by": null,
+      "detectability": "implementable"
+    },
+    {
+      "id": "linter-autofix-breaks-closure-capture",
+      "title": "A linter's 'safe' autofix removes an `except ... as NAME` binding that a closure still uses",
+      "agent": "lint-rule-triager",
+      "severity": "FIX",
+      "pattern": "`except Exception as exc: retry(lambda c: c.fail(error=str(exc))); raise`. Some linters (ruff F841/F821, pyflakes) don't see the use inside the lambda/nested def, report `exc` as unused and undefined, and offer a *safe* fix that deletes `as exc`. After the fix the closure raises NameError on the error path -- the path tests rarely exercise.",
+      "guarded_twin": "Bind the value outside the closure (`message = str(exc)` before the lambda), or pass it as a default argument (`lambda c, msg=str(exc): ...`). Either keeps the code correct under the autofix and silences the false positive.",
+      "hunt": "For each F841 on an `except ... as NAME` line, look for NAME inside a lambda or nested def in the same handler; the matching F821 at that use is the co-signal. Never recommend the autofix for these; also check whether whole-project `--fix` runs elsewhere (pre-commit, CI).",
+      "expected": "error-handling code keeps working after the project's own lint autofix.",
+      "caught_as": "SILENT until someone runs the autofix; then the error path raises NameError instead of reporting the original failure, and the test suite usually still passes.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "ruff issue #6878 (F841/F821 false positive on exception names used in nested functions)",
+        "pyflakes issue #265"
+      ],
+      "differential": "An `except ... as NAME` whose NAME is really unused anywhere (no closure) is a genuine F841; the fix is safe there.",
+      "detected_by": null,
+      "detectability": "implementable"
     }
   ]
 }

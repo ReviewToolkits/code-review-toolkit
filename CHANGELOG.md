@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Enhanced
+
+- **`explore` runs into a run directory, and its synthesis consolidates, re-anchors and
+  reproduces** (feedback from a full review of a threaded application). Phase 0 creates
+  `<run_dir>/` outside the reviewed checkout (agent reports, kept artifacts, `findings.json`) and
+  hands every agent the same rules: the checkout is read-only and left without tool caches, scratch
+  work goes in a private `mktemp -d` with `TMPDIR` pointing there, and reproducers worth keeping go
+  in `artifacts/<agent>/`. Phase 3 gains three steps: a consolidation agent writes a deduplicated
+  `findings.json` with a fixed schema (in-context synthesis of a full run doesn't fit), every FIX
+  finding is re-anchored against the project's unmerged branches, and findings are promoted to
+  `reproduced` or `refuted`. The summary template gains a Concurrency line.
+- **`informed-explore` no longer writes `.code-review/findings.json` into the reviewed checkout** by
+  default: the memory goes into the run directory and comes back with `--catalog`.
+- **`prior-art` covers trackers that aren't GitHub**: GitLab (`glab`, or the anonymous REST API),
+  local tracker keys in commits and roadmap files, and unmerged branches, with two new verdicts,
+  `fixed-unmerged` and `tracked-locally`.
+- **`docs/reproduction-convention.md` covers races and stalls**: forced interleavings with
+  `Event`s and `Barrier`s, timing a trivial coroutine to prove an event-loop stall, `faulthandler`
+  for deadlocks, being honest about injected cancellation, and a shared harness whose reproducers
+  each end in one `BUG:`/`OK:` line, runnable against any git ref.
+
+### Added
+
+- **Three shapes**: `cleanup-inside-try-triggers-rollback` and `side-channel-raise-in-finally`
+  (silent-failure-hunter), and `linter-autofix-breaks-closure-capture` (lint-rule-triager: ruff's
+  F841 "safe" fix deletes an `except ... as exc` binding that a lambda still uses).
+
 ### Added
 
 - **`concurrency-auditor` agent and `scan_concurrency.py`: the catalog's first threading shapes** —

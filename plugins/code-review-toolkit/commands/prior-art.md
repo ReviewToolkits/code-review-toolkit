@@ -41,10 +41,48 @@ gh api -X GET search/issues -f q="repo:$R is:issue TERM1 TERM2" \
 - **Search human language plus a label**, not a bare identifier. Identifiers tokenize unreliably.
 - Put every filter inside `q`: `is:issue`, `state:open`, `in:title`, `label:bug`, `repo:O/R`.
 
+### Not on GitHub
+
+- **GitLab.** `glab issue list --search "TERM1 TERM2" --all` if `glab` is installed; otherwise the
+  REST API works anonymously for public projects (URL-encode the project path, `/` → `%2F`):
+
+  ```bash
+  P=group%2Fproject
+  curl -s "https://gitlab.com/api/v4/projects/$P/issues?search=TERM1+TERM2&scope=all&per_page=100" |
+    python3 -c 'import json,sys; [print("#%s [%s] %s" % (i["iid"], i["state"], i["title"])) for i in json.load(sys.stdin)]'
+  # merge requests: .../merge_requests?search=...&state=all
+  ```
+
+  GitLab "work items" (tasks, epics) may not appear in the issues endpoint; check the project's
+  web UI once to see where its tracking lives.
+- **No public tracker, or a private one.** Many projects track work by **keys** in commit subjects
+  and docs (`[fix] ... (B92)`, `ABC-123`, a `ROADMAP.md` or `TODO.md` with key → status). That is
+  prior art too, and it's local:
+
+  ```bash
+  git -C <project> log --all --oneline -i -E --grep 'TERM1|TERM2'   # all branches, not just HEAD
+  grep -rn -E '\b[A-Z]{1,3}[0-9]*-?[0-9]+\b' ROADMAP.md CHANGELOG.md docs/ | grep -i TERM
+  ```
+
+### Unmerged branches are prior art
+
+The most consequential prior art is often a fix that already exists on a branch nobody merged yet
+(a release branch, a long-running feature branch). Search them before calling anything novel:
+
+```bash
+git -C <project> branch -r --no-merged origin/HEAD          # what's unmerged
+git -C <project> log --oneline origin/HEAD..<branch> -- <file of the finding>
+git -C <project> diff origin/HEAD...<branch> -- <file>      # what the branch changed there
+```
+
+A finding fixed on an unmerged branch gets the verdict `fixed-unmerged` (below), with the branch
+name, and should be checked by re-running its reproducer against an export of that branch.
+
 ## Workflow
 
-1. **Identify the tracker.** From the project's `pyproject.toml` / `setup.cfg` URLs, its README, or
-   its git remote. Record it; a search against the wrong repo is worse than no search.
+1. **Identify the tracker.** From the project's `pyproject.toml` / `setup.cfg` / `setup.py` URLs,
+   its README, or its git remote. Record it; a search against the wrong repo is worse than no
+   search. Note whether the project also uses local tracker keys, and list its unmerged branches.
 
 2. **Search each finding three ways.** One query is not a search:
    - the **symptom** in human language ("coverage reports 0% for symlinked files")
@@ -68,6 +106,8 @@ gh api -X GET search/issues -f q="repo:$R is:issue TERM1 TERM2" \
    | `partial` | A related fix landed and did not cover this case | Frame as a follow-up on that PR, not as a fresh bug |
    | `reverted` | Fixed, then backed out, no follow-up | The tracker says fixed and the code says otherwise. Re-open |
    | `refuted` | The tracker shows the finding is wrong | **Withdraw it.** Record the refutation |
+   | `fixed-unmerged` | An unmerged branch already fixes it | Report as "fixed on `<branch>`, not merged"; confirm with the reproducer |
+   | `tracked-locally` | A local key (commit, ROADMAP) already tracks it | Cite the key; the maintainer knows, so it's context, not news |
 
 5. **Write the verdict into the finding.** Add a `prior_art` field with the verdict, the issue
    numbers, and one line on why. A finding without one is not ready to be called novel.

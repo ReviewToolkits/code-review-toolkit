@@ -86,6 +86,34 @@ Before launching any agents:
 3. Check for CLAUDE.md or equivalent project documentation
 4. Determine project language(s) and framework(s)
 5. Print a brief project summary to confirm scope
+6. Create the **run directory** (below) and list the project's **unmerged branches** for Phase 3:
+   `git -C <project> branch -r --no-merged origin/HEAD` (or the default branch). A review reported
+   against `main` while a release branch already fixes half of it misleads the maintainer.
+
+#### The run directory
+
+Every run writes into one directory **outside the reviewed checkout**, e.g.
+`reports/<project>_v<N>/` in the directory the review was started from:
+
+```
+<run_dir>/
+├── brief.md            # what each agent was told (scope, context, constraints)
+├── agents/<agent>.md   # each agent's full report, written by the agent itself
+├── artifacts/<agent>/  # reproducers and harnesses an agent wants kept
+├── findings.json       # Phase 3 consolidation
+└── FINDINGS.md / REPORT.md
+```
+
+Tell every agent its report path and its artifacts directory, and these rules, verbatim:
+
+- **The reviewed checkout is read-only.** No edits, no `git checkout`/`switch`/`stash`/`worktree`,
+  and no tool caches left behind (`.ruff_cache`, `.mypy_cache`, `__pycache__` from running code).
+  To run or patch code, export a copy: `git -C <project> archive HEAD | tar -x -C <private dir>`.
+- **Scratch work goes in a private `mktemp -d`**, never a fixed name in a shared directory: agents
+  run in parallel and overwrite each other's files. Set `TMPDIR` to that private directory when
+  running the project's own code, so its temp files don't spill into a shared `/tmp`.
+- **Anything worth keeping goes in `artifacts/<agent>/`**: a reproducer left in a temp directory is
+  lost when the run ends.
 
 ### Phase 0.5: External Tool Analysis (optional)
 
@@ -166,7 +194,43 @@ If `parallel` is specified, run agents within each group concurrently. Run at mo
 
 ### Phase 3: Synthesis
 
-After all agents complete, perform deduplication and conflict resolution, then produce a unified summary.
+After all agents complete, consolidate, re-anchor and reproduce, then write the summary.
+
+#### Step 1: Consolidate into `findings.json`
+
+For more than a handful of agents, don't synthesize in context: the reports of a full run add up to
+hundreds of kilobytes. Dispatch **one consolidation agent** that reads every `agents/*.md` and writes
+`<run_dir>/findings.json`, one object per deduplicated finding:
+
+| Field | Content |
+|---|---|
+| `id` | stable id (`<PREFIX>-001`), ordered FIX → CONSIDER → POLICY, worst failure first |
+| `title`, `classification`, `status` | status per the reproduction convention: `candidate` / `confirmed` / `reproduced` / `refuted` |
+| `locations` | `path:line` list, checked against the file |
+| `mechanism`, `failure_scenario` | how it fails; concrete inputs → wrong outcome |
+| `agents`, `source_refs` | who found it, and where in their reports |
+| `repro` | artifact paths, if reproduced |
+| `propagation_gap_of`, `prior_art`, `introduced_by` | fix-propagation and history context |
+| `notes` | dedup decisions, corrections |
+
+Then **spot-check it yourself**: re-read a sample of locations (all FIX findings if feasible), and
+every finding whose agents disagreed. The deduplication and contradiction rules below are the
+consolidation agent's instructions.
+
+#### Step 2: Re-anchor against unmerged branches
+
+For every FIX finding, check each unmerged branch that touches its files
+(`git diff --stat <default>...<branch> -- <file>`): `fixed`, `partially-fixed`, `unchanged`,
+`moved`, or `worse`. Re-run the finding's reproducer against an export of each branch that claims a
+fix (and of the default branch as the control). Record `branch_status` per finding. A finding
+already fixed on a branch is reported as "fixed on `<branch>`, not merged", not as live.
+
+#### Step 3: Reproduce
+
+Promote what you can from `confirmed` to `reproduced`, following `docs/reproduction-convention.md`
+(minimal, deterministic reproducers with a shared harness; races forced with Events, never timed).
+A reproducer that fails to show the defect makes the finding `refuted` (or narrows it): keep it in
+the report with the evidence.
 
 #### Deduplication and Conflict Resolution
 
@@ -220,6 +284,7 @@ Before writing the summary:
 - Complexity: [N hotspots found, N critical]
 - Test Coverage: [N modules untested, N critical gaps]
 - Error Handling: [N silent failures, N critical]
+- Concurrency: [N guards inferred, N races / deadlocks / event-loop stalls]
 - Documentation: [X% coverage, N accuracy issues]
 - Project Docs: [N broken references, N contradictions]
 - Type System: [X% annotated, N design issues]
