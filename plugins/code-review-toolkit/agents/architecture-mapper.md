@@ -36,10 +36,31 @@ Key fields:
   - `form` (`import` / `from` / `dynamic`) and `dynamic`: literal `importlib.import_module("m")` and
     `__import__("m")` calls are listed as imports too
   - `names` is always a list; for `import a.b` it holds the module itself
+- `cycles` also follow the implicit step into a parent package: importing `a.b.c` from outside `a.b`
+  runs `a/b/__init__.py` first, so a cycle can pass through an `__init__.py` that no import names
+  directly. Name that step when you report such a cycle
 - `dynamic_import_sites`: `import_module`/`__import__` calls with a computed name (`file`, `line`,
   `expression`, `prefix`). They are not graph edges, so a module reached only this way shows fan-in 0
-  — check them before calling such a module orphaned
+  — check them before calling such a module orphaned. `expanded_targets` lists the modules directly
+  under a literal `prefix` that the call can load
+- `dynamic_cycles`: cycles that close only through one of those expanded edges (`cycle`,
+  `via_dynamic_import`, `import_time`). They are *possible*: read the call site for an allowlist
+  that narrows which modules really load, then confirm one with the fresh-interpreter test below
+- `import_time_side_effects`: process-wide operations a module performs on import (`category`:
+  `logging`, `environment`, `filesystem`, `sys`, `process_global`), directly or through a
+  same-module function it calls on import (`via`, `call_line`). Root-logger setup in an importable
+  library rewrites its host's logging; rate it by whether the project is also used as a library
 - `external_dependencies`: third-party packages and which files use them
+- `string_imports`: modules named in string constants that a framework loads by name
+  (`"pkg.ext.Extension"`, `"pkg.app:app"`), `internal` (with `resolved_file`) or `external`. An
+  internal one is a real use of that module, so it is not orphaned
+- `dependency_check`: imports compared with the declared dependencies (`sources`).
+  `imported_not_declared` is a FIX candidate unless `conditional_only` (an optional dependency) or
+  the package arrives through a declared one (a transitive dependency is still worth a CONSIDER).
+  `declared_not_imported` lists candidates, not removals: servers, plugins and CLI tools are loaded
+  without an import, and an import name that differs from its distribution name shows in both
+  lists. `null` (with `dependency_check_reason`) means nothing declared dependencies: say it was not
+  checked
 
 ## Analysis Strategy
 
