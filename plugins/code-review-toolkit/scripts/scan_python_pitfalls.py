@@ -2003,15 +2003,67 @@ def _check_except_in_loop_without_exit(tree: ast.AST) -> list[dict]:
     return out
 
 
+def _raised_name(node: ast.Raise) -> str:
+    exc = node.exc.func if isinstance(node.exc, ast.Call) else node.exc
+    return _dotted_name(exc).split(".")[-1] if exc is not None else ""
+
+
+def _handler_catches(handler: ast.ExceptHandler, raised: str) -> bool:
+    """Does *handler* catch an exception of class *raised*?"""
+    if handler.type is None:
+        return True
+    types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    caught = {_dotted_name(t).split(".")[-1] for t in types}
+    if caught & {"Exception", "BaseException", raised}:
+        # `Exception` does not catch the BaseException-only family.
+        return not (
+            raised in ("SystemExit", "KeyboardInterrupt", "GeneratorExit")
+            and not caught & {"BaseException", raised}
+        )
+    return bool(caught & _EXC_ANCESTORS.get(raised, set()))
+
+
+def _raises_in_handler(handler: ast.ExceptHandler):
+    """Yield ``(raise, caught_inside)`` for each `raise` in *handler*'s own body.
+
+    *caught_inside* is true when a `try` inside the handler has an `except`
+    that catches the raised class, so the raise never leaves the handler.
+    Nested handlers and functions are skipped: they are visited on their own.
+    """
+
+    def visit(stmts: list[ast.stmt], catchers: list[list[ast.ExceptHandler]]):
+        for stmt in stmts:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(stmt, ast.Raise):
+                name = _raised_name(stmt)
+                caught = bool(name) and any(
+                    _handler_catches(h, name) for hs in catchers for h in hs
+                )
+                yield stmt, caught
+                continue
+            if isinstance(stmt, ast.Try):
+                yield from visit(stmt.body, [*catchers, stmt.handlers])
+                yield from visit(stmt.orelse, catchers)
+                yield from visit(stmt.finalbody, catchers)
+                continue
+            for name in ("body", "orelse"):
+                sub = getattr(stmt, name, None)
+                if isinstance(sub, list) and sub and isinstance(sub[0], ast.stmt):
+                    yield from visit(sub, catchers)
+            for case in getattr(stmt, "cases", []):
+                yield from visit(case.body, catchers)
+
+    yield from visit(handler.body, [])
+
+
 def _check_raise_without_from(tree: ast.AST) -> list[dict]:
     out: list[dict] = []
     for candidate in ast.walk(tree):
         if not isinstance(candidate, ast.ExceptHandler):
             continue
         handler = candidate
-        for node in ast.walk(handler):
-            if not isinstance(node, ast.Raise):
-                continue
+        for node, caught_inside in _raises_in_handler(handler):
             if node.exc is None:  # bare `raise` re-raises; correct
                 continue
             if node.cause is not None:  # explicit `from err` / `from None`
@@ -2019,17 +2071,21 @@ def _check_raise_without_from(tree: ast.AST) -> list[dict]:
             # Re-raising the caught name itself needs no cause.
             if isinstance(node.exc, ast.Name) and node.exc.id == handler.name:
                 continue
-            out.append(
-                _finding(
-                    "raise-without-from-in-except",
-                    "CONSIDER",
-                    "medium",
-                    node,
-                    "raising a new exception inside `except` without `from` loses the "
-                    "explicit cause",
-                    "use `from err` to chain or `from None` to suppress deliberately",
-                )
+            finding = _finding(
+                "raise-without-from-in-except",
+                "CONSIDER",
+                "medium",
+                node,
+                "raising a new exception inside `except` without `from` loses the "
+                "explicit cause",
+                "use `from err` to chain or `from None` to suppress deliberately",
             )
+            if _raised_name(node) == "SystemExit":
+                # An exit prints no traceback, so there is no chain to show.
+                finding["suppressed"] = "system-exit"
+            elif caught_inside:
+                finding["suppressed"] = "caught-inside-the-handler"
+            out.append(finding)
     return out
 
 

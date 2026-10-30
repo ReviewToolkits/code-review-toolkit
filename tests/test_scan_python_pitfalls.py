@@ -955,6 +955,58 @@ class TestRaiseWithoutFrom(unittest.TestCase):
         self.assertNotIn("raise-without-from-in-except", shapes(src))
 
 
+class TestRaiseWithoutFromDifferentials(unittest.TestCase):
+    shape = "raise-without-from-in-except"
+
+    def _reasons(self, src: str) -> tuple[list[dict], list[str]]:
+        with TempProject({"mod.py": src}) as root:
+            result = mod.analyze(str(root / "mod.py"))
+        found = [f for f in result["findings"] if f["shape"] == self.shape]
+        reasons = [
+            e["reason"] for e in result["suppressed"] if e["shape"] == self.shape
+        ]
+        return found, reasons
+
+    def test_system_exit_is_suppressed(self):
+        src = (
+            "import logging\nlog = logging.getLogger(__name__)\n"
+            "def main(spec):\n    try:\n        run(spec)\n"
+            "    except FileNotFoundError as e:\n        log.error(e)\n"
+            "        raise SystemExit(2)\n"
+        )
+        self.assertEqual(self._reasons(src), ([], ["system-exit"]))
+
+    def test_raise_caught_by_its_own_nested_try_is_suppressed(self):
+        src = (
+            "def rollback(moved, errors):\n    try:\n        apply(moved)\n"
+            "    except Exception:\n        for entry in moved:\n            try:\n"
+            "                if not entry.exists():\n"
+            "                    raise FileNotFoundError(entry)\n"
+            "                restore(entry)\n"
+            "            except OSError as exc:\n                errors.append(exc)\n"
+            "        raise\n"
+        )
+        self.assertEqual(self._reasons(src), ([], ["caught-inside-the-handler"]))
+
+    def test_nested_try_that_does_not_catch_it_still_flags(self):
+        src = (
+            "def f(t):\n    try:\n        return int(t)\n    except ValueError:\n"
+            "        try:\n            raise TypeError('bad')\n"
+            "        except KeyError:\n            pass\n"
+        )
+        found, reasons = self._reasons(src)
+        self.assertEqual((len(found), reasons), (1, []))
+
+    def test_raise_in_a_nested_handler_is_reported_once(self):
+        src = (
+            "def f(t):\n    try:\n        return int(t)\n    except ValueError:\n"
+            "        try:\n            cleanup()\n"
+            "        except OSError:\n            raise RuntimeError('cleanup')\n"
+        )
+        found, _ = self._reasons(src)
+        self.assertEqual(len(found), 1)
+
+
 class TestFlagNotResetOnEarlyExit(unittest.TestCase):
     """idlelib pyshell.py:488 -- a stuck guard flag wedges the component."""
 
