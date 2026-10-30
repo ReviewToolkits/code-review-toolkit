@@ -24,6 +24,9 @@ python <plugin_root>/scripts/check_typing.py [scope]
 - **`status: OK`** with `files_checked` — the number is part of the finding. "0 errors across 45
   files" and "0 errors" are different claims.
 
+Each finding carries mypy's `notes` for it (the Superclass/Subclass signatures of an `override`, the
+candidate list of a `call-overload`): read them before re-running mypy by hand.
+
 `uses_project_config` should normally be true. The project's own config is used **as-is and never
 overridden**: reporting errors a project has deliberately configured away is reporting your
 preferences, not their defects. If it is false, say so — the baseline is your judgement, not theirs.
@@ -39,10 +42,15 @@ preferences, not their defects. If it is false, say so — the baseline is your 
   zero of the above; conflating them makes every legacy project look broken.
 - **`other`** — everything else. Read before classifying.
 
-## Phase 3 — The phantom imports (the signature finding)
+## Phase 3 — Annotations that stopped checking (the signature findings)
 
-`phantom_import_findings` comes from a labelled second pass with `--disallow-any-unimported`, kept
-separate so the baseline count stays honest.
+Two labelled extra passes find them. Each runs alongside the baseline, is diffed against it, and is
+reported separately so the baseline count stays honest. `summary.labelled_passes` says whether each
+ran; a count of `null` means the pass did not run or failed, **not** zero.
+
+### Phantom imports
+
+`phantom_import_findings` comes from the labelled `--disallow-any-unimported` pass.
 
 Each one means: **an annotation stopped checking and nothing told anyone.** The import is under
 `TYPE_CHECKING` so there is no runtime error, and `ignore_missing_imports` swallows the diagnostic,
@@ -56,6 +64,25 @@ which is what makes it a real finding rather than a flag that fires everywhere.
 For each phantom import: resolve the name against the actual package tree, propose the correction,
 and **verify the correction introduces no new errors** before proposing it.
 
+### Unreachable code
+
+`unreachable_findings` comes from the labelled `--warn-unreachable` pass. A block mypy proves
+unreachable is a block it never type-checks, and the usual cause is a **wrong annotation**, not dead
+code: a module-level `x = None` with no annotation narrows every `if x is not None:` body away;
+`rows: list[str | None] = None` (where `list[str] | None` was meant) makes the `None` branch
+"impossible". The phantom-import pass cannot see either. For each, find the annotation that makes
+the branch impossible, and check whether fixing it exposes new errors — the wrong annotation is
+often hiding some.
+
+Not every hit is a wrong annotation. Known false-positive shapes:
+- **Attribute narrowing across `yield`/`await` or concurrent mutation.** `if self._closing: raise`
+  early in a context manager makes a later `self._closing and ...` in `finally` "unreachable", though
+  another thread's `close()` can set it meanwhile. ACCEPTABLE, and a reason not to recommend
+  turning `warn_unreachable` on blindly in concurrent code.
+- **Defensive `isinstance` checks** on input, monkeypatchable state, or a third-party stub that is
+  narrower than the runtime (an attribute typed `str` that can also hold a `dict`). Usually
+  ACCEPTABLE.
+
 ## Phase 4 — Stale ignores, correctly measured
 
 `summary.stale_ignores` comes **only** from mypy's own `unused-ignore` code.
@@ -64,8 +91,11 @@ and **verify the correction introduces no new errors** before proposing it.
 ignores *exist*. It is exactly the false alarm that produced a "36 stale ignores" claim with no
 evidence behind it, and repeating it will cost you the report's credibility.
 
-If `warn_unused_ignores` is not enabled in the project's config, the correct statement is "this
-cannot be measured under the project's current configuration" — not zero.
+`summary.stale_ignores_source` says how it was measured: `project-config` (the config enables
+`warn_unused_ignores` or `strict`, so the baseline already reports them) or `warn-unused-ignores-pass`
+(a labelled pass measured them; say so, since the project's own config would not report them).
+`stale_ignore_findings` lists them either way. If `stale_ignores` is `null`, it was **not measured**
+— `stale_ignores_reason` says why — and the correct statement is "not measured", never zero.
 
 ## Phase 5 — Report
 
@@ -82,8 +112,12 @@ cannot be measured under the project's current configuration" — not zero.
 | File:line | Import | Correct name | Annotations affected |
 |---|---|---|---|
 
-### Stale ignores ([N], from mypy's unused-ignore)
-[Or: "not measurable — the project does not enable warn_unused_ignores".]
+### Unreachable code ([N], labelled --warn-unreachable pass)
+| File:line | Annotation that makes it unreachable | Classification |
+|---|---|---|
+
+### Stale ignores ([N], from mypy's unused-ignore; say which `stale_ignores_source`)
+[Or, when `stale_ignores` is null: "not measured" and the `stale_ignores_reason`.]
 
 ### Annotation coverage
 [missing_annotations as a migration estimate, explicitly NOT as defects.]

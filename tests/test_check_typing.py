@@ -307,6 +307,154 @@ class TestMaxFiles(unittest.TestCase):
         self.assertIn("files_capped", result)
 
 
+_BASE_ERR = "pkg/m.py:2: error: bad  [arg-type]\n"
+_ONE_ERROR = "Found 1 error in 1 file (checked 2 source files)\n"
+_TWO_ERRORS = "Found 2 errors in 1 file (checked 2 source files)\n"
+_UNUSED_IGNORE = 'pkg/m.py:1: error: Unused "type: ignore" comment  [unused-ignore]\n'
+_UNREACHABLE = "pkg/m.py:7: error: Statement is unreachable  [unreachable]\n"
+
+
+def _run(files: dict[str, str], responses: dict[str, str], **kwargs):
+    with TempProject(files) as root, FakeMypy(responses) as fake:
+        result = mod.analyze(str(root / "pkg"), mypy_bin=str(fake.bin), **kwargs)
+        flags_seen = [
+            [a for a in c["argv"] if a.startswith("--") and a != "--cache-dir"]
+            for c in fake.calls()
+        ]
+        return result, flags_seen
+
+
+_PKG = {"pkg/__init__.py": "", "pkg/m.py": "import yaml  # type: ignore\nx = 1\n"}
+
+
+class TestStaleIgnores(unittest.TestCase):
+    """#62: with warn_unused_ignores off, `stale_ignores: 0` meant "not
+    measured" and read as "none"."""
+
+    def test_measured_by_a_labelled_pass_when_the_config_is_silent(self):
+        result, _ = _run(
+            _PKG,
+            {
+                "": _BASE_ERR + _ONE_ERROR,
+                "--warn-unused-ignores": _UNUSED_IGNORE + _BASE_ERR + _TWO_ERRORS,
+            },
+        )
+        self.assertEqual(result["summary"]["stale_ignores"], 1)
+        self.assertEqual(
+            result["summary"]["stale_ignores_source"], "warn-unused-ignores-pass"
+        )
+        self.assertEqual(result["stale_ignore_findings"][0]["line"], 1)
+        # The baseline stays the project's own.
+        self.assertEqual(result["summary"]["total"], 1)
+
+    def test_unmeasured_is_null_with_a_reason_not_zero(self):
+        result, _ = _run(
+            _PKG,
+            {"": "Success: no issues found in 2 source files\n"},
+            unused_ignores_pass=False,
+        )
+        self.assertIsNone(result["summary"]["stale_ignores"])
+        self.assertIn("not measured", result["summary"]["stale_ignores_reason"])
+
+    def test_a_failed_pass_is_null_not_zero(self):
+        result, _ = _run(
+            _PKG,
+            {
+                "": "Success: no issues found in 2 source files\n",
+                "--warn-unused-ignores": "mypy: error: something broke\n",
+            },
+        )
+        self.assertIsNone(result["summary"]["stale_ignores"])
+        self.assertIn("failed", result["summary"]["stale_ignores_reason"])
+        self.assertFalse(
+            result["summary"]["labelled_passes"]["warn-unused-ignores"]["ran"]
+        )
+
+    def test_project_config_that_enables_it_is_used_without_an_extra_pass(self):
+        files = {**_PKG, "mypy.ini": "[mypy]\nwarn_unused_ignores = True\n"}
+        result, flags_seen = _run(files, {"": _UNUSED_IGNORE + _BASE_ERR + _TWO_ERRORS})
+        self.assertEqual(result["summary"]["stale_ignores"], 1)
+        self.assertEqual(result["summary"]["stale_ignores_source"], "project-config")
+        self.assertFalse(any("--warn-unused-ignores" in f for f in flags_seen))
+
+
+class TestConfigEnables(unittest.TestCase):
+    def _check(self, name: str, text: str) -> bool:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / name
+            path.write_text(text)
+            return mod.config_enables(str(path), "warn_unused_ignores")
+
+    def test_ini_true(self):
+        self.assertTrue(self._check("mypy.ini", "[mypy]\nwarn_unused_ignores = True\n"))
+
+    def test_ini_false_is_false(self):
+        self.assertFalse(
+            self._check("mypy.ini", "[mypy]\nwarn_unused_ignores = False\n")
+        )
+
+    def test_strict_implies_it(self):
+        self.assertTrue(self._check("setup.cfg", "[mypy]\nstrict = true\n"))
+
+    def test_per_module_only_is_not_whole_tree(self):
+        self.assertFalse(
+            self._check(
+                "mypy.ini", "[mypy]\n[mypy-pkg.*]\nwarn_unused_ignores = True\n"
+            )
+        )
+
+    @unittest.skipIf(sys.version_info < (3, 11), "tomllib is 3.11+")
+    def test_pyproject(self):
+        self.assertTrue(
+            self._check("pyproject.toml", "[tool.mypy]\nwarn_unused_ignores = true\n")
+        )
+        self.assertFalse(
+            self._check("pyproject.toml", "[tool.ruff]\nline-length = 1\n")
+        )
+
+    def test_no_config(self):
+        self.assertFalse(mod.config_enables(None, "warn_unused_ignores"))
+
+
+class TestUnreachablePass(unittest.TestCase):
+    """#64: a labelled --warn-unreachable pass finds blocks a wrong annotation
+    has removed from checking, which the phantom-import pass cannot see."""
+
+    def test_only_what_the_pass_adds_is_reported_and_labelled(self):
+        result, _ = _run(
+            _PKG,
+            {
+                "": _BASE_ERR + _ONE_ERROR,
+                "--warn-unreachable": _BASE_ERR + _UNREACHABLE + _TWO_ERRORS,
+            },
+        )
+        self.assertEqual(result["summary"]["unreachable"], 1)
+        (f,) = result["unreachable_findings"]
+        self.assertEqual(
+            (f["line"], f["code"], f["pass"]), (7, "unreachable", "warn-unreachable")
+        )
+        self.assertEqual(result["summary"]["total"], 1)
+        self.assertEqual([x["code"] for x in result["findings"]], ["arg-type"])
+
+    def test_skipped_pass_is_null_not_zero(self):
+        result, flags_seen = _run(
+            _PKG,
+            {"": _BASE_ERR + _ONE_ERROR},
+            unreachable_pass=False,
+            strict_pass=False,
+        )
+        self.assertIsNone(result["summary"]["unreachable"])
+        self.assertIsNone(result["summary"]["phantom_imports"])
+        self.assertFalse(result["summary"]["strict_pass_ran"])
+        self.assertFalse(any("--warn-unreachable" in f for f in flags_seen))
+
+    def test_clean_pass_is_a_measured_zero(self):
+        result, _ = _run(_PKG, {"": _BASE_ERR + _ONE_ERROR})
+        self.assertEqual(result["summary"]["unreachable"], 0)
+        self.assertEqual(result["summary"]["phantom_imports"], 0)
+        self.assertTrue(result["summary"]["labelled_passes"]["warn-unreachable"]["ran"])
+
+
 class TestConfigDiscovery(unittest.TestCase):
     def test_pyproject_without_a_mypy_section_is_not_a_config(self):
         import tempfile
