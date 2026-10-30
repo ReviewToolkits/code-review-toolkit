@@ -758,6 +758,27 @@ class TestGetToolVersion(unittest.TestCase):
             result = mod.get_tool_version("nonexistent")
             self.assertIsNone(result)
 
+    def test_mypy_trailing_build_note_is_not_the_version(self):
+        # `mypy --version` ends in "(compiled: yes)"; the last token was taken.
+        with patch.object(mod.subprocess, "run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="mypy 1.19.0 (compiled: yes)\n")
+            self.assertEqual(mod.get_tool_version("mypy"), "1.19.0")
+
+    def test_other_version_formats(self):
+        cases = {
+            "vulture 2.16\n": "2.16",
+            "mypy 2.4.1+dev.0abc (compiled: no)\n": "2.4.1+dev.0abc",
+        }
+        for stdout, expected in cases.items():
+            with patch.object(mod.subprocess, "run") as mock_run:
+                mock_run.return_value = MagicMock(stdout=stdout)
+                self.assertEqual(mod.get_tool_version("tool"), expected, stdout)
+
+    def test_no_version_token_is_none(self):
+        with patch.object(mod.subprocess, "run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="unknown build\n")
+            self.assertIsNone(mod.get_tool_version("tool"))
+
 
 # ---------------------------------------------------------------------------
 # Safe runner
@@ -834,6 +855,44 @@ class TestNoCacheInReviewedProject(unittest.TestCase):
             self.assertFalse(seen["cache"].is_relative_to(root))
             self.assertFalse(seen["cache"].exists(), "cache left behind")
             self.assertFalse((root / ".mypy_cache").exists())
+
+    def _mypy_call(self, files, argv_extra=()):
+        seen: dict = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            seen["cwd"] = kwargs.get("cwd")
+            return MagicMock(stdout="", stderr="")
+
+        with TempProject(files) as root:
+            with patch.object(mod.subprocess, "run", side_effect=fake_run):
+                result = mod.run_mypy(
+                    mod.parse_args([str(root), *argv_extra]), root, root
+                )
+            return root, seen, result
+
+    def test_mypy_reads_the_project_config_whatever_the_cwd(self):
+        # mypy discovers its config from the working directory, which is the
+        # agent's private temp dir: the project's [tool.mypy] was ignored.
+        root, seen, result = self._mypy_call(
+            {"m.py": "x = 1\n", "mypy.ini": "[mypy]\nstrict = True\n"}
+        )
+        cmd = seen["cmd"]
+        self.assertEqual(result["config_source"], "project")
+        self.assertEqual(cmd[cmd.index("--config-file") + 1], str(root / "mypy.ini"))
+        self.assertEqual(result["config_file"], str(root / "mypy.ini"))
+        self.assertEqual(seen["cwd"], str(root))
+
+    def test_curated_mypy_run_reads_no_config_at_all(self):
+        # Neither a config in the caller's cwd nor the ignored project one.
+        for files, extra in (
+            ({"m.py": "x = 1\n"}, ()),
+            ({"m.py": "x = 1\n", "mypy.ini": "[mypy]\n"}, ("--ignore-config",)),
+        ):
+            _root, seen, result = self._mypy_call(files, extra)
+            self.assertEqual(result["config_source"], "curated")
+            self.assertIn("--config-file=", seen["cmd"])
+            self.assertIsNone(result["config_file"])
 
     def test_mypy_cache_is_removed_even_when_mypy_times_out(self):
         seen: dict = {}

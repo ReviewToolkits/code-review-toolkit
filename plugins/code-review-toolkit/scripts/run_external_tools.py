@@ -90,16 +90,22 @@ def make_relative(filepath: str, project_root: Path) -> str:
     return filepath
 
 
+# The first version-looking token: `mypy 1.19.0 (compiled: yes)` ends in
+# "yes)", so the last whitespace token is not the version.
+_VERSION_TOKEN = re.compile(r"\b\d+(?:\.\d+)+\S*")
+
+
 def get_tool_version(cmd: str) -> str | None:
-    """Get a tool's version string."""
+    """Get a tool's version string, or None when --version names none."""
     try:
         result = subprocess.run(
             [cmd, "--version"],
             capture_output=True, text=True, timeout=10,
         )
-        return result.stdout.strip().split()[-1] if result.stdout else None
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    except (subprocess.TimeoutExpired, OSError):
         return None
+    match = _VERSION_TOKEN.search(result.stdout or "")
+    return match.group(0).rstrip(",;)") if match else None
 
 
 # ---------------------------------------------------------------------------
@@ -654,12 +660,23 @@ def run_mypy(
     """Run mypy and return normalized findings."""
     cmd = ["mypy", "--output=json"]
 
-    if args.ignore_config or not has_project_config("mypy", project_root):
+    # mypy looks for its config in the WORKING directory (walking up to the
+    # repository root), not next to the files it checks. Run from an agent's
+    # private temp directory, a project's `[tool.mypy]` was silently ignored
+    # while the output still said `config_source: "project"`. So name the
+    # config file explicitly, and disable discovery (`--config-file=`) for the
+    # curated run so a stray config in the caller's cwd cannot leak in either.
+    config_file = find_config_file("mypy", project_root)
+    if args.ignore_config or config_file is None:
         cmd.extend(["--ignore-missing-imports", "--no-error-summary"])
         if args.mypy_strict:
             cmd.append("--strict")
+        cmd.append("--config-file=")
         config_source = "curated"
+        config_used = None
     else:
+        config_used = str(project_root / config_file)
+        cmd.extend(["--config-file", config_used])
         config_source = "project"
 
     # mypy's default cache is `.mypy_cache/` in the working directory, which is
@@ -671,9 +688,11 @@ def run_mypy(
     cmd.append(str(scan_root))
 
     try:
+        # cwd: relative paths in the config (`mypy_path`, `files`) resolve
+        # against the working directory, as when the project runs mypy itself.
         result = subprocess.run(
             cmd, capture_output=True, text=True,
-            timeout=_TOOL_TIMEOUTS["mypy"],
+            timeout=_TOOL_TIMEOUTS["mypy"], cwd=str(project_root),
         )
     finally:
         shutil.rmtree(cache_dir, ignore_errors=True)
@@ -689,6 +708,8 @@ def run_mypy(
 
     return {
         "config_source": config_source,
+        # The config file mypy was told to read (None for the curated run).
+        "config_file": config_used,
         "strict_mode": args.mypy_strict,
         "total_findings": len(findings),
         "findings_capped": len(findings) > args.max_findings,
