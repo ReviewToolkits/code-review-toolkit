@@ -506,6 +506,21 @@ class TestEnvelopeAndOptions(unittest.TestCase):
             result = mod.analyze(str(root))
         self.assertEqual(result["summary"]["total_findings"], 1)
 
+    def test_by_directory_buckets_by_the_files_own_directory(self):
+        # Scoping a single package used to give {"pkg": N}, useless for
+        # triage. Each file's own directory gives `pkg/stores`, ...
+        files = {
+            "pkg/a.py": "def f(x=[]):\n    x.append(1)\n",
+            "pkg/stores/b.py": "def g(y=[]):\n    y.append(1)\n",
+            "pkg/stores/c.py": "def h(z=[]):\n    z.append(1)\n",
+            "top.py": "def k(w=[]):\n    w.append(1)\n",
+        }
+        with TempProject(files) as root:
+            summary = mod.analyze(str(root))["summary"]
+        self.assertEqual(summary["by_directory"], {"pkg/stores": 2, ".": 1, "pkg": 1})
+        # The first-component roll-up is kept for spotting generated trees.
+        self.assertEqual(summary["by_top_directory"], {"pkg": 3, ".": 1})
+
     def test_every_check_maps_to_a_catalogued_shape(self):
         catalog = import_script("build_informed_briefing")
         ids = {s["id"] for s in catalog._load_shapes()}

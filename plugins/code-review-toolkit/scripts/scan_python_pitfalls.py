@@ -4085,6 +4085,15 @@ def analyze_file(
     return findings
 
 
+def _directory_bucket(rel_file: str) -> str:
+    """The directory a finding's file lives in (`pkg/stores/db.py` -> `pkg/stores`).
+
+    Root-level files bucket as ``.``.
+    """
+    parent = Path(rel_file).parent.as_posix()
+    return parent if parent not in ("", "/") else "."
+
+
 def analyze(
     target: str,
     *,
@@ -4145,14 +4154,17 @@ def analyze(
     by_severity: dict[str, int] = {}
     by_confidence: dict[str, int] = {}
     by_directory: dict[str, int] = {}
+    by_top_directory: dict[str, int] = {}
     for finding in findings:
         by_shape[finding["shape"]] = by_shape.get(finding["shape"], 0) + 1
         by_severity[finding["severity"]] = by_severity.get(finding["severity"], 0) + 1
         by_confidence[finding["confidence"]] = (
             by_confidence.get(finding["confidence"], 0) + 1
         )
-        top = finding["file"].split("/")[0] if "/" in finding["file"] else "."
-        by_directory[top] = by_directory.get(top, 0) + 1
+        directory = _directory_bucket(finding["file"])
+        by_directory[directory] = by_directory.get(directory, 0) + 1
+        top = directory.lstrip("/").split("/")[0] or "."
+        by_top_directory[top] = by_top_directory.get(top, 0) + 1
 
     result = build_envelope(project_root, scan_root, files_total, len(files))
     result["summary"] = {
@@ -4162,8 +4174,15 @@ def analyze(
         "by_confidence": dict(sorted(by_confidence.items())),
         # Sorted by count: a single directory dominating usually means generated
         # content, not a real defect cluster. Triage the directory, not each hit.
+        # Keyed by each file's own directory (`pkg/stores`, `pkg/routes`), so
+        # a single-package scope still breaks down; `by_top_directory` keeps the
+        # first-component roll-up, where a generated tree spread over many
+        # subdirectories still shows as one bucket.
         "by_directory": dict(
             sorted(by_directory.items(), key=lambda kv: (-kv[1], kv[0]))
+        ),
+        "by_top_directory": dict(
+            sorted(by_top_directory.items(), key=lambda kv: (-kv[1], kv[0]))
         ),
         "suppressed_by_differential": dict(sorted(suppressed_counts.items())),
         "checks_run": sorted(checks or (set(_CHECKS) | set(_PROJECT_CHECKS))),

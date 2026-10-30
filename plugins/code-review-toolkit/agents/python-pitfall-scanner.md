@@ -25,7 +25,7 @@ Useful options:
 - `--max-files N` — cap the scan
 
 The output envelope carries `summary.by_shape`, `summary.by_severity`, `summary.by_confidence`,
-`summary.by_directory` and `summary.suppressed_by_differential`, plus a
+`summary.by_directory`, `summary.by_top_directory` and `summary.suppressed_by_differential`, plus a
 `findings` list and a `suppressed` list. Each finding has `shape`, `severity`, `confidence`, `file`,
 `line`, `message`, and `detail`.
 
@@ -37,10 +37,12 @@ data (`self.last_error = exc`), or sit in `__del__`. Give the counts in your rep
 
 ## Phase 2 — Read `by_directory` FIRST
 
-Before triaging anything, look at `summary.by_directory`. **If one directory dominates the counts,
-that is almost always generated content, not a defect cluster.** Observed in practice: report
-artifacts, golden/fixture files, vendored trees, and generated stress-test scripts routinely produce
-90%+ of raw findings.
+Before triaging anything, look at `summary.by_directory` (each file's own directory, e.g.
+`pkg/stores`, `pkg/routes`) and `summary.by_top_directory` (the first path component). **If one
+directory dominates the counts, that is almost always generated content, not a defect cluster.**
+Observed in practice: report artifacts, golden/fixture files, vendored trees, and generated
+stress-test scripts routinely produce 90%+ of raw findings. A generated tree spread over many
+subdirectories shows up in `by_top_directory`, not in `by_directory`.
 
 Triage the *directory*, not each hit:
 1. Check whether the dominant directory is hand-written source at all.
