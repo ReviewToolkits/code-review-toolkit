@@ -129,6 +129,89 @@ class TestCommitClassification(unittest.TestCase):
         self.assertEqual(mod.classify_commit("Merge branch 'main'"), "chore")
 
 
+class TestSubjectSignals(unittest.TestCase):
+    """Pre-conventional subjects: domain nouns, leading verbs, lint sweeps."""
+
+    def _detail(self, subject):
+        detail = mod.classify_commit_detail(subject)
+        return detail["type"], detail["source"]
+
+    def test_domain_noun_document_is_not_docs(self):
+        # Where documents are the data, "documents" is not the docs.
+        self.assertNotEqual(
+            mod.classify_commit("[api] Paginate the documents listing"), "docs"
+        )
+        self.assertNotEqual(
+            mod.classify_commit("Purge expired documents from the archive"),
+            "docs",
+        )
+
+    def test_domain_noun_version_is_not_chore(self):
+        self.assertNotEqual(
+            mod.classify_commit("Show the schema version on the status page"),
+            "chore",
+        )
+
+    def test_document_as_leading_verb_is_still_docs(self):
+        self.assertEqual(self._detail("Document the timeout flag"), ("docs", "verb"))
+
+    def test_leading_verb_beats_a_later_keyword(self):
+        # "failure" is a fix keyword, but the commit adds a feature.
+        self.assertEqual(
+            self._detail("Add a reconnect option for socket failures"),
+            ("feature", "verb"),
+        )
+
+    def test_explicit_fix_word_beats_a_feature_verb(self):
+        self.assertEqual(
+            self._detail("Add a guard to fix the crash on empty input"),
+            ("fix", "verb"),
+        )
+
+    def test_lint_sweep_is_not_a_fix(self):
+        self.assertEqual(
+            self._detail("Fix the flake8 warnings in utils"), ("chore", "strong")
+        )
+        self.assertEqual(
+            self._detail("run black and format the package"), ("chore", "strong")
+        )
+        self.assertEqual(self._detail("Add a mypy job"), ("chore", "strong"))
+
+    def test_docstring_work_is_docs(self):
+        self.assertEqual(
+            self._detail("Add docstrings to the parser module"), ("docs", "strong")
+        )
+        self.assertEqual(
+            self._detail("fix spelling in the user guide"), ("docs", "strong")
+        )
+
+    def test_a_bug_word_keeps_a_lint_or_doc_subject_a_fix(self):
+        self.assertEqual(mod.classify_commit("Fix crash in the lint command"), "fix")
+        self.assertEqual(
+            mod.classify_commit("Fix crash when a docstring is missing"), "fix"
+        )
+
+    def test_unclosed_conventional_scope_still_states_the_type(self):
+        self.assertEqual(
+            self._detail("feat(export: write timestamps in UTC"),
+            ("feature", "conventional"),
+        )
+
+    def test_conventional_chore_with_fix_inside_stays_chore(self):
+        self.assertEqual(
+            self._detail("chore: fix spelling in comments"), ("chore", "conventional")
+        )
+        self.assertEqual(
+            self._detail("ci: fix the release job"), ("chore", "conventional")
+        )
+
+    def test_area_prefix_is_skipped_before_the_verb(self):
+        self.assertEqual(self._detail("cli: add a --quiet flag"), ("feature", "verb"))
+
+    def test_plain_format_noun_is_not_a_lint_sweep(self):
+        self.assertEqual(mod.classify_commit("Fix date format parsing"), "fix")
+
+
 class TestParseArgs(unittest.TestCase):
     """Test CLI argument parsing."""
 
@@ -747,10 +830,10 @@ class TestTaggedAndKeyedClassification(unittest.TestCase):
         self.assertEqual((detail["type"], detail["source"]), ("chore", "conventional"))
         self.assertEqual(mod.classify_commit("feat(api)!: drop v1 routes"), "feature")
 
-    def test_area_tag_falls_through_to_keywords(self):
-        # [store] names an area, not a type.
+    def test_area_tag_falls_through_to_the_subject(self):
+        # [db] names an area, not a type; the subject's own verb decides.
         detail = mod.classify_commit_detail("[db] Add schema migrations (T1-32)")
-        self.assertEqual((detail["type"], detail["source"]), ("feature", "keyword"))
+        self.assertEqual((detail["type"], detail["source"]), ("feature", "verb"))
 
     def test_unmapped_key_stays_unknown(self):
         subject = "[db] Validate column types (T1-33)"

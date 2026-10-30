@@ -41,6 +41,10 @@ from scan_common import (  # noqa: E402
 # out. Plain substring matching was wrong in both directions on a validation
 # project:
 # "prefixes" counted as a fix, "policies" as a chore (it contains "ci").
+# "document" and "version" are not keywords: in a project whose data model
+# has documents or versions they are domain nouns, and every feature that
+# mentioned them was filed as docs or chore. "Document X" as the leading verb
+# is still docs (_LEADING_VERBS).
 CLASSIFICATION_RULES: list[tuple[str, list[str]]] = [
     (
         "fix",
@@ -77,7 +81,7 @@ CLASSIFICATION_RULES: list[tuple[str, list[str]]] = [
             "spelling",
             "changelog",
             "documentation",
-            "document(?:s|ed)?",
+            "docstrings?",
         ],
     ),
     (
@@ -120,7 +124,6 @@ CLASSIFICATION_RULES: list[tuple[str, list[str]]] = [
             "config",
             "lint",
             "format",
-            "version",
             "release",
             "merge",
             "revert(?:s|ed)?",
@@ -184,7 +187,8 @@ _TYPE_WORDS: dict[str, str] = {
     "pkg": "chore",
 }
 
-_CONVENTIONAL_RE = re.compile(r"^\s*([A-Za-z]+)(?:\([^)]*\))?!?:\s")
+# The scope may be left unclosed (`feat(api: ...`): the type is still stated.
+_CONVENTIONAL_RE = re.compile(r"^\s*([A-Za-z]+)(?:\([^)]*\)?)?!?:\s")
 _LEADING_TAGS_RE = re.compile(r"^\s*((?:\[[^\[\]\n]+\]\s*)+)")
 _TAG_RE = re.compile(r"\[([^\[\]]+)\]")
 # Tracker keys: `ABC-123` (Jira style) or a single capital followed by digits,
@@ -192,6 +196,93 @@ _TAG_RE = re.compile(r"\[([^\[\]]+)\]")
 _TRACKER_KEY_RE = re.compile(
     r"(?<![\w-])([A-Z][A-Z0-9]*-\d+(?:-\d+)*|[A-Z]\d+(?:-\d+)*)(?![\w-])"
 )
+
+# Words that settle a subject's type wherever they appear, ahead of its leading
+# verb: "Add docstrings to the parser" is docs, "Fix the flake8 warnings" and
+# "Add a mypy job" are tooling chores, "Add tests for X" is test work. On a
+# validation project the keyword list counted lint sweeps as bug fixes.
+_STRONG_SIGNALS: list[tuple[str, re.Pattern[str]]] = [
+    (
+        "docs",
+        re.compile(
+            r"\b(?:docstrings?|readme|changelog|typos?|spelling|misspell\w*)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "chore",
+        re.compile(
+            r"\b(?:flake8|pylint|isort|ruff|mypy|pre-commit|linters?|lint(?:s|ing)?"
+            r"|formatting|reformat(?:s|ted|ting)?)\b"
+            r"|\bblack\b.*\bformat|\bformat\w*\b.*\bblack\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "test",
+        re.compile(
+            r"^(?:add|adds|added|adding|improve[sd]?|extend(?:s|ed)?|increase[sd]?)"
+            r"\s+(?:\S+\s+){0,2}?(?:unit\s*)?(?:tests?|test\s+cases?|coverage)\b",
+            re.IGNORECASE,
+        ),
+    ),
+]
+
+# A subject without a stated type usually opens with an imperative verb, and
+# that verb says more than any keyword later in the line: "Add a reconnect
+# option for socket failures" is a feature, not a fix. A feature verb still yields to an
+# explicit fix word ("Add a guard to fix the crash").
+_VERBS_BY_TYPE = {
+    "feature": (
+        "add adds added adding implement implements implemented introduce "
+        "introduces introduced enable enables enabled allow allows allowed "
+        "expose exposes exposed provide provides provided create creates created"
+    ),
+    "fix": (
+        "fix fixes fixed fixing resolve resolves resolved repair repairs "
+        "repaired correct corrects corrected prevent prevents prevented"
+    ),
+    "refactor": (
+        "refactor refactors refactored rename renames renamed move moves moved "
+        "extract extracts extracted simplify simplifies simplified split splits "
+        "inline inlines inlined restructure restructured reorganize reorganized "
+        "reorganise reorganised clean cleans cleaned cleanup deduplicate "
+        "deduplicated tidy"
+    ),
+    "docs": "document documents documented",
+    "chore": "bump bumps bumped upgrade upgrades upgraded release merge revert",
+}
+_LEADING_VERBS: dict[str, str] = {
+    verb: category
+    for category, verbs in _VERBS_BY_TYPE.items()
+    for verb in verbs.split()
+}
+_EXPLICIT_FIX_RE = re.compile(
+    r"\b(?:fix(?:es|ed|ing)?|bugs?|bugfix(?:es)?|hotfix(?:es)?|crash(?:es|ed|ing)?"
+    r"|regressions?|segfaults?|leak(?:s|ed|ing)?)\b",
+    re.IGNORECASE,
+)
+# Words that name a defect, as opposed to the verb "fix" alone ("Fixed all
+# flake8 errors" is a lint sweep; "Fix crash in the lint command" is a fix).
+_BUG_WORDS_RE = re.compile(
+    r"\b(?:bugs?|bugfix(?:es)?|hotfix(?:es)?|crash(?:es|ed|ing)?|regressions?"
+    r"|segfaults?|leak(?:s|ed|ing)?|deadlocks?|hang(?:s|ing)?)\b",
+    re.IGNORECASE,
+)
+# An area prefix that is not a Conventional Commits type: `cli: add x`.
+_AREA_PREFIX_RE = re.compile(r"^\s*[\w./-]+:\s+")
+
+
+def _leading_verb_type(subject: str) -> str | None:
+    """The type the subject's opening verb names, or None."""
+    words = re.findall(r"[A-Za-z][\w-]*", subject[:80])
+    if not words:
+        return None
+    category = _LEADING_VERBS.get(words[0].lower())
+    if category == "feature" and _EXPLICIT_FIX_RE.search(subject):
+        return "fix"
+    return category
+
 
 # Precedence when one commit carries several typed signals of equal rank.
 _TYPE_PRIORITY = {t: i for i, t in enumerate(COMMIT_TYPES)}
@@ -249,10 +340,11 @@ def classify_commit_detail(
 
     Signals, strongest first: a Conventional Commits type (`fix(cli): ...`), a
     leading bracketed tag that names a type (`[fix][cli] ...`), a tracker key
-    whose prefix is mapped by `key_types` (`... (K7)` with `K=fix`), and last
-    a word-boundary keyword match. Returns
+    mapped by `key_types` (`... (K7)` with `K=fix`, or the whole key `K7=fix`),
+    a strong word (`docstrings`, `flake8`, "add tests"), the subject's leading
+    verb, and last a word-boundary keyword match. Returns
     {"type", "source", "tags", "keys"}; source is one of conventional / tag /
-    key / keyword / None.
+    key / strong / verb / keyword / None.
     """
     tags: list[str] = []
     tag_match = _LEADING_TAGS_RE.match(message)
@@ -275,6 +367,21 @@ def classify_commit_detail(
         if key_type:
             detail.update(type=key_type, source="key")
             return detail
+    # The rest reads the subject without its leading tags or area prefix.
+    rest = message[tag_match.end() :] if tag_match else message
+    rest = _AREA_PREFIX_RE.sub("", rest, count=1)
+    bug_words = _BUG_WORDS_RE.search(rest) is not None
+    for category, pattern in _STRONG_SIGNALS:
+        # "Fix crash when a docstring is missing" is still a fix.
+        if bug_words and category != "test":
+            continue
+        if pattern.search(rest):
+            detail.update(type=category, source="strong")
+            return detail
+    verb_type = _leading_verb_type(rest)
+    if verb_type:
+        detail.update(type=verb_type, source="verb")
+        return detail
     for category, pattern in _KEYWORD_RES:
         if pattern.search(message):
             detail.update(type=category, source="keyword")
