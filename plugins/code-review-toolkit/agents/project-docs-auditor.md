@@ -36,7 +36,7 @@ Before starting analysis, discover and list all documentation that exists in the
 - `Dockerfile`, `docker-compose.yml` / `compose.yaml`: exposed ports, env vars, entry commands, health checks, volumes — compare each with what the code actually reads and serves
 - `*.example` / `*.sample` / `dotenv.example` / `config.yml.example`: every key must exist in the code with the documented meaning and default
 - `Makefile` / `justfile` / `noxfile.py` / `tox.ini`: targets that reference scripts, paths or flags that no longer exist
-- CI configuration (`.github/workflows/`, `.gitlab-ci.yml` or a variant name, `.circleci/`): commands, Python versions, and whether what CI tests matches what the docs promise
+- CI configuration (`.github/workflows/`, `.gitlab-ci.yml` or a variant name, `.circleci/`): commands, Python versions, whether what CI tests matches what the docs promise, and whether each step actually runs (see "CI Steps That Pass Without Running")
 
 In practice these files hold more contradictions than the README: nobody reads them until a
 deployment fails.
@@ -74,12 +74,103 @@ For code blocks in README and docs, check:
 - Do the function signatures match (parameter names, required params)?
 - Are the return types / usage patterns consistent with actual code?
 
-Don't execute the examples — just verify they're structurally valid against the current API.
+**Run the examples when it's cheap.** A command can have a valid name, valid flags and valid
+ids and still fail, because the code behind it regressed. Only running it shows that. Run the
+README and guide quickstarts, CLI invocations and short snippets:
+
+- in an exported copy (`git archive HEAD | tar -x -C "$d/export"`), never in the checkout, with
+  `TMPDIR` pointing at your private directory, and with the package importing from the export
+  (assert `pkg.__file__` is under it);
+- never anything destructive, and never against a real external service or real credentials.
+  Use a local server the docs tell you to start, or fall back to the structural checks above.
+
+A doc example that fails because the docs are stale is a doc finding. One that fails because
+the code is wrong goes under "Behaviour Defects Found Through the Docs" in the output. Mark
+which examples you ran and which you only checked structurally.
+
+### Project-Provided Doc-Drift Checks
+
+Many projects generate their reference pages (CLI reference, config reference, OpenAPI
+snapshot) and ship a check that diffs them against the code. Find it and run it in the export
+before validating those pages by hand:
+
+```bash
+grep -nE -- "--check|docs?-(check|ref)|ref-check|snapshot|cog\b" Makefile justfile tox.ini noxfile.py \
+  .pre-commit-config.yaml .github/workflows/*.y*ml 2>/dev/null
+ls scripts/ tools/ 2>/dev/null
+```
+
+A failing check is a finding by itself (the committed reference is stale). A passing one settles
+the generated pages in seconds, so audit by hand only what the generator doesn't cover:
+hand-written usage lines, prose around the generated tables, and the pages that link to them.
+
+### Documented `make` Targets
+
+For every `make X` (or `just X`, `nox -s X`, `tox -e X`) in the docs, check that `X` is a target.
+Watch for one silent failure in particular: `X` is not a target, but a file or directory named
+`X` exists. A documented `make tests`, with a `tests/` directory and only a `test` target,
+prints "Nothing to be done for 'tests'" and exits 0, so the reader believes the tests passed. A
+real target that shares its name with a directory and is missing from `.PHONY` fails the same
+way.
+
+```bash
+# Command-shaped mentions only: a line that starts with `make`/`$ make`, or `make` in backticks.
+for t in $(grep -rhoE '(^\s*(\$ )?|`)make [a-z][a-z0-9_.-]*' README* CONTRIBUTING* docs/ 2>/dev/null | awk '{print $NF}' | sort -u); do
+  grep -qE "^$t:" Makefile || echo "not a target: make $t$( [ -e "$t" ] && echo '  (a path of that name exists: silent no-op)')"
+  grep -qE "^$t:" Makefile && [ -e "$t" ] && ! grep -qE "^\.PHONY:.*\b$t\b" Makefile && echo "not .PHONY, collides with a path: make $t"
+done
+```
+
+Confirm a hit with `make -n X` in an export ("Nothing to be done" / "is up to date", exit 0).
 
 ### Link Validation
 
 - Internal links (relative paths in markdown) → do the targets exist?
 - Don't validate external URLs (that's a different tool)
+
+### The Built Documentation Site
+
+Some defects exist only in the rendered site: template tags the engine didn't expand, links that
+work on GitHub but not under the site's URL prefix, and API pages left empty because the
+docstring extractor couldn't import a module. If the project configures a site generator
+(`mkdocs.yml`, `docs/conf.py`, `_config.yml`), build it in an exported copy into your private
+directory and scan the output:
+
+```bash
+cd "$export" && mkdocs build -d "$d/site" 2> "$d/site.err"              # or:
+cd "$export" && sphinx-build -b html docs "$d/site" 2> "$d/site.err"
+```
+
+```bash
+python3 - "$d/site" <<'EOF'
+import html, pathlib, re, sys
+root = pathlib.Path(sys.argv[1])
+for page in sorted(root.rglob("*.html")):
+    text = page.read_text(errors="replace")
+    rel = page.relative_to(root)
+    # Another engine's tags (Jekyll/Liquid) are wrong anywhere, code blocks included: a reader
+    # copies them. Generic {{ }} / {% %} count only in prose, since docs may show templates.
+    foreign = r"\{%-?\s*(?:raw|endraw|include|highlight|endhighlight|post_url)\b[^%]*%\}"
+    for m in re.finditer(foreign, text):
+        print(rel, "FOREIGN-TEMPLATE-TAG", m.group(0)[:80])
+    prose = re.sub(r"<(script|style|pre|code)\b.*?</\1>", "", text, flags=re.S)
+    for m in re.finditer(r"\{%.*?%\}|\{\{.*?\}\}", re.sub(r"<[^>]+>", "", prose)):
+        if not re.fullmatch(foreign, m.group(0)):
+            print(rel, "TEMPLATE-LEFTOVER", m.group(0)[:80])
+    for m in re.finditer(r'(?:href|src)="(/[^"#?]*)', text):
+        if rel.name != "404.html":  # generators make the 404 page root-absolute on purpose
+            print(rel, "ROOT-ABSOLUTE", m.group(1))  # breaks under a URL prefix
+    for m in re.finditer(r'(?:href|src)="(?![a-z]+:|#|/)([^"#?]+)', text):
+        target = (page.parent / html.unescape(m.group(1))).resolve()
+        if not target.exists() and not (target / "index.html").exists():
+            print(rel, "MISSING-TARGET", m.group(1))
+EOF
+```
+
+Also read `site.err`: a docstring extractor's "could not import" or "failed to collect" warning
+means an API page rendered empty. Report a failed build as a finding when CI or the docs say the
+site is built from this tree. If the generator or its plugins aren't installed, say the site was
+not checked. Don't report that as "no site defects".
 
 ### Classification Guidance
 
@@ -104,6 +195,30 @@ Check that documentation files don't contradict each other or project metadata.
 - Does CLAUDE.md's coding conventions match what CONTRIBUTING.md says?
 - Do different docs files agree on project structure, installation steps, supported platforms?
 - Are there contradictory instructions? (e.g., README says "run `pip install .`" but CONTRIBUTING.md says "run `pip install -e .[dev]`" for the same purpose)
+
+### CI Steps That Pass Without Running
+
+A green CI step is a claim that the check ran. The README badge, CONTRIBUTING.md and the job's
+own name all repeat that claim. Some steps are green whatever happens:
+
+- `continue-on-error: true`, `|| true`, `set +e`, `exit 0` after the tool, or a tool flag that
+  turns failures into warnings (`--exit-zero`, `-f`/`--force`)
+- an `if:` that never holds for the triggers the workflow has, or a `paths:` filter that excludes
+  the code the job claims to check
+- a job named for an artifact it doesn't use, such as "test the wheel" that installs from the
+  source tree, or "scan the package" pointed at a path that doesn't exist
+
+For each such step, read one recent log and confirm the tool ran against the intended target
+(files scanned > 0, tests collected > 0, the scanned path exists):
+
+```bash
+gh run list --workflow <file>.yml -L 5 --json databaseId,conclusion,headBranch
+gh run view <id> --log | grep -n -A15 "<step name>"
+```
+
+A step that has been green for months while checking nothing is a FIX when the docs, a badge or
+a release checklist cite it. Name the run id you read as evidence. Without `gh` or network
+access, report the step as "not verified" from the workflow file alone.
 
 ### Documentation ↔ Code Conventions Consistency
 
@@ -176,7 +291,7 @@ For each:
 [Same structure, briefer]
 
 ### Valid References Checked
-[Count: "N references validated, N broken, N stale"]
+[Count: "N references validated, N broken, N stale; N examples run, N checked structurally only; doc-drift checks run: <names or none>"]
 
 ## Cross-File Consistency
 
@@ -205,6 +320,17 @@ For each:
 - Configuration options: N documented / N total
 - Environment variables: N documented / N total
 - Public modules: N mentioned / N total
+
+## Behaviour Defects Found Through the Docs
+
+[Code defects, not doc defects, that came to light while validating the docs: an example or a
+quickstart that fails because the code regressed, a documented default the code no longer
+applies. List them here, not under Broken References, so they reach the code reviewers.]
+For each:
+- **Doc**: [file:line of the example or statement]
+- **Ran**: [the exact command or snippet, and where: export path]
+- **Expected (per the docs)** / **Actual**: [...]
+- **Classification and status**: [FIX / CONSIDER; reproduced / confirmed / candidate]
 
 ## Recommendations
 
