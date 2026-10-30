@@ -278,5 +278,70 @@ class TestMaxFiles(unittest.TestCase):
             self.assertGreater(output["files_total"], 3)
 
 
+def _run_main(target) -> dict:
+    """Run correlate_tests.main() on *target* and return its parsed JSON."""
+    import io
+    import sys
+
+    old_stdout, old_argv = sys.stdout, sys.argv
+    sys.stdout = io.StringIO()
+    sys.argv = ["correlate_tests.py", str(target)]
+    try:
+        mod.main()
+        return json.loads(sys.stdout.getvalue())
+    finally:
+        sys.stdout, sys.argv = old_stdout, old_argv
+
+
+class TestSuiteWideCounts(unittest.TestCase):
+    """`summary.total_test_methods` counts the whole suite, not matched files."""
+
+    def test_uncorrelated_pytest_functions_are_counted(self):
+        with TempProject({
+            "pkg/__init__.py": "",
+            "pkg/core.py": "def run():\n    pass\n",
+            # Name-matched to core.py.
+            "tests/test_core.py": "def test_run():\n    pass\n",
+            # Feature-named: matches no source by name.
+            "tests/test_feature.py": (
+                "def test_a():\n    pass\n"
+                "\n"
+                "def test_b():\n    pass\n"
+                "\n"
+                "class TestPlain:\n"
+                "    def test_c(self):\n        pass\n"
+            ),
+        }) as root:
+            out = _run_main(root)
+        self.assertEqual(out["summary"]["total_test_methods"], 4)
+
+    def test_file_matching_two_sources_counted_once(self):
+        with TempProject({
+            "pkg1/utils.py": "",
+            "pkg2/utils.py": "",
+            "tests/test_utils.py": "def test_x():\n    pass\n",
+        }) as root:
+            out = _run_main(root)
+        self.assertEqual(out["summary"]["total_test_methods"], 1)
+
+    def test_skipped_pytest_function_counted_as_skipped(self):
+        with TempProject({
+            "tests/test_feature.py": (
+                "import pytest\n"
+                "\n"
+                "@pytest.mark.skip(reason='x')\n"
+                "def test_skipped():\n    pass\n"
+                "\n"
+                "def test_active():\n    pass\n"
+            ),
+        }) as root:
+            out = _run_main(root)
+            info = mod._extract_test_info(root / "tests/test_feature.py")
+        self.assertEqual(info["standalone_tests"], ["test_active"])
+        self.assertEqual(info["skipped_standalone_tests"], ["test_skipped"])
+        self.assertEqual(out["summary"]["total_test_methods"], 1)
+        self.assertEqual(out["summary"]["total_skipped_tests"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

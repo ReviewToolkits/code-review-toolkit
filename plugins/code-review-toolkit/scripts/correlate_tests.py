@@ -46,16 +46,38 @@ def classify_files(
     return source, test
 
 
+def _is_skipped(func: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """True for `@unittest.skip...`, `@pytest.mark.skip/skipif` and the like."""
+    return any(
+        (isinstance(d, ast.Attribute) and "skip" in d.attr.lower())
+        or (isinstance(d, ast.Call)
+            and isinstance(d.func, ast.Attribute)
+            and "skip" in d.func.attr.lower())
+        or (isinstance(d, ast.Name) and "skip" in d.id.lower())
+        for d in func.decorator_list
+    )
+
+
 def _extract_test_info(filepath: Path) -> dict:
-    """Extract test classes and methods from a test file."""
+    """Extract test classes and methods from a test file.
+
+    Counts unittest `TestCase` methods, methods of plain pytest classes and
+    pytest-style module-level `test*` functions alike.
+    """
     try:
         source = filepath.read_text(encoding="utf-8", errors="replace")
         tree = ast.parse(source, filename=str(filepath))
     except SyntaxError:
-        return {"classes": [], "standalone_tests": [], "parse_error": True}
+        return {
+            "classes": [],
+            "standalone_tests": [],
+            "skipped_standalone_tests": [],
+            "parse_error": True,
+        }
 
     classes: list[dict] = []
     standalone: list[str] = []
+    skipped_standalone: list[str] = []
 
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.ClassDef):
@@ -64,15 +86,7 @@ def _extract_test_info(filepath: Path) -> dict:
             for child in ast.iter_child_nodes(node):
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     if child.name.startswith("test"):
-                        is_skipped = any(
-                            (isinstance(d, ast.Attribute) and "skip" in d.attr.lower())
-                            or (isinstance(d, ast.Call)
-                                and isinstance(d.func, ast.Attribute)
-                                and "skip" in d.func.attr.lower())
-                            or (isinstance(d, ast.Name) and "skip" in d.id.lower())
-                            for d in child.decorator_list
-                        )
-                        if is_skipped:
+                        if _is_skipped(child):
                             skipped.append(child.name)
                         else:
                             methods.append(child.name)
@@ -86,11 +100,15 @@ def _extract_test_info(filepath: Path) -> dict:
             })
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if node.name.startswith("test"):
-                standalone.append(node.name)
+                if _is_skipped(node):
+                    skipped_standalone.append(node.name)
+                else:
+                    standalone.append(node.name)
 
     return {
         "classes": classes,
         "standalone_tests": standalone,
+        "skipped_standalone_tests": skipped_standalone,
         "parse_error": False,
     }
 
@@ -321,6 +339,7 @@ def main() -> None:
                 total_test_methods += len(cls["test_methods"])
                 total_skipped += len(cls["skipped_methods"])
             total_test_methods += len(ti["standalone_tests"])
+            total_skipped += len(ti["skipped_standalone_tests"])
 
         src_info = source_info[src]
         public_surface = (
@@ -342,6 +361,18 @@ def main() -> None:
     # Summary.
     total_source = len(source_info)
     tested = total_source - len(untested)
+    # Suite-wide counts. These used to be summed over `source_coverage`, which
+    # counts only correlated test files (about a fifth of a feature-named
+    # pytest suite) and counts
+    # a test file twice when it correlates with two sources.
+    suite_test_methods = 0
+    suite_skipped = 0
+    for ti in test_info.values():
+        suite_test_methods += len(ti["standalone_tests"])
+        suite_skipped += len(ti["skipped_standalone_tests"])
+        for cls in ti["classes"]:
+            suite_test_methods += len(cls["test_methods"])
+            suite_skipped += len(cls["skipped_methods"])
 
     output = {
         "project_root": str(project_root),
@@ -357,12 +388,11 @@ def main() -> None:
             "coverage_percentage": (
                 round(100 * tested / total_source, 1) if total_source else 0
             ),
-            "total_test_methods": sum(
-                sc["test_method_count"] for sc in source_coverage
-            ),
-            "total_skipped_tests": sum(
-                sc["skipped_test_count"] for sc in source_coverage
-            ),
+            # Every test function and method in every test file found
+            # (pytest-style module-level functions and plain-class methods
+            # included), skipped ones excluded; correlated or not.
+            "total_test_methods": suite_test_methods,
+            "total_skipped_tests": suite_skipped,
             # Non-empty when the tests were found OUTSIDE the scanned tree, so a
             # reader can tell "this package has no tests" from "the tests live
             # somewhere else and the scope missed them".

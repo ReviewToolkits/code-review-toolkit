@@ -26,8 +26,9 @@ Parse the JSON output. This gives you the complete source↔test file mapping, t
 Key fields:
 - `untested_sources`: source files with no corresponding tests
 - `source_coverage`: per-file test correspondence with `test_method_count`, `public_surface_size`, `has_tests`
-- `summary`: aggregate statistics (source files, test files, coverage percentage, total test methods, skipped tests)
-- `test_details`: per-test-file class/method inventory including `skipped_methods`
+- `summary`: aggregate statistics (source files, test files, coverage percentage, total test methods, skipped tests).
+  `total_test_methods` / `total_skipped_tests` count the whole suite found (pytest-style module-level `test*` functions and plain-class methods included), not only correlated files
+- `test_details`: per-test-file class/method inventory including `skipped_methods` and `skipped_standalone_tests`
 
 ## External Tool Integration
 
