@@ -3234,6 +3234,156 @@ def _first_await(stmts: list[ast.stmt]) -> ast.AST | None:
     return None
 
 
+_CONTAINER_FACTORIES = frozenset(
+    {
+        "dict",
+        "list",
+        "set",
+        "collections.defaultdict",
+        "collections.OrderedDict",
+        "collections.deque",
+        "collections.Counter",
+        "weakref.WeakValueDictionary",
+        "weakref.WeakKeyDictionary",
+        "weakref.WeakSet",
+    }
+)
+
+
+def _module_state(p: Project) -> list[dict]:
+    """Process-global state: the starting point for a re-entrancy review.
+
+    Module-level instances of project classes (singletons), module-level
+    containers that some function mutates, and globals a function rebinds
+    (`global _client; _client = Client()`). Listed whether or not any lock is
+    involved: in a project with no threads, a second in-process call (a test
+    runner, an embedding application, a server) is the concurrency.
+    """
+    out: list[dict] = []
+    for mod in p.modules.values():
+        defined: dict[str, tuple[str, str, int]] = {}  # name -> (kind, class, line)
+        for stmt in mod.tree.body:
+            if isinstance(stmt, ast.Assign):
+                targets, value = stmt.targets, stmt.value
+            elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+                targets, value = [stmt.target], stmt.value
+            else:
+                continue
+            for tgt in targets:
+                if not isinstance(tgt, ast.Name) or tgt.id in mod.lock_globals:
+                    continue
+                kind, cls = "", ""
+                if isinstance(value, ast.Call):
+                    cls_key = p.resolve_class(mod, value.func)
+                    if cls_key and not p.classes[cls_key].is_lock_class:
+                        kind, cls = "instance", cls_key.split(":", 1)[-1]
+                    elif p.qualify(mod, value.func) in _CONTAINER_FACTORIES:
+                        kind = "container"
+                elif isinstance(
+                    value,
+                    (
+                        ast.Dict,
+                        ast.List,
+                        ast.Set,
+                        ast.DictComp,
+                        ast.ListComp,
+                        ast.SetComp,
+                    ),
+                ):
+                    kind = "container"
+                else:
+                    kind = "value"
+                defined[tgt.id] = (kind, cls, stmt.lineno)
+        if not defined:
+            continue
+        importers = {mod.name: {n: n for n in defined}}
+        for other in p.modules.values():
+            if other is mod:
+                continue
+            names = {
+                alias: target.rsplit(".", 1)[-1]
+                for alias, target in other.imports.items()
+                if target.rsplit(".", 1)[0] == mod.name
+                and target.rsplit(".", 1)[-1] in defined
+            }
+            if names:
+                importers[other.name] = names
+        mutated: dict[str, set[str]] = {}
+        rebound: dict[str, set[str]] = {}
+        used: dict[str, set[str]] = {}
+        for func in p.funcs.values():
+            names = importers.get(func.module)
+            if not names:
+                continue
+            declared = {
+                n
+                for node in _walk_scope(func.node)
+                if isinstance(node, ast.Global)
+                for n in node.names
+            }
+            local = {
+                node.id
+                for node in _walk_scope(func.node)
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+            } | {a.arg for a in ast.walk(func.node.args) if isinstance(a, ast.arg)}
+            for node in _walk_scope(func.node):
+                if not isinstance(node, ast.Name) or node.id not in names:
+                    continue
+                name = names[node.id]
+                if isinstance(node.ctx, ast.Store):
+                    if node.id in declared:
+                        rebound.setdefault(name, set()).add(func.qualname)
+                    continue
+                if node.id in local and node.id not in declared:
+                    continue
+                used.setdefault(name, set()).add(func.qualname)
+            for node in _walk_scope(func.node):
+                base = None
+                if isinstance(node, (ast.Subscript,)) and isinstance(
+                    node.ctx, (ast.Store, ast.Del)
+                ):
+                    base = node.value
+                elif (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in _MUTATING_METHODS
+                ):
+                    base = node.func.value
+                if (
+                    isinstance(base, ast.Name)
+                    and base.id in names
+                    and (base.id not in local or base.id in declared)
+                ):
+                    mutated.setdefault(names[base.id], set()).add(func.qualname)
+        for name, (kind, cls, line) in defined.items():
+            entry = None
+            if name in rebound:
+                entry = {"kind": "rebound", "by": sorted(rebound[name])}
+            elif kind == "instance":
+                entry = {
+                    "kind": "instance",
+                    "class": cls,
+                    "by": sorted(used.get(name, ())),
+                }
+            elif kind == "container" and name in mutated:
+                entry = {"kind": "container", "by": sorted(mutated[name])}
+            if entry is None:
+                continue
+            by = entry.pop("by")
+            out.append(
+                {
+                    "name": f"{mod.name}:{name}",
+                    "file": mod.rel,
+                    "line": line,
+                    **entry,
+                    "functions": by[:10],
+                    "function_count": len(by),
+                }
+            )
+    out.sort(key=lambda e: (e["file"], e["line"]))
+    return out
+
+
 # --------------------------------------------------------------------------
 # Driver
 # --------------------------------------------------------------------------
@@ -3355,6 +3505,7 @@ def analyze(
         for kind in mod.lock_globals.values():
             lock_kinds[kind] = lock_kinds.get(kind, 0) + 1
 
+    module_state = _module_state(project)
     result = build_envelope(project_root, scan_root, files_total, len(files))
     result["summary"] = {
         "total_findings": len(findings),
@@ -3387,6 +3538,7 @@ def analyze(
             if v is None and (items := _yield_with_items(project.funcs[k].node))
         ),
         "guards_inferred": len(guards),
+        "module_state_entries": len(module_state),
         "slow_locks": sorted(k.split(":", 1)[-1] for k in summaries.slow_locks),
         # File I/O and pipe waits under a lock: mostly by design, so summarized
         # per lock instead of one finding each (--all-blocking lists them).
@@ -3397,6 +3549,7 @@ def analyze(
         },
     }
     result["guards"] = guards
+    result["module_state"] = module_state
     result["findings"] = findings
     return result
 

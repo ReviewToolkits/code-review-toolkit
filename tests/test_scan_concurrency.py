@@ -1360,6 +1360,64 @@ class TestSignalHandlers(unittest.TestCase):
         self.assertEqual(of(scan(src), self.shape), [])
 
 
+class TestModuleState(unittest.TestCase):
+    """The re-entrancy starting point when the guard map is empty."""
+
+    def test_inventory(self):
+        files = {
+            "pkg/settings.py": """
+            import threading
+
+            class Settings:
+                def load(self):
+                    return {}
+
+            SETTINGS = Settings()
+            _registry = {}
+            DEFAULTS = {"timeout": 5}
+            _client = None
+            _lock = threading.Lock()
+
+            def register(name, fn):
+                _registry[name] = fn
+
+            def get_client():
+                global _client
+                if _client is None:
+                    _client = object()
+                return _client
+
+            def timeout():
+                return DEFAULTS["timeout"]
+
+            def shadow():
+                _registry = {}
+                _registry["x"] = 1
+            """,
+            "pkg/cli.py": """
+            from pkg.settings import SETTINGS, _registry
+
+            def run():
+                SETTINGS.load()
+                _registry.clear()
+            """,
+        }
+        result = scan_project(files)
+        state = {e["name"]: e for e in result["module_state"]}
+        self.assertEqual(
+            set(state),
+            {"pkg.settings:SETTINGS", "pkg.settings:_registry", "pkg.settings:_client"},
+        )
+        self.assertEqual(state["pkg.settings:SETTINGS"]["kind"], "instance")
+        self.assertEqual(state["pkg.settings:SETTINGS"]["functions"], ["run"])
+        self.assertEqual(state["pkg.settings:_registry"]["kind"], "container")
+        self.assertEqual(
+            state["pkg.settings:_registry"]["functions"], ["register", "run"]
+        )
+        self.assertEqual(state["pkg.settings:_client"]["kind"], "rebound")
+        self.assertEqual(result["summary"]["module_state_entries"], 3)
+
+
 class TestEnvelopeAndOptions(unittest.TestCase):
     def test_envelope_and_summary(self):
         result = scan_project({"pkg/mod.py": "x = 1\n"})
