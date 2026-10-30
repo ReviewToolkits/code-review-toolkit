@@ -96,12 +96,21 @@ _ASSERT_INVARIANT_MAP: dict[str, str] = {
 # pytest patterns
 _PYTEST_RAISES_NAMES = {"raises", "warns", "deprecated_call"}
 
-# High-signal test name patterns
-_HIGH_SIGNAL_PATTERNS = re.compile(
-    r"(?:error|invalid|empty|none|null|negative|overflow|underflow|"
-    r"boundary|edge|corner|fail|crash|corrupt|malform|bad|broken|"
-    r"cleanup|close|teardown|shutdown|concurrent|thread|async|race)",
-    re.IGNORECASE,
+# High-signal words in a test's (or its file's) name, matched as prefixes of
+# underscore-separated words: `race` matches `races` but not `trace`.
+_HIGH_SIGNAL_WORDS = (
+    "error", "invalid", "empty", "none", "null", "negative", "overflow",
+    "underflow", "boundary", "edge", "corner", "fail", "crash", "corrupt",
+    "malform", "bad", "broken", "cleanup", "close", "teardown", "shutdown",
+    "concurren", "thread", "async", "race", "cancel", "timeout", "retr",
+    "recover", "rollback", "deadlock", "lock", "leak", "reject",
+)
+# The subset naming failure modes that tests rarely cover and reviews rarely
+# find unaided (races, lost cancellations, partial rollbacks): within the
+# error/boundary tier these are selected first.
+_STRONG_SIGNAL_WORDS = (
+    "concurren", "thread", "race", "cancel", "timeout", "retr", "recover",
+    "rollback", "deadlock", "lock", "leak", "crash", "corrupt",
 )
 
 
@@ -960,45 +969,89 @@ def _similarity_reason(
 # Test selection (three-tier)
 # ---------------------------------------------------------------------------
 
-def _is_high_signal_test(name: str) -> bool:
-    """Check if test name matches high-signal patterns."""
-    return bool(_HIGH_SIGNAL_PATTERNS.search(name))
+def _is_high_signal_test(name: str, file: str = "") -> bool:
+    """True when the test's name, or its file's name, uses failure vocabulary.
+
+    Matched per underscore-separated word, by prefix (`race` matches `races`
+    but not `trace`), so `test_cache_race.py` marks every test in it.
+    """
+    return any(w.startswith(_HIGH_SIGNAL_WORDS) for w in _name_words(name, file))
+
+
+def _name_words(name: str, file: str = "") -> list[str]:
+    return _tokens(name) + (_tokens(Path(file).stem) if file else [])
+
+
+def _is_strong_signal_test(name: str, file: str = "") -> bool:
+    return any(w.startswith(_STRONG_SIGNAL_WORDS) for w in _name_words(name, file))
+
+
+# Bug-fix commit subjects: whole words (`fix`, `fixes`, `[fix]`) and word
+# prefixes, so `prefix` or `dispatch` do not count.
+_FIX_COMMIT_RE = re.compile(
+    r"\b(?:fix|bug|crash|leak|error|patch|regress|race|cancel|rollback|"
+    r"concurren|lock|deadlock|timeout|thread)",
+    re.IGNORECASE,
+)
+
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", re.MULTILINE)
+_BUG_FIX_LIST_CAP = 15
+
+
+def _git(args: list[str], cwd: Path, timeout: int = 10) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", *args], capture_output=True, text=True, timeout=timeout,
+            cwd=str(cwd), check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _tests_touched(source: str, added: list[tuple[int, int]]) -> list[str]:
+    """Names of the test functions whose body overlaps an added line range."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return []
+    names: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not node.name.startswith("test"):
+            continue
+        first = min([node.lineno] + [d.lineno for d in node.decorator_list])
+        last = node.end_lineno or node.lineno
+        if any(start <= last and end >= first for start, end in added):
+            names.append(node.name)
+    return names
 
 
 def _get_bug_fix_tests(
     test_files: list[Path], project_root: Path
 ) -> tuple[list[dict], int]:
-    """Identify tests added/modified in bug-fix commits using git.
+    """Identify the tests that bug-fix commits added or changed, using git.
 
-    Returns ``(capped_list, true_total)`` -- the caller reports both, so a
-    reader cannot mistake the cap for a measurement.
+    A commit counts as a fix when its subject uses fix vocabulary (see
+    `_FIX_COMMIT_RE`). For each test file it touched, the diff's added lines
+    name the test functions it changed (`test_functions`, with
+    `attribution: "function"`); when no test function was touched (a fixture
+    or helper changed) the entry keeps `test_functions: []` and
+    `attribution: "file"`. Returns ``(entries, total)``; the caller caps the
+    list it prints, never the list it selects from.
     """
-    try:
-        result = subprocess.run(
-            ["git", "log", "--oneline", "--diff-filter=AM",
-             "--format=%H %s", "-100", "--", "*.py"],
-            capture_output=True, text=True, timeout=30,
-            cwd=str(project_root),
-        )
-        if result.returncode != 0:
-            return [], 0
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    log = _git(
+        ["log", "--format=%H %s", "-100", "--", "*.py"], project_root, timeout=30
+    )
+    if log is None:
         return [], 0
 
     fix_commits: list[tuple[str, str]] = []
-    for line in result.stdout.strip().split("\n"):
-        if not line:
-            continue
-        parts = line.split(" ", 1)
-        if len(parts) < 2:
-            continue
-        sha, msg = parts
-        msg_lower = msg.lower()
-        if any(kw in msg_lower for kw in ("fix", "bug", "crash", "leak", "error", "patch")):
+    for line in log.strip().split("\n"):
+        sha, _, msg = line.partition(" ")
+        if sha and msg and _FIX_COMMIT_RE.search(msg):
             fix_commits.append((sha, msg))
-
-    if not fix_commits:
-        return [], 0
 
     test_rel_paths = set()
     for tf in test_files:
@@ -1009,25 +1062,54 @@ def _get_bug_fix_tests(
 
     bug_fix_tests: list[dict] = []
     for sha, msg in fix_commits[:30]:
-        try:
-            diff_result = subprocess.run(
-                ["git", "diff-tree", "--no-commit-id", "-r", "--name-only", sha],
-                capture_output=True, text=True, timeout=10,
-                cwd=str(project_root),
-            )
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            continue
+        changed = _git(
+            ["diff-tree", "--no-commit-id", "-r", "--name-only", sha], project_root
+        )
+        for changed_file in (changed or "").strip().split("\n"):
+            if changed_file not in test_rel_paths:
+                continue
+            diff = _git(["show", "-U0", "--format=", sha, "--", changed_file],
+                        project_root) or ""
+            added = [
+                (int(start), int(start) + max(int(count or 1), 1) - 1)
+                for start, count in _HUNK_RE.findall(diff)
+                if count != "0"
+            ]
+            at_commit = _git(["show", f"{sha}:{changed_file}"], project_root) or ""
+            functions = _tests_touched(at_commit, added)
+            bug_fix_tests.append({
+                "test_file": changed_file,
+                "fix_commit": sha[:8],
+                "fix_message": msg[:120],
+                "test_functions": functions,
+                "attribution": "function" if functions else "file",
+            })
 
-        for changed_file in diff_result.stdout.strip().split("\n"):
-            if changed_file in test_rel_paths:
-                bug_fix_tests.append({
-                    "test_file": changed_file,
-                    "fix_commit": sha[:8],
-                    "fix_message": msg[:120],
-                })
+    return bug_fix_tests, len(bug_fix_tests)
 
-    # Caller records the total; see `bug_fix_tests_total` in the envelope.
-    return bug_fix_tests[:15], len(bug_fix_tests)
+
+def _round_robin(tests: list[dict], file_rank=None) -> list[dict]:
+    """Interleave tests across files, keeping each file's own order.
+
+    Without this the alphabetically first files fill every slot of a tier.
+    *file_rank* (file → sort key) orders the files; it matters whenever a
+    tier spans more files than it has slots.
+    """
+    by_file: dict[str, list[dict]] = {}
+    for t in tests:
+        by_file.setdefault(t.get("file", ""), []).append(t)
+    files = list(by_file)
+    if file_rank is not None:
+        files.sort(key=file_rank)
+    queues = [by_file[f] for f in files]
+    out: list[dict] = []
+    depth = 0
+    while len(out) < len(tests):
+        for queue in queues:
+            if depth < len(queue):
+                out.append(queue[depth])
+        depth += 1
+    return out
 
 
 def select_tests(
@@ -1038,13 +1120,23 @@ def select_tests(
     """Select high-value tests using three-tier prioritization.
 
     Each item in test_info is {file, function, line, assertions, ...}.
-    Returns selected subset with selection_tier added.
+    Returns selected subset with selection_tier added. Within a tier, tests
+    are taken round-robin across files.
     """
     tier1: list[dict] = []  # bug-fix tests
     tier2: list[dict] = []  # error/boundary tests
     tier3: list[dict] = []  # remaining tests
 
-    fix_test_files = {bt["test_file"] for bt in bug_fix_tests}
+    # Tests a fix changed, by name; whole files only where the fix touched
+    # no test function (or the entry predates function attribution).
+    fix_functions = {
+        (bt["test_file"], fn)
+        for bt in bug_fix_tests
+        for fn in bt.get("test_functions") or ()
+    }
+    fix_files = {
+        bt["test_file"] for bt in bug_fix_tests if not bt.get("test_functions")
+    }
 
     for t in test_info:
         # Skip tests with only implementation-detail assertions
@@ -1054,14 +1146,29 @@ def select_tests(
 
         rel_file = t.get("file", "")
 
-        if rel_file in fix_test_files:
+        if (rel_file, t.get("function")) in fix_functions or rel_file in fix_files:
             tier1.append({**t, "selection_tier": "bug_fix"})
-        elif _is_high_signal_test(t.get("function", "")) or any(
+        elif _is_high_signal_test(t.get("function", ""), rel_file) or any(
             a["invariant_type"] == "error_condition" for a in behavioral
         ):
             tier2.append({**t, "selection_tier": "error_boundary"})
         else:
             tier3.append({**t, "selection_tier": "general"})
+
+    # Concurrency/cancellation/rollback tests first within tier 2, then the
+    # rest; each group round-robin across files.
+    # Files whose own name carries the signal (`test_cache_race.py`) first.
+    strong = [t for t in tier2 if _is_strong_signal_test(t["function"], t["file"])]
+    weak = [t for t in tier2 if not _is_strong_signal_test(t["function"], t["file"])]
+    tier2 = _round_robin(
+        strong, lambda f: not _is_strong_signal_test("", f)
+    ) + _round_robin(weak)
+    # Bug-fix files in commit order, newest fix first.
+    newest_fix: dict[str, int] = {}
+    for i, bt in enumerate(bug_fix_tests):
+        newest_fix.setdefault(bt["test_file"], i)
+    tier1 = _round_robin(tier1, lambda f: newest_fix.get(f, len(newest_fix)))
+    tier3 = _round_robin(tier3)
 
     # Distribute quota: 10/10/10 by default, redistribute if any tier is short
     quota1 = min(len(tier1), max_tests // 3)
@@ -1227,8 +1334,10 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
             test_files, project_root
         )
 
-    # Select high-value tests
+    # Select high-value tests from ALL bug-fix tests; only the printed list
+    # is capped.
     selected = select_tests(all_test_info, bug_fix_tests, max_tests=30)
+    bug_fix_tests = bug_fix_tests[:_BUG_FIX_LIST_CAP]
 
     # For each selected test with a resolved tested function, find similar functions
     invariants: list[dict] = []
@@ -1320,7 +1429,7 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
             "untested_similar_functions_capped": untested_similar_total > 20,
             "bug_fix_tests_found": len(bug_fix_tests),
             "bug_fix_tests_total": bug_fix_tests_total,
-            "bug_fix_tests_capped": bug_fix_tests_total > 15,
+            "bug_fix_tests_capped": bug_fix_tests_total > _BUG_FIX_LIST_CAP,
         },
         "invariants": invariants,
         "bug_fix_tests": bug_fix_tests,

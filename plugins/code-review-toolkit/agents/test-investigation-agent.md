@@ -35,7 +35,11 @@ Parse the JSON output. Key fields:
   owned by one candidate only), `constructor`, `test_name_convention`, `first_call`. `result_asserted` says the test
   checks that call's outcome; `via_helper` that the call is made inside a helper in the test file. Treat the last four
   methods as hints and read the test before relying on them
-- `bug_fix_tests[]`: Tests associated with bug-fix commits (highest signal)
+- `bug_fix_tests[]`: Tests associated with bug-fix commits (highest signal). Each entry names the `test_functions` the
+  fix added or changed (`attribution: "function"`); `attribution: "file"` with an empty list means the fix touched only
+  fixtures or helpers in that file. The list is capped (`bug_fix_tests_total` is the real count), but selection draws
+  from all of them. Within each tier, tests are taken round-robin across files; concurrency, cancellation, rollback,
+  lock and timeout tests come first in the error/boundary tier
 - `untested_similar_functions[]`: Functions similar to tested ones but with no tests
 - `summary`: Aggregate statistics
 - `status`, `test_discovery`, `warnings`: where the tests came from. When the scope (e.g. `pkg/`) holds no tests, the script

@@ -496,5 +496,127 @@ class TestResolveTestedFunction(unittest.TestCase):
         self.assertIsNone(_tested(result, "test_dim_mismatch_is_rejected"))
 
 
+def _t(name: str, file: str, inv_type: str = "equality") -> dict:
+    return {
+        "file": file,
+        "function": name,
+        "line": 1,
+        "assertions": [{"invariant_type": inv_type, "is_implementation_detail": False}],
+    }
+
+
+class TestSelectionSpread(unittest.TestCase):
+    """Selection is not alphabetical and knows concurrency vocabulary."""
+
+    def test_round_robin_across_files(self):
+        tests = [_t(f"test_invalid_{i}", "tests/test_a.py") for i in range(5)]
+        tests += [_t(f"test_invalid_{i}", "tests/test_b.py") for i in range(5)]
+        selected = mod.select_tests(tests, [], max_tests=2)
+        self.assertEqual(
+            sorted(s["file"] for s in selected),
+            ["tests/test_a.py", "tests/test_b.py"],
+        )
+
+    def test_file_name_carries_signal(self):
+        tests = [
+            _t("test_get_returns_value", "tests/test_cache_race.py"),
+            # True negative: `race` inside `trace` is not the word race.
+            _t("test_get_returns_value", "tests/test_trace.py"),
+        ]
+        tiers = {
+            s["file"]: s["selection_tier"]
+            for s in mod.select_tests(tests, [], max_tests=30)
+        }
+        self.assertEqual(tiers["tests/test_cache_race.py"], "error_boundary")
+        self.assertEqual(tiers["tests/test_trace.py"], "general")
+
+    def test_concurrency_words_selected_before_generic_error_words(self):
+        tests = [_t("test_invalid_name", "tests/test_a.py", "error_condition")]
+        tests += [
+            _t(name, "tests/test_z.py", "error_condition")
+            for name in (
+                "test_cancelled_request_keeps_slot",
+                "test_rollback_on_failure",
+                "test_does_not_deadlock",
+                "test_lock_released_after_timeout",
+            )
+        ]
+        selected = mod.select_tests(tests, [], max_tests=1)
+        self.assertEqual(selected[0]["file"], "tests/test_z.py")
+
+    def test_bug_fix_tier_is_per_function(self):
+        tests = [
+            _t("test_old_behaviour", "tests/test_a.py"),
+            _t("test_regression_for_fix", "tests/test_a.py"),
+        ]
+        fixes = [{
+            "test_file": "tests/test_a.py",
+            "fix_commit": "abc",
+            "fix_message": "fix: x",
+            "test_functions": ["test_regression_for_fix"],
+            "attribution": "function",
+        }]
+        tiers = {
+            s["function"]: s["selection_tier"]
+            for s in mod.select_tests(tests, fixes, max_tests=30)
+        }
+        self.assertEqual(tiers["test_regression_for_fix"], "bug_fix")
+        self.assertEqual(tiers["test_old_behaviour"], "general")
+
+    def test_fix_commit_vocabulary(self):
+        for subject in (
+            "[fix] handle empty input",
+            "Avoid a deadlock when closing the pool",
+            "Close the race between flush and read",
+            "Roll back on cancel: rollback partial writes",
+            "Bound the request timeout",
+        ):
+            self.assertTrue(mod._FIX_COMMIT_RE.search(subject), subject)
+        for subject in ("Add a prefix option", "Refactor the dispatch table"):
+            self.assertIsNone(mod._FIX_COMMIT_RE.search(subject), subject)
+
+
+def _git(root, *args, env=None):
+    import os
+    import subprocess
+
+    full_env = dict(os.environ)
+    full_env.update({
+        "GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@example.com",
+    })
+    subprocess.run(
+        ["git", *args], cwd=str(root), capture_output=True, check=True, env=full_env,
+    )
+
+
+class TestBugFixAttribution(unittest.TestCase):
+    """A fix commit marks the test functions it added, not the whole file."""
+
+    def test_added_test_function_is_named(self):
+        old = (
+            "def test_existing():\n"
+            "    assert True\n"
+        )
+        new = old + (
+            "\n"
+            "\n"
+            "def test_flush_race_regression():\n"
+            "    assert True\n"
+        )
+        with TempProject({"pkg/core.py": "X = 1\n", "tests/test_core.py": old}) as root:
+            _git(root, "init", "-q", "-b", "main")
+            _git(root, "add", "-A")
+            _git(root, "commit", "-q", "-m", "Add core")
+            (root / "tests/test_core.py").write_text(new, encoding="utf-8")
+            _git(root, "commit", "-q", "-am", "Fix the flush race")
+            entries, total = mod._get_bug_fix_tests(
+                [root / "tests/test_core.py"], root
+            )
+        self.assertEqual(total, 1)
+        self.assertEqual(entries[0]["test_functions"], ["test_flush_race_regression"])
+        self.assertEqual(entries[0]["attribution"], "function")
+
+
 if __name__ == "__main__":
     unittest.main()
