@@ -724,6 +724,74 @@ class TestTemplateReferences(unittest.TestCase):
         test_only = {u["name"] for u in out["referenced_only_from_tests"]}
         self.assertIn("Run.failed", test_only)
 
+
+class TestSharedMethodNames(unittest.TestCase):
+    """A call to `A._load()` must not keep an unrelated `B._load()` alive."""
+
+    FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/stores.py": (
+            "class Base:\n"
+            "    def fetch(self):\n"
+            "        return self._open()\n"
+            "class Primary(Base):\n"
+            "    def _open(self):\n"
+            "        return 1\n"
+            "    def query(self):\n"
+            "        return self._conn()\n"
+            "    def _conn(self):\n"
+            "        return 1\n"
+            "class Ledger:\n"
+            "    def _conn(self):\n"
+            "        return 2\n"
+            "    def _open(self):\n"
+            "        return 2\n"
+            "class Mirror(Base):\n"
+            "    def _open(self):\n"
+            "        return 3\n"
+            "    def _close(self):\n"
+            "        return 3\n"
+            "class Other:\n"
+            "    def _close(self):\n"
+            "        return 4\n"
+            "def close_all(item):\n"
+            "    return item._close()\n"
+        ),
+        "pkg/app.py": (
+            "from pkg.stores import Primary, Mirror, close_all\n"
+            "Primary().query()\nPrimary().fetch()\nclose_all(Mirror())\n"
+        ),
+        "tests/test_stores.py": (
+            "from pkg.stores import Ledger\n"
+            "def test_catalog():\n"
+            "    assert Ledger()._conn() == 2\n"
+        ),
+    }
+
+    def _run(self):
+        with TempProject(self.FILES) as root:
+            return _run_main(root, root / "pkg")
+
+    def test_self_call_in_an_unrelated_class_does_not_count(self):
+        out = self._run()
+        test_only = {u["name"] for u in out["referenced_only_from_tests"]}
+        unreferenced = {u["name"] for u in out["unreferenced_symbols"]}
+        self.assertIn("Ledger._conn", test_only)
+        self.assertNotIn("Primary._conn", test_only | unreferenced)
+        # No reference at all on Ledger's side either.
+        self.assertIn("Ledger._open", unreferenced)
+
+    def test_self_call_in_a_base_class_reaches_every_override(self):
+        unreferenced = {u["name"] for u in self._run()["unreferenced_symbols"]}
+        self.assertNotIn("Primary._open", unreferenced)
+        self.assertNotIn("Mirror._open", unreferenced)
+
+    def test_call_through_another_receiver_counts_for_every_class(self):
+        unreferenced = {u["name"] for u in self._run()["unreferenced_symbols"]}
+        self.assertNotIn("Mirror._close", unreferenced)
+        self.assertNotIn("Other._close", unreferenced)
+
+
 if __name__ == "__main__":
     unittest.main()
 

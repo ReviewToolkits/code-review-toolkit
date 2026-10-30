@@ -102,6 +102,17 @@ def _decorator_kind(decorators: list[ast.expr]) -> str | None:
     return None
 
 
+def _is_self_receiver(node: ast.expr) -> bool:
+    """`self`, `cls` or `super()` -- a receiver bound to the enclosing class."""
+    if isinstance(node, ast.Name):
+        return node.id in ("self", "cls")
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "super"
+    )
+
+
 def _is_inert_base(name: str) -> bool:
     last = name.rsplit(".", 1)[-1]
     return last in _INERT_BASES or last.endswith(("Error", "Exception", "Warning"))
@@ -257,21 +268,41 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
                     })
 
     # Collect all referenced names (everything used, not just defined).
+    # Attribute references are also split by receiver: `self.x` / `cls.x` /
+    # `super().x` inside a class body can only reach that class's hierarchy,
+    # while `obj.x` may reach any class.
     class _NameCollector(ast.NodeVisitor):
         def __init__(self) -> None:
             self.names: set[str] = set()
+            self.plain: set[str] = set()
+            self.other_attrs: set[str] = set()
+            self.self_attrs: dict[str, set[str]] = {}
+            self.classes: list[str] = []
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self.classes.append(node.name)
+            self.generic_visit(node)
+            self.classes.pop()
 
         def visit_Name(self, node: ast.Name) -> None:
             self.names.add(node.id)
+            self.plain.add(node.id)
             self.generic_visit(node)
 
         def visit_Attribute(self, node: ast.Attribute) -> None:
             self.names.add(node.attr)
+            if self.classes and _is_self_receiver(node.value):
+                self.self_attrs.setdefault(self.classes[-1], set()).add(node.attr)
+            else:
+                self.other_attrs.add(node.attr)
             self.generic_visit(node)
 
     collector = _NameCollector()
     collector.visit(tree)
     result["referenced_names"] = collector.names
+    result["plain_names"] = collector.plain
+    result["other_attr_refs"] = collector.other_attrs
+    result["self_attr_refs"] = collector.self_attrs
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -513,6 +544,71 @@ def _split_refs(all_files: list[dict]) -> tuple[set[str], set[str]]:
     return prod, test
 
 
+class _MethodRefs:
+    """Class-aware references for methods whose name more than one class defines.
+
+    Matching by bare name alone lets a call to `A._load()` keep an unrelated
+    `B._load()` alive. For such a shared name, a `self.`/`cls.`/`super().`
+    reference counts only for classes in the same hierarchy as the class whose
+    body contains it; a reference through any other receiver (`obj._load()`),
+    a bare name, a string or an import still counts for every class.
+    """
+
+    def __init__(self, all_files: list[dict]) -> None:
+        owners: dict[str, set[str]] = {}
+        for fa in all_files:
+            for sym in fa["defined_symbols"]:
+                if sym["type"] == "method":
+                    owners.setdefault(sym["name"].split(".")[-1], set()).add(
+                        sym["class"]
+                    )
+        self.shared = {name for name, classes in owners.items() if len(classes) > 1}
+        self.plain = {"prod": set(), "test": set()}
+        self.self_refs: dict[str, dict[str, set[str]]] = {"prod": {}, "test": {}}
+        bases: dict[str, set[str]] = {}
+        for fa in all_files:
+            bucket = "test" if fa["is_test"] else "prod"
+            self.plain[bucket] |= (
+                fa.get("plain_names", set())
+                | fa.get("other_attr_refs", set())
+                | fa.get("string_refs", set())
+            )
+            for imp in fa["imports"]:
+                if imp["is_from"]:
+                    self.plain[bucket].add(imp["module"].rsplit(".", 1)[-1])
+            for cls, names in fa.get("self_attr_refs", {}).items():
+                self.self_refs[bucket].setdefault(cls, set()).update(names)
+            for cls, names in fa.get("class_bases", {}).items():
+                bases.setdefault(cls, set()).update(n.rsplit(".", 1)[-1] for n in names)
+        self._bases = bases
+        self._children: dict[str, set[str]] = {}
+        for cls, parents in bases.items():
+            for parent in parents:
+                self._children.setdefault(parent, set()).add(cls)
+
+    def _closure(self, start: str, edges: dict[str, set[str]]) -> set[str]:
+        seen = {start}
+        stack = [start]
+        while stack:
+            for nxt in edges.get(stack.pop(), ()):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        return seen
+
+    def applies(self, sym: dict) -> bool:
+        return sym["type"] == "method" and sym["name"].split(".")[-1] in self.shared
+
+    def referenced(self, sym: dict, bucket: str) -> bool:
+        """Whether *sym* (a shared-name method) is referenced from *bucket*."""
+        name = sym["name"].split(".")[-1]
+        if name in self.plain[bucket]:
+            return True
+        cls = sym["class"]
+        related = self._closure(cls, self._bases) | self._closure(cls, self._children)
+        return any(name in self.self_refs[bucket].get(c, ()) for c in related)
+
+
 def _method_confidence(sym: dict) -> str:
     # A private method with no reference anywhere has no caller outside the
     # class either; a public one may be API used by code outside the project.
@@ -537,14 +633,20 @@ def find_unreferenced_symbols(
     origin; for this check every origin counts as a use.
     """
     prod, test = _split_refs(all_files)
-    global_refs = (
-        prod | test | set(external_refs or ()) | set(test_refs or ())
-        | set(doc_refs or ())
-    )
+    outside = set(external_refs or ()) | set(test_refs or ()) | set(doc_refs or ())
+    global_refs = prod | test | outside
+    methods = _MethodRefs(all_files)
 
     unreferenced = []
     for fa, sym, bare_name in _candidates(all_files, excluded, excluded_functions):
-        if bare_name in global_refs:
+        if methods.applies(sym):
+            if (
+                bare_name in outside
+                or methods.referenced(sym, "prod")
+                or methods.referenced(sym, "test")
+            ):
+                continue
+        elif bare_name in global_refs:
             continue
         if sym["type"] == "method":
             confidence = _method_confidence(sym)
@@ -580,13 +682,22 @@ def find_test_only_symbols(
     `unreferenced_symbols`.
     """
     prod, test = _split_refs(all_files)
-    prod |= set(external_refs or ())
+    outside_prod = set(external_refs or ())
+    prod |= outside_prod
     test |= set(test_refs or ())
     docs = set(doc_refs or ())
+    methods = _MethodRefs(all_files)
 
     test_only = []
     for fa, sym, bare_name in _candidates(all_files):
-        if fa["is_test"] or bare_name in prod or bare_name not in test:
+        if fa["is_test"] or bare_name not in test:
+            continue
+        if methods.applies(sym):
+            # A same-named method on an unrelated class does not keep this one
+            # alive in production.
+            if bare_name in outside_prod or methods.referenced(sym, "prod"):
+                continue
+        elif bare_name in prod:
             continue
         if sym.get("decorator_kind"):
             continue  # registered by its decorator: that is a production use
@@ -896,9 +1007,11 @@ def main() -> None:
         if sym["type"] == "method"
     )
 
-    # Drop per-file referenced_names to free memory.
+    # Drop per-file reference sets to free memory.
     for fa in file_analyses:
-        fa.pop("referenced_names", None)
+        for key in ("referenced_names", "plain_names", "other_attr_refs"):
+            fa.pop(key, None)
+        fa.pop("self_attr_refs", None)
 
     orphans = find_orphan_files(
         file_analyses, project_root, external_refs | test_refs | doc_refs
