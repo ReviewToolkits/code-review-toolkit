@@ -30,7 +30,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scan_common import emit  # noqa: E402
+from scan_common import emit, exit_on_help  # noqa: E402
 
 # Which top-level lists in each script's report are FINDINGS, and the fields that
 # identify one. `line` is deliberately never part of a key -- see the module
@@ -280,6 +280,7 @@ def analyze(argv: list[str]) -> dict:
 
 
 def main() -> None:
+    exit_on_help(sys.argv[1:], __doc__)
     try:
         result = analyze(sys.argv[1:])
         emit(result)

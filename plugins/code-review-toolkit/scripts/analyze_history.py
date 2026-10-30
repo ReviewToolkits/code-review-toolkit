@@ -1669,6 +1669,9 @@ def analyze(argv: list[str] | None = None) -> dict:
 
 def main() -> None:
     """Entry point."""
+    from scan_common import exit_on_help
+
+    exit_on_help(sys.argv[1:], __doc__)
     result = analyze()
     if "error" in result:
         json.dump(result, sys.stdout, indent=2)

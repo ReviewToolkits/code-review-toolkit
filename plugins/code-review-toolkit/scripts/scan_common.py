@@ -117,14 +117,39 @@ def relative_to_root(path: Path, root: Path) -> str:
         return str(path)
 
 
-def parse_common_args(argv: Sequence[str]) -> tuple[str, int]:
+HELP_FLAGS = frozenset({"-h", "--help"})
+
+
+def exit_on_help(argv: Sequence[str], doc: str | None = None) -> None:
+    """Print usage and exit 0 when *argv* asks for help; otherwise return.
+
+    Without this, ``--help`` fell into the "unknown flag, ignore it" branch and
+    ``-h`` became the target path, so asking a script for its usage silently
+    ran a full scan of the current directory. *doc* defaults to the running
+    script's module docstring, which every script opens with a ``Usage:``
+    section.
+    """
+    if not any(arg in HELP_FLAGS for arg in argv):
+        return
+    if doc is None:
+        doc = getattr(sys.modules.get("__main__"), "__doc__", None)
+    script = Path(sys.argv[0]).name if sys.argv and sys.argv[0] else "script"
+    text = (doc or "").strip() or f"Usage: python {script} [path] [--max-files N]"
+    sys.stdout.write(text + "\n")
+    sys.exit(0)
+
+
+def parse_common_args(argv: Sequence[str], doc: str | None = None) -> tuple[str, int]:
     """Parse the CLI arguments every analysis script accepts.
 
     Recognizes a single positional target path (default ``.``) and
     ``--max-files N``. Unknown ``--flags`` are ignored so individual scripts can
     add their own without re-implementing this loop. A non-integer
     ``--max-files`` exits with a JSON error rather than an unhandled traceback.
+    ``-h``/``--help`` prints *doc* (default: the running script's docstring)
+    and exits 0 without scanning -- see :func:`exit_on_help`.
     """
+    exit_on_help(argv, doc)
     max_files = 0
     positional: list[str] = []
     i = 0

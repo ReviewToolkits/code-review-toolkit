@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scan_common import (  # noqa: E402
     discover_python_files,
     find_project_root,
+    parse_common_args,
 )
 
 
@@ -161,21 +162,8 @@ def scan_file(filepath: Path, project_root: Path, use_git: bool) -> list[dict]:
 
 
 def main() -> None:
-    max_files = 0  # 0 = no limit
-    positional: list[str] = []
-    argv = sys.argv[1:]
-    i = 0
-    while i < len(argv):
-        if argv[i] == "--max-files" and i + 1 < len(argv):
-            max_files = int(argv[i + 1])
-            i += 2
-        elif argv[i].startswith("--"):
-            i += 1
-        else:
-            positional.append(argv[i])
-            i += 1
-    target = Path(positional[0]) if positional else Path(".")
-    target = target.resolve()
+    target_arg, max_files = parse_common_args(sys.argv[1:], __doc__)
+    target = Path(target_arg).resolve()
 
     project_root = find_project_root(target)
     scan_root = target if target.is_dir() else project_root

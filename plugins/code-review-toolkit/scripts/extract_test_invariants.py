@@ -704,6 +704,9 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
 
 def main() -> None:
     """CLI entry point."""
+    from scan_common import exit_on_help
+
+    exit_on_help(sys.argv[1:], __doc__)
     try:
         max_files = 0
         with_git = False
