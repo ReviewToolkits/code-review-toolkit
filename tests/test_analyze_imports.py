@@ -863,5 +863,98 @@ class TestImportTimeSideEffects(unittest.TestCase):
         )
 
 
+_DEP_FILES = {
+    "pkg/__init__.py": "",
+    "pkg/app.py": (
+        "import logging\n"
+        "import yaml\n"
+        "import toolz\n"
+        "from zope.interface import Interface\n"
+        "try:\n    import ujson\nexcept ImportError:\n    ujson = None\n"
+        "log = logging.getLogger('pkg.app')\n"
+        "EXTENSIONS = ['fancy_ext.Extension']\n"
+        "SERVER = 'pkg.app:app'\n"
+        "CONFIG = 'pkg.yaml'\n"
+        "DATA = 'yaml.dump'\n"
+    ),
+}
+
+
+class TestStringImportsAndDependencyCheck(unittest.TestCase):
+    """Modules loaded by name, and imports vs declared dependencies."""
+
+    PYPROJECT = (
+        "[project]\n"
+        'name = "demo-app"\n'
+        "dependencies = [\n"
+        '  "PyYAML>=6",\n'
+        '  "fancy-ext==1.0",\n'
+        '  "zope.interface",\n'
+        '  "unused-lib<2",\n'
+        "]\n"
+        "[project.optional-dependencies]\n"
+        'speed = ["ujson"]\n'
+    )
+
+    def _run(self, files, pyproject=None):
+        with TempProject(files) as root:
+            if pyproject is not None:
+                (root / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+            return mod.analyze(str(root))
+
+    def test_string_imports(self):
+        out = self._run(_DEP_FILES, self.PYPROJECT)
+        self.assertEqual(
+            [(e["string"], e["category"]) for e in out["string_imports"]],
+            [("fancy_ext.Extension", "external"), ("pkg.app:app", "internal")],
+        )
+
+    def test_imported_but_not_declared(self):
+        check = self._run(_DEP_FILES, self.PYPROJECT)["dependency_check"]
+        self.assertEqual(check["sources"], ["pyproject.toml"])
+        self.assertEqual(
+            check["imported_not_declared"],
+            [
+                {
+                    "top_level": "toolz",
+                    "files": ["pkg/app.py"],
+                    "conditional_only": False,
+                }
+            ],
+        )
+
+    def test_declared_but_not_imported_counts_string_loads(self):
+        check = self._run(_DEP_FILES, self.PYPROJECT)["dependency_check"]
+        self.assertEqual(
+            check["declared_not_imported"], [{"name": "unused-lib", "group": "runtime"}]
+        )
+
+    def test_conditional_import_is_flagged(self):
+        pyproject = self.PYPROJECT.replace('speed = ["ujson"]', "")
+        check = self._run(_DEP_FILES, pyproject)["dependency_check"]
+        flags = {
+            e["top_level"]: e["conditional_only"]
+            for e in check["imported_not_declared"]
+        }
+        self.assertEqual(flags, {"toolz": False, "ujson": True})
+
+    def test_setup_py_install_requires_is_read_without_running_it(self):
+        files = dict(_DEP_FILES)
+        files["setup.py"] = (
+            "from setuptools import setup\n"
+            "REQS = ['PyYAML', 'toolz', 'zope.interface', 'fancy-ext']\n"
+            "raise SystemExit('setup.py must not be executed')\n"
+            "setup(name='demo', install_requires=REQS, extras_require={'x': ['ujson']})\n"
+        )
+        check = self._run(files)["dependency_check"]
+        self.assertEqual(check["sources"], ["setup.py"])
+        self.assertEqual(check["imported_not_declared"], [])
+
+    def test_no_declaration_is_unmeasured_not_clean(self):
+        out = self._run({"pkg/__init__.py": "", "pkg/a.py": "import toolz\n"})
+        self.assertIsNone(out["dependency_check"])
+        self.assertIn("no dependency declaration", out["dependency_check_reason"])
+
+
 if __name__ == "__main__":
     unittest.main()

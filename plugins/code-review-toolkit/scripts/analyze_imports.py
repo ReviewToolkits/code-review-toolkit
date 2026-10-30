@@ -16,7 +16,9 @@ Usage:
 """
 
 import ast
+import configparser
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -536,7 +538,38 @@ def analyze_file(
 
     result["dynamic_import_sites"] = dynamic_sites
     result["import_time_side_effects"] = import_time_side_effects(tree)
+    result["string_import_candidates"] = _string_import_candidates(tree)
     return result
+
+
+# A string that names a module, optionally with an attribute: "pkg.mod.Class",
+# "pkg.mod:app". Frameworks load these by name (Jinja extensions, uvicorn
+# apps, Django settings, entry points), so the import never appears in `ast`.
+_DOTTED_STRING = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+(?::[A-Za-z_][\w.]*)?"
+)
+
+
+def _string_import_candidates(tree: ast.AST) -> list[dict]:
+    """Dotted string constants that may name a module (filtered later against
+    the project's modules and declared dependencies). Logger names are skipped:
+    `getLogger("pkg.mod")` names a logger, it imports nothing."""
+    logger_args = {
+        id(arg)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and _dotted_name(node.func).rsplit(".", 1)[-1] == "getLogger"
+        for arg in [*node.args, *(k.value for k in node.keywords)]
+    }
+    found = [
+        {"line": node.lineno, "string": node.value}
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in logger_args
+        and _DOTTED_STRING.fullmatch(node.value)
+    ]
+    return sorted(found, key=lambda c: c["line"])
 
 
 # --- import-time side effects ------------------------------------------------
@@ -1190,6 +1223,348 @@ def _cycles_in(file_adj: dict[str, set[str]]) -> list[list[str]]:
     return cycles
 
 
+# --- declared vs imported dependencies ---------------------------------------
+
+# Import names whose distribution name is not derivable by normalisation
+# (`yaml` -> `pyyaml` and `dotenv` -> `python-dotenv` are derived; these are not).
+_IMPORT_TO_DIST: dict[str, tuple[str, ...]] = {
+    "PIL": ("pillow",),
+    "bs4": ("beautifulsoup4",),
+    "sklearn": ("scikit_learn",),
+    "skimage": ("scikit_image",),
+    "cv2": ("opencv_python", "opencv_python_headless", "opencv_contrib_python"),
+    "attr": ("attrs",),
+    "Crypto": ("pycryptodome", "pycrypto"),
+    "Cryptodome": ("pycryptodomex",),
+    "git": ("gitpython",),
+    "MySQLdb": ("mysqlclient",),
+    "dns": ("dnspython",),
+    "fitz": ("pymupdf",),
+    "pkg_resources": ("setuptools",),
+    "win32api": ("pywin32",),
+    "win32con": ("pywin32",),
+    "_cffi_backend": ("cffi",),
+}
+_REQUIREMENT_NAME = re.compile(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
+
+
+def _norm_dist(name: str) -> str:
+    """PEP 503-style normalisation, with `_` as the separator."""
+    return re.sub(r"[-_.]+", "_", name).lower()
+
+
+def _requirement_name(spec: object) -> str | None:
+    if not isinstance(spec, str) or spec.lstrip().startswith(("-", "#")):
+        return None
+    match = _REQUIREMENT_NAME.match(spec)
+    return match.group(1) if match else None
+
+
+def declared_dependencies(
+    project_root: Path,
+) -> tuple[list[dict], list[str], list[str]]:
+    """``(declared, sources, notes)`` from the project's packaging metadata:
+    pyproject.toml, setup.cfg, a literal ``setup()`` call and requirements files.
+
+    Each declared entry is ``{"name", "group"}``. ``group`` is ``runtime``,
+    ``build``, ``optional:<extra>``, ``group:<name>`` (dependency groups, poetry/uv/pdm
+    dev groups) or ``file:<requirements file>``.
+    """
+    declared: list[dict] = []
+    sources: list[str] = []
+    notes: list[str] = []
+    project_name = None
+
+    def add(names, group: str) -> None:
+        for spec in names or ():
+            name = _requirement_name(spec)
+            if name:
+                declared.append({"name": name, "group": group})
+
+    pyproject = project_root / "pyproject.toml"
+    if pyproject.is_file():
+        try:
+            import tomllib
+        except ImportError:  # Python 3.10
+            tomllib = None  # type: ignore[assignment]
+            notes.append("pyproject.toml not read: tomllib needs Python 3.11+")
+        if tomllib is not None:
+            try:
+                data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                data = {}
+                notes.append(f"pyproject.toml not read: {exc}")
+            project = data.get("project", {})
+            project_name = project.get("name")
+            add(project.get("dependencies"), "runtime")
+            add(data.get("build-system", {}).get("requires"), "build")
+            for extra, names in (project.get("optional-dependencies") or {}).items():
+                add(names, f"optional:{extra}")
+            for group, names in (data.get("dependency-groups") or {}).items():
+                add([n for n in names if isinstance(n, str)], f"group:{group}")
+            tool = data.get("tool", {})
+            poetry = tool.get("poetry", {})
+            project_name = project_name or poetry.get("name")
+            add([k for k in poetry.get("dependencies", {}) if k != "python"], "runtime")
+            add(list(poetry.get("dev-dependencies", {})), "group:dev")
+            for group, body in (poetry.get("group") or {}).items():
+                add(list((body or {}).get("dependencies", {})), f"group:{group}")
+            add(tool.get("uv", {}).get("dev-dependencies"), "group:dev")
+            for group, names in (
+                tool.get("pdm", {}).get("dev-dependencies") or {}
+            ).items():
+                add(names, f"group:{group}")
+            if declared:
+                sources.append("pyproject.toml")
+
+    setup_cfg = project_root / "setup.cfg"
+    if setup_cfg.is_file():
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            parser.read(setup_cfg, encoding="utf-8")
+        except (configparser.Error, UnicodeDecodeError) as exc:
+            notes.append(f"setup.cfg not read: {exc}")
+        else:
+            before = len(declared)
+            if parser.has_option("options", "install_requires"):
+                add(parser.get("options", "install_requires").splitlines(), "runtime")
+            if parser.has_section("options.extras_require"):
+                for extra, value in parser.items("options.extras_require"):
+                    add(value.splitlines(), f"optional:{extra}")
+            if len(declared) > before:
+                sources.append("setup.cfg")
+
+    setup_py = project_root / "setup.py"
+    if setup_py.is_file():
+        before = len(declared)
+        for names, group in _setup_py_requirements(setup_py):
+            if group == "name":
+                project_name = project_name or names[0]
+                continue
+            add(names, group)
+        if len(declared) > before:
+            sources.append("setup.py")
+
+    has_runtime = any(d["group"] == "runtime" for d in declared)
+    requirement_files = sorted(project_root.glob("requirements*.txt")) + sorted(
+        (project_root / "requirements").glob("*.txt")
+    )
+    for path in requirement_files:
+        rel = str(path.relative_to(project_root))
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        group = (
+            "runtime"
+            if rel == "requirements.txt" and not has_runtime
+            else f"file:{rel}"
+        )
+        before = len(declared)
+        add(lines, group)
+        if len(declared) > before:
+            sources.append(rel)
+
+    if project_name:
+        own = _norm_dist(project_name)
+        declared = [d for d in declared if _norm_dist(d["name"]) != own]
+    return declared, sources, notes
+
+
+def _setup_py_requirements(path: Path) -> list[tuple[list[str], str]]:
+    """Literal ``install_requires`` / ``extras_require`` (and ``name``, as group
+    ``"name"``) of a ``setup()`` call, read with ``ast`` -- setup.py is never
+    executed. A module-level name bound to a literal list or dict is followed
+    once."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError, ValueError):
+        return []
+    bound = {
+        t.id: node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        for t in node.targets
+        if isinstance(t, ast.Name)
+    }
+
+    def literal(node: ast.expr | None) -> object:
+        if isinstance(node, ast.Name):
+            node = bound.get(node.id)
+        try:
+            return ast.literal_eval(node) if node is not None else None
+        except (ValueError, TypeError, SyntaxError, RecursionError):
+            return None
+
+    out: list[tuple[list[str], str]] = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call) and _dotted_name(node.func).endswith("setup")
+        ):
+            continue
+        for kw in node.keywords:
+            value = literal(kw.value)
+            if kw.arg == "name" and isinstance(value, str):
+                out.append(([value], "name"))
+            elif kw.arg == "install_requires" and isinstance(value, (list, tuple)):
+                out.append(([v for v in value if isinstance(v, str)], "runtime"))
+            elif kw.arg == "extras_require" and isinstance(value, dict):
+                for extra, names in value.items():
+                    if isinstance(names, (list, tuple)):
+                        out.append(
+                            (
+                                [v for v in names if isinstance(v, str)],
+                                f"optional:{extra}",
+                            )
+                        )
+    return out
+
+
+def _dists_for_import(
+    top: str, declared: set[str], *, exact_only: bool = False
+) -> set[str]:
+    """Declared (normalised) distributions that may provide import name *top*."""
+    n = _norm_dist(top)
+    exact = {d for d in (n, f"python_{n}", f"py{n}", f"{n}_python") if d in declared}
+    exact |= {d for d in _IMPORT_TO_DIST.get(top, ()) if d in declared}
+    if exact or exact_only:
+        return exact
+    # `zope` from `zope.interface`, `psycopg2` from `psycopg2-binary`.
+    return {d for d in declared if d.startswith(f"{n}_")}
+
+
+def dependency_check(
+    file_analyses: list[dict],
+    string_imports: list[dict],
+    project_root: Path,
+    scan_root: Path,
+) -> dict | None:
+    """Compare what the code imports with what the project declares.
+
+    Returns None when the project declares no dependencies anywhere this can
+    read, so "nothing undeclared" is never reported for an unmeasured project.
+    """
+    declared, sources, notes = declared_dependencies(project_root)
+    if not sources:
+        return None
+    names = {_norm_dist(d["name"]) for d in declared}
+    runtime = {_norm_dist(d["name"]): d for d in declared if d["group"] == "runtime"}
+
+    files_by_top: dict[str, set[str]] = {}
+    unconditional: set[str] = set()
+    for fa in file_analyses:
+        if Path(fa["file"]).name == "setup.py":
+            continue  # build-time imports, declared (if anywhere) in build-system
+        for imp in fa["imports"]:
+            top = imp["top_level"]
+            if imp["category"] != "external" or not top or imp["type_checking_only"]:
+                continue
+            files_by_top.setdefault(top, set()).add(fa["file"])
+            if not imp["conditional"]:
+                unconditional.add(top)
+
+    used: set[str] = set()
+    missing: list[dict] = []
+    for top in sorted(files_by_top):
+        dists = _dists_for_import(top, names)
+        used |= dists
+        if not dists:
+            missing.append(
+                {
+                    "top_level": top,
+                    "files": sorted(files_by_top[top]),
+                    # Only imported inside try/except ImportError: an optional
+                    # dependency, which need not be declared.
+                    "conditional_only": top not in unconditional,
+                }
+            )
+    for item in string_imports:
+        if item["category"] == "external":
+            used |= _dists_for_import(item["module"].split(".")[0], names)
+
+    unused = [
+        {"name": d["name"], "group": "runtime"}
+        for key, d in sorted(runtime.items())
+        if key not in used
+    ]
+    if scan_root != project_root:
+        notes.append(
+            "scope is narrower than the project, so a runtime dependency used "
+            "only outside it is listed in declared_not_imported"
+        )
+    notes.append(
+        "an import name that does not derive from its distribution name "
+        "appears in both lists (e.g. import `foo` from distribution `bar-foo`)"
+    )
+    notes.append(
+        "a runtime dependency loaded only by a framework or CLI (a server, a "
+        "plugin entry point) is never imported; declared_not_imported lists "
+        "candidates to check, not removals"
+    )
+    return {
+        "sources": sources,
+        "declared_count": len(declared),
+        "imported_not_declared": missing,
+        "declared_not_imported": unused,
+        "notes": notes,
+    }
+
+
+def string_imports(
+    file_analyses: list[dict],
+    all_files: list[str],
+    project_packages: set[str],
+    project_root: Path,
+) -> list[dict]:
+    """String constants that name a project module or a declared dependency.
+
+    Internal strings must resolve to a scanned module below the top package
+    (longest dotted prefix); external ones must name a declared distribution
+    the code never imports. Arbitrary dotted text ("config.yaml", "a.b") is
+    not reported.
+    """
+    modules = {module_name_for(f): f for f in all_files}
+    declared, _, _ = declared_dependencies(project_root)
+    declared_names = {_norm_dist(d["name"]) for d in declared}
+    imported = {
+        imp["top_level"]
+        for fa in file_analyses
+        for imp in fa["imports"]
+        if imp["category"] == "external" and imp["top_level"]
+    }
+    out: list[dict] = []
+    for fa in file_analyses:
+        for cand in fa.get("string_import_candidates", []):
+            module = cand["string"].split(":", 1)[0]
+            top = module.split(".")[0]
+            entry = {"file": fa["file"], "line": cand["line"], "string": cand["string"]}
+            if top in project_packages:
+                parts = module.split(".")
+                # At least `pkg.mod`: a bare package plus one unknown component
+                # is usually a file name ("pkg.yaml", "pkg.conf").
+                for i in range(len(parts), 1, -1):
+                    path = modules.get(".".join(parts[:i]))
+                    if path:
+                        out.append(
+                            {
+                                **entry,
+                                "module": ".".join(parts[:i]),
+                                "category": "internal",
+                                "resolved_file": path,
+                            }
+                        )
+                        break
+            elif (
+                top not in imported
+                and not _is_stdlib(top)
+                and _dists_for_import(top, declared_names, exact_only=True)
+            ):
+                # Only packages the code never imports: a string naming one it
+                # does import adds nothing, and is usually a file name.
+                out.append({**entry, "module": module, "category": "external"})
+    return out
+
+
 def _prefix_module(site: dict, project_root: Path) -> str | None:
     """The dotted prefix a computed dynamic import name starts with, resolved
     against the importing file when it is relative (`f".{name}"`)."""
@@ -1303,6 +1678,12 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
         for fa in file_analyses
         for site in fa.get("dynamic_import_sites", [])
     ]
+    loaded_by_name = string_imports(
+        file_analyses, all_file_paths, project_packages, project_root
+    )
+    dependencies = dependency_check(
+        file_analyses, loaded_by_name, project_root, scan_root
+    )
     side_effects = [
         {"file": fa["file"], **effect}
         for fa in file_analyses
@@ -1348,6 +1729,7 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
 
     # Prune intermediate fields from file analyses to reduce memory.
     for fa in file_analyses:
+        fa.pop("string_import_candidates", None)
         for imp in fa["imports"]:
             imp.pop("resolved_module", None)
 
@@ -1426,6 +1808,18 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
         # warning filters), directly or through a module-level function the
         # module calls on import (`via`, `call_line`).
         "import_time_side_effects": side_effects,
+        # Modules named in string constants that a framework loads by name
+        # ("pkg.ext.Extension", "pkg.app:app"). Not graph edges.
+        "string_imports": loaded_by_name,
+        # Imports vs the dependencies declared in pyproject.toml / setup.cfg /
+        # requirements*.txt. None when no declaration could be read.
+        "dependency_check": dependencies,
+        "dependency_check_reason": (
+            None
+            if dependencies is not None
+            else "no dependency declaration found (pyproject.toml, setup.cfg, "
+            "requirements*.txt, setup.py)"
+        ),
         "re_exports": re_exports,
     }
     return output
