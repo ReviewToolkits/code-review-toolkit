@@ -369,5 +369,132 @@ class TestDiscoverTestsOutsideScope(unittest.TestCase):
         self.assertEqual(result["warnings"], [])
 
 
+def _tested(result: dict, test_name: str) -> dict | None:
+    for inv in result["invariants"]:
+        if inv["function"] == test_name:
+            return inv["tested_function"]
+    raise AssertionError(f"{test_name} not selected")
+
+
+_MAPPING_SRC = {
+    "pkg/__init__.py": "from pkg.store import Store\n",
+    "pkg/store.py": (
+        "class Store:\n"
+        "    def __init__(self, path=None):\n"
+        "        self.items = []\n"
+        "\n"
+        "    def add(self, item):\n"
+        "        self.items.append(item)\n"
+        "\n"
+        "    def count(self):\n"
+        "        return len(self.items)\n"
+        "\n"
+        "    def lookup(self, key):\n"
+        "        return None\n"
+    ),
+    "pkg/core.py": "def parse(text):\n    return text\n",
+    "pkg/shapes.py": "def dim(v):\n    return len(v)\n",
+    "pkg/api.py": (
+        "from fastapi import APIRouter\n"
+        "\n"
+        "router = APIRouter()\n"
+        "\n"
+        "@router.get('/items/{item_id}')\n"
+        "def read_item(item_id):\n"
+        "    return {}\n"
+        "\n"
+        "@router.post('/items')\n"
+        "def create_item(body):\n"
+        "    return {}\n"
+    ),
+}
+
+
+class TestResolveTestedFunction(unittest.TestCase):
+    """pytest-style tests map to the code they exercise."""
+
+    def _analyze(self, tests: dict) -> dict:
+        with TempProject({**_MAPPING_SRC, **tests}) as root:
+            return mod.analyze(str(root))
+
+    def test_method_on_fixture_object(self):
+        result = self._analyze({
+            "tests/conftest.py": (
+                "import pytest\n"
+                "from pkg.store import Store\n"
+                "\n"
+                "@pytest.fixture\n"
+                "def store(tmp_path):\n"
+                "    s = Store(tmp_path)\n"
+                "    yield s\n"
+            ),
+            "tests/test_things.py": (
+                "def test_unknown_key_is_none(store):\n"
+                "    assert store.lookup('x') is None\n"
+            ),
+        })
+        tested = _tested(result, "test_unknown_key_is_none")
+        self.assertEqual(
+            (tested["function"], tested["file"], tested["match_method"]),
+            ("Store.lookup", "pkg/store.py", "method_call"),
+        )
+
+    def test_asserted_call_beats_setup_call(self):
+        result = self._analyze({
+            "tests/test_things.py": (
+                "from pkg import Store\n"
+                "\n"
+                "def test_behaviour():\n"
+                "    s = Store()\n"
+                "    s.add(1)\n"
+                "    assert s.count() == 1\n"
+            ),
+        })
+        tested = _tested(result, "test_behaviour")
+        self.assertEqual(tested["function"], "Store.count")
+        self.assertTrue(tested["result_asserted"])
+
+    def test_http_route_through_test_client(self):
+        result = self._analyze({
+            "tests/test_api.py": (
+                "def test_missing_returns_404(client):\n"
+                "    client.post('/api/items', json={})\n"
+                "    r = client.get(f'/api/items/{42}')\n"
+                "    assert r.status_code == 404\n"
+            ),
+        })
+        tested = _tested(result, "test_missing_returns_404")
+        self.assertEqual(
+            (tested["function"], tested["file"], tested["match_method"]),
+            ("read_item", "pkg/api.py", "http_route"),
+        )
+
+    def test_module_alias_call(self):
+        result = self._analyze({
+            "tests/test_core.py": (
+                "import pkg.core as c\n"
+                "\n"
+                "def test_empty_text():\n"
+                "    assert c.parse('') == ''\n"
+            ),
+        })
+        tested = _tested(result, "test_empty_text")
+        self.assertEqual(
+            (tested["function"], tested["match_method"]),
+            ("parse", "imported_call"),
+        )
+
+    def test_first_word_of_test_name_is_not_enough(self):
+        # `test_dim_*` names no function the test calls or imports: matching
+        # on the first word alone mapped it to an unrelated `dim`.
+        result = self._analyze({
+            "tests/test_api.py": (
+                "def test_dim_mismatch_is_rejected():\n"
+                "    assert 1 + 1 == 2\n"
+            ),
+        })
+        self.assertIsNone(_tested(result, "test_dim_mismatch_is_rejected"))
+
+
 if __name__ == "__main__":
     unittest.main()

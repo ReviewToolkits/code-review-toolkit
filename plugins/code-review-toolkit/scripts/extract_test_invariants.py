@@ -23,7 +23,11 @@ from scan_common import (  # noqa: E402
     discover_python_files,
     find_project_root,
 )
-from correlate_tests import find_external_tests  # noqa: E402
+from correlate_tests import (  # noqa: E402
+    build_module_index,
+    find_external_tests,
+    module_name,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -190,81 +194,633 @@ def extract_assertions(func_node: ast.FunctionDef) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Test → source mapping
 # ---------------------------------------------------------------------------
+#
+# pytest suites rarely call the code under test as a bare imported function.
+# They call methods on objects built from imported classes or by fixtures
+# (`db = Database(...)`; `def test_x(db): db.query(...)`), and drive web
+# apps through a test client (`client.post("/api/items/...")`).
+# The mapper therefore resolves calls through the test file's imports, typed
+# local variables, conftest fixtures and HTTP route decorators, and only
+# then falls back to name matching.
 
-def _extract_imports(tree: ast.Module) -> dict[str, str]:
-    """Extract import-name → module-path mapping from a module AST."""
+_HTTP_VERBS = frozenset({"get", "post", "put", "patch", "delete", "head", "options"})
+_ROUTE_DECORATORS = _HTTP_VERBS | {"route", "api_route", "websocket"}
+# One-word names too generic to identify a function from a test name alone.
+_GENERIC_TOKENS = frozenset({
+    "get", "set", "run", "add", "new", "make", "main", "call", "init", "load",
+    "save", "read", "write", "open", "close", "start", "stop", "test", "check",
+    "update", "create", "delete", "list", "is", "has", "to", "from", "do",
+})
+_SKIP_CALLS = frozenset({
+    "setUp", "tearDown", "patch", "MagicMock", "Mock", "AsyncMock",
+    "skipTest", "skipIf", "skipUnless", "raises", "warns", "fixture",
+    "parametrize", "approx", "subTest",
+})
+
+
+def _extract_imports(tree: ast.Module, package: str = "") -> dict[str, str]:
+    """Map each name an import binds to the dotted path it refers to.
+
+    `import a.b` binds `a` (to `a`); `import a.b as x` binds `x` to `a.b`;
+    `from a import b as c` binds `c` to `a.b`. Relative imports are resolved
+    against *package*.
+    """
     imports: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                name = alias.asname or alias.name
-                imports[name] = alias.name
+                if alias.asname:
+                    imports[alias.asname] = alias.name
+                else:
+                    first = alias.name.split(".")[0]
+                    imports[first] = first
         elif isinstance(node, ast.ImportFrom):
-            module = node.module or ""
+            if node.level:
+                base = package.split(".") if package else []
+                if node.level > 1:
+                    base = base[: len(base) - (node.level - 1)]
+                module = ".".join(base + ([node.module] if node.module else []))
+            else:
+                module = node.module or ""
             for alias in node.names:
+                if alias.name == "*":
+                    continue
                 name = alias.asname or alias.name
                 imports[name] = f"{module}.{alias.name}" if module else alias.name
     return imports
 
 
-def _first_significant_call(func_node: ast.FunctionDef) -> str | None:
-    """Find the first non-assertion, non-setup call in a test function body."""
-    for node in ast.walk(func_node):
-        if not isinstance(node, ast.Call):
-            continue
-        name = _get_call_name(node.func)
-        if name is None:
-            continue
-        # Skip assertions, setup, and common test helpers
-        if name.startswith("assert") or name.startswith("mock") or name in (
-            "setUp", "tearDown", "patch", "MagicMock", "Mock",
-            "skipTest", "skipIf", "skipUnless",
-        ):
-            continue
-        return name
+def _dotted_chain(node: ast.expr) -> list[str] | None:
+    """`a.b.c` as `["a", "b", "c"]`; None for anything but names/attributes."""
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return parts[::-1]
+
+
+def _tokens(name: str) -> list[str]:
+    return [t for t in name.lower().strip("_").split("_") if t]
+
+
+def _path_segments(node: ast.expr) -> list[str | None] | None:
+    """URL path segments of a str / f-string literal; None marks a wildcard."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        text = node.value
+    elif isinstance(node, ast.JoinedStr):
+        pieces = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                pieces.append(value.value)
+            else:
+                pieces.append("\0")
+        text = "".join(pieces)
+    else:
+        return None
+    if not text.startswith("/"):
+        return None
+    text = text.split("?", 1)[0]
+    return [
+        None if "\0" in seg else seg for seg in text.strip("/").split("/") if seg
+    ]
+
+
+def _template_segments(path: str) -> list[str | None]:
+    """Segments of a route template; `{param}` / `<param>` become wildcards."""
+    return [
+        None if ("{" in seg or "<" in seg) else seg
+        for seg in path.strip("/").split("/")
+        if seg
+    ]
+
+
+class SourceIndex:
+    """What a test may reach in the source tree, indexed for call resolution."""
+
+    def __init__(self, source_files: list[Path], project_root: Path):
+        self.project_root = project_root
+        self.modules = build_module_index(source_files, project_root)
+        self.functions: dict[tuple[str, str], int] = {}
+        self.classes: dict[tuple[str, str], dict] = {}
+        self.class_by_name: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        self.routes: list[dict] = []
+        self.short_names: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        self._bindings: dict[str, dict[str, str]] = {}
+        for path in source_files:
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+            except (SyntaxError, ValueError):
+                continue
+            rel = str(path.relative_to(project_root))
+            package = module_name(path, project_root)
+            if path.name != "__init__.py":
+                package = package.rpartition(".")[0]
+            self._bindings[rel] = _extract_imports(tree, package)
+            self._index_tree(tree, rel)
+
+    def _index_tree(self, tree: ast.Module, rel: str) -> None:
+        method_nodes: set[int] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                methods: dict[str, int] = {}
+                for child in node.body:
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        methods[child.name] = child.lineno
+                        method_nodes.add(id(child))
+                self.classes[(rel, node.name)] = {
+                    "line": node.lineno,
+                    "methods": methods,
+                    "bases": [
+                        chain[-1]
+                        for chain in map(_dotted_chain, node.bases)
+                        if chain
+                    ],
+                }
+                self.class_by_name[node.name].append((rel, node.name))
+                for name, line in methods.items():
+                    self.functions[(rel, f"{node.name}.{name}")] = line
+                    self.short_names[name].append((rel, f"{node.name}.{name}"))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self._index_route(node, rel)
+                if id(node) not in method_nodes and (rel, node.name) not in self.functions:
+                    self.functions[(rel, node.name)] = node.lineno
+                    self.short_names[node.name].append((rel, node.name))
+
+    def _index_route(self, node: ast.FunctionDef | ast.AsyncFunctionDef, rel: str):
+        for dec in node.decorator_list:
+            if not (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)):
+                continue
+            verb = dec.func.attr
+            if verb not in _ROUTE_DECORATORS or not dec.args:
+                continue
+            path = dec.args[0]
+            if not (isinstance(path, ast.Constant) and isinstance(path.value, str)):
+                continue
+            if not path.value.startswith("/"):
+                continue
+            if verb in _HTTP_VERBS:
+                methods = {verb}
+            else:
+                methods = {"get"}
+                for kw in dec.keywords:
+                    if kw.arg == "methods" and isinstance(kw.value, (ast.List, ast.Tuple)):
+                        methods = {
+                            e.value.lower()
+                            for e in kw.value.elts
+                            if isinstance(e, ast.Constant) and isinstance(e.value, str)
+                        }
+            self.routes.append({
+                "file": rel,
+                "line": node.lineno,
+                "function": node.name,
+                "methods": methods,
+                "segments": _template_segments(path.value),
+            })
+
+    # -- resolution ---------------------------------------------------------
+
+    def resolve_dotted(self, dotted: str, _depth: int = 0) -> tuple[str, str] | None:
+        """`pkg.mod.Class.meth` → `(file, "Class.meth")`, following re-exports."""
+        parts = dotted.split(".")
+        for i in range(len(parts), 0, -1):
+            files = self.modules.get(".".join(parts[:i]))
+            if not files:
+                continue
+            rest = parts[i:]
+            if not rest:
+                return None
+            rel = files[0]
+            qual = ".".join(rest)
+            if (rel, qual) in self.functions or (rel, rest[0]) in self.classes:
+                return rel, qual
+            # `from pkg import Thing` where pkg/__init__.py re-exports Thing.
+            binding = self._bindings.get(rel, {}).get(rest[0])
+            if binding and _depth < 3 and binding != dotted:
+                return self.resolve_dotted(
+                    ".".join([binding, *rest[1:]]), _depth + 1
+                )
+            return None
+        return None
+
+    def method(self, rel: str, cls: str, name: str, _seen=None) -> tuple[str, str] | None:
+        """`(file, "Class.name")` for *name* on *cls* or the nearest base."""
+        if (rel, f"{cls}.{name}") in self.functions:
+            return rel, f"{cls}.{name}"
+        seen = _seen or set()
+        seen.add((rel, cls))
+        info = self.classes.get((rel, cls))
+        for base in info["bases"] if info else []:
+            # Same file first, then a unique class of that name anywhere.
+            owners = [(rel, base)] if (rel, base) in self.classes else (
+                self.class_by_name.get(base, []) if len(self.class_by_name.get(base, [])) == 1 else []
+            )
+            for owner in owners:
+                if owner in seen:
+                    continue
+                found = self.method(owner[0], owner[1], name, seen)
+                if found:
+                    return found
+        return None
+
+    def match_route(self, verb: str, segments: list[str | None]) -> dict | None:
+        """The most specific route whose template is a suffix of the path."""
+        best = None
+        best_key = (0, 0)
+        for route in self.routes:
+            if verb not in route["methods"]:
+                continue
+            tmpl = route["segments"]
+            if len(tmpl) > len(segments) or not tmpl:
+                continue
+            tail = segments[len(segments) - len(tmpl):]
+            literal = 0
+            for want, got in zip(tmpl, tail):
+                if want is None or got is None:
+                    continue
+                if want != got:
+                    break
+                literal += 1
+            else:
+                key = (literal, len(tmpl))
+                if literal and key > best_key:
+                    best, best_key = route, key
+        return best
+
+
+class _TestFileContext:
+    """Per-test-file resolution state: its imports and the fixtures it sees."""
+
+    def __init__(self, path: Path, tree: ast.Module, index: SourceIndex,
+                 fixtures: dict[str, tuple[str, str]]):
+        self.index = index
+        package = module_name(path, index.project_root).rpartition(".")[0]
+        self.bindings = _extract_imports(tree, package)
+        self.fixtures = fixtures
+        self.local_functions = {
+            n.name: n
+            for n in tree.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and not n.name.startswith("test")
+        }
+        # Classes this file imports: an untyped `x.meth()` may be one of theirs.
+        self.imported_classes: list[tuple[str, str]] = []
+        for dotted in self.bindings.values():
+            hit = index.resolve_dotted(dotted)
+            if hit and hit in index.classes:
+                self.imported_classes.append(hit)
+        self.imported_files = {
+            hit[0]
+            for hit in (index.resolve_dotted(d) for d in self.bindings.values())
+            if hit
+        } | {
+            files[0]
+            for d in self.bindings.values()
+            if (files := index.modules.get(d))
+        }
+
+    def resolve_chain(self, chain: list[str]) -> tuple[str, str] | None:
+        target = self.bindings.get(chain[0])
+        if target is None:
+            return None
+        return self.index.resolve_dotted(".".join([target, *chain[1:]]))
+
+
+def _class_of_call(call: ast.expr, ctx: _TestFileContext) -> tuple[str, str] | None:
+    """The source class a call constructs, if it is one."""
+    if not isinstance(call, ast.Call):
+        return None
+    chain = _dotted_chain(call.func)
+    if not chain:
+        return None
+    hit = ctx.resolve_chain(chain)
+    if hit and hit in ctx.index.classes:
+        return hit
     return None
 
 
-def resolve_tested_function(
-    test_file: Path, func_node: ast.FunctionDef, tree: ast.Module,
-    source_functions: dict[str, list[dict]],
-) -> dict | None:
-    """Try to identify the source function being tested.
+def collect_fixture_types(
+    conftests: list[tuple[Path, ast.Module]], index: SourceIndex
+) -> dict[str, tuple[str, str]]:
+    """Map pytest fixture names to the source class they return or yield."""
+    types: dict[str, tuple[str, str]] = {}
+    for path, tree in conftests:
+        ctx = _TestFileContext(path, tree, index, {})
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            name = node.name
+            is_fixture = False
+            for dec in node.decorator_list:
+                target = dec.func if isinstance(dec, ast.Call) else dec
+                chain = _dotted_chain(target)
+                if chain and chain[-1] == "fixture":
+                    is_fixture = True
+                    if isinstance(dec, ast.Call):
+                        for kw in dec.keywords:
+                            if kw.arg == "name" and isinstance(kw.value, ast.Constant):
+                                name = str(kw.value.value)
+            if not is_fixture:
+                continue
+            local: dict[str, tuple[str, str]] = {}
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Assign) and len(sub.targets) == 1:
+                    cls = _class_of_call(sub.value, ctx)
+                    if cls and isinstance(sub.targets[0], ast.Name):
+                        local[sub.targets[0].id] = cls
+                elif isinstance(sub, (ast.Return, ast.Yield)) and sub.value is not None:
+                    cls = _class_of_call(sub.value, ctx)
+                    if cls is None and isinstance(sub.value, ast.Name):
+                        cls = local.get(sub.value.id)
+                    if cls:
+                        types[name] = cls
+    return types
 
-    Strategy: check test function name (test_X → X), then check imports,
-    then check first significant call in the test body.
+
+def _names_in(node: ast.AST) -> set[str]:
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+_RAISES_CONTEXTS = frozenset({
+    "raises", "warns", "assertRaises", "assertRaisesRegex", "assertWarns",
+    "assertWarnsRegex",
+})
+
+
+def _asserted_calls(func_node: ast.AST) -> set[int]:
+    """ids of the Call nodes whose outcome the test checks.
+
+    A call is checked when it sits inside an `assert` / `self.assertX(...)`,
+    inside a `with pytest.raises(...)` / `self.assertRaises(...)` block, or
+    when its result is bound to a name that (directly or through further
+    assignments) reaches such a check: `r = client.post(...); body = r.json();
+    assert body["ok"]`. A setup call (`cfg.set(...)`, creating the collection
+    the test then queries) is not.
     """
-    # Strategy 1: test name convention (test_foo → foo)
-    name = func_node.name
-    if name.startswith("test_"):
-        candidate = name[5:]  # strip "test_"
-        # Strip trailing qualifiers like _empty, _invalid, _returns_none
-        base = candidate.split("_")[0] if "_" in candidate else candidate
-        for full_name, locations in source_functions.items():
-            short = full_name.rsplit(".", 1)[-1] if "." in full_name else full_name
-            if short == candidate or short == base:
-                loc = locations[0]
-                return {
-                    "function": full_name,
-                    "file": loc["file"],
-                    "line": loc["line"],
-                    "match_method": "test_name_convention",
-                }
+    checked: set[int] = set()
+    checked_names: set[str] = set()
+    assigns: list[tuple[set[str], ast.expr]] = []
 
-    # Strategy 2: first significant call in the test body
-    first_call = _first_significant_call(func_node)
-    if first_call:
-        for full_name, locations in source_functions.items():
-            short = full_name.rsplit(".", 1)[-1] if "." in full_name else full_name
-            if short == first_call:
-                loc = locations[0]
-                return {
-                    "function": full_name,
-                    "file": loc["file"],
-                    "line": loc["line"],
-                    "match_method": "first_call",
-                }
+    def calls_in(node: ast.AST) -> set[int]:
+        return {id(c) for c in ast.walk(node) if isinstance(c, ast.Call)}
 
+    for node in ast.walk(func_node):
+        if isinstance(node, ast.Assert):
+            checked |= calls_in(node)
+            checked_names |= _names_in(node.test)
+        elif isinstance(node, ast.Call):
+            chain = _dotted_chain(node.func)
+            if chain and chain[-1].startswith("assert"):
+                for arg in [*node.args, *(k.value for k in node.keywords)]:
+                    checked |= calls_in(arg)
+                    checked_names |= _names_in(arg)
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                expr = item.context_expr
+                chain = _dotted_chain(expr.func) if isinstance(expr, ast.Call) else None
+                if chain and chain[-1] in _RAISES_CONTEXTS:
+                    for stmt in node.body:
+                        checked |= calls_in(stmt)
+        if isinstance(node, ast.Assign):
+            assigns.append((set().union(*map(_names_in, node.targets)), node.value))
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and node.value:
+            assigns.append((_names_in(node.target), node.value))
+    changed = True
+    while changed:
+        changed = False
+        for targets, value in assigns:
+            if targets & checked_names:
+                new = _names_in(value) - checked_names
+                if new:
+                    checked_names |= new
+                    changed = True
+    for targets, value in assigns:
+        if targets & checked_names:
+            checked |= calls_in(value)
+    return checked
+
+
+def _call_candidates(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ctx: _TestFileContext,
+    via_helper: bool = False,
+    helper_asserted: bool = False,
+) -> list[dict]:
+    """Source functions a test body calls, in source order."""
+    index = ctx.index
+    var_types: dict[str, tuple[str, str]] = {}
+    for arg in func_node.args.args + func_node.args.kwonlyargs:
+        if arg.arg in ctx.fixtures:
+            var_types[arg.arg] = ctx.fixtures[arg.arg]
+    for node in ast.walk(func_node):
+        targets: list[ast.expr] = []
+        value = None
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+            targets, value = [node.optional_vars], node.context_expr
+        cls = _class_of_call(value, ctx) if value is not None else None
+        if cls:
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    var_types[target.id] = cls
+
+    calls = sorted(
+        (n for n in ast.walk(func_node) if isinstance(n, ast.Call)),
+        key=lambda n: (n.lineno, n.col_offset),
+    )
+    checked = _asserted_calls(func_node)
+    found: list[dict] = []
+
+    def add(rel: str, qual: str, kind: str, line: int | None = None) -> None:
+        if line is None:
+            line = index.functions.get((rel, qual)) or index.classes.get(
+                (rel, qual), {}
+            ).get("line", 0)
+        found.append({
+            "function": qual, "file": rel, "line": line,
+            "match_method": kind, "via_helper": via_helper,
+            # The test checks this call's outcome (see _asserted_calls).
+            # Through a helper: whether the test checks the helper's result.
+            "result_asserted": helper_asserted if via_helper else id(call) in checked,
+        })
+
+    for call in calls:
+        func = call.func
+        chain = _dotted_chain(func)
+        if chain and chain[-1] in _SKIP_CALLS or (
+            chain and chain[-1].startswith("assert")
+        ):
+            continue
+        # client.post("/api/...") → the route handler.
+        if isinstance(func, ast.Attribute) and func.attr in _HTTP_VERBS and call.args:
+            segments = _path_segments(call.args[0])
+            if segments is not None:
+                route = index.match_route(func.attr, segments)
+                if route:
+                    add(route["file"], route["function"], "http_route", route["line"])
+                continue
+        if not chain:
+            continue
+        # var.meth() on a variable or fixture of a known source class.
+        if len(chain) == 2 and chain[0] in var_types:
+            rel, cls = var_types[chain[0]]
+            hit = index.method(rel, cls, chain[1])
+            if hit:
+                add(hit[0], hit[1], "method_call")
+                continue
+        hit = ctx.resolve_chain(chain)
+        if hit:
+            rel, qual = hit
+            if (rel, qual) in index.classes:
+                init = index.method(rel, qual, "__init__")
+                add(*(init or hit), "constructor")
+            elif (rel, qual) in index.functions:
+                add(rel, qual, "method_call" if "." in qual else "imported_call")
+            continue
+        # A helper defined in the test file: look one level inside it.
+        if len(chain) == 1 and chain[0] in ctx.local_functions and not via_helper:
+            found.extend(_call_candidates(
+                ctx.local_functions[chain[0]], ctx,
+                via_helper=True, helper_asserted=id(call) in checked,
+            ))
+            continue
+        # x.meth() on an untyped receiver, where meth belongs to a class the
+        # file imports or a fixture provides.
+        if len(chain) >= 2:
+            owners = list(dict.fromkeys(ctx.imported_classes + list(var_types.values())))
+            hits = [index.method(r, c, chain[-1]) for r, c in owners]
+            hits = list(dict.fromkeys(h for h in hits if h))
+            if len(hits) == 1:
+                add(hits[0][0], hits[0][1], "method_name_match")
+                continue
+        # Last resort: a distinctive name defined exactly once in the source
+        # (`cli.run_cli(...)` on a module a fixture reloaded).
+        name = chain[-1]
+        homes = index.short_names.get(name, [])
+        if (
+            len(homes) == 1
+            and not name.startswith("__")
+            and ("_" in name.strip("_") or len(name) >= 8)
+            and name not in ctx.local_functions
+        ):
+            add(homes[0][0], homes[0][1], "unique_name_match")
+    return found
+
+
+def resolve_tested_function(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ctx: _TestFileContext,
+) -> dict | None:
+    """Identify the source function a test exercises.
+
+    1. Among the source functions the test body calls (through imports, typed
+       variables, fixtures, HTTP routes, one level of same-file helpers), the
+       one the test's name mentions (`test_get_document_*` → `get_document`).
+    2. Otherwise, preferring real calls over constructors: the call whose
+       outcome the test asserts, then one sharing a distinctive word with the
+       test name, the most often asserted, direct over helper calls, earliest.
+    3. Otherwise the test-name convention (`test_foo_bar_*` → `foo_bar`),
+       restricted to modules the test imports unless the name is specific.
+    4. Otherwise the first bare call to a function defined exactly once.
+    """
+    index = ctx.index
+    test_tokens = _tokens(func_node.name)
+    if test_tokens and test_tokens[0] == "test":
+        test_tokens = test_tokens[1:]
+
+    def named_in_test(short: str) -> int:
+        toks = _tokens(short)
+        if not toks:
+            return 0
+        if len(toks) == 1 and (len(toks[0]) < 4 or toks[0] in _GENERIC_TOKENS):
+            return 0
+        n = len(toks)
+        for i in range(len(test_tokens) - n + 1):
+            if test_tokens[i:i + n] == toks:
+                return n
+        return 0
+
+    def overlap(short: str) -> int:
+        # Distinctive words shared with the test name (`*_on_upload` and
+        # `upload_post`).
+        return sum(
+            1 for t in _tokens(short)
+            if len(t) >= 4 and t not in _GENERIC_TOKENS and t in test_tokens
+        )
+
+    candidates = _call_candidates(func_node, ctx)
+    if candidates:
+        # How often the test checks each function's outcome: the code under
+        # test is usually the one asserted on repeatedly.
+        asserted_count: dict[tuple[str, str], int] = defaultdict(int)
+        for c in candidates:
+            if c["result_asserted"]:
+                asserted_count[(c["file"], c["function"])] += 1
+
+        def rank(item: tuple[int, dict]) -> tuple:
+            i, c = item
+            short = c["function"].rsplit(".", 1)[-1]
+            return (
+                named_in_test(short),
+                # A constructor's result is asserted on whenever any method of
+                # the object is; it is the subject only when nothing else is.
+                c["match_method"] != "constructor",
+                # Private helpers poked from a test are usually setup.
+                not short.startswith("_"),
+                c["result_asserted"],
+                overlap(short),
+                asserted_count[(c["file"], c["function"])],
+                not c["via_helper"],
+                -i,
+            )
+
+        best = max(enumerate(candidates), key=rank)[1]
+        if named_in_test(best["function"].rsplit(".", 1)[-1]):
+            return {**best, "match_method": "call_named_in_test",
+                    "call_kind": best["match_method"]}
+        return best
+
+    # 3. Name convention: the longest leading run of test-name tokens that
+    #    names a source function.
+    for n in range(len(test_tokens), 0, -1):
+        short = "_".join(test_tokens[:n])
+        homes = index.short_names.get(short, [])
+        if not homes:
+            continue
+        if n == 1 and (len(short) < 4 or short in _GENERIC_TOKENS):
+            homes = [h for h in homes if h[0] in ctx.imported_files]
+        elif n == 1:
+            imported = [h for h in homes if h[0] in ctx.imported_files]
+            homes = imported or (homes if len(homes) == 1 else [])
+        if homes:
+            rel, qual = min(homes, key=lambda h: h[0] not in ctx.imported_files)
+            return {"function": qual, "file": rel,
+                    "line": index.functions.get((rel, qual), 0),
+                    "match_method": "test_name_convention", "via_helper": False,
+                    "result_asserted": False}
+
+    # 4. A bare call to an unambiguous module-level function.
+    for call in sorted(
+        (n for n in ast.walk(func_node) if isinstance(n, ast.Call)),
+        key=lambda n: (n.lineno, n.col_offset),
+    ):
+        if isinstance(call.func, ast.Name):
+            name = call.func.id
+            if name in ctx.local_functions or name in _SKIP_CALLS:
+                continue
+            homes = [h for h in index.short_names.get(name, []) if "." not in h[1]]
+            if len(homes) == 1:
+                rel, qual = homes[0]
+                return {"function": qual, "file": rel,
+                        "line": index.functions.get((rel, qual), 0),
+                        "match_method": "first_call", "via_helper": False,
+                        "result_asserted": False}
     return None
 
 
@@ -531,12 +1087,40 @@ def select_tests(
 # Main analysis
 # ---------------------------------------------------------------------------
 
+def _conftest_trees(
+    test_file: Path, project_root: Path, cache: dict[Path, ast.Module | None]
+) -> list[tuple[Path, ast.Module]]:
+    """conftest.py files that apply to *test_file*, outermost first."""
+    chain: list[Path] = []
+    directory = test_file.parent
+    while True:
+        chain.append(directory / "conftest.py")
+        if directory == project_root or directory == directory.parent:
+            break
+        directory = directory.parent
+    found: list[tuple[Path, ast.Module]] = []
+    for path in reversed(chain):
+        if path not in cache:
+            tree = None
+            if path.is_file():
+                try:
+                    tree = ast.parse(
+                        path.read_text(encoding="utf-8", errors="replace")
+                    )
+                except (SyntaxError, ValueError):
+                    tree = None
+            cache[path] = tree
+        if cache[path] is not None:
+            found.append((path, cache[path]))
+    return found
+
+
 def _extract_all_test_info(
-    test_files: list[Path], project_root: Path,
-    source_functions: dict[str, list[dict]],
+    test_files: list[Path], project_root: Path, index: SourceIndex,
 ) -> list[dict]:
     """Extract test function info from all test files."""
     all_tests: list[dict] = []
+    conftest_cache: dict[Path, ast.Module | None] = {}
 
     for filepath in test_files:
         try:
@@ -546,6 +1130,14 @@ def _extract_all_test_info(
             continue
 
         rel = str(filepath.relative_to(project_root))
+        # Fixtures from the applicable conftest.py files, then the file's own;
+        # a nearer definition overrides an outer one, as in pytest.
+        fixtures = collect_fixture_types(
+            _conftest_trees(filepath, project_root, conftest_cache)
+            + [(filepath, tree)],
+            index,
+        )
+        ctx = _TestFileContext(filepath, tree, index, fixtures)
 
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -557,9 +1149,7 @@ def _extract_all_test_info(
             if not assertions:
                 continue
 
-            tested_func = resolve_tested_function(
-                filepath, node, tree, source_functions,
-            )
+            tested_func = resolve_tested_function(node, ctx)
 
             info: dict = {
                 "file": rel,
@@ -626,7 +1216,8 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
     source_functions = extract_source_functions(source_files, project_root)
 
     # Extract all test info
-    all_test_info = _extract_all_test_info(test_files, project_root, source_functions)
+    index = SourceIndex(source_files, project_root)
+    all_test_info = _extract_all_test_info(test_files, project_root, index)
 
     # Get bug-fix tests if git is available
     bug_fix_tests: list[dict] = []

@@ -27,7 +27,14 @@ where `<plugin_root>` is the root of the code-review-toolkit plugin directory.
 
 Parse the JSON output. Key fields:
 
-- `invariants[]`: Selected test functions with extracted assertions, invariant types, tested function mapping, and pre-computed similar functions
+- `invariants[]`: Selected test functions with extracted assertions, invariant types, tested function mapping, and pre-computed similar functions.
+  `tested_function` is `{function, file, line, match_method, via_helper, result_asserted}` or `null`. `match_method`, strongest first:
+  `call_named_in_test` (a call the test makes that its name mentions; `call_kind` says how the call resolved),
+  `method_call` (a method on an object built from an imported class or a conftest fixture), `imported_call`, `http_route`
+  (a test-client request matched to a route decorator), `method_name_match` / `unique_name_match` (the method name is
+  owned by one candidate only), `constructor`, `test_name_convention`, `first_call`. `result_asserted` says the test
+  checks that call's outcome; `via_helper` that the call is made inside a helper in the test file. Treat the last four
+  methods as hints and read the test before relying on them
 - `bug_fix_tests[]`: Tests associated with bug-fix commits (highest signal)
 - `untested_similar_functions[]`: Functions similar to tested ones but with no tests
 - `summary`: Aggregate statistics
