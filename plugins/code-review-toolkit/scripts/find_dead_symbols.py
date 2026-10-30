@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scan_common import (  # noqa: E402
+    _is_excluded,
     discover_python_files,
     find_project_root,
 )
@@ -99,6 +100,17 @@ def _decorator_kind(decorators: list[ast.expr]) -> str | None:
         if last not in _INERT_DECORATORS:
             return "decorated"
     return None
+
+
+def _is_self_receiver(node: ast.expr) -> bool:
+    """`self`, `cls` or `super()` -- a receiver bound to the enclosing class."""
+    if isinstance(node, ast.Name):
+        return node.id in ("self", "cls")
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "super"
+    )
 
 
 def _is_inert_base(name: str) -> bool:
@@ -256,21 +268,41 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
                     })
 
     # Collect all referenced names (everything used, not just defined).
+    # Attribute references are also split by receiver: `self.x` / `cls.x` /
+    # `super().x` inside a class body can only reach that class's hierarchy,
+    # while `obj.x` may reach any class.
     class _NameCollector(ast.NodeVisitor):
         def __init__(self) -> None:
             self.names: set[str] = set()
+            self.plain: set[str] = set()
+            self.other_attrs: set[str] = set()
+            self.self_attrs: dict[str, set[str]] = {}
+            self.classes: list[str] = []
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self.classes.append(node.name)
+            self.generic_visit(node)
+            self.classes.pop()
 
         def visit_Name(self, node: ast.Name) -> None:
             self.names.add(node.id)
+            self.plain.add(node.id)
             self.generic_visit(node)
 
         def visit_Attribute(self, node: ast.Attribute) -> None:
             self.names.add(node.attr)
+            if self.classes and _is_self_receiver(node.value):
+                self.self_attrs.setdefault(self.classes[-1], set()).add(node.attr)
+            else:
+                self.other_attrs.add(node.attr)
             self.generic_visit(node)
 
     collector = _NameCollector()
     collector.visit(tree)
     result["referenced_names"] = collector.names
+    result["plain_names"] = collector.plain
+    result["other_attr_refs"] = collector.other_attrs
+    result["self_attr_refs"] = collector.self_attrs
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -400,10 +432,14 @@ def _framework_classes(all_files: list[dict]) -> set[str]:
 
 
 def _candidates(
-    all_files: list[dict], excluded: dict[str, int] | None = None
+    all_files: list[dict],
+    excluded: dict[str, int] | None = None,
+    excluded_functions: dict[str, int] | None = None,
 ):
     """Yield (file_analysis, symbol, bare_name) for every symbol the dead-code
-    checks may report, counting each method left out in *excluded* by reason.
+    checks may report, counting each method left out in *excluded* by reason,
+    and each top-level function left out by its decorator in
+    *excluded_functions*.
 
     Methods were once skipped wholesale ("too noisy") while the summary still
     read `unreferenced_symbols: 0`. They are now checked, minus the shapes a
@@ -462,6 +498,15 @@ def _candidates(
             # Skip magic methods — called implicitly.
             if sym.get("is_magic"):
                 continue
+            # A registering decorator is how the function is reached:
+            # `@dispatcher.register(list)`, `@app.get("/")`, `@pytest.fixture`.
+            # This exclusion used to apply to methods only, so a top-level
+            # `singledispatch` overload was reported as high-confidence dead.
+            if sym["type"] == "function" and sym.get("decorator_kind"):
+                if excluded_functions is not None:
+                    kind = sym["decorator_kind"]
+                    excluded_functions[kind] = excluded_functions.get(kind, 0) + 1
+                continue
             # Skip test methods — called by test runner.
             if sym.get("is_test_method"):
                 continue
@@ -499,6 +544,71 @@ def _split_refs(all_files: list[dict]) -> tuple[set[str], set[str]]:
     return prod, test
 
 
+class _MethodRefs:
+    """Class-aware references for methods whose name more than one class defines.
+
+    Matching by bare name alone lets a call to `A._load()` keep an unrelated
+    `B._load()` alive. For such a shared name, a `self.`/`cls.`/`super().`
+    reference counts only for classes in the same hierarchy as the class whose
+    body contains it; a reference through any other receiver (`obj._load()`),
+    a bare name, a string or an import still counts for every class.
+    """
+
+    def __init__(self, all_files: list[dict]) -> None:
+        owners: dict[str, set[str]] = {}
+        for fa in all_files:
+            for sym in fa["defined_symbols"]:
+                if sym["type"] == "method":
+                    owners.setdefault(sym["name"].split(".")[-1], set()).add(
+                        sym["class"]
+                    )
+        self.shared = {name for name, classes in owners.items() if len(classes) > 1}
+        self.plain = {"prod": set(), "test": set()}
+        self.self_refs: dict[str, dict[str, set[str]]] = {"prod": {}, "test": {}}
+        bases: dict[str, set[str]] = {}
+        for fa in all_files:
+            bucket = "test" if fa["is_test"] else "prod"
+            self.plain[bucket] |= (
+                fa.get("plain_names", set())
+                | fa.get("other_attr_refs", set())
+                | fa.get("string_refs", set())
+            )
+            for imp in fa["imports"]:
+                if imp["is_from"]:
+                    self.plain[bucket].add(imp["module"].rsplit(".", 1)[-1])
+            for cls, names in fa.get("self_attr_refs", {}).items():
+                self.self_refs[bucket].setdefault(cls, set()).update(names)
+            for cls, names in fa.get("class_bases", {}).items():
+                bases.setdefault(cls, set()).update(n.rsplit(".", 1)[-1] for n in names)
+        self._bases = bases
+        self._children: dict[str, set[str]] = {}
+        for cls, parents in bases.items():
+            for parent in parents:
+                self._children.setdefault(parent, set()).add(cls)
+
+    def _closure(self, start: str, edges: dict[str, set[str]]) -> set[str]:
+        seen = {start}
+        stack = [start]
+        while stack:
+            for nxt in edges.get(stack.pop(), ()):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        return seen
+
+    def applies(self, sym: dict) -> bool:
+        return sym["type"] == "method" and sym["name"].split(".")[-1] in self.shared
+
+    def referenced(self, sym: dict, bucket: str) -> bool:
+        """Whether *sym* (a shared-name method) is referenced from *bucket*."""
+        name = sym["name"].split(".")[-1]
+        if name in self.plain[bucket]:
+            return True
+        cls = sym["class"]
+        related = self._closure(cls, self._bases) | self._closure(cls, self._children)
+        return any(name in self.self_refs[bucket].get(c, ()) for c in related)
+
+
 def _method_confidence(sym: dict) -> str:
     # A private method with no reference anywhere has no caller outside the
     # class either; a public one may be API used by code outside the project.
@@ -512,6 +622,7 @@ def find_unreferenced_symbols(
     test_refs: set[str] | None = None,
     doc_refs: set[str] | None = None,
     excluded: dict[str, int] | None = None,
+    excluded_functions: dict[str, int] | None = None,
 ) -> list[dict]:
     """Find functions, classes and methods defined but never referenced anywhere.
 
@@ -522,14 +633,20 @@ def find_unreferenced_symbols(
     origin; for this check every origin counts as a use.
     """
     prod, test = _split_refs(all_files)
-    global_refs = (
-        prod | test | set(external_refs or ()) | set(test_refs or ())
-        | set(doc_refs or ())
-    )
+    outside = set(external_refs or ()) | set(test_refs or ()) | set(doc_refs or ())
+    global_refs = prod | test | outside
+    methods = _MethodRefs(all_files)
 
     unreferenced = []
-    for fa, sym, bare_name in _candidates(all_files, excluded):
-        if bare_name in global_refs:
+    for fa, sym, bare_name in _candidates(all_files, excluded, excluded_functions):
+        if methods.applies(sym):
+            if (
+                bare_name in outside
+                or methods.referenced(sym, "prod")
+                or methods.referenced(sym, "test")
+            ):
+                continue
+        elif bare_name in global_refs:
             continue
         if sym["type"] == "method":
             confidence = _method_confidence(sym)
@@ -565,13 +682,22 @@ def find_test_only_symbols(
     `unreferenced_symbols`.
     """
     prod, test = _split_refs(all_files)
-    prod |= set(external_refs or ())
+    outside_prod = set(external_refs or ())
+    prod |= outside_prod
     test |= set(test_refs or ())
     docs = set(doc_refs or ())
+    methods = _MethodRefs(all_files)
 
     test_only = []
     for fa, sym, bare_name in _candidates(all_files):
-        if fa["is_test"] or bare_name in prod or bare_name not in test:
+        if fa["is_test"] or bare_name not in test:
+            continue
+        if methods.applies(sym):
+            # A same-named method on an unrelated class does not keep this one
+            # alive in production.
+            if bare_name in outside_prod or methods.referenced(sym, "prod"):
+                continue
+        elif bare_name in prod:
             continue
         if sym.get("decorator_kind"):
             continue  # registered by its decorator: that is a production use
@@ -706,6 +832,38 @@ def find_commented_code(filepath: Path, project_root: Path) -> list[dict]:
     return blocks
 
 
+# Template files read attributes and call helpers by name: `{{ order.total }}`
+# in a Jinja template is a production use no Python file shows.
+_TEMPLATE_SUFFIXES = frozenset({".html", ".htm", ".jinja", ".jinja2", ".j2"})
+_TEMPLATE_BLOCK = re.compile(r"\{\{(.*?)\}\}|\{%(.*?)%\}", re.DOTALL)
+_MAX_TEMPLATE_BYTES = 2_000_000
+
+
+def template_refs(scan_root: Path) -> tuple[set[str], list[str]]:
+    """Identifiers inside `{{ ... }}` and `{% ... %}` blocks of the template
+    files under *scan_root*, and the files read (relative to *scan_root*)."""
+    names: set[str] = set()
+    files: list[str] = []
+    for path in sorted(scan_root.rglob("*")):
+        if path.suffix.lower() not in _TEMPLATE_SUFFIXES or not path.is_file():
+            continue
+        if _is_excluded(path, scan_root):
+            continue
+        try:
+            if path.stat().st_size > _MAX_TEMPLATE_BYTES:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        found = False
+        for match in _TEMPLATE_BLOCK.finditer(text):
+            found = True
+            names |= set(_IDENTIFIER.findall(match.group(1) or match.group(2) or ""))
+        if found:
+            files.append(str(path.relative_to(scan_root)))
+    return names, files
+
+
 # Where references from outside the scanned tree come from, by kind.
 _TEST_SCOPES = ("conftest.py", "tests", "test")
 _DOC_SCOPES = ("doc", "Doc", "docs")
@@ -822,18 +980,24 @@ def main() -> None:
                     continue
                 bucket |= set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", body))
 
+    # Templates inside the scanned tree are production code too.
+    from_templates, template_files = template_refs(scan_root)
+    external_refs |= from_templates
+
     # Find issues (before converting sets to lists).
     unused_imports: list[dict] = []
     for fa in file_analyses:
         unused_imports.extend(find_unused_imports(fa))
 
     excluded_methods: dict[str, int] = {}
+    excluded_functions: dict[str, int] = {}
     unreferenced = find_unreferenced_symbols(
         file_analyses,
         external_refs,
         test_refs=test_refs,
         doc_refs=doc_refs,
         excluded=excluded_methods,
+        excluded_functions=excluded_functions,
     )
     test_only = find_test_only_symbols(
         file_analyses, external_refs, test_refs=test_refs, doc_refs=doc_refs
@@ -843,9 +1007,11 @@ def main() -> None:
         if sym["type"] == "method"
     )
 
-    # Drop per-file referenced_names to free memory.
+    # Drop per-file reference sets to free memory.
     for fa in file_analyses:
-        fa.pop("referenced_names", None)
+        for key in ("referenced_names", "plain_names", "other_attr_refs"):
+            fa.pop(key, None)
+        fa.pop("self_attr_refs", None)
 
     orphans = find_orphan_files(
         file_analyses, project_root, external_refs | test_refs | doc_refs
@@ -883,9 +1049,15 @@ def main() -> None:
             "methods_defined": methods_defined,
             "methods_excluded": sum(excluded_methods.values()),
             "methods_excluded_by_reason": dict(sorted(excluded_methods.items())),
+            # Top-level functions left out because a decorator registers them
+            # (`@dispatcher.register`, `@app.get`, `@pytest.fixture`).
+            "functions_excluded_by_reason": dict(sorted(excluded_functions.items())),
             "referenced_only_from_tests": len(test_only),
             "external_reference_scopes": external_scopes,
             "external_reference_scope_kinds": scope_kinds,
+            # Template files (Jinja/HTML) whose `{{ }}`/`{% %}` blocks were read
+            # as production references.
+            "template_files_scanned": template_files,
             "orphan_files": len(orphans),
             "commented_code_blocks": len(commented_code),
             "high_confidence_items": len(high_confidence),

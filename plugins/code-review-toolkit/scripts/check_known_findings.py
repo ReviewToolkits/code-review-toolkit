@@ -46,6 +46,10 @@ from scan_common import emit, find_project_root, load_data  # noqa: E402
 _ORDER = (
     "present",
     "present_elsewhere",
+    # The scanner still finds the candidate, but a differential now settles it
+    # (`scan_python_pitfalls` lists it under `suppressed`). The code is still
+    # there, so this is never evidence of a fix.
+    "suppressed",
     "absent_in_qualname",
     "absent",
     "out_of_scope",
@@ -187,6 +191,9 @@ def analyze(target: str, *, max_files: int = 0, catalog: str | None = None) -> d
     fresh: dict[tuple[str, str], list[dict]] = {}
     for f in scan["findings"]:
         fresh.setdefault((Path(f["file"]).name, f["shape"]), []).append(f)
+    settled: dict[tuple[str, str], list[dict]] = {}
+    for f in scan.get("suppressed") or []:
+        settled.setdefault((Path(f["file"]).name, f["shape"]), []).append(f)
 
     qual_cache: dict[Path, list[tuple[int, int, str]]] = {}
 
@@ -228,7 +235,28 @@ def analyze(target: str, *, max_files: int = 0, catalog: str | None = None) -> d
         index = index_for(path)
         qualname = qualname_at(index, lines[0]) if lines else None
         hits = fresh.get((Path(rel).name, shape), [])
+        muted = [
+            m
+            for m in settled.get((Path(rel).name, shape), [])
+            if qualname is None or qualname_at(index, m["line"]) == qualname
+        ]
+
+        def suppressed() -> dict:
+            hit = muted[0]
+            return {
+                "verdict": "suppressed",
+                "qualname": qualname,
+                "matched_at": f"{hit['file']}:{hit['line']}",
+                "note": (
+                    f"the scanner still finds this candidate, but suppresses it "
+                    f"({hit.get('reason')}); the code is unchanged, so this is "
+                    "not evidence of a fix -- check whether the differential is right"
+                ),
+            }
+
         if not hits:
+            if muted:
+                return suppressed()
             return {"verdict": "absent", "qualname": qualname, "matched_at": None}
         # Same qualname => same finding, whatever the line did.
         hit_quals = {qualname_at(index, h["line"]): h for h in hits}
@@ -239,6 +267,8 @@ def analyze(target: str, *, max_files: int = 0, catalog: str | None = None) -> d
                 "qualname": qualname,
                 "matched_at": f"{hit['file']}:{hit['line']}",
             }
+        if muted:
+            return suppressed()
         if qualname is None:
             # The catalog recorded no line, so any hit in the file is a match.
             return {
@@ -314,6 +344,8 @@ def analyze(target: str, *, max_files: int = 0, catalog: str | None = None) -> d
             # Deliberately excludes out_of_scope and not_scannable: neither was
             # looked at, so neither is evidence of anything.
             "possibly_fixed": counts["absent"] + counts["absent_in_qualname"],
+            # `suppressed` (in the counts above) is in neither: still in the
+            # code, but no longer reported.
             "not_checked": counts["out_of_scope"] + counts["not_scannable"],
         },
         "notes": [
@@ -324,6 +356,12 @@ def analyze(target: str, *, max_files: int = 0, catalog: str | None = None) -> d
             "counts above rather than reported as absent.",
             "Keyed on (file, shape, qualname), never on line numbers, so a "
             "finding whose line moved is still `present`.",
+            (
+                f"{counts['suppressed']} catalog entries are `suppressed`: the "
+                "scanner still finds them but a differential now settles them. "
+                "They are neither still-present nor possibly fixed; check "
+                "whether the suppression is right."
+            ),
         ],
         "results": results,
         "findings": still_present,

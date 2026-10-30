@@ -3,6 +3,7 @@
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
+from typing import ClassVar
 
 from helpers import TempProject, import_script
 
@@ -71,6 +72,63 @@ class TestMarkerDetection(unittest.TestCase):
         )
         skip_items = [i for i in items if i["category"] == "SKIP"]
         self.assertEqual(len(skip_items), 1)
+
+    def test_pytest_skip_spellings(self):
+        src = (
+            "import pytest\n"
+            "from pytest import mark\n"
+            "@pytest.mark.skip(reason='flaky')\n"
+            "def test_a(): pass\n"
+            "@mark.skip('later')\n"
+            "def test_b(): pass\n"
+            "@pytest.mark.skipif(True, reason='x')\n"
+            "def test_c(): pass\n"
+            "def test_d():\n"
+            "    pytest.skip('not on CI')\n"
+            "class T:\n"
+            "    def test_e(self):\n"
+            "        self.skipTest('needs network')\n"
+        )
+        items = self._scan(src, "test_mod.py")
+        self.assertEqual(
+            [(i["line"], i["category"]) for i in items],
+            [(3, "SKIP"), (5, "SKIP"), (7, "SKIP"), (10, "SKIP"), (13, "SKIP")],
+        )
+
+    def test_xfail_spellings(self):
+        src = (
+            "import pytest, unittest\n"
+            "@pytest.mark.xfail(strict=True)\n"
+            "def test_a(): pass\n"
+            "def test_b():\n    pytest.xfail('known bug')\n"
+            "@unittest.expectedFailure\n"
+            "def test_c(): pass\n"
+        )
+        items = self._scan(src, "test_mod.py")
+        self.assertEqual(
+            [(i["line"], i["category"]) for i in items],
+            [(2, "XFAIL"), (5, "XFAIL"), (6, "XFAIL")],
+        )
+
+    def test_skip_lookalikes_are_not_markers(self):
+        src = (
+            "bookmark.skip(1)\n"
+            "self.mark.skip = True\n"
+            "# pytest.skip('in a comment')\n"
+            "def skip_rows(n): pass\n"
+        )
+        self.assertEqual(self._scan(src), [])
+
+    def test_nosec_and_pylint_disable(self):
+        src = (
+            "result = eval(code)  # nosec B307\n"
+            "import pickle  # pylint: disable=import-outside-toplevel\n"
+        )
+        items = self._scan(src)
+        self.assertEqual(
+            [(i["category"], i["text"]) for i in items],
+            [("NOSEC", "B307"), ("PYLINT_DISABLE", "import-outside-toplevel")],
+        )
 
     def test_multiple_markers(self):
         items = self._scan(
@@ -278,6 +336,204 @@ class TestTrackerKeys(unittest.TestCase):
         with TempProject({"m.py": ""}) as root, self.assertRaises(SystemExit) as ctx:
             _run_main([str(root), "--key-regex", "("])
         self.assertEqual(ctx.exception.code, 2)
+
+
+_CONFIG_PROJECT = {
+    "pkg/__init__.py": "",
+    "pyproject.toml": (
+        "[project]\n"
+        'name = "demo"\n'
+        "dependencies = [\n"
+        '  "alpha==1.3.0",  # fork until upstream merges the fix\n'
+        '  "beta>=1.2,<2.0.0",\n'
+        '  "gamma>=1.0,<1.4",\n'
+        "  # pinned below 3 until the new API is adopted\n"
+        '  "delta>=2,<3",\n'
+        '  "epsilon!=2.1.0",\n'
+        '  "zeta>=1.0",\n'
+        "]\n"
+        "[tool.ruff.lint]\n"
+        "ignore = [\n"
+        '  "E501",\n'
+        '  "B008",\n'
+        "]\n"
+        "[tool.ruff.lint.per-file-ignores]\n"
+        '"tests/*" = ["S101"]\n'
+        "[tool.mypy]\n"
+        "ignore_missing_imports = true\n"
+        "ignore_errors = false\n"
+        "[tool.pytest.ini_options]\n"
+        'filterwarnings = ["error", "ignore::DeprecationWarning"]\n'
+        "[tool.codespell]\n"
+        'ignore-words-list = "te"\n'
+    ),
+    "setup.cfg": "[flake8]\nextend-ignore =\n    E203,\n    W503\nmax-line-length = 100\n",
+    "tox.ini": "[tox]\n# TODO: drop py38 once the CI image is updated\nenvlist = py310\n",
+    "requirements-lock.txt": "".join(f"pkg{i}==1.{i}\n" for i in range(25)),
+    ".github/workflows/ci.yml": (
+        "jobs:\n"
+        "  test:\n"
+        "    continue-on-error: true\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - uses: some-org/shared-action@main\n"
+        "      - uses: ./local-action\n"
+        "      - run: make lint || true\n"
+        "      # continue-on-error: true\n"
+    ),
+}
+
+
+class TestConfigDebt(unittest.TestCase):
+    """Pins, project-wide suppressions and CI failure allowances live outside
+    the .py files the marker scan reads."""
+
+    @classmethod
+    def setUpClass(cls):
+        files = dict(_CONFIG_PROJECT)
+        pyproject = files.pop("pyproject.toml")
+        with TempProject(files) as root:
+            # TempProject writes its own minimal pyproject.toml last.
+            (root / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+            cls.out = _run_main([str(root / "pkg")])
+        cls.debt = cls.out["config_debt"]
+
+    def test_pins_with_a_decision_are_listed_with_their_comment(self):
+        pins = {p["name"]: p for p in self.debt["pins"]}
+        self.assertEqual(set(pins), {"alpha", "gamma", "delta", "epsilon"})
+        self.assertEqual(pins["alpha"]["kinds"], ["exact"])
+        self.assertEqual(pins["alpha"]["comment"], "fork until upstream merges the fix")
+        self.assertEqual(
+            pins["delta"]["comment_above"],
+            "pinned below 3 until the new API is adopted",
+        )
+        self.assertEqual(pins["epsilon"]["kinds"], ["exclusion"])
+
+    def test_routine_major_caps_are_listed_compactly(self):
+        self.assertEqual(
+            self.debt["routine_caps"], ["beta>=1.2,<2.0.0 (pyproject.toml:5)"]
+        )
+
+    def test_lockfile_is_skipped_not_reported_pin_by_pin(self):
+        self.assertEqual(self.debt["skipped_lockfiles"], ["requirements-lock.txt"])
+
+    def test_project_wide_suppressions(self):
+        found = {(s["tool"], s["setting"]) for s in self.debt["suppressions"]}
+        self.assertEqual(
+            found,
+            {
+                ("ruff", "ignore"),
+                ("ruff", "tests/*"),
+                ("mypy", "ignore_missing_imports"),
+                ("pytest", "filterwarnings"),
+                ("flake8", "extend-ignore"),
+            },
+        )
+        ruff = next(s for s in self.debt["suppressions"] if s["setting"] == "ignore")
+        self.assertIn("B008", ruff["value"])
+        flake8 = next(s for s in self.debt["suppressions"] if s["tool"] == "flake8")
+        self.assertIn("W503", flake8["value"])
+
+    def test_ci_failure_allowances_and_floating_actions(self):
+        self.assertEqual(
+            [(c["line"], c["kind"]) for c in self.debt["ci"]],
+            [(3, "continue_on_error"), (6, "unpinned_action"), (8, "error_ignored")],
+        )
+
+    def test_todo_in_a_config_comment(self):
+        self.assertEqual(
+            [(m["file"], m["category"]) for m in self.debt["markers"]],
+            [("tox.ini", "TODO")],
+        )
+
+    def test_summary_counts(self):
+        self.assertEqual(
+            self.out["summary"]["config_debt"],
+            {"pins": 4, "routine_caps": 1, "suppressions": 5, "ci": 3, "markers": 1},
+        )
+
+
+class TestTrackerKeyResolution(unittest.TestCase):
+    """Done marks, changelog-only history and keys that live on branches."""
+
+    FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "ROADMAP.md": (
+            "| key | item | target |\n|---|---|---|\n"
+            "| ABC-1 | ~~Faster index~~ | v1.0 |\n"
+            "| ABC-2 | Plugin registry | v1.6 |\n"
+            "| ABC-4 | ~~Bulk export (needs ABC-2 first)~~ | v1.0 |\n"
+            "| ABC-6 | Docs site | v2.0 |\n"
+            "\n"
+            "- [x] ABC-8 ticked item, see ABC-9\n"
+            "- [ ] ABC-9 open item\n"
+        ),
+        "CHANGELOG.md": "## 1.0\n- ABC-6 first slice shipped\n- ABC-50 old fix\n",
+    }
+
+    def _tracker(self, files=None):
+        with TempProject(files or self.FILES) as root:
+            return _run_main([str(root), "--key-regex", r"\bABC-\d+\b"])["tracker_keys"]
+
+    def test_struck_task_cell_marks_the_row_key_done(self):
+        tk = self._tracker()
+        self.assertEqual(tk["open_in_planning_docs"], ["ABC-2", "ABC-9"])
+
+    def test_a_struck_row_does_not_close_a_key_it_only_mentions(self):
+        keys = {k["key"]: k for k in self._tracker()["keys"]}
+        self.assertTrue(keys["ABC-4"]["struck_through"])
+        self.assertFalse(keys["ABC-2"]["struck_through"])
+        self.assertTrue(keys["ABC-8"]["struck_through"])
+        self.assertFalse(keys["ABC-9"]["struck_through"])
+
+    def test_open_row_with_a_changelog_mention_is_a_conflicting_signal(self):
+        self.assertEqual(self._tracker()["conflicting_signals"], ["ABC-6"])
+
+    def test_changelog_only_keys_are_collapsed(self):
+        tk = self._tracker()
+        self.assertEqual(tk["changelog_only_keys"], ["ABC-50"])
+        self.assertNotIn("ABC-50", [k["key"] for k in tk["keys"]])
+        self.assertEqual(tk["summary"]["keys_only_in_changelog"], 1)
+        self.assertEqual(tk["summary"]["keys_total"], 7)
+
+    def test_branches_not_searched_without_git(self):
+        tk = self._tracker()
+        self.assertFalse(tk["unmerged_branches_searched"])
+        self.assertIsNone(tk["branch_only"])
+        self.assertIsNone(tk["summary"]["branch_only"])
+
+    def test_key_only_on_an_unmerged_branch(self):
+        import subprocess
+
+        def git(root, *args):
+            subprocess.run(
+                ["git", "-c", "user.name=T", "-c", "user.email=t@t", *args],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+
+        with TempProject(self.FILES) as root:
+            git(root, "init", "-q", "-b", "main")
+            git(root, "add", "-A")
+            git(root, "commit", "-q", "-m", "roadmap; ABC-1 shipped")
+            git(root, "checkout", "-q", "-b", "feat/retry")
+            git(
+                root, "commit", "-q", "--allow-empty", "-m", "fix: ABC-77 retry backoff"
+            )
+            git(root, "commit", "-q", "--allow-empty", "-m", "ABC-2: wip")
+            git(root, "checkout", "-q", "main")
+            tk = _run_main([str(root), "--key-regex", r"\bABC-\d+\b"])["tracker_keys"]
+        self.assertTrue(tk["unmerged_branches_searched"])
+        (only,) = tk["branch_only"]
+        self.assertEqual(
+            (only["key"], only["commits"], only["refs"]),
+            ("ABC-77", 1, ["feat/retry"]),
+        )
+        keys = {k["key"]: k for k in tk["keys"]}
+        self.assertEqual(keys["ABC-2"]["unmerged_commits"], 1)
+        self.assertEqual(keys["ABC-1"]["unmerged_commits"], 0)
+        self.assertEqual(keys["ABC-1"]["commits"], 1)
 
 
 if __name__ == "__main__":
