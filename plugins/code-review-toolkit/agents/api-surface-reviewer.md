@@ -21,6 +21,17 @@ In Python, the "public API" is:
 3. CLI commands and their arguments
 4. Configuration file format and options
 5. Any classes, functions, or constants documented as user-facing
+6. **Declarative surfaces**, which are the primary surface of a spec- or config-driven tool:
+   - spec/schema keys the user writes (YAML/JSON/TOML documents the tool reads)
+   - config-file keys and environment variables
+   - expression or template forms (`${var}`, `${{ code }}`, `{{ jinja }}`) and the context
+     variables they can see
+   - output formats, report fields, and **exit codes**
+     (`grep -rnE "sys\.exit|SystemExit|\.Exit\(|ctx\.exit" [scope]` lists the exit sites)
+
+   Judge these with the same questions as Python names: does one concept have one spelling, can
+   a user who learned one key predict the next, and does every documented key or code exist and
+   behave as documented?
 
 ## Analysis Dimensions
 
@@ -193,6 +204,19 @@ Each `!!` row is a candidate. Decide which transport is right from the documente
 (OpenAPI schema, SDK docstrings, README), not from the majority. Two transports that agree can
 both be wrong.
 
+**For a CLI or a config-driven tool**, the "transports" are the channels a setting arrives
+through: the CLI flag, the config-file key, the environment variable and the default. For each
+setting, tabulate its spelling, type, default and precedence in every channel, and diff them:
+
+| Setting | Flag | Config key | Env var | Default (flag / config schema / code) | Documented precedence |
+|---|---|---|---|---|---|
+
+Typical divergences: a flag whose config key is spelled differently or is missing, a default
+that differs between the flag declaration and the config schema, a setting read from the config
+file but not from the flag that claims to override it, an env var the docs name but the code
+never reads, and a precedence that differs from the docs. Confirm each row by running the CLI
+twice in an export, once with the flag and once with the config key.
+
 ### 6c. REST/OpenAPI surface (if applicable)
 
 For an HTTP API, compare the documented contract (OpenAPI schema, docs) with behavior:
@@ -244,6 +268,9 @@ Tag each recommendation with `[breaking]`, `[breaks-generated-clients]`, `[addit
 - Public classes: N
 - Public functions/methods: N
 - CLI commands: N (if applicable)
+- Spec keys / config keys / env vars: N / N / N (if applicable)
+- Expression or template forms: N (if applicable)
+- Exit codes: N distinct, N documented (if applicable)
 - Estimated patterns to learn: N
 
 ## Naming Consistency
