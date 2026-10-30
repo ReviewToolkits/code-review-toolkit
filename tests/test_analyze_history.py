@@ -925,6 +925,59 @@ class TestTaggedAndKeyedClassification(unittest.TestCase):
         self.assertEqual(keyed["summary"]["commits_by_type"], {"feature": 1, "fix": 1})
         self.assertEqual(keyed["summary"]["classified_by"], {"key": 2})
 
+    def test_single_key_entry_overrides_its_prefix(self):
+        types = mod.parse_key_types("T=feature,T4-12=fix")
+        self.assertEqual(types, {"T": "feature", "T4-12": "fix"})
+        self.assertEqual(
+            mod.classify_commit("[db] Bound the queue (T4-12)", types), "fix"
+        )
+        self.assertEqual(
+            mod.classify_commit("[db] Stream the export (T4-20)", types), "feature"
+        )
+        args = mod.parse_args(["--key-type", "T4-12=fix"])
+        self.assertEqual(args["key_types"], {"T4-12": "fix"})
+
+    def test_unknown_commit_inherits_its_keys_majority(self):
+        commits = [
+            {"type": "fix", "keys": ["T4-12"]},
+            {"type": "fix", "keys": ["T4-12"]},
+            {"type": "feature", "keys": ["T4-12"]},
+            {"type": "unknown", "keys": ["T4-12"]},
+            {"type": "unknown", "keys": ["T4-13"]},
+        ]
+        self.assertEqual(mod.inherit_key_majority(commits), 1)
+        self.assertEqual(commits[3]["type"], "fix")
+        self.assertEqual(commits[3]["type_source"], "key-majority")
+        self.assertEqual(commits[4]["type"], "unknown")
+
+    def test_no_majority_or_single_vote_inherits_nothing(self):
+        tie = [
+            {"type": "fix", "keys": ["K1"]},
+            {"type": "feature", "keys": ["K1"]},
+            {"type": "unknown", "keys": ["K1"]},
+        ]
+        lone = [
+            {"type": "fix", "keys": ["K2"]},
+            {"type": "unknown", "keys": ["K2"]},
+        ]
+        self.assertEqual(mod.inherit_key_majority(tie), 0)
+        self.assertEqual(mod.inherit_key_majority(lone), 0)
+        self.assertEqual(tie[2]["type"], "unknown")
+
+    def test_key_majority_reaches_the_analysis(self):
+        with GitTempProject(
+            [
+                {"files": {"a.py": "x = 1\n"}, "message": "[fix] Bound reads (K9)"},
+                {"files": {"a.py": "x = 2\n"}, "message": "[fix] Bound writes (K9)"},
+                {"files": {"a.py": "x = 3\n"}, "message": "[db] Queue limits (K9)"},
+            ]
+        ) as root:
+            result = mod.analyze([str(root), *_WINDOW, "--no-function"])
+        self.assertEqual(result["summary"]["commits_by_type"], {"fix": 3})
+        self.assertEqual(
+            result["summary"]["classified_by"], {"tag": 2, "key-majority": 1}
+        )
+
 
 class TestCommitterDateWindow(unittest.TestCase):
     """The window selects on the committer date, so the reported

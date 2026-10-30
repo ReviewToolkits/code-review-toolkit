@@ -15,8 +15,9 @@ Options:
     --max-commits N   Cap total commits analyzed (default: 2000)
     --no-function     Skip function-level churn (file-level only, faster)
     --no-branches     Skip the unmerged remote branch listing
-    --key-type SPEC   Map tracker-key prefixes to commit types, e.g.
-                      B=fix,F=feature (repeatable)
+    --key-type SPEC   Map tracker-key prefixes, or single keys, to commit
+                      types, e.g. B=fix,F=feature or T4-12=fix (repeatable;
+                      a key entry overrides its prefix's)
 """
 
 import ast
@@ -309,7 +310,12 @@ def tracker_key_prefix(key: str) -> str:
 
 
 def parse_key_types(spec: str) -> dict[str, str]:
-    """Parse `B=fix,F=feature` into {prefix: type}. Raises ValueError."""
+    """Parse `B=fix,F=feature,T4-12=fix` into {prefix or key: type}.
+
+    An entry names either a whole prefix (`B`) or one tracker key (`T4-12`).
+    A key entry overrides its prefix's entry, so a prefix that mixes fixes and
+    features can be mapped key by key. Raises ValueError.
+    """
     result: dict[str, str] = {}
     for item in spec.split(","):
         item = item.strip()
@@ -318,13 +324,53 @@ def parse_key_types(spec: str) -> dict[str, str]:
         prefix, sep, ctype = item.partition("=")
         prefix, ctype = prefix.strip(), ctype.strip().lower()
         ctype = _TYPE_WORDS.get(ctype, ctype)
-        if not sep or not re.fullmatch(r"[A-Z]+", prefix) or ctype not in COMMIT_TYPES:
+        names_key = re.fullmatch(r"[A-Z]+", prefix) or _TRACKER_KEY_RE.fullmatch(prefix)
+        if not sep or not names_key or ctype not in COMMIT_TYPES:
             raise ValueError(
-                f"bad --key-type entry {item!r}: expected PREFIX=TYPE with an "
-                f"uppercase prefix and TYPE one of {', '.join(COMMIT_TYPES)}"
+                f"bad --key-type entry {item!r}: expected PREFIX=TYPE or KEY=TYPE "
+                "with an uppercase prefix (B) or a tracker key (T4-12), and TYPE "
+                f"one of {', '.join(COMMIT_TYPES)}"
             )
         result[prefix] = ctype
     return result
+
+
+def _key_type(key: str, key_types: dict[str, str]) -> str:
+    """The mapped type of one key: its own entry first, then its prefix's."""
+    return key_types.get(key) or key_types.get(tracker_key_prefix(key), "")
+
+
+def inherit_key_majority(commits: list[dict], min_votes: int = 2) -> int:
+    """Give an `unknown` commit the majority type of its key's other commits.
+
+    A tracker key carried by several commits is one piece of work: in a
+    hardening series where half the commits were tagged as fixes, the rest
+    stayed `unknown`. The inherited type needs at least `min_votes` classified
+    commits and a strict majority among them; the source is `key-majority`.
+    Returns how many commits were reclassified.
+    """
+    votes: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for commit in commits:
+        if commit["type"] == "unknown":
+            continue
+        for key in commit.get("keys", []):
+            votes[key][commit["type"]] += 1
+    changed = 0
+    for commit in commits:
+        if commit["type"] != "unknown":
+            continue
+        for key in commit.get("keys", []):
+            tally = votes.get(key)
+            if not tally:
+                continue
+            total = sum(tally.values())
+            best = min(tally, key=lambda t: (-tally[t], _TYPE_PRIORITY.get(t, 99)))
+            if total >= min_votes and tally[best] * 2 > total:
+                commit["type"] = best
+                commit["type_source"] = "key-majority"
+                changed += 1
+                break
+    return changed
 
 
 def _best_type(types: Iterable[str]) -> str | None:
@@ -363,7 +409,7 @@ def classify_commit_detail(
         detail.update(type=tag_type, source="tag")
         return detail
     if key_types:
-        key_type = _best_type(key_types.get(tracker_key_prefix(k), "") for k in keys)
+        key_type = _best_type(_key_type(k, key_types) for k in keys)
         if key_type:
             detail.update(type=key_type, source="key")
             return detail
@@ -1634,6 +1680,9 @@ def analyze(argv: list[str] | None = None) -> dict:
             project_root,
             key_types,
         )
+
+    # An unknown commit inherits its tracker key's majority type.
+    inherit_key_majority(commits)
 
     # If using --last, derive time range from actual commits.
     commit_cap_applied = len(commits) >= max_commits
