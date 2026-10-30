@@ -1,6 +1,6 @@
 ---
 name: concurrency-auditor
-description: Use this agent to find lock-discipline and blocking defects in threaded and async Python code — state touched without the lock that guards it everywhere else, check-then-act races, `acquire()` without a `finally` release, ignored `acquire(timeout=)` results, lock-order cycles, a non-reentrant lock (or a read-to-write upgrade) re-acquired through a call chain, `Condition` misuse, slow work or waits on other threads while holding a lock, `await` while holding a thread lock, `async def` code that reaches a blocking call or a slow thread lock through sync helpers, and signal handlers that lock or log. Backed by `scan_concurrency.py`, which infers which lock guards which attribute and follows the project's call graph; its checks map 1:1 to the `concurrency-auditor` shapes in `data/python_bug_shapes.json`.\n\n<example>\nContext: A threaded server occasionally hangs or loses updates.\nuser: "Under load our service sometimes hangs, and counters drift. Can you look for concurrency bugs?"\nassistant: "I'll use the concurrency-auditor — it infers which lock guards each piece of shared state and flags the accesses that skip it, and it builds the lock-order graph to find deadlock cycles."\n<commentary>\nLost updates and hangs under load are the two symptoms its guard inference and lock-order checks target.\n</commentary>\n</example>\n\n<example>\nContext: An asyncio/FastAPI app stops answering health checks during maintenance operations.\nuser: "While a restore runs, even /health stops responding."\nassistant: "I'll run the concurrency-auditor: its transitive check follows sync calls made from `async def` code down to thread locks that other code holds across slow work."\n<commentary>\nThe direct blocking-call check only sees names like time.sleep in the coroutine itself; this agent follows the call chain.\n</commentary>\n</example>
+description: Use this agent to find lock-discipline and blocking defects in threaded and async Python code — state touched without the lock that guards it everywhere else, check-then-act races, `acquire()` without a `finally` release, ignored `acquire(timeout=)` results, lock-order cycles, a non-reentrant lock (or a read-to-write upgrade) re-acquired through a call chain, `Condition` misuse, slow work or waits on other threads while holding a lock, `await` while holding a thread lock, `async def` code that reaches a blocking call or a slow thread lock through sync helpers, signal handlers that lock or log, and slots or semaphores taken before the `try` that releases them. Backed by `scan_concurrency.py`, which infers which lock guards which attribute and follows the project's call graph; its checks map 1:1 to the `concurrency-auditor` shapes in `data/python_bug_shapes.json`.\n\n<example>\nContext: A threaded server occasionally hangs or loses updates.\nuser: "Under load our service sometimes hangs, and counters drift. Can you look for concurrency bugs?"\nassistant: "I'll use the concurrency-auditor — it infers which lock guards each piece of shared state and flags the accesses that skip it, and it builds the lock-order graph to find deadlock cycles."\n<commentary>\nLost updates and hangs under load are the two symptoms its guard inference and lock-order checks target.\n</commentary>\n</example>\n\n<example>\nContext: An asyncio/FastAPI app stops answering health checks during maintenance operations.\nuser: "While a restore runs, even /health stops responding."\nassistant: "I'll run the concurrency-auditor: its transitive check follows sync calls made from `async def` code down to thread locks that other code holds across slow work."\n<commentary>\nThe direct blocking-call check only sees names like time.sleep in the coroutine itself; this agent follows the call chain.\n</commentary>\n</example>
 model: inherit
 color: red
 ---
@@ -26,6 +26,9 @@ Options:
   bare method names (`encode_batch`). Use it for the project's own slow operations (model inference,
   index builds) once you know them; the built-in list covers sleep, network, subprocess, thread
   waits, pipes and file I/O.
+- `--all-blocking` — report every file-I/O and pipe wait under a lock as its own finding. By
+  default they are summarized per lock in `summary.blocking_low_signal`, because they are mostly
+  by design.
 - `--max-files N` — cap the scan.
 
 Scan the package, not the tests: test fixtures take locks in odd ways on purpose.
@@ -36,14 +39,25 @@ Scan the package, not the tests: test fixtures take locks in odd ways on purpose
 
 - **`locks_declared`** — lock objects by kind. `custom` / `custom-reentrant` are the project's own
   lock classes (`custom-reentrant` tracks its owner thread, so re-entry is allowed).
-- **`lock_context_managers`** — the project's `@contextmanager`s that hold a lock around `yield`.
-  If the project has lock helpers missing from this list, the scanner can't see what they guard:
-  say so, and grep their call sites yourself.
+- **`lock_context_managers`** — the project's `@contextmanager`s that hold a lock around `yield`,
+  including ones that wrap another lock CM (`lock_context_managers_wrapping` names what each
+  wraps). `lock_context_manager_kinds` gives the reentrancy each one inherits from the locks it
+  holds (`RLock`, `Lock`, ...; `custom` = unknown).
+- **`possible_lock_cms_missed`** — `@contextmanager`s with a `with` around `yield` that did not
+  resolve to a lock. Check each: a lock helper missing from `lock_context_managers` hides every
+  site that uses it. Say so in the report, and grep its call sites yourself.
 - **`guards`** (top level) — the inferred guard map: `state` → `lock`, with guarded/total site
   counts. This is the project's locking contract as the code practices it. Read it as documentation
   and look for state you'd expect to be guarded that is missing from it.
 - **`slow_locks`** — locks some code holds across blocking work. Waiting for one of these is slow.
   Every `transitive-blocking-call-in-async` finding at `medium`/`high` goes through one.
+- **`blocking_low_signal`** — file I/O and pipe waits under a lock, grouped by lock and by the leaf
+  call the chains end in. Not findings: read it for a lock that is held across far more I/O than
+  its purpose needs, and for pipes (a request/reply channel under a lock is where the desync hunt
+  in Phase 4 starts).
+- **`module_state`** (top level) — module-level singletons, mutated module containers and
+  globals rebound through `global`, with the functions that touch each. This is the starting
+  point when the guard map is empty (see Phase 4).
 
 ## Phase 3 — Triage each finding
 
@@ -52,7 +66,9 @@ Each finding has `shape`, `severity`, `confidence`, `file`, `line`, `function`, 
 per hop.
 
 - **Verify every hop of the chain.** Call resolution is static. A hop resolved by method name alone
-  (the receiver's type is unknown) lowers confidence by one level; it can be wrong. Open each
+  (the receiver's type is unknown) ends in `[weak: name-only]`, or `[weak: name-only, 1 of N
+  candidates]` when several classes define the method. It lowers confidence by one level and can
+  be wrong: when two classes share method names, check the receiver's real type first. Open each
   `file:line` and confirm the call goes where the chain says.
 - **`meanwhile, another thread holds X here`** marks where the chain switches thread: the steps
   before it are the path under review; the steps after it are a different path that holds the lock
@@ -77,6 +93,7 @@ Per shape, what to check:
 | `await-while-holding-thread-lock` | Can another task on the same loop take this lock? |
 | `transitive-blocking-call-in-async` | How long can the other path hold the lock (the `meanwhile` hop)? Seconds-long operations (restore, compaction, model loads) make it a FIX. |
 | `signal-handler-does-real-work` | Can the main thread be inside that lock (often `logging`'s) when the signal lands? |
+| `slot-acquired-before-the-try-that-releases-it` | Can the flagged line raise or be cancelled while the slot is held? Check that the slot is really taken on that path, and that no caller releases it. |
 
 Consult `data/python_non_bugs.md` for the false-positive taxonomy, and dismiss with the stated
 reason.
@@ -87,9 +104,11 @@ The scanner reads one process's source. Hunt these by hand, starting from the gu
 locks it found:
 
 - **Exits that skip a release.** `asyncio.CancelledError` and `KeyboardInterrupt` are
-  `BaseException`s: an `except Exception:` cleanup doesn't run for them. Find every slot, semaphore
-  or counter released in an `except Exception` block, or only on the success path, and check what
-  cancellation does there. Note that anyio's `run_in_threadpool` delays cancellation until the
+  `BaseException`s: an `except Exception:` cleanup doesn't run for them. The scanner flags the
+  common forms for `x.release()` slots (`slot-acquired-before-the-try-that-releases-it`); hunt
+  the rest by hand: counters (`+= 1` / `-= 1`), releases in another function or a response
+  background task, and explicit `raise`/`return` exits it skips. Check what cancellation does on
+  each path. Note that anyio's `run_in_threadpool` delays cancellation until the
   thread finishes, so a client disconnect may not cancel a sync handler at all: establish the real
   trigger before claiming one.
 - **Request/reply channels after a timeout** (`request-reply-channel-desync-after-timeout`):
@@ -106,6 +125,16 @@ locks it found:
   check done mechanically for one shape.
 - **Docstrings that promise concurrency properties** ("lock-free", "called with the lock held",
   "other collections keep serving"). Each is a testable claim.
+- **A project with no concurrency** (`locks_declared` empty, no `async def`): the hazards are
+  still there, one level up. Start from `module_state`:
+  - **Re-entrancy of process-global state.** For each singleton, mutated container or rebound
+    global, ask what a second in-process call sees: a test runner calling `main()` twice, an
+    application embedding the library, a planned server mode. State left over from the first
+    call (a cached client, a registry that only grows, a setting that is never reset) is a
+    finding.
+  - **Blocking I/O without a deadline.** HTTP clients with no `timeout=` (or `timeout=None`),
+    `subprocess.run` without `timeout=`, socket reads with no timeout: one stalled peer hangs
+    the whole run.
 
 ## Phase 5 — Reproduce what you can
 
