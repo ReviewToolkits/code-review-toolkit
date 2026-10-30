@@ -802,6 +802,56 @@ class TestRunToolSafely(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# The reviewed project is left untouched
+# ---------------------------------------------------------------------------
+
+
+class TestNoCacheInReviewedProject(unittest.TestCase):
+    """Neither ruff nor mypy may leave a cache directory in the project."""
+
+    def test_ruff_runs_without_a_cache(self):
+        with TempProject({"m.py": "x = 1\n"}) as root:
+            with patch.object(mod.subprocess, "run") as run:
+                run.return_value = MagicMock(stdout="[]", stderr="")
+                mod.run_ruff(mod.parse_args([str(root)]), root, root)
+            for call in run.call_args_list:
+                self.assertIn("--no-cache", call.args[0])
+
+    def test_mypy_cache_is_private_and_removed(self):
+        seen: dict = {}
+
+        def fake_run(cmd, **kwargs):
+            cache = Path(cmd[cmd.index("--cache-dir") + 1])
+            seen["cache"] = cache
+            seen["existed_during_run"] = cache.is_dir()
+            (cache / "3.14").mkdir()  # mypy populates it
+            return MagicMock(stdout="", stderr="")
+
+        with TempProject({"m.py": "x = 1\n"}) as root:
+            with patch.object(mod.subprocess, "run", side_effect=fake_run):
+                mod.run_mypy(mod.parse_args([str(root)]), root, root)
+            self.assertTrue(seen["existed_during_run"])
+            self.assertFalse(seen["cache"].is_relative_to(root))
+            self.assertFalse(seen["cache"].exists(), "cache left behind")
+            self.assertFalse((root / ".mypy_cache").exists())
+
+    def test_mypy_cache_is_removed_even_when_mypy_times_out(self):
+        seen: dict = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cache"] = Path(cmd[cmd.index("--cache-dir") + 1])
+            raise subprocess.TimeoutExpired(cmd, 300)
+
+        with TempProject({"m.py": "x = 1\n"}) as root:
+            with patch.object(mod.subprocess, "run", side_effect=fake_run):
+                result = mod.run_tool_safely(
+                    "mypy", mod.parse_args([str(root)]), root, root
+                )
+        self.assertIn("timed out", result["error"])
+        self.assertFalse(seen["cache"].exists())
+
+
+# ---------------------------------------------------------------------------
 # Integration: full pipeline with mocked tools
 # ---------------------------------------------------------------------------
 

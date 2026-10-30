@@ -22,6 +22,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
@@ -343,7 +344,8 @@ def run_ruff(
     args: argparse.Namespace, project_root: Path, scan_root: Path,
 ) -> dict:
     """Run ruff and return normalized findings."""
-    cmd = ["ruff", "check", "--output-format=json"]
+    # --no-cache: ruff otherwise writes `.ruff_cache/` into the reviewed project.
+    cmd = ["ruff", "check", "--output-format=json", "--no-cache"]
 
     if args.ignore_config or not has_project_config("ruff", project_root):
         # DEFECT-GRADE selection is `run_lint_rules.py`'s job, not this script's.
@@ -462,12 +464,21 @@ def run_mypy(
     else:
         config_source = "project"
 
+    # mypy's default cache is `.mypy_cache/` in the working directory, which is
+    # usually the reviewed project. Give it a private cache and remove it
+    # afterwards, so the review leaves nothing behind. A real directory rather
+    # than `/dev/null`: the run stays an ordinary incremental run.
+    cache_dir = tempfile.mkdtemp(prefix="crt-mypy-cache-")
+    cmd.extend(["--cache-dir", cache_dir])
     cmd.append(str(scan_root))
 
-    result = subprocess.run(
-        cmd, capture_output=True, text=True,
-        timeout=_TOOL_TIMEOUTS["mypy"],
-    )
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=_TOOL_TIMEOUTS["mypy"],
+        )
+    finally:
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
     findings = parse_mypy_output(
         result.stdout, max_findings=args.max_findings,
