@@ -885,84 +885,106 @@ def extract_source_functions(source_files: list[Path], project_root: Path) -> di
     return dict(functions)
 
 
+def _top_dir(rel: str) -> str:
+    """First directory of a project-relative path ('' for a top-level file)."""
+    return rel.split("/", 1)[0] if "/" in rel else ""
+
+
+def _shared_leading_words(a: list[str], b: list[str]) -> int:
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
 def find_similar_functions(
     func_name: str, func_info: dict,
     all_functions: dict[str, list[dict]],
     max_similar: int = 5,
 ) -> list[dict]:
-    """Find functions structurally similar to the given one.
+    """Find functions that should plausibly satisfy the same invariant.
 
-    Similarity is based on name pattern and parameter count.
+    A candidate needs a NAME relation to the tested function; structure alone
+    (parameter count, async-ness, "different module") only ranks candidates
+    that have one. Measured on a FastAPI project, structure-only matches were
+    nearly all noise (benchmark helpers, CLI entry points). The relations:
+
+    - the same name elsewhere: a sibling implementation or override
+      (`FileStore.close` for `MemoryStore.close`), or the same operation in
+      another layer (a route handler and the service function it wraps);
+    - the same leading words: `validate_config` for `validate_input`, but a
+      generic first word (`get_`, `list_`, `create_`) needs two
+      (`get_user_by_id` for `get_user_by_name`, not `get_logger` for
+      `get_config`).
+
+    Candidates outside the tested function's top-level directory (benchmarks/
+    and scripts/ for a package's function), private helpers of a public
+    function, and dunder methods are not considered.
     """
     results: list[dict] = []
     base_name = func_info.get("name", func_name.rsplit(".", 1)[-1])
+    base_words = _tokens(base_name)
     base_params = func_info.get("param_count", 0)
+    base_file = func_info.get("file", "")
+    base_top = _top_dir(base_file)
+    base_private = base_name.startswith("_")
 
-    # Extract the verb prefix (validate_, parse_, process_, handle_, etc.)
-    parts = base_name.split("_")
-    prefix = parts[0] if parts else ""
-
+    base_line = func_info.get("line")
     for qname, locations in all_functions.items():
-        if qname == func_name:
+        short = qname.rsplit(".", 1)[-1]
+        if short.startswith("__") or (short.startswith("_") and not base_private):
+            continue
+        # Same-named functions in other modules are separate candidates
+        # (a route handler and the service function it wraps).
+        loc = next(
+            (
+                cand for cand in locations
+                if (cand["file"], cand["line"]) != (base_file, base_line)
+                and _top_dir(cand["file"]) == base_top
+            ),
+            None,
+        )
+        if loc is None:
             continue
 
-        short = qname.rsplit(".", 1)[-1] if "." in qname else qname
-        loc = locations[0]
+        same_name = short == base_name
+        shared = _shared_leading_words(base_words, _tokens(short))
+        needed = 2 if base_words and base_words[0] in _GENERIC_TOKENS else 1
+        prefix_match = (
+            not same_name and shared >= needed and len(base_words[0]) > 2
+        )
+        if not (same_name or prefix_match):
+            continue
 
-        # Same file is less interesting — different files are higher signal
-        same_file = loc["file"] == func_info.get("file", "")
-
-        # Similarity scoring
-        score = 0
-
-        # Name prefix match (validate_input ↔ validate_config)
-        other_parts = short.split("_")
-        if other_parts and other_parts[0] == prefix and len(prefix) > 2:
-            score += 3
-
-        # Similar parameter count (±1)
+        score = 6 if same_name else 2 * shared
         if abs(loc.get("param_count", 0) - base_params) <= 1:
             score += 1
-
-        # Same async nature
         if loc.get("is_async") == func_info.get("is_async"):
             score += 1
-
-        # Same method-ness
         if loc.get("is_method") == func_info.get("is_method"):
             score += 1
 
-        # Different file bonus (cross-module invariant propagation is higher value)
-        if not same_file:
-            score += 1
-
-        if score >= 3:
-            results.append({
-                "function": qname,
-                "file": loc["file"],
-                "line": loc["line"],
-                "similarity_score": score,
-                "similarity_reason": _similarity_reason(prefix, short, base_params, loc, same_file),
-            })
+        if same_name:
+            reason = f"same name '{short}' elsewhere"
+        else:
+            reason = f"same '{'_'.join(base_words[:shared])}_' prefix"
+        if abs(loc.get("param_count", 0) - base_params) <= 1:
+            reason += ", similar parameter count"
+        if loc["file"] != base_file:
+            reason += ", different module"
+        results.append({
+            "function": qname,
+            "file": loc["file"],
+            "line": loc["line"],
+            "similarity_score": score,
+            "similarity_reason": reason,
+        })
 
     # Sort by score descending, take top N
     results.sort(key=lambda x: x["similarity_score"], reverse=True)
     return results[:max_similar]
-
-
-def _similarity_reason(
-    prefix: str, other_name: str, base_params: int, loc: dict, same_file: bool
-) -> str:
-    """Build a human-readable similarity explanation."""
-    reasons: list[str] = []
-    other_parts = other_name.split("_")
-    if other_parts and other_parts[0] == prefix and len(prefix) > 2:
-        reasons.append(f"same '{prefix}_' prefix")
-    if abs(loc.get("param_count", 0) - base_params) <= 1:
-        reasons.append("similar parameter count")
-    if not same_file:
-        reasons.append("different module")
-    return ", ".join(reasons) if reasons else "structural similarity"
 
 
 # ---------------------------------------------------------------------------
@@ -1278,6 +1300,18 @@ def _extract_all_test_info(
     return all_tests
 
 
+def _tested_location(tested: dict, source_functions: dict[str, list[dict]]) -> dict:
+    """The source_functions entry for the tested function's own file."""
+    locations = source_functions.get(tested["function"], [])
+    for loc in locations:
+        if loc["file"] == tested.get("file"):
+            return loc
+    if locations:
+        return locations[0]
+    return {"param_count": 0, "file": tested.get("file", ""),
+            "name": tested["function"].rsplit(".", 1)[-1]}
+
+
 def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
     """Run test invariant extraction and return structured results."""
     target_path = Path(target).resolve()
@@ -1352,8 +1386,7 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
 
         func_name = tested["function"]
         # Find the function info for similarity matching
-        func_locations = source_functions.get(func_name, [])
-        func_info = func_locations[0] if func_locations else {"param_count": 0}
+        func_info = _tested_location(tested, source_functions)
 
         similar = find_similar_functions(
             func_name, func_info, source_functions, max_similar=5,
@@ -1365,8 +1398,8 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
         })
 
     # Find untested similar functions (functions similar to tested ones but with no tests)
-    tested_func_names = {
-        t["tested_function"]["function"]
+    tested_funcs = {
+        (t["tested_function"]["file"], t["tested_function"]["function"])
         for t in all_test_info
         if t.get("tested_function")
     }
@@ -1376,11 +1409,10 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
         if tested is None:
             continue
         func_name = tested["function"]
-        func_locations = source_functions.get(func_name, [])
-        func_info = func_locations[0] if func_locations else {"param_count": 0}
+        func_info = _tested_location(tested, source_functions)
 
         for sim in find_similar_functions(func_name, func_info, source_functions):
-            if sim["function"] not in tested_func_names:
+            if (sim["file"], sim["function"]) not in tested_funcs:
                 untested_similar.append({
                     "function": sim["function"],
                     "file": sim["file"],
@@ -1392,11 +1424,11 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
                 })
 
     # Deduplicate untested_similar by function name
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     deduped: list[dict] = []
     for item in untested_similar:
-        if item["function"] not in seen:
-            seen.add(item["function"])
+        if (item["file"], item["function"]) not in seen:
+            seen.add((item["file"], item["function"]))
             deduped.append(item)
     untested_similar_total = len(deduped)
     untested_similar = deduped[:20]

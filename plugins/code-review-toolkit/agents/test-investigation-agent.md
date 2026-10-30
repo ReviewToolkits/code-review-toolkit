@@ -41,6 +41,10 @@ Parse the JSON output. Key fields:
   from all of them. Within each tier, tests are taken round-robin across files; concurrency, cancellation, rollback,
   lock and timeout tests come first in the error/boundary tier
 - `untested_similar_functions[]`: Functions similar to tested ones but with no tests
+- `similar_functions[]` (per invariant) and `untested_similar_functions[]` list only candidates with a name relation:
+  the same name elsewhere (a sibling implementation, an override, or the same operation in another layer) or the
+  same leading words (two for a generic first word such as `get_`). Parameter count and module only rank them. They
+  stay within the tested function's top-level directory and skip private helpers of public functions
 - `summary`: Aggregate statistics
 - `status`, `test_discovery`, `warnings`: where the tests came from. When the scope (e.g. `pkg/`) holds no tests, the script
   takes them from the project's pytest `testpaths` or a `tests/`/`test/` directory and says so in `warnings`

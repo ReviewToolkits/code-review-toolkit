@@ -185,6 +185,56 @@ class TestSimilarFunctions(unittest.TestCase):
         self.assertLessEqual(len(similar), 3)
 
 
+def _fn(name: str, file: str, params: int = 1, method: bool = False) -> dict:
+    return {"file": file, "line": 1, "param_count": params, "is_method": method,
+            "is_async": False, "name": name.rsplit(".", 1)[-1]}
+
+
+class TestSimilarFunctionPrecision(unittest.TestCase):
+    """Similarity needs a name relation; structure alone is noise."""
+
+    def _similar(self, tested: str, funcs: dict[str, dict]) -> list[str]:
+        table = {name: [info] for name, info in funcs.items()}
+        return [
+            s["function"]
+            for s in mod.find_similar_functions(tested, funcs[tested], table)
+        ]
+
+    def test_same_method_on_sibling_class(self):
+        funcs = {
+            "MemoryStore.close": _fn("MemoryStore.close", "pkg/memory.py", 0, True),
+            "FileStore.close": _fn("FileStore.close", "pkg/files.py", 0, True),
+        }
+        self.assertEqual(
+            self._similar("MemoryStore.close", funcs), ["FileStore.close"]
+        )
+
+    def test_parameter_count_alone_is_not_similarity(self):
+        funcs = {
+            "validate_input": _fn("validate_input", "pkg/a.py"),
+            "record": _fn("record", "pkg/b.py"),
+            "summary": _fn("summary", "pkg/c.py"),
+        }
+        self.assertEqual(self._similar("validate_input", funcs), [])
+
+    def test_generic_first_word_needs_a_second(self):
+        funcs = {
+            "get_config": _fn("get_config", "pkg/a.py"),
+            "get_logger": _fn("get_logger", "pkg/b.py"),
+            "get_config_path": _fn("get_config_path", "pkg/c.py"),
+        }
+        self.assertEqual(self._similar("get_config", funcs), ["get_config_path"])
+
+    def test_other_top_level_dirs_and_private_helpers_skipped(self):
+        funcs = {
+            "ensure_key": _fn("ensure_key", "pkg/auth.py"),
+            "ensure_label": _fn("ensure_label", "scripts/sync.py"),
+            "_ensure_dir": _fn("_ensure_dir", "pkg/util.py"),
+            "ensure_token": _fn("ensure_token", "pkg/tokens.py"),
+        }
+        self.assertEqual(self._similar("ensure_key", funcs), ["ensure_token"])
+
+
 class TestSelectTests(unittest.TestCase):
     """Test the three-tier test selection algorithm."""
 
