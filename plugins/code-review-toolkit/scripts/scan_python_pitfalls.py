@@ -3224,6 +3224,227 @@ def _check_asymmetric_encode_decode(tree: ast.AST) -> list[dict]:
     return out
 
 
+_JSON_PARSE_CALLS = frozenset({"json.loads", "orjson.loads", "ujson.loads"})
+# Names and calls that suggest bytes straight off the wire or a binary file.
+_BYTESISH_TOKENS = frozenset(
+    {
+        "body",
+        "content",
+        "bytes",
+        "buf",
+        "buffer",
+        "payload",
+        "chunk",
+        "packet",
+        "blob",
+    }
+)
+_BYTESISH_CALLS = frozenset({"read", "recv", "read_bytes", "getvalue", "recv_bytes"})
+
+
+def _is_json_parse(node: ast.AST, helpers: set[str]) -> bool:
+    """`json.loads(...)`, `resp.json()`, or a same-module helper returning one."""
+    if not isinstance(node, ast.Call):
+        return False
+    name = _call_name(node)
+    if name in _JSON_PARSE_CALLS or name in helpers:
+        return True
+    return (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == "json"
+        and not node.args
+        and not node.keywords
+    )
+
+
+def _json_helpers(tree: ast.AST) -> set[str]:
+    """Module functions that return `json.loads(...)` directly."""
+    out: set[str] = set()
+    for fn in getattr(tree, "body", []):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in _walk_same_scope(fn):
+            if isinstance(node, ast.Return) and _is_json_parse(node.value, set()):
+                out.add(fn.name)
+    return out
+
+
+def _guarded_as_mapping(scope: ast.AST, name: str) -> bool:
+    """`isinstance(name, dict)` / `type(name) is dict` anywhere in the scope."""
+    for node in _walk_same_scope(scope):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in ("isinstance", "type")
+            and node.args
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == name
+        ):
+            return True
+    return False
+
+
+def _used_as_mapping(node: ast.AST, name: str) -> bool:
+    """`key in name` or `name[key]` (a non-integer subscript)."""
+    if isinstance(node, ast.Compare):
+        return any(isinstance(op, (ast.In, ast.NotIn)) for op in node.ops) and any(
+            isinstance(c, ast.Name) and c.id == name for c in node.comparators
+        )
+    return (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == name
+        and isinstance(node.slice, (ast.Constant, ast.Name))
+        and not (
+            isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, int)
+        )
+    )
+
+
+def _external_json(call: ast.AST, scope: ast.AST) -> bool:
+    """Parsed from a message body (`resp.json()`, `json.loads(body)`), not a file."""
+    if not isinstance(call, ast.Call):
+        return False
+    if isinstance(call.func, ast.Attribute) and call.func.attr == "json":
+        return True
+    return bool(call.args) and _is_bytesish(call.args[0], scope)
+
+
+def _check_parsed_json_assumed_object(tree: ast.AST) -> list[dict]:
+    """`body = json.loads(raw)` then `key in body` / `body[key]`: valid JSON may
+    be a list, a string, a number or `null`, and none of them is a dict."""
+    out: list[dict] = []
+    helpers = _json_helpers(tree)
+    for scope in _iter_scopes(tree):
+        parsed: dict[str, ast.Assign] = {}
+        for node in _walk_same_scope(scope):
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and _is_json_parse(node.value, helpers)
+            ):
+                parsed[node.targets[0].id] = node
+        for name, assign in parsed.items():
+            if _guarded_as_mapping(scope, name):
+                continue
+            use = next(
+                (
+                    node
+                    for node in _walk_same_scope(scope)
+                    if getattr(node, "lineno", 0) > assign.lineno
+                    and _used_as_mapping(node, name)
+                ),
+                None,
+            )
+            if use is None:
+                continue
+            # A helper's result counts as external: helpers wrap message bodies.
+            value = assign.value
+            external = _call_name(value) in helpers or _external_json(value, scope)
+            out.append(
+                _finding(
+                    "parsed-json-assumed-object",
+                    "FIX" if external else "CONSIDER",
+                    "medium" if external else "low",
+                    use,
+                    f"`{name}` comes from parsing JSON (line {assign.lineno}) and is used as "
+                    f"a dict with no isinstance check: a body that is a list, string, "
+                    f"number or null raises TypeError here",
+                    "guard with `isinstance(x, dict)` (skip or report other shapes), or "
+                    "validate against a schema first",
+                )
+            )
+    return out
+
+
+def _is_bytesish(arg: ast.AST, scope: ast.AST) -> bool:
+    """Does *arg* look like bytes (off the wire, or a binary read)?"""
+    if isinstance(arg, ast.Constant):
+        return isinstance(arg.value, bytes)
+    if isinstance(arg, ast.Call):
+        tail = arg.func.attr if isinstance(arg.func, ast.Attribute) else ""
+        if tail in ("decode", "read_text") or _call_name(arg) == "str":
+            return False
+        if tail in _BYTESISH_CALLS:
+            return True
+        return any(t in _BYTESISH_TOKENS for t in _call_name(arg).lower().split("_"))
+    name = _dotted_name(arg).split(".")[-1].lower()
+    if name in ("text",):
+        return False
+    if isinstance(arg, ast.Name):
+        # `body = _get_body(msg)`: follow one local assignment.
+        for node in _walk_same_scope(scope):
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == arg.id
+            ):
+                value = node.value
+                if isinstance(value, ast.Call) and _call_tail(value) in (
+                    "decode",
+                    "read_text",
+                ):
+                    return False
+    return any(t in _BYTESISH_TOKENS for t in name.strip("_").split("_"))
+
+
+def _check_narrow_parse_except(tree: ast.AST) -> list[dict]:
+    """`json.loads(raw_bytes)` caught by `except JSONDecodeError` only.
+
+    On bytes, json.loads first detects and decodes the encoding, and that step
+    raises UnicodeDecodeError: a sibling ValueError the handler does not list.
+    """
+    out: list[dict] = []
+    for scope in _iter_scopes(tree):
+        for node in _walk_same_scope(scope):
+            if not isinstance(node, ast.Try) or not node.handlers:
+                continue
+            caught: set[str] = set()
+            for handler in node.handlers:
+                if handler.type is None:
+                    caught.add("BaseException")
+                    continue
+                types = (
+                    handler.type.elts
+                    if isinstance(handler.type, ast.Tuple)
+                    else [handler.type]
+                )
+                caught |= {_dotted_name(t).split(".")[-1] for t in types}
+            if "JSONDecodeError" not in caught or caught & {
+                "ValueError",
+                "UnicodeDecodeError",
+                "UnicodeError",
+                "Exception",
+                "BaseException",
+            }:
+                continue
+            for stmt in node.body:
+                for call in [stmt, *_walk_same_scope(stmt)]:
+                    if not (
+                        isinstance(call, ast.Call)
+                        and _call_name(call) in _JSON_PARSE_CALLS
+                        and call.args
+                        and _is_bytesish(call.args[0], scope)
+                    ):
+                        continue
+                    out.append(
+                        _finding(
+                            "narrow-parse-except-misses-decode-error",
+                            "FIX",
+                            "medium",
+                            call,
+                            f"`{ast.unparse(call)}` may be given bytes, and the handler "
+                            f"catches only JSONDecodeError: undecodable bytes raise "
+                            f"UnicodeDecodeError, which escapes",
+                            "catch ValueError (the common base of both), or decode with "
+                            "an explicit `errors=` before parsing",
+                        )
+                    )
+    return out
+
+
 # Accessor-pair verbs: (decode side, encode side).
 _PAIR_VERBS = (
     ("get", "set"),
@@ -4488,6 +4709,8 @@ _CHECKS = {
     "save-state-clobbered-by-reentry": _check_save_state_clobbered,
     "return-ignored-against-checked-family": _check_return_ignored_against_family,
     "unformatted-format-string-literal": _check_unformatted_format_string,
+    "parsed-json-assumed-object": _check_parsed_json_assumed_object,
+    "narrow-parse-except-misses-decode-error": _check_narrow_parse_except,
 }
 
 

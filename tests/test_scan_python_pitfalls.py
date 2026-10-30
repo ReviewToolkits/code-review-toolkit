@@ -1472,6 +1472,67 @@ class TestAsymmetricAccessorPair(unittest.TestCase):
         self.assertEqual(self._found(src), [])
 
 
+class TestParsedJsonAssumedObject(unittest.TestCase):
+    shape = "parsed-json-assumed-object"
+
+    def _found(self, src: str) -> list[dict]:
+        return [f for f in scan(src) if f["shape"] == self.shape]
+
+    def test_helper_result_tested_with_in(self):
+        src = (
+            "import json\n"
+            "def _get_json(msg):\n    return json.loads(msg.content)\n"
+            "def redact(msg, field):\n    doc = _get_json(msg)\n"
+            "    if doc and field in doc:\n        doc[field] = '***'\n"
+        )
+        found = self._found(src)
+        self.assertEqual([(f["line"], f["confidence"]) for f in found], [(6, "medium")])
+
+    def test_file_json_is_a_low_lead(self):
+        src = (
+            "import json\ndef load(path):\n    m = json.loads(path.read_text())\n"
+            "    return m['version']\n"
+        )
+        self.assertEqual([f["confidence"] for f in self._found(src)], ["low"])
+
+    def test_isinstance_guard_and_index_use_are_silent(self):
+        src = (
+            "import json\n"
+            "def a(resp, k):\n    doc = resp.json()\n"
+            "    if isinstance(doc, dict) and k in doc:\n        return doc[k]\n"
+            "def b(raw):\n    items = json.loads(raw)\n    return items[0]\n"
+        )
+        self.assertEqual(self._found(src), [])
+
+
+class TestNarrowParseExcept(unittest.TestCase):
+    shape = "narrow-parse-except-misses-decode-error"
+
+    def _found(self, src: str) -> list[dict]:
+        return [f for f in scan(src) if f["shape"] == self.shape]
+
+    def test_bytes_body_with_json_decode_error_only(self):
+        src = (
+            "import json\nfrom json import JSONDecodeError\n"
+            "def parse(msg):\n    try:\n        body = read_body(msg)\n"
+            "        return json.loads(body)\n    except JSONDecodeError:\n"
+            "        return None\n"
+        )
+        self.assertEqual(len(self._found(src)), 1)
+
+    def test_value_error_or_str_input_is_silent(self):
+        src = (
+            "import json\n"
+            "def a(msg):\n    try:\n        return json.loads(msg.content)\n"
+            "    except ValueError:\n        return None\n"
+            "def b(msg):\n    try:\n        return json.loads(msg.text)\n"
+            "    except json.JSONDecodeError:\n        return None\n"
+            "def c(msg):\n    try:\n        return json.loads(msg.content.decode('utf-8', 'replace'))\n"
+            "    except json.JSONDecodeError:\n        return None\n"
+        )
+        self.assertEqual(self._found(src), [])
+
+
 class TestAsymmetricEncodeDecode(unittest.TestCase):
     """_pyrepl readline.py:443 vs :460 -- lenient read, strict write-back."""
 

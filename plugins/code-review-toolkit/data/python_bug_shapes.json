@@ -806,6 +806,44 @@
       "detectability": "implemented"
     },
     {
+      "id": "parsed-json-assumed-object",
+      "title": "The result of parsing JSON used as a dict with no isinstance check",
+      "agent": "python-pitfall-scanner",
+      "severity": "FIX",
+      "pattern": "The result of `json.loads(...)` / `response.json()` (directly, or through a helper that returns it) used with `key in doc` or `doc[key]` and no `isinstance(doc, dict)` guard. Valid JSON may be a list, a string, a number, a bool or null: `in` on a number raises TypeError, and on a string or list it succeeds and the following item assignment raises.",
+      "guarded_twin": "`if isinstance(doc, dict) and key in doc:`, or schema validation before use. A sibling that already handles a mapping-typed source (a headers object) is the twin.",
+      "hunt": "Every json.loads/.json() result that is subscripted by a string key or tested with `in`, especially in code applied to every message (hooks, redaction, logging middleware), where one endpoint returning a list breaks all of them.",
+      "expected": "non-object JSON is skipped or reported, never fatal.",
+      "caught_as": "A crash on the first message whose body is a list or a scalar, often far from the configuration that enabled the code path.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "RFC 8259 section 2: a JSON text is any serialized value, not only an object"
+      ],
+      "differential": "Fine when a schema or validator upstream guarantees an object, or when the use sits inside a try that turns TypeError into a reported result. Reported `low` when the JSON comes from a file the project writes itself.",
+      "detected_by": "scan_python_pitfalls.py",
+      "detectability": "implemented"
+    },
+    {
+      "id": "narrow-parse-except-misses-decode-error",
+      "title": "`json.loads(raw_bytes)` guarded by `except JSONDecodeError` only",
+      "agent": "python-pitfall-scanner",
+      "severity": "FIX",
+      "pattern": "`json.loads(body)` where `body` may be bytes (an HTTP body, a binary read, a socket), inside a `try` whose handlers list `JSONDecodeError` but not `ValueError`. On bytes, json.loads first detects the encoding and decodes, and that step raises UnicodeDecodeError -- a sibling ValueError subclass the handler does not list.",
+      "guarded_twin": "`except ValueError:` (the common base of JSONDecodeError and UnicodeDecodeError), or decode explicitly with `errors=` before parsing.",
+      "hunt": "Grep `JSONDecodeError` and check whether the parsed argument can be bytes from an external source.",
+      "expected": "binary or non-UTF-8 input takes the same 'not JSON' path as malformed text.",
+      "caught_as": "An uncaught UnicodeDecodeError on the first binary body (an image, a PDF, latin-1 text).",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "Python docs, json.loads: 's can now be of type bytes or bytearray. The input encoding should be UTF-8, UTF-16 or UTF-32.'"
+      ],
+      "differential": "Not a bug when the argument is always str (already decoded, `.text`, `read_text()`). The scanner flags only arguments that look like bytes (body, content, payload, a `.read()`/`.recv()` result).",
+      "detected_by": "scan_python_pitfalls.py",
+      "detectability": "implemented"
+    },
+    {
       "id": "coverage-claiming-commit-that-reduced-coverage",
       "title": "A commit claiming to add test coverage that removed it",
       "agent": "git-history-analyzer",
