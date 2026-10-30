@@ -68,7 +68,8 @@ code-review-toolkit/
 │   ├── agents/                      # 19 agent prompt definitions (markdown)
 │   ├── commands/                    # 8 command definitions (markdown)
 │   ├── scripts/                     # 17 Python scripts (the core code)
-│   └── data/                        # bug-shape catalog + FP taxonomy
+│   ├── data/                        # bug-shape catalog + FP taxonomy
+│   └── docs/                        # docs the prompts cite (shipped with the plugin)
 └── tests/                           # unittest suite
 ```
 
@@ -198,6 +199,13 @@ Every finding is tagged:
   sibling toolkits' convention but differing from every other script here.
 - **`build_informed_briefing.py` prints Markdown, not JSON.** It is the one deliberate exception to
   the output contract.
+- **Anything a prompt cites must ship.** The installed plugin is `plugins/code-review-toolkit/` only;
+  a file at the repo root (`docs/`) is invisible to an installed agent. Cite plugin files as
+  `<plugin_root>/...`; `test_release_discipline` checks every cited path exists in the plugin.
+- **Parallel agents on this repo: make the worktrees yourself.** The Agent tool's
+  `isolation: "worktree"` makes a worktree of the *session's* cwd repo, which during a review is the
+  reviewed project. Have each agent run `git worktree add <path> -b <branch> main` on this repo, and
+  give each a private scratch directory.
 - **Keep the README counts honest.** Both READMEs state agent/script/command counts; they have drifted
   before. Update them in the same commit that adds a component.
 
