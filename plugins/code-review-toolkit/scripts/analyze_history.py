@@ -339,7 +339,15 @@ def _is_git_repo(path: Path) -> bool:
 
 
 def _check_script_timeout() -> bool:
-    """Return True if the script has exceeded its timeout."""
+    """Return True if the script has exceeded its timeout.
+
+    The clock starts in `analyze()`. Called as a library, before or without
+    `analyze()`, there is no budget to exceed: comparing against an unset
+    start of 0.0 made every check report a timeout, so `find_unmerged_branches`
+    returned no branches at all.
+    """
+    if not _SCRIPT_START:
+        return False
     return (time.monotonic() - _SCRIPT_START) > _SCRIPT_TIMEOUT
 
 
@@ -1274,6 +1282,12 @@ def find_unmerged_branches(
             behind, ahead = (int(x) for x in counts.stdout.split()[:2])
             if ahead == 0:
                 continue
+            # `=` marks a branch commit whose patch is already in base (a
+            # cherry-pick or a rebased copy), `+` one whose patch is not.
+            marks = _run_git(
+                ["rev-list", "--cherry-mark", "--right-only", f"{base}...{name}"],
+                git_root,
+            )
             log = _run_git(
                 [
                     "log",
@@ -1296,6 +1310,13 @@ def find_unmerged_branches(
             )
         except (subprocess.TimeoutExpired, ValueError):
             continue
+        in_base: set[str] | None = None
+        if marks.returncode == 0:
+            in_base = {
+                line[1:].strip()
+                for line in marks.stdout.splitlines()
+                if line.startswith("=")
+            }
         commits = []
         for entry in log.stdout.splitlines():
             sha, cdate, subject = (entry.split("\x00") + ["", ""])[:3]
@@ -1307,6 +1328,9 @@ def find_unmerged_branches(
                     "message": subject,
                     "type": detail["type"],
                     "keys": detail["keys"],
+                    # True: the same patch is already in base, so this commit
+                    # is not unmerged work. None: the check failed.
+                    "patch_in_base": None if in_base is None else sha in in_base,
                 }
             )
         changed = (
@@ -1315,10 +1339,22 @@ def find_unmerged_branches(
         branches.append(
             {
                 "branch": name,
+                # Raw commit count (`rev-list base..branch`). A branch rebased
+                # or cherry-picked onto base still counts every copy here;
+                # `ahead_patch_unique` is the work base does not have.
                 "ahead": ahead,
+                "ahead_patch_unique": (
+                    None if in_base is None else max(ahead - len(in_base), 0)
+                ),
+                "ahead_patch_in_base": None if in_base is None else len(in_base),
                 "behind": behind,
                 "last_commit_date": date,
                 "fix_commits_shown": sum(1 for c in commits if c["type"] == "fix"),
+                "fix_commits_shown_unique": sum(
+                    1
+                    for c in commits
+                    if c["type"] == "fix" and c["patch_in_base"] is not True
+                ),
                 "commits": commits,
                 "commits_truncated": ahead > len(commits),
                 "files_in_scope_changed": len(changed),
@@ -1335,7 +1371,10 @@ def find_unmerged_branches(
         "note": (
             "Commits on remote branches that are not in the base branch, as "
             "of the last fetch (this script never fetches). Treat them as "
-            "prior art: a finding may already be fixed, or attempted, there."
+            "prior art: a finding may already be fixed, or attempted, there. "
+            "A commit with patch_in_base true is a copy of a commit base "
+            "already has (cherry-pick or rebase), so it is not unmerged work; "
+            "`ahead_patch_unique` counts the rest."
         ),
         "branches": branches,
     }

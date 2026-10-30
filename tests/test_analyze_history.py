@@ -1090,6 +1090,38 @@ class TestUnmergedBranches(unittest.TestCase):
         self.assertEqual(names, {"origin/work"})
         self.assertEqual(unmerged["remote_branches_total"], 2)  # work, merged
 
+    def test_cherry_picked_commit_is_not_unmerged_work(self):
+        root = self._repo()
+        # Land the branch's fix on main as a cherry-pick: a new sha, same patch.
+        fix_sha = _git(root, "rev-parse", "origin/work~1")
+        _git(root, "cherry-pick", "-x", fix_sha)
+        _git(root, "update-ref", "refs/remotes/origin/main", "HEAD")
+        result = mod.analyze([str(root), *_WINDOW, "--no-function"])
+        work = result["unmerged_branches"]["branches"][0]
+        self.assertEqual(work["ahead"], 2)
+        self.assertEqual(work["ahead_patch_unique"], 1)
+        self.assertEqual(work["ahead_patch_in_base"], 1)
+        by_message = {c["message"]: c["patch_in_base"] for c in work["commits"]}
+        self.assertEqual(by_message, {"[doc] Notes": False, "[fix] Guard a (K7)": True})
+        self.assertEqual(work["fix_commits_shown"], 1)
+        self.assertEqual(work["fix_commits_shown_unique"], 0)
+
+    def test_unique_patches_are_all_counted(self):
+        root = self._repo()
+        result = mod.analyze([str(root), *_WINDOW, "--no-function"])
+        work = result["unmerged_branches"]["branches"][0]
+        self.assertEqual(work["ahead_patch_unique"], 2)
+        self.assertEqual(work["fix_commits_shown_unique"], 1)
+
+    def test_library_call_without_analyze_lists_branches(self):
+        # A fresh module: analyze() has never started the script clock.
+        fresh = import_script("analyze_history")
+        root = self._repo()
+        unmerged = fresh.find_unmerged_branches(root)
+        self.assertTrue(unmerged["available"])
+        self.assertEqual([b["branch"] for b in unmerged["branches"]], ["origin/work"])
+        self.assertFalse(unmerged["truncated"])
+
     def test_no_branches_flag_skips(self):
         root = self._repo()
         result = mod.analyze([str(root), *_WINDOW, "--no-function", "--no-branches"])
