@@ -1,6 +1,6 @@
 # Code Review Toolkit
 
-A [Claude Code](https://docs.anthropic.com/en/docs/claude-code) plugin that bundles 19 specialized agents and 8 commands for exploring and analyzing existing codebases. It answers the question: **where are the problems in this codebase, and what should I fix first?**
+A [Claude Code](https://docs.anthropic.com/en/docs/claude-code) plugin that bundles 20 specialized agents and 9 commands for exploring and analyzing existing codebases. It answers the question: **where are the problems in this codebase, and what should I fix first?**
 
 ## Installation
 
@@ -60,9 +60,9 @@ For your first time, start with `map` to understand the architecture, then `heal
 
 ## What's Included
 
-- **19 analysis agents** covering concrete correctness defects (mutable defaults, late-binding closures, unreachable `except` ordering, asyncio pitfalls), concurrency defects (lock-guard inference, lock-order cycles, blocking work under locks and on the event loop), defect-grade lint triage, type-checker-provable defects, architecture, git history context, consistency, complexity, test coverage, error handling, documentation, project documentation accuracy, type design, dead code, tech debt, pattern consistency, API surface review, test-invariant investigation, and git history analysis (fix propagation, churn×quality risk).
-- **8 commands** (`explore`, `informed-explore`, `map`, `hotspots`, `health`, `audit`, `known-issues`, `prior-art`) for exploration, release gating, regression tracking, and tracker searches.
-- **23 helper scripts** for correctness scanning, concurrency scanning, tiered lint triage, mypy integrity checks, complexity and clone measurement, import analysis, dead symbol detection, test correlation, findings-to-coverage mapping, type counting, debt collection, test-invariant extraction, git history analysis, finding annotation (introducing commit, branch presence), error-handling and exception surveys, docstring and convention surveys, external-tool integration, known-findings cross-referencing, report diffing, shared utilities, and informed-briefing assembly.
+- **20 analysis agents** covering concrete correctness defects (mutable defaults, late-binding closures, unreachable `except` ordering, asyncio pitfalls), concurrency defects (lock-guard inference, lock-order cycles, blocking work under locks and on the event loop), defect-grade lint triage, type-checker-provable defects, architecture, git history context, consistency, complexity, test coverage, error handling, documentation, project documentation accuracy, type design, dead code, tech debt, pattern consistency, API surface review, test-invariant investigation, git history analysis (fix propagation, churn×quality risk), and a blind skeptic that judges security claims against the project's own threat model.
+- **9 commands** (`explore`, `informed-explore`, `map`, `hotspots`, `health`, `audit`, `known-issues`, `prior-art`, `security-gate`) for exploration, release gating, regression tracking, tracker searches, and gating security claims before disclosure.
+- **25 helper scripts** for correctness scanning, concurrency scanning, tiered lint triage, mypy integrity checks, complexity and clone measurement, import analysis, dead symbol detection, test correlation, findings-to-coverage mapping, type counting, debt collection, test-invariant extraction, git history analysis, finding annotation (introducing commit, branch presence), error-handling and exception surveys, docstring and convention surveys, external-tool integration, known-findings cross-referencing, report diffing, threat-model discovery, security-claim gating, shared utilities, and informed-briefing assembly.
 - **A bug-shape catalog and false-positive taxonomy** (`data/`) that power `informed-explore`, so a re-review hunts un-found siblings of known defect shapes instead of re-deriving the basics.
 
 For detailed usage, agent descriptions, and recommended workflows, see the [plugin README](plugins/code-review-toolkit/README.md).

@@ -6,6 +6,60 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — security-claims gate
+
+A review run labelled findings "security" far more readily than the project's maintainers would. In
+one real review, 84 items went to a project's security team as vulnerabilities, 13 of them rated
+"medium". A strict re-triage against the project's own published audit kept 6, all Low, and found
+one item that repeated an audit finding the project had already accepted. It ran after the report
+was sent. The gate makes that pass mandatory, and makes it happen first. Design:
+`docs/security-gate-design.md`.
+
+- **`find_threat_model.py`** collects the project's own security record:
+  - `SECURITY.md` and policy pages (HTML included), with their scope sections, and any external
+    policy URLs to read;
+  - security-model documents;
+  - **published audits**, whose finding tables (id, title, severity, status) become **precedents**
+    and accepted risks;
+  - GitHub security advisories, CVE/GHSA references, security-labelled issues and security commits;
+  - incident reports, and rules of engagement ("no security research without authorization").
+
+  `status` is `found`, `partial` or `missing`. A network source that could not be queried is
+  reported in `errors`, never as an empty result.
+- **`security_gate.py`** has three subcommands:
+  - `blind` strips the finder's severity, classification and impact prose from security claims, and
+    attaches `precedent_hints`, the precedents whose wording overlaps a claim, to catch audit
+    duplicates;
+  - `signoff` computes `SECURITY-GATE: SOLID= ARGUABLE= BUG= THREAT-MODEL= PRECEDENTS= --
+    PASS|NEEDS-SIGN-OFF|BLOCKED`. It blocks on a missing threat model, a claim without a verdict,
+    a severity above low that isn't anchored to a precedent of at least that severity, a `solid`
+    duplicate, or more than 5 `solid` items without an override;
+  - `score` measures agreement with reference verdicts.
+- **`security-claims-skeptic` agent** triages each claim blind against a fixed rubric:
+  - who the attacker is and what privilege they need;
+  - whether the claim depends on a staff action, on the operator's own infrastructure failing, or
+    on an attacker who already controls the session;
+  - what the attacker gains, and whether the impact was demonstrated or only inferred;
+  - whether the issue is already public or accepted;
+  - for availability claims, who pays the cost.
+
+  The fixed-twin argument counts only when the earlier fix was security-motivated. The agent writes
+  the strongest counterargument and the claim's overstatements for every verdict.
+- **`security-gate` command** ties these together, writes `SECURITY-GATE.md`, and carries the
+  disclosure guidance:
+  - lead with a few strong reports and list the arguable items by title only;
+  - send no unsolicited archives;
+  - don't rush.
+- **Findings schema** (`explore` consolidation): `security_claim: {attacker, preconditions, gain}`,
+  empty unless all three can be named, and `publication_sensitive`, which is separate from whether a
+  finding is a vulnerability. `prior-art` now requires published audits and advisories as a source
+  for security claims, and `audit` routes security claims through the gate.
+- **Regression fixture** (`tests/fixtures/security_gate/`): a fictional project with a policy and an
+  audit, and 12 synthetic claims, one per rubric question, with expected verdicts. Unit tests cover
+  the deterministic half; the README describes the agent evaluation. Skeptic runs: 11/12, then
+  12/12 after adding `incomplete_fix_of` (a remediated precedent's fix escaped by a sibling path is
+  news, not a duplicate).
+
 ## [1.16.0] - 2026-10-30
 
 This release fixes the feedback from two review runs on 1.15.0, consolidated into one ledger of 128

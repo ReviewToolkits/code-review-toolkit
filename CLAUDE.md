@@ -65,9 +65,9 @@ code-review-toolkit/
 ├── CHANGELOG.md                     # Keep a Changelog format
 ├── plugins/code-review-toolkit/
 │   ├── .claude-plugin/plugin.json
-│   ├── agents/                      # 19 agent prompt definitions (markdown)
-│   ├── commands/                    # 8 command definitions (markdown)
-│   ├── scripts/                     # 23 Python scripts (the core code) + a pytest plugin
+│   ├── agents/                      # 20 agent prompt definitions (markdown)
+│   ├── commands/                    # 9 command definitions (markdown)
+│   ├── scripts/                     # 25 Python scripts (the core code) + a pytest plugin
 │   ├── data/                        # bug-shape catalog + FP taxonomy
 │   └── docs/                        # docs the prompts cite (shipped with the plugin)
 └── tests/                           # unittest suite
@@ -106,6 +106,8 @@ candidates, and prints JSON to stdout.
 | `survey_docstrings.py` | Docstring coverage, Returns/Raises/Args contract checks, testable claims, suppression comments |
 | `survey_conventions.py` | Convention variants, majority and minority sites (formatting, logging, typing generics, exits, prints) |
 | `pytest_plugins/crt_leaktrack.py` | pytest plugin (not counted as a script): attributes unclosed sqlite3 connections |
+| `find_threat_model.py` | A project's own security record: policy and scope, published audit tables as severity precedents, advisories, security issues/commits, rules of engagement (`security-gate`) |
+| `security_gate.py` | `blind` (strip the finder's opinion from security claims), `signoff` (compute the `SECURITY-GATE:` line), `score` (agreement with reference verdicts) |
 
 **Dependency graph:** `scan_common.py` is at the center; every other script imports from it.
 `measure_complexity.py` also imports `analyze_history.py` (to attribute fixes to functions as they
@@ -145,12 +147,13 @@ is the calibration loop.**
 
 ### Agents
 
-19 markdown files with YAML frontmatter (name, description) plus a structured prompt. Agents contain
+20 markdown files with YAML frontmatter (name, description) plus a structured prompt. Agents contain
 no analysis logic — they run a script, read the JSON, then do the qualitative review the script
 cannot. Scripts find candidates (with a real false-positive rate); agents confirm or dismiss them.
 
-Two agents are **qualitative** (no backing script — they use Grep/Read directly):
-api-surface-reviewer and project-docs-auditor. The other seventeen are
+Three agents are **qualitative** (no backing script — they use Grep/Read directly):
+api-surface-reviewer, project-docs-auditor and security-claims-skeptic (its scripts are run by the
+`security-gate` command, not by the agent). The other seventeen are
 script-backed, and each ends with a `## Running the script` section (timeout, private `mktemp -d`
 output, no retry after a failure); `test_release_discipline` fails if a new one omits it.
 
@@ -164,6 +167,7 @@ output, no retry after a failure); `test_release_discipline` fails if a new one 
 - `audit` — release-gating: every scanner, a machine-readable sign-off, BLOCK on an incomplete run
 - `known-issues` — cross-references a catalog of earlier findings against a fresh scan
 - `prior-art` — searches the project's tracker before a finding is called novel
+- `security-gate` — judges security claims blind against the project's own threat model; sign-off line, BLOCK on unanchored severity or no threat model
 
 ### Classification system
 

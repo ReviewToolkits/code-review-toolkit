@@ -69,6 +69,12 @@ regardless of what the fresh scan says about it.
 Run `/prior-art` over the FIX findings. An audit that calls something novel without having searched
 the tracker is making a claim it has not checked.
 
+### 3b. Security claims go through the gate
+
+If any finding carries a `security_claim`, run [`security-gate`](security-gate.md) over them. The
+audit's FIX count includes them as defects either way, but **only the gate decides whether one is a
+vulnerability**. Quote its sign-off line in `AUDIT.md`.
+
 ### 4. Triage — and count only what survives
 
 Dispatch the owning agent for each finding class. **The counts in the sign-off line are
