@@ -56,7 +56,9 @@ was sent. The gate makes that pass mandatory, and makes it happen first. Design:
   for security claims, and `audit` routes security claims through the gate.
 - **Regression fixture** (`tests/fixtures/security_gate/`): a fictional project with a policy and an
   audit, and 12 synthetic claims, one per rubric question, with expected verdicts. Unit tests cover
-  the deterministic half; the README describes the agent evaluation.
+  the deterministic half; the README describes the agent evaluation. Skeptic runs: 11/12, then
+  12/12 after adding `incomplete_fix_of` (a remediated precedent's fix escaped by a sibling path is
+  news, not a duplicate).
 
 ## [1.16.0] - 2026-10-30
 

@@ -51,4 +51,5 @@ python3 $S/security_gate.py score --verdicts /tmp/gate/verdicts.json \
 A healthy skeptic agrees on at least 10 of 12, names both duplicates and exceeds no ceiling.
 First run (before `incomplete_fix_of` existed): 11/12, both duplicates named, no ceiling exceeded.
 The miss was C12, treated as a duplicate of the remediated QS-4; that led to the new field.
+Run 2 (with the field): 12/12, both duplicates and both incomplete fixes named, no ceiling exceeded.
 Record the result in the changelog entry of any change to the agent's prompt.
