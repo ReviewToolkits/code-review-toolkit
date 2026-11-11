@@ -4,7 +4,7 @@ A comprehensive collection of specialized agents for exploring and analyzing exi
 
 ## Overview
 
-This plugin bundles 19 expert analysis agents and 8 commands. Each agent focuses on a specific aspect of code quality and is designed for codebase-scale analysis — scanning entire modules or projects rather than reviewing diffs.
+This plugin bundles 20 expert analysis agents and 9 commands. Each agent focuses on a specific aspect of code quality and is designed for codebase-scale analysis — scanning entire modules or projects rather than reviewing diffs.
 
 ### Key Design Principles
 
@@ -77,7 +77,7 @@ No third-party Python packages are required — all scripts use only the standar
 The primary command. Runs the foundational context providers (architecture-mapper + git-history-context) first, then dispatches selected agents with both structural and temporal context.
 
 ```bash
-# Full exploration (all 19 agents)
+# Full exploration (all analysis agents)
 /code-review-toolkit:explore
 
 # Specific directory
@@ -158,6 +158,14 @@ regression after a revert, is detected. Static and drift-tolerant: no repros are
 Searches the project's tracker before a finding is called novel. It refutes wrong findings, and it
 turns "file a new issue" into "comment on the existing one" when the issue is already reported.
 
+### `/code-review-toolkit:security-gate <findings.json> [project]`
+
+Gates security claims before anything reaches a security team. Collects the project's own threat
+model (security policy and scope, published audits with their severities, advisories, security
+history), has the `security-claims-skeptic` triage every claim **blind** against it, requires any
+severity above low to name one of the project's precedents, and emits a machine-readable sign-off
+(`SECURITY-GATE: ... -- PASS|NEEDS-SIGN-OFF|BLOCKED`). Disclosure carries only `solid` items.
+
 ## Agents
 
 ### Tier 1: Foundational
@@ -193,6 +201,7 @@ turns "file a new issue" into "comment on the existing one" when the issue is al
 | **tech-debt-inventory** | TODOs/FIXMEs, deprecated usage, debt age analysis | New |
 | **api-surface-reviewer** | Public API naming consistency, parameter conventions, learnability | New |
 | **project-docs-auditor** | README/docs accuracy, cross-file consistency, reference validation | New |
+| **security-claims-skeptic** | Blind triage of security claims against the project's threat model and precedents; run by `security-gate` | New |
 
 ## Recommended Workflows
 
@@ -299,6 +308,7 @@ code-review-toolkit/
 │   ├── pattern-consistency-checker.md
 │   ├── project-docs-auditor.md
 │   ├── python-pitfall-scanner.md
+│   ├── security-claims-skeptic.md
 │   ├── silent-failure-hunter.md
 │   ├── tech-debt-inventory.md
 │   ├── test-coverage-analyzer.md
@@ -313,7 +323,8 @@ code-review-toolkit/
 │   ├── informed-explore.md
 │   ├── known-issues.md
 │   ├── map.md
-│   └── prior-art.md
+│   ├── prior-art.md
+│   └── security-gate.md
 ├── data/
 │   ├── python_bug_shapes.json
 │   └── python_non_bugs.md
@@ -335,6 +346,7 @@ code-review-toolkit/
     ├── diff_findings.py
     ├── extract_test_invariants.py
     ├── find_dead_symbols.py
+    ├── find_threat_model.py
     ├── map_exceptions.py
     ├── map_findings_coverage.py
     ├── measure_complexity.py
@@ -343,6 +355,7 @@ code-review-toolkit/
     ├── scan_common.py
     ├── scan_concurrency.py
     ├── scan_python_pitfalls.py
+    ├── security_gate.py
     ├── survey_conventions.py
     ├── survey_docstrings.py
     └── survey_error_handling.py

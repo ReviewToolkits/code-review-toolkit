@@ -1,0 +1,85 @@
+{
+  "QS-C01": {
+    "verdict": [
+      "solid"
+    ],
+    "max_severity": "low",
+    "why": "fixed twin of QS-1, which was security-motivated; needs only a session, gain is account takeover beyond what the session allows (password-free email change)"
+  },
+  "QS-C02": {
+    "verdict": [
+      "arguable",
+      "bug"
+    ],
+    "duplicates": "QS-6",
+    "why": "repeats accepted audit finding QS-6"
+  },
+  "QS-C03": {
+    "verdict": [
+      "bug"
+    ],
+    "why": "staff tool; no attacker"
+  },
+  "QS-C04": {
+    "verdict": [
+      "bug"
+    ],
+    "why": "needs the operator's own infrastructure to fail"
+  },
+  "QS-C05": {
+    "verdict": [
+      "bug",
+      "arguable"
+    ],
+    "why": "attacker already holds the session cookie"
+  },
+  "QS-C06": {
+    "verdict": [
+      "bug"
+    ],
+    "why": "authenticated, rate-limited, cost-symmetric DoS; out of scope by policy"
+  },
+  "QS-C07": {
+    "verdict": [
+      "solid"
+    ],
+    "max_severity": "medium",
+    "precedent": "QS-2",
+    "why": "cheap, unauthenticated, site-wide; comparable to QS-2"
+  },
+  "QS-C08": {
+    "verdict": [
+      "bug",
+      "arguable"
+    ],
+    "duplicates": "QS-7",
+    "why": "accepted audit finding QS-7 and a public TODO; authenticated"
+  },
+  "QS-C09": {
+    "verdict": [
+      "arguable"
+    ],
+    "max_severity": "low",
+    "why": "parser differential shown; installer impact inferred, not demonstrated"
+  },
+  "QS-C10": {
+    "verdict": [
+      "bug"
+    ],
+    "why": "gives nothing beyond the login form under the same rate limits"
+  },
+  "QS-C11": {
+    "verdict": [
+      "bug"
+    ],
+    "why": "out of scope by policy (missing headers on static pages)"
+  },
+  "QS-C12": {
+    "verdict": [
+      "solid"
+    ],
+    "max_severity": "low",
+    "why": "the leak QS-4 was fixed to close, through a sibling path",
+    "incomplete_fix_of": "QS-4"
+  }
+}

@@ -246,6 +246,8 @@ hundreds of kilobytes. Dispatch **one consolidation agent** that reads every `ag
 | `agents`, `source_refs` | who found it, and where in their reports |
 | `repro` | artifact paths, if reproduced |
 | `propagation_gap_of`, `prior_art`, `introduced_by` | fix-propagation and history context |
+| `security_claim` | `{attacker, preconditions, gain}`, **empty unless all three can be named concretely**. Touching auth, rate limits or uploads is not a claim; "would help an attacker" is not a claim |
+| `publication_sensitive` | `true` when publication should wait for coordination with the project. Cheap and right under doubt; it never makes a finding a security claim |
 | `notes` | dedup decisions, corrections |
 
 Tell the consolidation agent to work **report by report into an on-disk working file**
@@ -253,6 +255,10 @@ Tell the consolidation agent to work **report by report into an on-disk working 
 report first: 19 reports came to 545 KB, at the edge of one agent's context. Above ~300 KB of
 reports, shard instead: one agent per area (e.g. Groups A+B, C, D+E) writes a partial file, and a
 final pass merges the partials.
+
+**No finding is called a vulnerability, in a report or to anyone, until
+[`security-gate`](security-gate.md) has signed it off.** The consolidation step records claims; the
+gate judges them blind against the project's own threat model and precedents.
 
 Then **spot-check it yourself**: re-read a sample of locations (all FIX findings if feasible), and
 every finding whose agents disagreed. The deduplication and contradiction rules below are the

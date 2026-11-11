@@ -64,6 +64,22 @@ gh api -X GET search/issues -f q="repo:$R is:issue TERM1 TERM2" \
   grep -rn -E '\b[A-Z]{1,3}[0-9]*-?[0-9]+\b' ROADMAP.md CHANGELOG.md docs/ | grep -i TERM
   ```
 
+### The project's security record is prior art
+
+For any finding that carries a `security_claim`, the tracker is not enough. **Published audits and
+advisories are a required source**: a claim that repeats an audit finding the project has already
+published (and perhaps accepted) is not news, and reporting it as new wastes the security team's
+time. Run `find_threat_model.py` (it collects audit finding tables, GitHub security advisories,
+CVE/GHSA references and security-labelled issues) and check each claim against its `precedents`:
+
+```bash
+python3 <plugin_root>/scripts/find_threat_model.py <project> --repo OWNER/REPO --format md
+```
+
+Also search the web for "<project> security audit": audit reports are often published by the firm
+or a funder, not in the project's tree. A match gets the verdict `known` (or `partial` for a sibling
+of a remediated finding), citing the audit finding id.
+
 ### Unmerged branches are prior art
 
 The most consequential prior art is often a fix that already exists on a branch nobody merged yet

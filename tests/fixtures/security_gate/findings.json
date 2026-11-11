@@ -1,0 +1,220 @@
+{
+  "findings": [
+    {
+      "id": "QS-C01",
+      "title": "Change-email form verifies the password of the submitted user id, not the session user",
+      "mechanism": "The form handler looks up the account by the user_id field in the POST body and checks the submitted password against that account, then changes the email of the session's account.",
+      "locations": [
+        "quayside/accounts/views.py:412"
+      ],
+      "evidence": "Reproducer: POST with user_id of the attacker's own second account and that account's password; the session account's email changes.",
+      "security_claim": {
+        "attacker": "anyone with a logged-in session",
+        "preconditions": "a session on the victim's account (e.g. an unlocked shared computer)",
+        "gain": "change the account email, and so take over the account, without knowing its password"
+      },
+      "severity": "medium",
+      "classification": "FIX",
+      "kind": "vulnerability",
+      "impact": "full account takeover"
+    },
+    {
+      "id": "QS-C02",
+      "title": "Address blocklist stops password login but not API-token requests",
+      "mechanism": "The blocklist check runs in the login view only; the API-token authentication policy never consults the address blocklist.",
+      "locations": [
+        "quayside/auth/tokens.py:88"
+      ],
+      "evidence": "Reproducer: blocklist 203.0.113.9, upload with a token from that address: 200.",
+      "security_claim": {
+        "attacker": "a user whose address is blocklisted",
+        "preconditions": "a valid API token created before the ban",
+        "gain": "keeps uploading after being blocked"
+      },
+      "severity": "medium",
+      "classification": "FIX",
+      "kind": "vulnerability",
+      "impact": "blocklisting is ineffective"
+    },
+    {
+      "id": "QS-C03",
+      "title": "Admin 'delete user' crashes on service accounts, so staff cannot remove them",
+      "mechanism": "The admin view dereferences user.email, which is None for service accounts; the delete is rolled back.",
+      "locations": [
+        "quayside/admin/views/users.py:230"
+      ],
+      "evidence": "Reproducer: admin deletes a service account: AttributeError, 500.",
+      "security_claim": {
+        "attacker": "anyone",
+        "preconditions": "a service account exists",
+        "gain": "the account cannot be removed by staff"
+      },
+      "severity": "medium",
+      "classification": "FIX",
+      "kind": "vulnerability",
+      "impact": "staff cannot respond to abuse"
+    },
+    {
+      "id": "QS-C04",
+      "title": "Security notification emails are lost when the task queue is unavailable",
+      "mechanism": "Notifications are enqueued after commit; if the broker is down the enqueue raises and is swallowed.",
+      "locations": [
+        "quayside/email/__init__.py:51"
+      ],
+      "evidence": "Reproducer: stop the broker, log in from a new device: no email is ever sent.",
+      "security_claim": {
+        "attacker": "an attacker",
+        "preconditions": "the task broker is down",
+        "gain": "victims are not told about a new login"
+      },
+      "severity": "low",
+      "classification": "FIX",
+      "kind": "vulnerability",
+      "impact": "users miss security alerts"
+    },
+    {
+      "id": "QS-C05",
+      "title": "A request in flight during logout writes the session back, re-authenticating it",
+      "mechanism": "Logout clears the session, but a concurrent request that loaded the session earlier saves it on response.",
+      "locations": [
+        "quayside/sessions.py:140"
+      ],
+      "evidence": "Reproducer forces the interleaving with events: the old session is valid after logout.",
+      "security_claim": {
+        "attacker": "an attacker",
+        "preconditions": "the attacker holds the victim's session cookie",
+        "gain": "the session survives the victim's logout"
+      },
+      "severity": "medium",
+      "classification": "FIX",
+      "kind": "vulnerability",
+      "impact": "logout does not end sessions"
+    },
+    {
+      "id": "QS-C06",
+      "title": "Authenticated users can upload many large files slowly to tie up workers",
+      "mechanism": "Upload size is checked after the body is read; each upload holds a worker until the body arrives.",
+      "locations": [
+        "quayside/upload/views.py:77"
+      ],
+      "evidence": "Reproducer: 20 slow uploads hold 20 workers.",
+      "security_claim": {
+        "attacker": "any registered user",
+        "preconditions": "an account and a project; uploads are rate limited per user",
+        "gain": "worker exhaustion while the uploads last"
+      },
+      "severity": "medium",
+      "classification": "FIX",
+      "kind": "vulnerability",
+      "impact": "denial of service"
+    },
+    {
+      "id": "QS-C07",
+      "title": "Unauthenticated request with a long Accept-Language header holds a global lock for seconds",
+      "mechanism": "Locale negotiation runs a quadratic parse while holding the process-wide translation lock; every request waits for that lock.",
+      "locations": [
+        "quayside/i18n.py:63"
+      ],
+      "evidence": "Reproducer: one 64 KiB header holds the lock for 4.1 s; concurrent requests wait the full time.",
+      "security_claim": {
+        "attacker": "anyone, no account needed",
+        "preconditions": "none",
+        "gain": "every request on the worker stalls while the parse runs; a few requests per second stall the site"
+      },
+      "severity": "high",
+      "classification": "FIX",
+      "kind": "vulnerability",
+      "impact": "site-wide outage"
+    },
+    {
+      "id": "QS-C08",
+      "title": "Archive upload validation has no decompressed-size cap (decompression bomb)",
+      "mechanism": "Archive members are decompressed fully before validation; a TODO in the source notes the missing cap.",
+      "locations": [
+        "quayside/upload/archives.py:120"
+      ],
+      "evidence": "Reproducer: a 400 KiB archive inflates to 3 GiB during validation.",
+      "security_claim": {
+        "attacker": "anyone",
+        "preconditions": "an account with upload rights",
+        "gain": "memory and CPU exhaustion on the upload worker"
+      },
+      "severity": "medium",
+      "classification": "FIX",
+      "kind": "vulnerability",
+      "impact": "denial of service"
+    },
+    {
+      "id": "QS-C09",
+      "title": "Two ZIP readers disagree on member names when a Unicode path extra field is present",
+      "mechanism": "The validator reads raw names; the metadata extractor honours the Unicode path extra; a crafted archive shows each a different member.",
+      "locations": [
+        "quayside/upload/zipcheck.py:200"
+      ],
+      "evidence": "Reproducer: the two readers list different members. No installer was tested.",
+      "security_claim": {
+        "attacker": "a malicious uploader",
+        "preconditions": "an account with upload rights",
+        "gain": "installers may install files the validator never saw"
+      },
+      "severity": "medium",
+      "classification": "FIX",
+      "kind": "vulnerability",
+      "impact": "validation bypass"
+    },
+    {
+      "id": "QS-C10",
+      "title": "Password-confirmation endpoint reveals whether a password is correct",
+      "mechanism": "The endpoint returns 403 for a wrong password and 200 for a right one; it uses the login rate limits.",
+      "locations": [
+        "quayside/accounts/confirm.py:30"
+      ],
+      "evidence": "Reproducer: the response code differs for right and wrong passwords.",
+      "security_claim": {
+        "attacker": "anyone",
+        "preconditions": "a target username",
+        "gain": "a password oracle"
+      },
+      "severity": "medium",
+      "classification": "FIX",
+      "kind": "vulnerability",
+      "impact": "credential guessing"
+    },
+    {
+      "id": "QS-C11",
+      "title": "Static documentation pages lack Content-Security-Policy and Permissions-Policy headers",
+      "mechanism": "The static file route bypasses the middleware that adds security headers.",
+      "locations": [
+        "quayside/static.py:15"
+      ],
+      "evidence": "Reproducer: curl -I on /docs/ shows no CSP header.",
+      "security_claim": {
+        "attacker": "a web attacker",
+        "preconditions": "an injection elsewhere",
+        "gain": "easier exploitation of any future XSS"
+      },
+      "severity": "low",
+      "classification": "FIX",
+      "kind": "vulnerability",
+      "impact": "defence in depth missing"
+    },
+    {
+      "id": "QS-C12",
+      "title": "Password-reset limiter answers 429 only for ordinary accounts, revealing which accounts are staff",
+      "mechanism": "The per-user reset limiter is skipped for privileged accounts, so repeated requests return 429 for ordinary accounts and never for privileged ones.",
+      "locations": [
+        "quayside/accounts/reset.py:90"
+      ],
+      "evidence": "Reproducer: 10 resets for an ordinary account give 429; for a staff account, never.",
+      "security_claim": {
+        "attacker": "anyone",
+        "preconditions": "a list of usernames",
+        "gain": "identify privileged (staff) accounts to target"
+      },
+      "severity": "medium",
+      "classification": "FIX",
+      "kind": "vulnerability",
+      "impact": "staff enumeration"
+    }
+  ]
+}
