@@ -6,6 +6,7 @@ import subprocess
 import time
 import unittest
 from pathlib import Path
+from typing import ClassVar
 from unittest.mock import patch, MagicMock
 
 from helpers import TempProject, import_script
@@ -609,6 +610,94 @@ class TestCoverageJsonParsing(unittest.TestCase):
             )
             result = mod.parse_coverage_json(root / "coverage.json", root)
             self.assertEqual(result["files"], [])
+
+
+class _FakeCoverageData:
+    def __init__(self, basename):
+        self.basename = basename
+
+    def read(self):
+        pass
+
+    def measured_files(self):
+        return list(_FakeCoverage.executed)
+
+    def lines(self, filename):
+        return _FakeCoverage.executed[filename]
+
+
+class _FakeCoverage:
+    """Stands in for coverage.Coverage: analysis2 returns statements/missing."""
+
+    executed: ClassVar[dict] = {}
+    statements: ClassVar[dict] = {}
+
+    def __init__(self, data_file=None, config_file=True):
+        self.data_file = data_file
+
+    def load(self):
+        pass
+
+    def analysis2(self, filename):
+        stmts = self.statements[filename]
+        missing = [n for n in stmts if n not in self.executed[filename]]
+        return filename, stmts, [], missing, ""
+
+
+class TestCoverageSqliteParsing(unittest.TestCase):
+    """The .coverage path recovers statement counts and missed lines."""
+
+    def _parse_with_fake(self, root, executed, statements):
+        fake = MagicMock(
+            Coverage=_FakeCoverage,
+            CoverageData=_FakeCoverageData,
+            CoverageException=Exception,
+        )
+        _FakeCoverage.executed = executed
+        _FakeCoverage.statements = statements
+        with patch.dict("sys.modules", {"coverage": fake}):
+            return mod.parse_coverage_sqlite(root / ".coverage", root)
+
+    def test_statements_and_missing_lines_are_recovered(self):
+        with TempProject({"pkg/m.py": "a = 1\nb = 2\nif a:\n    c = 3\n"}) as root:
+            (root / ".coverage").write_bytes(b"")
+            src = str(root / "pkg" / "m.py")
+            result = self._parse_with_fake(root, {src: [1, 2, 3]}, {src: [1, 2, 3, 4]})
+        entry = result["files"][0]
+        self.assertEqual(entry["file"], "pkg/m.py")
+        self.assertEqual(entry["statements"], 4)
+        self.assertEqual(entry["covered"], 3)
+        self.assertEqual(entry["missing_lines"], [4])
+        self.assertEqual(entry["coverage_percent"], 75.0)
+        self.assertEqual(result["total_statements"], 4)
+        self.assertEqual(result["files_unanalysed"], 0)
+
+    def test_a_missing_source_file_is_reported_not_counted(self):
+        with TempProject({"m.py": "x = 1\n"}) as root:
+            (root / ".coverage").write_bytes(b"")
+            gone = "/nonexistent/elsewhere/gone.py"
+            result = self._parse_with_fake(root, {gone: [1]}, {})
+        self.assertEqual(result["files_unanalysed"], 1)
+        self.assertIsNone(result["coverage_percent"])  # unmeasured, not 0
+        self.assertEqual(result["files"][0]["covered_lines"], [1])
+        self.assertIn("could not be analysed", result["files"][0]["note"])
+
+    @unittest.skipUnless(
+        mod.check_coverage_importable(), "the coverage package is not installed"
+    )
+    def test_real_coverage_data_file(self):
+        from coverage import CoverageData
+
+        with TempProject(
+            {"m.py": "a = 1\nif a:\n    b = 2\nelse:\n    c = 3\n"}
+        ) as root:
+            data = CoverageData(basename=str(root / ".coverage"))
+            data.add_lines({str(root / "m.py"): [1, 2, 3]})
+            data.write()
+            result = mod.parse_coverage_sqlite(root / ".coverage", root)
+        entry = result["files"][0]
+        self.assertEqual(entry["statements"], 4)
+        self.assertEqual(entry["missing_lines"], [5])
 
 
 # ---------------------------------------------------------------------------
@@ -1417,6 +1506,157 @@ class TestVultureConfidence(unittest.TestCase):
     def test_an_explicit_threshold_is_still_honoured(self):
         _, cmd = self._run(["--vulture-min-confidence", "80"])
         self.assertIn("--min-confidence=80", cmd)
+
+
+class TestVultureDeadSymbolsCrossCheck(unittest.TestCase):
+    """Vulture hits are tagged with what find_dead_symbols.py concluded."""
+
+    REPORT: ClassVar[dict] = {
+        "unreferenced_symbols": [
+            {"file": "pkg/a.py", "line": 20, "name": "helper", "type": "function"},
+        ],
+        "referenced_only_from_tests": [],
+    }
+
+    def _run(self, report):
+        with (
+            TempProject({"pkg/a.py": "x = 1\n"}) as root,
+            patch.object(mod.subprocess, "run") as run,
+        ):
+            run.return_value = MagicMock(stdout=VULTURE_OUTPUT, stderr="")
+            args = mod.parse_args([str(root)])
+            if report is not None:
+                path = root / "dead.json"
+                path.write_text(json.dumps(report), encoding="utf-8")
+                args.dead_symbols = str(path)
+            return mod.run_vulture(args, root, root)
+
+    def test_hits_are_tagged_with_the_scripts_verdict(self):
+        out = self._run(self.REPORT)
+        status = {f["name"]: f["script_status"] for f in out["findings"]}
+        # The script reports `helper` too: corroborated.
+        self.assertEqual(status["helper"], "unreferenced")
+        # A method the script checked and did not report: it found a
+        # reference or excluded it (framework base, registration...).
+        self.assertEqual(status["_open_writer"], "referenced_or_excluded")
+        # Imports and variables are outside what the script checks.
+        self.assertEqual(status["os"], "not_checked")
+        self.assertEqual(status["exc_tb"], "not_checked")
+        referenced = {f["name"]: f["script_referenced"] for f in out["findings"]}
+        self.assertTrue(referenced["_open_writer"])
+        self.assertFalse(referenced["helper"])
+        self.assertEqual(
+            out["script_cross_check"],
+            {"not_checked": 2, "referenced_or_excluded": 1, "unreferenced": 1},
+        )
+
+    def test_test_only_and_per_symbol_exclusions(self):
+        report = {
+            "unreferenced_symbols": [],
+            "referenced_only_from_tests": [
+                {"file": "pkg/a.py", "line": 20, "name": "helper"},
+            ],
+            "excluded_symbols": [
+                {
+                    "file": "pkg/a.py",
+                    "line": 10,
+                    "name": "Writer._open_writer",
+                    "reason": "framework_base",
+                },
+            ],
+        }
+        out = self._run(report)
+        by_name = {f["name"]: f for f in out["findings"]}
+        self.assertEqual(by_name["helper"]["script_status"], "test_only")
+        self.assertEqual(by_name["_open_writer"]["script_status"], "excluded")
+        self.assertEqual(
+            by_name["_open_writer"]["script_excluded_reason"], "framework_base"
+        )
+
+    def test_without_a_report_nothing_is_claimed(self):
+        out = self._run(None)
+        self.assertIsNone(out["script_cross_check"])
+        self.assertNotIn("script_status", out["findings"][0])
+
+    def test_an_unreadable_report_is_an_error_not_a_clean_check(self):
+        out = self._run({"not": "a report"})
+        self.assertIsNone(out["script_cross_check"])
+        self.assertIn(
+            "not a find_dead_symbols.py report", out["script_cross_check_error"]
+        )
+
+
+class TestMypyNotes(unittest.TestCase):
+    """mypy notes are not findings; the parse is cross-checked."""
+
+    def _mypy_out(self, stdout):
+        with (
+            TempProject({"a.py": "x = 1\n"}) as root,
+            patch.object(mod.subprocess, "run") as run,
+        ):
+            run.return_value = MagicMock(stdout=stdout, stderr="")
+            return mod.run_mypy(mod.parse_args([str(root)]), root, root)
+
+    def test_mypy_notes_are_not_findings(self):
+        # A run mypy calls a success, with only annotation-unchecked notes,
+        # must report zero findings and count the notes on their own.
+        note = json.dumps(
+            {
+                "file": "a.py",
+                "line": 2,
+                "column": 4,
+                "hint": None,
+                "message": "By default the bodies of untyped functions are not "
+                "checked, consider using --check-untyped-defs",
+                "code": "annotation-unchecked",
+                "severity": "note",
+            }
+        )
+        out = self._mypy_out(f"{note}\n{note}\n")
+        self.assertEqual(out["total_findings"], 0)
+        self.assertEqual(out["findings"], [])
+        self.assertEqual(out["notes_total"], 2)
+        self.assertEqual(out["notes_by_code"], {"annotation-unchecked": 2})
+        # JSON output states no summary: not stated, never zero.
+        self.assertIsNone(out["summary_errors"])
+
+    def test_mypy_errors_still_count_and_keep_their_hint(self):
+        err = json.dumps(
+            {
+                "file": "a.py",
+                "line": 6,
+                "column": 11,
+                "message": "Bad override",
+                "hint": "This violates the Liskov substitution principle",
+                "code": "override",
+                "severity": "error",
+            }
+        )
+        out = self._mypy_out(err + "\n")
+        self.assertEqual(out["total_findings"], 1)
+        self.assertEqual(out["notes_total"], 0)
+        self.assertIn("Liskov", out["findings"][0]["hint"])
+
+    def test_mypy_text_notes_attach_to_their_error(self):
+        out = self._mypy_out(
+            "a.py:5: error: Signature incompatible  [override]\n"
+            "a.py:5: note:      Superclass:\n"
+            "a.py:5: note:          def m(self) -> int\n"
+            "a.py:9: note: By default the bodies...  [annotation-unchecked]\n"
+            "Found 1 error in 1 file (checked 1 source file)\n"
+        )
+        self.assertEqual(out["total_findings"], 1)
+        self.assertEqual(len(out["findings"][0]["notes"]), 2)
+        self.assertEqual(out["notes_total"], 1)
+        self.assertEqual(out["summary_errors"], 1)
+        self.assertIsNone(out["count_mismatch"])
+
+    def test_mypy_summary_disagreeing_with_the_parse_is_flagged(self):
+        out = self._mypy_out(
+            "garbled error line\nFound 3 errors in 1 file (checked 1 source file)\n"
+        )
+        self.assertEqual(out["summary_errors"], 3)
+        self.assertIn("parsed 0 error(s)", out["count_mismatch"])
 
 
 class TestEarlyStopParsing(unittest.TestCase):

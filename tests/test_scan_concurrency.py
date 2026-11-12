@@ -7,6 +7,7 @@ none. Several shapes need a call chain, so fixtures span functions and modules.
 
 import unittest
 from textwrap import dedent
+from typing import ClassVar
 
 from helpers import TempProject, import_script
 
@@ -1671,3 +1672,143 @@ class TestSessionLevelSet(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestModelApplicability(unittest.TestCase):
+    """No in-process concurrency must not read as a clean result."""
+
+    def test_nothing_to_model_says_so(self):
+        out = scan_project({"pkg/mod.py": "def f(x):\n    return x + 1\n"})
+        summary = out["summary"]
+        self.assertFalse(summary["model_applicable"])
+        self.assertIn("not a clean result", summary["model_note"])
+        self.assertEqual(summary["concurrency_evidence"]["locks_declared"], 0)
+
+    def test_a_threaded_project_is_applicable(self):
+        out = scan_project({"pkg/mod.py": _GUARDED_CLASS.format(body="pass")})
+        self.assertTrue(out["summary"]["model_applicable"])
+        self.assertNotIn("model_note", out["summary"])
+
+    def test_thread_starts_and_async_count_as_concurrency(self):
+        for src in (
+            "import threading\ndef go(f):\n    threading.Thread(target=f).start()\n",
+            "async def handler():\n    return 1\n",
+            (
+                "from concurrent.futures import ThreadPoolExecutor\n"
+                "def go(f):\n    with ThreadPoolExecutor() as ex:\n        ex.submit(f)\n"
+            ),
+        ):
+            with self.subTest(src=src):
+                out = scan_project({"pkg/mod.py": src})
+                self.assertTrue(out["summary"]["model_applicable"])
+
+    def test_distributed_lock_subclasses_and_sites_are_listed(self):
+        src = """
+        from redis.lock import Lock
+        import filelock
+
+        class JobLock(Lock):
+            def __init__(self, client):
+                super().__init__(client, "job-lock")
+
+        class NightlyLock(JobLock):
+            pass
+
+        def run(client):
+            with JobLock(client):
+                pass
+
+        def nightly(client):
+            with NightlyLock(client):
+                pass
+
+        def export(path):
+            with filelock.FileLock(path + ".lock"):
+                pass
+
+        def refresh(client):
+            with client.lock("refresh", timeout=30):
+                pass
+
+        def unrelated(store):
+            with store.transaction():
+                pass
+        """
+        out = scan_project({"pkg/tasks.py": src})
+        summary = out["summary"]
+        locks = summary["distributed_locks"]
+        self.assertEqual(
+            [(c["class"], c["base"]) for c in locks["classes"]],
+            [
+                ("pkg.tasks.JobLock", "redis.lock.Lock"),
+                ("pkg.tasks.NightlyLock", "pkg.tasks.JobLock"),
+            ],
+        )
+        self.assertEqual(
+            [(site["function"], site["via"]) for site in locks["sites"]],
+            [
+                ("run", "class"),
+                ("nightly", "class"),
+                ("export", "class"),
+                ("refresh", "client-lock-method"),
+            ],
+        )
+        # Not in-process concurrency: the model still does not apply, and the
+        # note points at the sites.
+        self.assertFalse(summary["model_applicable"])
+        self.assertIn("4 distributed-lock site(s)", summary["model_note"])
+
+
+class TestSlowLockWitness(unittest.TestCase):
+    """The "meanwhile" holder a finding cites is the slowest, not the first."""
+
+    _FILES: ClassVar[dict] = {
+        "pkg/store.py": """
+            import subprocess, threading
+
+            class Store:
+                def __init__(self):
+                    self._state = threading.Lock()
+
+                def save_settings(self, path):
+                    with self._state:
+                        with open(path, "w") as fh:  # a quick, by-design hold
+                            fh.write("x")
+
+                def archive(self, src):
+                    with self._state:
+                        subprocess.run(["tar", "czf", "out.tgz", src])
+
+                def flush_metrics(self):
+                    with self._state:
+                        pass
+            """,
+        "pkg/app.py": """
+            import asyncio
+            from pkg.store import Store
+
+            async def flush_periodically(store: Store):
+                while True:
+                    await asyncio.sleep(10)
+                    store.flush_metrics()
+            """,
+    }
+
+    def test_the_slowest_holder_is_the_witness(self):
+        out = scan_project(self._FILES)
+        found = of(out["findings"], "transitive-blocking-call-in-async")
+        self.assertEqual(len(found), 1)
+        meanwhile = [step for step in found[0]["chain"] if "meanwhile" in step]
+        self.assertEqual(len(meanwhile), 1)
+        # The subprocess holder, not the file write found first in the file.
+        self.assertIn("archive", meanwhile[0])
+
+    def test_every_holder_is_listed_slowest_first(self):
+        holders = scan_project(self._FILES)["summary"]["slow_lock_holders"]
+        entry = holders["Store._state"]
+        self.assertEqual(entry["holders"], 2)
+        self.assertEqual(
+            [(h["category"], h["strong"]) for h in entry["top"]],
+            [("subprocess", True), ("file-io", True)],
+        )
+        self.assertIn("archive", entry["top"][0]["at"])

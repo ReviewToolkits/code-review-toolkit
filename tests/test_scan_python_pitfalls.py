@@ -146,6 +146,53 @@ class TestEqWithoutHash(unittest.TestCase):
         src = "class C:\n    __hash__ = None\n    def __eq__(self, o):\n        return True\n"
         self.assertNotIn("eq-without-hash", shapes(src))
 
+    EQ = "    def __eq__(self, o):\n        return True\n"
+
+    def _eq(self, src):
+        return [f for f in scan(src) if f["shape"] == "eq-without-hash"]
+
+    def test_never_hashed_service_class_is_low(self):
+        src = "class Service:\n    def run(self):\n        pass\n" + self.EQ
+        self.assertEqual(self._eq(src)[0]["confidence"], "low")
+
+    def test_instances_in_a_set_or_dict_key_stay_medium(self):
+        for use in (
+            "seen = {Point(1, 2)}\n",
+            "index = {Point(1, 2): 'a'}\n",
+            "s.add(Point(1, 2))\n",
+            "h = hash(Point(1, 2))\n",
+            "cache[Point(1, 2)] = 1\n",
+        ):
+            src = "class Point:\n" + self.EQ + use
+            with self.subTest(use=use):
+                self.assertEqual(self._eq(src)[0]["confidence"], "medium")
+
+    def test_value_type_stays_medium(self):
+        src = "class Version:\n    __slots__ = ('major',)\n" + self.EQ
+        self.assertEqual(self._eq(src)[0]["confidence"], "medium")
+        src = "class Rank:\n    def __lt__(self, o):\n        return True\n" + self.EQ
+        self.assertEqual(self._eq(src)[0]["confidence"], "medium")
+
+    def test_per_check_counts_say_what_was_considered(self):
+        src = (
+            "class A:\n"
+            + self.EQ
+            + "class B:\n    def __hash__(self):\n        return 1\n"
+            + self.EQ
+            + "class C:\n    pass\n"
+        )
+        with TempProject({"mod.py": src}) as root:
+            per_check = mod.analyze(str(root / "mod.py"))["summary"]["per_check"]
+        self.assertEqual(
+            per_check["eq-without-hash"],
+            {
+                "reported": 1,
+                "suppressed": {},
+                "considered": 2,
+                "skipped": {"defines-hash": 1},
+            },
+        )
+
 
 class TestMutationDuringIteration(unittest.TestCase):
     def test_del_during_dict_iteration(self):
@@ -390,6 +437,90 @@ class TestClassLevelMutable(unittest.TestCase):
         self.assertNotIn(
             "class-level-mutable-attribute", shapes("class C:\n    NAME = 'x'\n")
         )
+
+    def _clm(self, src):
+        return [x for x in scan(src) if x["shape"] == "class-level-mutable-attribute"]
+
+    def test_annotated_constructor_calls_are_found(self):
+        # `tags: set[str] = set()` was missed while `items = []` was reported.
+        src = (
+            "import collections\n"
+            "from collections import defaultdict, deque\n"
+            "class C:\n"
+            "    tags: set[str] = set()\n"
+            "    seen = dict()\n"
+            "    order = list()\n"
+            "    groups = defaultdict(list)\n"
+            "    recent = deque(maxlen=10)\n"
+            "    counts = collections.Counter()\n"
+            "    def add(self, t):\n"
+            "        self.tags.add(t)\n"
+        )
+        found = {f["message"].split()[0]: f["confidence"] for f in self._clm(src)}
+        self.assertEqual(
+            set(found),
+            {"C.tags", "C.seen", "C.order", "C.groups", "C.recent", "C.counts"},
+        )
+        self.assertEqual(found["C.tags"], "high")  # mutated in a method
+
+    def test_a_constructor_with_a_computed_argument_is_not_assumed_mutable(self):
+        # `list(DEFAULTS)` copies, but from what? Out of scope for this check.
+        self.assertEqual(self._clm("class C:\n    x = list(load())\n"), [])
+        self.assertEqual(self._clm("class C:\n    x = frozenset()\n"), [])
+
+    def test_dunder_hooks_are_suppressed_not_reported(self):
+        src = (
+            "class Item(Base):\n"
+            "    __tablename__ = 'items'\n"
+            "    __table_args__ = {'schema': 'app'}\n"
+            "    __acl__ = []\n"
+        )
+        with TempProject({"mod.py": src}) as root:
+            result = mod.analyze(str(root / "mod.py"))
+        self.assertEqual(
+            [
+                f
+                for f in result["findings"]
+                if f["shape"] == "class-level-mutable-attribute"
+            ],
+            [],
+        )
+        self.assertEqual(
+            result["summary"]["suppressed_by_differential"][
+                "class-level-mutable-attribute"
+            ],
+            {"dunder-hook-not-mutated": 2},
+        )
+
+    def test_a_mutated_dunder_is_still_reported(self):
+        src = (
+            "class Registry:\n"
+            "    __registry__ = {}\n"
+            "    def register(self, k, v):\n"
+            "        self.__registry__[k] = v\n"
+        )
+        f = self._clm(src)
+        self.assertEqual(f[0]["confidence"], "high")
+
+    def test_classvar_declares_the_sharing(self):
+        src = (
+            "from typing import ClassVar\n"
+            "class C:\n"
+            "    plugins: ClassVar[list] = []\n"
+            "    names: ClassVar[set[str]] = set()\n"
+            "    def add(self, p):\n"
+            "        self.plugins.append(p)\n"
+        )
+        found = {f["message"].split()[0]: f["confidence"] for f in self._clm(src)}
+        # Mutated: still reported, but the author declared it shared.
+        self.assertEqual(found, {"C.plugins": "medium"})
+
+    def test_declarative_class_attributes_are_low(self):
+        src = "class Base(DeclarativeBase):\n    type_annotation_map = {int: 'x'}\n"
+        self.assertEqual(self._clm(src)[0]["confidence"], "low")
+        # The same attribute on an ordinary class stays medium.
+        src = "class Plain:\n    type_annotation_map = {int: 'x'}\n"
+        self.assertEqual(self._clm(src)[0]["confidence"], "medium")
 
 
 class TestBareExcept(unittest.TestCase):
@@ -761,6 +892,106 @@ class TestExceptExceptionTooBroadGrading(unittest.TestCase):
         self.assertEqual(broad(src)[0]["confidence"], "high")
 
 
+class TestExceptExceptionTooBroadHandlerCalls(unittest.TestCase):
+    """A handler that notifies and carries on still swallows the failure."""
+
+    def test_notifying_handlers_are_reported_and_graded(self):
+        # `flash()` / `capture_exception()` used to exempt the handler, so
+        # the shape reported zero on code whose broad catches all do this.
+        src = (
+            "def save(request, form):\n    try:\n        form.save()\n"
+            "    except Exception:\n        request.session.flash('failed')\n"
+            "def send(mailer, msg):\n    try:\n        mailer.send(msg)\n"
+            "    except Exception as exc:\n        sentry_sdk.capture_exception(exc)\n"
+        )
+        found = {f["line"]: f for f in broad(src)}
+        self.assertEqual(set(found), {4, 9})
+        # Durable call, narrow body: high, downgraded once for the report.
+        self.assertEqual(found[4]["confidence"], "medium")
+        self.assertIn("reports it via `flash()`", found[4]["detail"])
+        self.assertIn("capture_exception()", found[9]["detail"])
+
+    def test_an_unknown_helper_call_is_graded_with_a_pointer(self):
+        src = (
+            "def f(o, state):\n    try:\n        o.flush()\n"
+            "    except Exception:\n        state.mark_dirty()\n"
+        )
+        f = broad(src)
+        self.assertEqual(f[0]["confidence"], "medium")
+        self.assertIn("`mark_dirty()` -- read it", f[0]["detail"])
+
+    def test_raising_and_exiting_calls_are_not_swallowing(self):
+        for handler in (
+            "abort(500)",
+            "pytest.fail('boom')",
+            "sys.exit(1)",
+            "task.retry(exc=exc)",
+            "raise_conflict(exc)",
+        ):
+            src = (
+                "def f(o, task):\n    try:\n        o.flush()\n"
+                f"    except Exception as exc:\n        {handler}\n"
+            )
+            with self.subTest(handler=handler):
+                self.assertEqual(broad(src), [])
+
+    def test_a_tuple_including_exception_is_broad(self):
+        src = (
+            "def f(o):\n    try:\n        o.flush()\n"
+            "    except (ValueError, Exception):\n        pass\n"
+        )
+        f = broad(src)
+        self.assertEqual(f[0]["confidence"], "high")
+        self.assertIn("`except Exception:`", f[0]["message"])
+
+    def test_a_returned_denial_is_an_error_result(self):
+        src = (
+            "def check(v, ctx):\n    try:\n        v.verify(ctx)\n"
+            "    except Exception as exc:\n        return PermissionDenied(str(exc))\n"
+        )
+        self.assertEqual(broad(src), [])
+
+
+class TestPerCheckCounts(unittest.TestCase):
+    """`summary.per_check`: zero findings is not the same as not checked."""
+
+    def test_broad_handlers_considered_and_skipped(self):
+        src = (
+            "def f(o):\n    try:\n        o.flush()\n    except Exception:\n"
+            "        raise\n"
+            "def g(o):\n    try:\n        o.flush()\n    except Exception:\n"
+            "        pass\n"
+        )
+        with TempProject({"mod.py": src}) as root:
+            per_check = mod.analyze(str(root / "mod.py"))["summary"]["per_check"]
+        self.assertEqual(
+            per_check["except-exception-too-broad"],
+            {
+                "reported": 1,
+                "suppressed": {},
+                "considered": 2,
+                "skipped": {"re-raises-or-exits": 1},
+            },
+        )
+
+    def test_a_check_that_saw_nothing_reports_zero_considered(self):
+        with TempProject({"mod.py": "x = 1\n"}) as root:
+            per_check = mod.analyze(str(root / "mod.py"))["summary"]["per_check"]
+        # Instrumented and nothing there: 0. Not instrumented: null.
+        self.assertEqual(per_check["except-exception-too-broad"]["considered"], 0)
+        self.assertEqual(per_check["except-exception-too-broad"]["skipped"], {})
+        self.assertEqual(per_check["mutable-default-argument"]["reported"], 0)
+        self.assertIsNone(per_check["mutable-default-argument"]["considered"])
+        self.assertEqual(set(per_check), set(mod._CHECKS) | set(mod._PROJECT_CHECKS))
+
+    def test_counts_do_not_leak_between_runs(self):
+        src = "class A:\n    def __eq__(self, o):\n        return True\n"
+        with TempProject({"mod.py": src}) as root:
+            mod.analyze(str(root / "mod.py"))
+            per_check = mod.analyze(str(root / "mod.py"))["summary"]["per_check"]
+        self.assertEqual(per_check["eq-without-hash"]["considered"], 1)
+
+
 class TestCleanupOnlyOnSuccess(unittest.TestCase):
     def test_close_last_in_try_is_flagged(self):
         src = (
@@ -989,6 +1220,41 @@ class TestRaiseWithoutFrom(unittest.TestCase):
             "    except ValueError as err:\n        raise err\n"
         )
         self.assertNotIn("raise-without-from-in-except", shapes(src))
+
+
+class TestRaiseWithoutFromGrading(unittest.TestCase):
+    """Style-grade by default; medium only where the original is dropped."""
+
+    def _conf(self, handler):
+        src = f"def f(t):\n    try:\n        return int(t)\n    {handler}\n"
+        hits = [f for f in scan(src) if f["shape"] == "raise-without-from-in-except"]
+        return hits[0]["confidence"]
+
+    def test_a_bound_and_unused_exception_is_medium(self):
+        # True positive: the handler captured the error and then dropped it.
+        self.assertEqual(
+            self._conf("except ValueError as err:\n        raise ConfigError('bad')"),
+            "medium",
+        )
+
+    def test_the_original_in_the_message_is_low(self):
+        self.assertEqual(
+            self._conf(
+                "except ValueError as err:\n        raise ConfigError(f'bad: {err}')"
+            ),
+            "low",
+        )
+
+    def test_no_binding_is_low(self):
+        self.assertEqual(
+            self._conf("except KeyError:\n        raise ConfigError('missing key')"),
+            "low",
+        )
+
+    def test_an_http_response_exception_is_low(self):
+        self.assertEqual(
+            self._conf("except ValueError as err:\n        raise HTTPNotFound()"), "low"
+        )
 
 
 class TestRaiseWithoutFromDifferentials(unittest.TestCase):

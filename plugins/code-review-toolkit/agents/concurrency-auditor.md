@@ -51,6 +51,10 @@ Scan the package, not the tests: test fixtures take locks in odd ways on purpose
   and look for state you'd expect to be guarded that is missing from it.
 - **`slow_locks`** — locks some code holds across blocking work. Waiting for one of these is slow.
   Every `transitive-blocking-call-in-async` finding at `medium`/`high` goes through one.
+  `slow_lock_holders` gives, per slow lock, how many distinct holders block under it and the
+  slowest few (process/network/sleep first, file I/O last; strongly resolved chains first). The
+  "meanwhile, another thread holds ..." step of a finding's `chain` is the first of these; cite
+  it, and check the others when it does not convince you.
 - **`blocking_low_signal`** — file I/O and pipe waits under a lock, grouped by lock and by the leaf
   call the chains end in. Not findings: read it for a lock that is held across far more I/O than
   its purpose needs, and for pipes (a request/reply channel under a lock is where the desync hunt
@@ -128,8 +132,13 @@ locks it found:
   check done mechanically for one shape.
 - **Docstrings that promise concurrency properties** ("lock-free", "called with the lock held",
   "other collections keep serving"). Each is a testable claim.
-- **A project with no concurrency** (`locks_declared` empty, no `async def`): the hazards are
-  still there, one level up. Start from `module_state`:
+- **A project with no concurrency** (`summary.model_applicable: false`; `concurrency_evidence`
+  says what was looked for): zero findings is **not** a clean result, and the report must say the
+  model did not apply. Read `summary.distributed_locks` first: cross-process lock classes (a
+  cache, file or coordination-service lock, and project subclasses of one) with every `with`
+  site. The races they guard live in the external store, so check each site's timeout, what
+  happens when the lock expires mid-work, and what runs when acquiring fails. The hazards are
+  also still there one level up. Start from `module_state`:
   - **Re-entrancy of process-global state.** For each singleton, mutated container or rebound
     global, ask what a second in-process call sees: a test runner calling `main()` twice, an
     application embedding the library, a planned server mode. State left over from the first

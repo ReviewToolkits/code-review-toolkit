@@ -732,9 +732,59 @@ def parse_mypy_output(
     return findings
 
 
+_MYPY_SUMMARY_RE = re.compile(
+    r"Found (\d+) errors? in \d+ files? \(checked \d+ source files?\)"
+)
+_MYPY_CLEAN_RE = re.compile(r"Success: no issues found in \d+ source files?")
+
+
+def parse_mypy_summary(stdout: str) -> int | None:
+    """The error count mypy states in its own summary line, or None.
+
+    The text output ends with ``Found N errors in ...`` or ``Success: no
+    issues found ...``; the JSON output has no summary line at all, so None
+    means "not stated", never "zero".
+    """
+    count = None
+    for line in stdout.splitlines():
+        m = _MYPY_SUMMARY_RE.search(line)
+        if m:
+            count = int(m.group(1))
+        elif _MYPY_CLEAN_RE.search(line):
+            count = 0
+    return count
+
+
+def split_mypy_notes(findings: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Separate mypy's ``note`` records from its errors and warnings.
+
+    A note is not a finding. One without an error code that follows an error
+    (the text output's Superclass/Subclass lines) belongs to that error and is
+    attached to it as ``notes``; one with a code of its own
+    (``annotation-unchecked``) or with no error before it stands alone. The
+    JSON output already folds attached notes into the error's ``hint``.
+    Counting notes as findings made a run mypy reported as a success show a
+    nonzero total that disagreed with check_typing's.
+    """
+    errors: list[dict] = []
+    standalone: list[dict] = []
+    current: dict | None = None
+    for finding in findings:
+        if finding.get("severity") == "note":
+            if current is not None and not finding.get("code"):
+                current.setdefault("notes", []).append(finding)
+            else:
+                standalone.append(finding)
+                current = None
+            continue
+        current = finding
+        errors.append(finding)
+    return errors, standalone
+
+
 def normalize_mypy_finding(finding: dict, project_root: Path) -> dict:
     """Normalize a single mypy finding."""
-    return {
+    normalized = {
         "code": finding.get("code", ""),
         "severity": finding.get("severity", "error"),
         "file": make_relative(finding.get("file", ""), project_root),
@@ -745,6 +795,11 @@ def normalize_mypy_finding(finding: dict, project_root: Path) -> dict:
         "fixable": False,
         "significance": "normal",
     }
+    if finding.get("hint"):
+        normalized["hint"] = finding["hint"]
+    if finding.get("notes"):
+        normalized["notes"] = [note.get("message", "") for note in finding["notes"]]
+    return normalized
 
 
 def run_mypy(
@@ -792,21 +847,43 @@ def run_mypy(
 
     # Parse everything, then cap: stopping the parse at max_findings made
     # `total_findings` equal the cap and `findings_capped` never true.
-    findings = parse_mypy_output(result.stdout)
+    findings, notes = split_mypy_notes(parse_mypy_output(result.stdout))
 
     normalized = [
-        normalize_mypy_finding(f, project_root)
-        for f in findings[:args.max_findings]
+        normalize_mypy_finding(f, project_root) for f in findings[: args.max_findings]
     ]
+    notes_by_code: dict[str, int] = {}
+    for note in notes:
+        key = note.get("code") or "(no code)"
+        notes_by_code[key] = notes_by_code.get(key, 0) + 1
+
+    # Cross-check the parse against what mypy itself said. The text output
+    # states its error count; the JSON output does not, so `summary_errors`
+    # is None there (not stated, not zero).
+    summary_errors = parse_mypy_summary(result.stdout)
+    errors = sum(1 for f in findings if f.get("severity") == "error")
+    count_mismatch = None
+    if summary_errors is not None and summary_errors != errors:
+        count_mismatch = (
+            f"parsed {errors} error(s) but mypy's summary line reported "
+            f"{summary_errors}: output format not understood"
+        )
 
     return {
         "config_source": config_source,
         # The config file mypy was told to read (None for the curated run).
         "config_file": config_used,
         "strict_mode": args.mypy_strict,
+        # Errors and warnings only: notes are counted separately below.
         "total_findings": len(findings),
         "findings_capped": len(findings) > args.max_findings,
         "findings": normalized,
+        # Standalone notes (e.g. `annotation-unchecked`: an untyped body mypy
+        # skipped). Not findings; a count of what mypy did NOT check.
+        "notes_total": len(notes),
+        "notes_by_code": dict(sorted(notes_by_code.items())),
+        "summary_errors": summary_errors,
+        "count_mismatch": count_mismatch,
     }
 
 
@@ -844,6 +921,84 @@ def parse_vulture_output(
     return findings
 
 
+# Vulture types whose symbol find_dead_symbols also checks (top-level functions,
+# classes and methods; a property is a decorated method there). Variables,
+# attributes and imports it does not check, so "absent from its output" says
+# nothing about those.
+_DEAD_SYMBOLS_CHECKED_TYPES = frozenset(
+    {"unused-function", "unused-method", "unused-class", "unused-property"}
+)
+
+
+def load_dead_symbols(path: str | None) -> tuple[dict | None, str | None]:
+    """Read a find_dead_symbols.py JSON report: ``(report, error)``."""
+    if not path:
+        return None, None
+    try:
+        report = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return None, f"could not read --dead-symbols {path}: {exc}"
+    if not isinstance(report, dict) or "unreferenced_symbols" not in report:
+        return None, f"--dead-symbols {path} is not a find_dead_symbols.py report"
+    return report, None
+
+
+def tag_vulture_with_dead_symbols(findings: list[dict], report: dict) -> dict:
+    """Mark each vulture hit with what find_dead_symbols.py concluded.
+
+    Vulture's 60% tier (functions, methods, classes) is mostly framework
+    dispatch it cannot see; find_dead_symbols already excludes registered,
+    framework-base and dispatch-prefixed symbols and follows references into
+    tests, docs and templates. Each hit gets ``script_status``:
+
+    - ``unreferenced``: the script reports it too (corroborated);
+    - ``test_only``: the script found references, but only from tests;
+    - ``excluded``: the script left it out on purpose (``script_excluded_reason``),
+      when the report lists per-symbol exclusions;
+    - ``referenced_or_excluded``: the script checked this kind of symbol and
+      reported nothing, so it found a reference or excluded it;
+    - ``not_checked``: a kind of symbol the script does not check.
+
+    ``script_referenced`` is True for ``test_only`` and
+    ``referenced_or_excluded``. Returns the per-status counts.
+    """
+
+    def index(entries: list[dict]) -> tuple[dict, dict]:
+        by_line, by_name = {}, {}
+        for entry in entries or []:
+            name = str(entry.get("name", "")).rsplit(".", 1)[-1]
+            by_line[(entry.get("file"), entry.get("line"))] = entry
+            by_name.setdefault((entry.get("file"), name), entry)
+        return by_line, by_name
+
+    tables = [
+        ("unreferenced", index(report.get("unreferenced_symbols", []))),
+        ("test_only", index(report.get("referenced_only_from_tests", []))),
+        ("excluded", index(report.get("excluded_symbols", []))),
+    ]
+    counts: dict[str, int] = {}
+    for finding in findings:
+        if finding.get("type") not in _DEAD_SYMBOLS_CHECKED_TYPES:
+            finding["script_status"] = "not_checked"
+            finding["script_referenced"] = False
+            counts["not_checked"] = counts.get("not_checked", 0) + 1
+            continue
+        key_line = (finding.get("file"), finding.get("line"))
+        key_name = (finding.get("file"), finding.get("name"))
+        status, matched = "referenced_or_excluded", None
+        for label, (by_line, by_name) in tables:
+            matched = by_line.get(key_line) or by_name.get(key_name)
+            if matched is not None:
+                status = label
+                break
+        finding["script_status"] = status
+        finding["script_referenced"] = status in ("test_only", "referenced_or_excluded")
+        if status == "excluded" and matched.get("reason"):
+            finding["script_excluded_reason"] = matched["reason"]
+        counts[status] = counts.get(status, 0) + 1
+    return dict(sorted(counts.items()))
+
+
 def run_vulture(
     args: argparse.Namespace, project_root: Path, scan_root: Path,
 ) -> dict:
@@ -867,6 +1022,14 @@ def run_vulture(
     # Most confident first, so the cap keeps the 90-100% hits (unused
     # imports, unreachable code) rather than whatever vulture printed first.
     findings.sort(key=lambda f: (-f["confidence"], f["file"], f["line"]))
+    # Cross-check against find_dead_symbols.py when its report is given
+    # (`--dead-symbols`): tag every hit before capping, so counts are complete.
+    dead_symbols, dead_symbols_error = load_dead_symbols(
+        getattr(args, "dead_symbols", None)
+    )
+    script_cross_check = None
+    if dead_symbols is not None:
+        script_cross_check = tag_vulture_with_dead_symbols(findings, dead_symbols)
     normalized = findings[:args.max_findings]
 
     by_confidence: dict[str, int] = {}
@@ -876,7 +1039,7 @@ def run_vulture(
         by_confidence[key] = by_confidence.get(key, 0) + 1
         by_type[finding["type"]] = by_type.get(finding["type"], 0) + 1
 
-    return {
+    out = {
         "min_confidence": min_confidence,
         "total_findings": len(findings),
         "findings_capped": len(findings) > args.max_findings,
@@ -889,8 +1052,14 @@ def run_vulture(
             sorted(by_confidence.items(), key=lambda kv: -int(kv[0]))
         ),
         "by_type": dict(sorted(by_type.items())),
+        # Per `script_status` counts when a find_dead_symbols report was
+        # given; null when none was (not cross-checked, not "no overlap").
+        "script_cross_check": script_cross_check,
         "findings": normalized,
     }
+    if dead_symbols_error:
+        out["script_cross_check_error"] = dead_symbols_error
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1068,9 +1237,39 @@ def parse_coverage_json(path: Path, project_root: Path) -> dict:
     }
 
 
-def parse_coverage_sqlite(path: Path, project_root: Path) -> dict | None:
-    """Parse .coverage SQLite database using the coverage package."""
+def _coverage_analysis(
+    cov, error: type[Exception], filename: str, project_root: Path
+) -> tuple | None:
+    """``(statements, missing)`` for one measured file, or None.
+
+    ``Coverage.analysis2`` re-parses the source to learn which lines are
+    statements, so it needs the file on disk; a data file recorded on another
+    machine, or with ``relative_files``, names paths that may not resolve.
+    """
+    if cov is None:
+        return None
+    path = Path(filename)
+    if not path.is_absolute():
+        path = project_root / path
+    if not path.is_file():
+        return None
     try:
+        _, statements, _, missing, _ = cov.analysis2(str(path))
+    except (error, OSError, SyntaxError, ValueError):
+        return None
+    return statements, missing
+
+
+def parse_coverage_sqlite(path: Path, project_root: Path) -> dict | None:
+    """Parse a ``.coverage`` SQLite database using the coverage package.
+
+    The data file stores only the executed lines. Statement counts and missed
+    lines come from ``Coverage.analysis2()``, which re-parses each source file
+    under the project's own coverage config (its exclusions apply); a file
+    that cannot be analysed keeps its executed lines and says why.
+    """
+    try:
+        import coverage
         from coverage import CoverageData
     except ImportError:
         return None
@@ -1078,28 +1277,70 @@ def parse_coverage_sqlite(path: Path, project_root: Path) -> dict | None:
     covdata = CoverageData(basename=str(path))
     covdata.read()
 
+    config = find_config_file("coverage", project_root)
+    try:
+        cov = coverage.Coverage(
+            data_file=str(path),
+            config_file=str(project_root / config) if config else False,
+        )
+        cov.load()
+    except (coverage.CoverageException, OSError, ValueError):
+        cov = None
+
     files: list[dict] = []
+    total_statements = total_covered = unanalysed = 0
     for filename in covdata.measured_files():
         lines = covdata.lines(filename)
         if lines is None:
             continue
-        files.append({
+        entry: dict = {
             "file": make_relative(filename, project_root),
             "covered_lines": sorted(lines),
-            "note": (
-                "Statement count unavailable from .coverage; "
-                "use coverage.json or coverage.xml for complete data"
-            ),
-        })
+        }
+        analysed = _coverage_analysis(
+            cov, coverage.CoverageException, filename, project_root
+        )
+        if analysed is None:
+            unanalysed += 1
+            entry["note"] = (
+                "Statement count unavailable: the source file could not be "
+                "analysed (missing, or recorded under another path)"
+            )
+        else:
+            statements, missing = analysed
+            covered = len(statements) - len(missing)
+            total_statements += len(statements)
+            total_covered += covered
+            entry.update(
+                statements=len(statements),
+                covered=covered,
+                missing_lines=sorted(missing),
+                coverage_percent=(
+                    round(100 * covered / len(statements), 1) if statements else 100.0
+                ),
+            )
+        files.append(entry)
 
-    return {
+    result = {
         "source": str(path.relative_to(project_root)),
-        "note": (
-            "Parsed from .coverage SQLite; for complete data generate "
-            "coverage.json or coverage.xml"
+        "total_statements": total_statements,
+        "total_covered": total_covered,
+        "coverage_percent": (
+            round(100 * total_covered / total_statements, 1)
+            if total_statements
+            else None
         ),
-        "files": files,
+        # Files whose statements could not be counted: their lines are absent
+        # from the totals above, so a nonzero count means partial totals.
+        "files_unanalysed": unanalysed,
+        "files": sorted(files, key=lambda f: f.get("coverage_percent", -1)),
     }
+    if unanalysed:
+        result["note"] = (
+            f"{unanalysed} measured file(s) could not be analysed; their "
+            "statement counts and missed lines are missing from the totals"
+        )
+    return result
 
 
 def read_coverage_data(
@@ -1306,6 +1547,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # Ruff options.
     parser.add_argument("--ruff-config", default=None, help="Path to ruff config file")
+    parser.add_argument(
+        "--dead-symbols",
+        default=None,
+        metavar="PATH",
+        help="find_dead_symbols.py JSON report: tag each vulture hit with its verdict",
+    )
     parser.add_argument(
         "--ruff-rules", default=None,
         help="Override rule selection (comma-separated, e.g. 'F,B,SIM')",

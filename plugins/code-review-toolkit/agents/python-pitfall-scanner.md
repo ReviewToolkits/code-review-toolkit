@@ -40,6 +40,13 @@ that are therefore not in `findings`:
   (`urlopen(u).close()`), or a handle the function never acquired.
 - `raise-without-from-in-except`: `raise SystemExit(...)` (no traceback, so no chain to show), and
   a raise that a `try` inside the same handler catches.
+- `class-level-mutable-attribute`: an unmutated dunder hook (`__table_args__`, `__acl__`,
+  `__slots__`), and an unmutated attribute annotated `ClassVar`.
+
+`summary.per_check` has one entry per check that ran: `reported`, `suppressed` (by reason), and, for
+the checks that count their candidates, `considered` and `skipped` (by reason). `considered: null`
+means the check does not count candidates, not that it saw none. When you write "no findings" for a
+shape, say whether it considered candidates (`considered: 0` vs `considered: 40, reported: 0`).
 
 Give the counts in your report's *Suppressed* section; spot-check one or two if a count looks
 surprising.
@@ -71,6 +78,13 @@ The scanner is tuned for **recall with an honest confidence signal**; you make t
 - **`medium`** — the shape matches but a legitimate reading exists. **You must check the code.** The
   `detail` field states exactly what to check.
 - **`low`** — weak signal; useful mainly as a starting point for a sibling hunt.
+
+**Confidence is a per-shape prior, adjusted by the site's differential: it is not a measured
+per-site probability.** On one service only 3 of 8 `high` findings were real. Do not report
+`high` as "confirmed", do not sort the report by it, and do not skip reading a `high` hit. The
+precision measured for a shape lives in the catalog entry's `validation` and `confirmed_examples`;
+when you confirm or dismiss hits of a shape, say how many of each, so the catalog can be
+calibrated.
 
 Read the actual source at every `file:line` before reporting. A finding you have not read is a
 hypothesis.

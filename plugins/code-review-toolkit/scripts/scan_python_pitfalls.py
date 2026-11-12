@@ -586,6 +586,31 @@ def _returns(name: str, body: list[ast.stmt]) -> bool:
     return False
 
 
+# Per-check bookkeeping for the summary's `per_check`: how many candidates a
+# check looked at and why it passed over some, so "no findings" can be told
+# apart from "nothing considered". analyze() resets it; a check that records
+# nothing reports `considered: null` (not instrumented), never 0.
+_STATS: dict[str, dict] = {}
+# The checks that call _note(): for these, no entry means "considered 0".
+_COUNTED_CHECKS = frozenset(
+    {
+        "class-level-mutable-attribute",
+        "eq-without-hash",
+        "except-exception-too-broad",
+        "raise-without-from-in-except",
+    }
+)
+
+
+def _note(shape: str, event: str, reason: str = "") -> None:
+    """Record that *shape* considered a candidate, or skipped one for *reason*."""
+    entry = _STATS.setdefault(shape, {"considered": 0, "skipped": {}})
+    if event == "considered":
+        entry["considered"] += 1
+    else:
+        entry["skipped"][reason] = entry["skipped"].get(reason, 0) + 1
+
+
 def _finding(
     shape: str,
     severity: str,
@@ -778,19 +803,77 @@ def _check_return_in_finally(tree: ast.AST) -> list[dict]:
     return out
 
 
+# Calls that hash their argument: a set or dict key needs `__hash__`.
+_HASHING_CALLS = frozenset(
+    {"hash", "set", "frozenset", "add", "fromkeys", "setdefault"}
+)
+# Methods that mark a class as a value type, one whose instances are compared
+# (and so plausibly hashed) by content.
+_VALUE_TYPE_METHODS = frozenset({"__lt__", "__le__", "__gt__", "__ge__", "__iter__"})
+
+
+def _instances_hashed(tree: ast.AST, name: str) -> bool:
+    """True if `name(...)` instances visibly reach a set, a dict key or hash()."""
+
+    def builds(node: ast.AST | None) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and _dotted_name(node.func).split(".")[-1] == name
+        )
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Set, ast.SetComp)):
+            elts = node.elts if isinstance(node, ast.Set) else [node.elt]
+            if any(builds(e) for e in elts):
+                return True
+        elif isinstance(node, ast.Dict):
+            if any(builds(k) for k in node.keys):
+                return True
+        elif isinstance(node, ast.DictComp):
+            if builds(node.key):
+                return True
+        elif isinstance(node, ast.Subscript) and builds(node.slice):
+            return True  # mapping[Name(...)]
+        elif isinstance(node, ast.Call) and _call_tail(node) in _HASHING_CALLS:
+            if any(builds(arg) for arg in node.args):
+                return True
+    return False
+
+
+def _is_value_type(cls: ast.ClassDef) -> bool:
+    """Ordering/iteration methods, `__slots__`, or a tuple-like base."""
+    for stmt in cls.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if stmt.name in _VALUE_TYPE_METHODS:
+                return True
+        elif isinstance(stmt, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "__slots__" for t in stmt.targets
+        ):
+            return True
+    return any(
+        _dotted_name(b).split(".")[-1] in ("tuple", "NamedTuple", "Enum")
+        for b in cls.bases
+    )
+
+
 def _check_eq_without_hash(tree: ast.AST) -> list[dict]:
     out: list[dict] = []
+    shape = "eq-without-hash"
     for cls in ast.walk(tree):
         if not isinstance(cls, ast.ClassDef):
             continue
-        decorators = _decorator_names(cls)
-        if decorators & _DATACLASS_DECORATORS:
-            continue  # eq/hash are derived
         methods = {
             m.name
             for m in cls.body
             if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
+        if "__eq__" not in methods:
+            continue
+        _note(shape, "considered")
+        decorators = _decorator_names(cls)
+        if decorators & _DATACLASS_DECORATORS:
+            _note(shape, "skipped", "dataclass")
+            continue  # eq/hash are derived
         # An explicit `__hash__ = None` is a deliberate opt-out.
         explicit = {
             t.id
@@ -799,22 +882,38 @@ def _check_eq_without_hash(tree: ast.AST) -> list[dict]:
             for t in stmt.targets
             if isinstance(t, ast.Name)
         }
-        if (
-            "__eq__" in methods
-            and "__hash__" not in methods
-            and "__hash__" not in explicit
-        ):
-            out.append(
-                _finding(
-                    "eq-without-hash",
-                    "CONSIDER",
-                    "medium",
-                    cls,
-                    f"class {cls.name} defines __eq__ but not __hash__; instances become "
-                    f"unhashable (Python sets __hash__ = None)",
-                    "only a problem if instances are used in a set or as dict keys -- check",
-                )
+        if "__hash__" in methods or "__hash__" in explicit:
+            _note(shape, "skipped", "defines-hash")
+            continue
+        # Unhashable instances are a defect only where something hashes them.
+        # Five of five hits on one web app were service and factory classes
+        # nothing ever puts in a set: report those at low.
+        if _instances_hashed(tree, cls.name):
+            conf = "medium"
+            why = "instances reach a set, a dict key or hash() in this module"
+        elif _is_value_type(cls):
+            conf = "medium"
+            why = (
+                "a value type (ordering, __slots__ or a tuple-like base): its "
+                "instances are likely to end up in a set or as dict keys"
             )
+        else:
+            conf = "low"
+            why = (
+                "no instance is seen in a set, as a dict key or in hash() in this "
+                "module -- only a problem if some caller hashes one"
+            )
+        out.append(
+            _finding(
+                shape,
+                "CONSIDER",
+                conf,
+                cls,
+                f"class {cls.name} defines __eq__ but not __hash__; instances become "
+                f"unhashable (Python sets __hash__ = None)",
+                why,
+            )
+        )
     return out
 
 
@@ -1061,42 +1160,125 @@ def _attribute_mutated_anywhere(tree: ast.AST, attr: str) -> bool:
     return False
 
 
+# Constructors that build a fresh mutable container. `x = set()` at class level
+# is the same shared object as `x = set([])` or `x = {}`.
+_MUTABLE_CONSTRUCTORS = frozenset(
+    {"list", "dict", "set", "defaultdict", "OrderedDict", "deque", "Counter"}
+)
+# Bare names a constructor may take without making the value opaque:
+# `defaultdict(list)`, `deque(maxlen=10)`.
+_CONSTRUCTOR_ARG_NAMES = frozenset(
+    {"list", "dict", "set", "int", "float", "str", "bool", "tuple", "frozenset"}
+)
+# Base-class names of declarative (ORM/schema) classes: their class attributes
+# are configuration a metaclass reads once, not per-instance state.
+_DECLARATIVE_BASE_SUFFIXES = ("Base", "Model", "DeclarativeBase", "Schema")
+
+
+def _is_mutable_value(value: ast.expr) -> bool:
+    """A list/dict/set literal, or a container constructor with plain arguments."""
+    if isinstance(value, (ast.List, ast.Dict, ast.Set)):
+        return True
+    if not isinstance(value, ast.Call):
+        return False
+    if _call_tail(value) not in _MUTABLE_CONSTRUCTORS:
+        return False
+    args = [*value.args, *(kw.value for kw in value.keywords)]
+    return all(
+        isinstance(a, ast.Constant)
+        or (isinstance(a, ast.Name) and a.id in _CONSTRUCTOR_ARG_NAMES)
+        for a in args
+    )
+
+
+def _is_classvar(annotation: ast.expr | None) -> bool:
+    """`ClassVar[...]` / `typing.ClassVar[...]`: sharing is declared."""
+    if annotation is None:
+        return False
+    if isinstance(annotation, ast.Subscript):
+        annotation = annotation.value
+    return _dotted_name(annotation).split(".")[-1] == "ClassVar"
+
+
+def _is_declarative_class(cls: ast.ClassDef) -> bool:
+    """An ORM/schema-style class: a declarative base, or a mapped table."""
+    for base in cls.bases:
+        if _dotted_name(base).split(".")[-1].endswith(_DECLARATIVE_BASE_SUFFIXES):
+            return True
+    return any(
+        isinstance(stmt, ast.Assign)
+        and any(
+            isinstance(t, ast.Name) and t.id == "__tablename__" for t in stmt.targets
+        )
+        for stmt in cls.body
+    )
+
+
 def _check_class_level_mutable(tree: ast.AST) -> list[dict]:
     out: list[dict] = []
+    shape = "class-level-mutable-attribute"
     for cls in ast.walk(tree):
         if not isinstance(cls, ast.ClassDef):
             continue
         if _decorator_names(cls) & _DATACLASS_DECORATORS:
             continue
+        declarative = _is_declarative_class(cls)
         for stmt in cls.body:
             targets: list[ast.expr] = []
             value: ast.expr | None = None
+            annotation: ast.expr | None = None
             if isinstance(stmt, ast.Assign):
                 targets, value = stmt.targets, stmt.value
             elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
                 targets, value = [stmt.target], stmt.value
-            if value is None or not isinstance(value, (ast.List, ast.Dict, ast.Set)):
+                annotation = stmt.annotation
+            if value is None or not _is_mutable_value(value):
                 continue
             for tgt in targets:
                 if not isinstance(tgt, ast.Name):
                     continue
+                _note(shape, "considered")
                 # The defect requires an actual mutation. ALL_CAPS reads as a
                 # constant, and an attribute never mutated in this module is
                 # declarative class config (the menu_specs/Meta pattern seen
                 # throughout idlelib) -- downgrade rather than drop, since the
                 # mutation could live in another module.
                 mutated = _attribute_mutated_anywhere(tree, tgt.id)
-                if mutated:
+                dunder = tgt.id.startswith("__") and tgt.id.endswith("__")
+                suppressed = None
+                if _is_classvar(annotation):
+                    if mutated:
+                        conf = "medium"
+                        why = (
+                            "annotated ClassVar, so the sharing is declared; a "
+                            "defect only if per-instance state was meant"
+                        )
+                    else:
+                        conf, why = "low", "annotated ClassVar and never mutated"
+                        suppressed = "annotated-classvar"
+                elif mutated:
                     conf, why = (
                         "high",
                         "the shared object is mutated in this module -- state bleeds "
                         "between instances",
                     )
+                elif dunder:
+                    # `__table_args__`, `__acl__`, `__slots__`, `__all__`: a
+                    # protocol hook a framework or the interpreter reads, and
+                    # on web apps most of this shape's output.
+                    conf, why = "low", "dunder hook, never mutated in this module"
+                    suppressed = "dunder-hook-not-mutated"
                 elif tgt.id.isupper():
                     conf, why = (
                         "low",
                         "ALL_CAPS and no mutation seen: reads as a constant (prefer a "
                         "tuple/frozenset to make that explicit)",
+                    )
+                elif declarative:
+                    conf = "low"
+                    why = (
+                        "declarative (ORM/schema) class and no mutation seen: "
+                        "configuration its base reads once"
                     )
                 else:
                     conf, why = (
@@ -1105,17 +1287,18 @@ def _check_class_level_mutable(tree: ast.AST) -> list[dict]:
                         "config, possibly overridden by subclasses -- confirm nothing "
                         "elsewhere mutates it",
                     )
-                out.append(
-                    _finding(
-                        "class-level-mutable-attribute",
-                        "FIX",
-                        conf,
-                        stmt,
-                        f"{cls.name}.{tgt.id} is a mutable class attribute shared by every "
-                        f"instance",
-                        why,
-                    )
+                finding = _finding(
+                    shape,
+                    "FIX",
+                    conf,
+                    stmt,
+                    f"{cls.name}.{tgt.id} is a mutable class attribute shared by every "
+                    f"instance",
+                    why,
                 )
+                if suppressed:
+                    finding["suppressed"] = suppressed
+                out.append(finding)
     return out
 
 
@@ -1309,6 +1492,89 @@ def _handler_swallows(handler: ast.ExceptHandler) -> bool:
     return True
 
 
+# Calls that leave the handler by raising or exiting: `abort(500)`,
+# `pytest.fail(...)`, `sys.exit(1)`, `raise_for_status()`, `task.retry()`.
+_RAISING_CALL_TAILS = frozenset(
+    {
+        "abort",
+        "fail",
+        "exit",
+        "_exit",
+        "reraise",
+        "throw",
+        "raise_for_status",
+        # A task queue's `task.retry(exc=...)` raises its retry exception.
+        "retry",
+    }
+)
+# Calls that tell a user or an operator about the failure without stopping
+# the caller: an error tracker, a flash message, a notification.
+_REPORTING_HINTS = (
+    "capture_exception",
+    "captureexception",
+    "capture_message",
+    "report",
+    "notify",
+    "flash",
+    "alert",
+    "sentry",
+)
+
+
+def _handler_exits(handler: ast.ExceptHandler) -> bool:
+    """True if the handler re-raises, or calls something that raises or exits."""
+    for node in ast.walk(handler):
+        if isinstance(node, ast.Raise):
+            return True
+        if isinstance(node, ast.Call):
+            tail = _call_tail(node)
+            if tail in _RAISING_CALL_TAILS or tail.startswith("raise_"):
+                return True
+    return False
+
+
+def _handler_calls(handler: ast.ExceptHandler) -> tuple[list[str], list[str]]:
+    """(reporting calls, other effectful calls) the handler makes.
+
+    Logging calls and side-effect-free helpers are neither: logging is graded
+    on its own, and a pure helper changes nothing.
+    """
+    reporting: list[str] = []
+    other: list[str] = []
+    for node in ast.walk(handler):
+        if not isinstance(node, ast.Call) or _logger_level(node) is not None:
+            continue
+        tail = _call_tail(node)
+        # A bare `error(...)` / `info(...)`: log-named, but with no logger
+        # receiver it is neither proven logging nor a report. Not counted.
+        if not tail or tail in _PURE_CALLS:
+            continue
+        if tail in _QUIET_LOG_METHODS or tail in _LOUD_LOG_METHODS:
+            continue
+        name = _dotted_name(node.func).lower()
+        if any(hint in name for hint in _REPORTING_HINTS):
+            reporting.append(tail)
+        else:
+            other.append(tail)
+    return reporting, other
+
+
+def _broad_handler_type(handler: ast.ExceptHandler) -> str | None:
+    """`Exception`/`BaseException` if the handler catches one, else None.
+
+    Also matches a dotted spelling (`builtins.Exception`) and a tuple that
+    includes one: `except (ValueError, Exception)` is just as broad.
+    """
+    types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    for node in types:
+        if node is None:
+            continue
+        name = _dotted_name(node).split(".")[-1]
+        if name in ("Exception", "BaseException"):
+            return name
+    return None
+
+
 # --- except-exception-too-broad grading -----------------------------------
 #
 # The size of the try body says little about whether a broad catch hides a
@@ -1436,7 +1702,7 @@ _PURE_CALLS = frozenset(
 )
 
 # A returned call whose name says it builds an error result.
-_ERROR_RESULT_HINTS = ("error", "fail", "reject", "abort", "problem")
+_ERROR_RESULT_HINTS = ("error", "fail", "reject", "abort", "problem", "denied")
 
 _EMPTY_CONTAINER_CALLS = frozenset({"dict", "list", "set", "tuple", "frozenset", "str"})
 
@@ -1772,29 +2038,49 @@ def _grade_broad_handler(
             conf, why = "high", _BROAD_DETAIL["in-domain"]
         else:
             conf, why = "medium", _BROAD_DETAIL["named-default"]
+    reporting, other = _handler_calls(handler)
     if loud:
         conf = _DOWNGRADE[conf]
         why += "; the handler logs at warning or above, so the failure is visible"
+    elif reporting:
+        conf = _DOWNGRADE[conf]
+        why += (
+            f"; the handler reports it via `{reporting[0]}()`, so a user or operator "
+            "sees it, but the caller still proceeds as if the operation worked"
+        )
+    elif other:
+        conf = _DOWNGRADE[conf]
+        why += (
+            f"; the handler calls `{other[0]}()` -- read it: dismiss if it "
+            "re-raises or records the failure"
+        )
     return conf, why
 
 
 def _check_except_exception_too_broad(tree: ast.AST) -> list[dict]:
     out: list[dict] = []
+    shape = "except-exception-too-broad"
     for node, following, fn, cls in _tries_in_context(tree):
         for handler in node.handlers:
-            if not isinstance(handler.type, ast.Name):
+            caught = _broad_handler_type(handler)
+            if caught is None:
                 continue
-            if handler.type.id not in {"Exception", "BaseException"}:
-                continue
-            if not _handler_swallows(handler):
+            _note(shape, "considered")
+            # Only a handler that re-raises or exits lets the failure out; one
+            # that returns an error result is graded (and suppressed) below.
+            # Any other call -- `flash()`, `capture_exception()`, a helper --
+            # used to exempt the handler outright, so the shape reported zero
+            # on code whose broad catches all notify and carry on.
+            if _handler_exits(handler):
+                _note(shape, "skipped", "re-raises-or-exits")
                 continue
             conf, why = _grade_broad_handler(node, handler, following, fn, cls)
             finding = _finding(
-                "except-exception-too-broad",
+                shape,
                 "CONSIDER" if conf in ("low", "suppressed") else "FIX",
                 conf,
                 handler,
-                f"`except {handler.type.id}:` swallows every failure of the "
+                f"`except {caught}:` swallows every failure of the "
                 f"guarded operation, not just the expected one",
                 why,
             )
@@ -2111,6 +2397,7 @@ def _raises_in_handler(handler: ast.ExceptHandler):
 
 def _check_raise_without_from(tree: ast.AST) -> list[dict]:
     out: list[dict] = []
+    shape = "raise-without-from-in-except"
     for candidate in ast.walk(tree):
         if not isinstance(candidate, ast.ExceptHandler):
             continue
@@ -2123,14 +2410,42 @@ def _check_raise_without_from(tree: ast.AST) -> list[dict]:
             # Re-raising the caught name itself needs no cause.
             if isinstance(node.exc, ast.Name) and node.exc.id == handler.name:
                 continue
+            _note(shape, "considered")
+            # Style-grade by default: the implicit chain ("During handling of
+            # the above exception...") still prints the original, and these
+            # dominated the totals on a web app. Medium only where the
+            # original's details are visibly dropped: the handler binds the
+            # exception and then never uses it.
+            raised = _raised_name(node)
+            if raised.startswith("HTTP") or raised.endswith(("Redirect", "Response")):
+                conf = "low"
+                why = (
+                    "an HTTP response exception: control flow, not an error chain "
+                    "-- `from None` states that if wanted"
+                )
+            elif handler.name and not any(
+                handler.name in _names_used(stmt) for stmt in handler.body
+            ):
+                conf = "medium"
+                why = (
+                    f"the handler binds `{handler.name}` and never uses it: the new "
+                    "exception's message drops the original's details -- use "
+                    f"`from {handler.name}`, or put them in the message"
+                )
+            else:
+                conf = "low"
+                why = (
+                    "style: the implicit chain still shows the original; use "
+                    "`from err` to chain or `from None` to suppress deliberately"
+                )
             finding = _finding(
-                "raise-without-from-in-except",
+                shape,
                 "CONSIDER",
-                "medium",
+                conf,
                 node,
                 "raising a new exception inside `except` without `from` loses the "
                 "explicit cause",
-                "use `from err` to chain or `from None` to suppress deliberately",
+                why,
             )
             if _raised_name(node) == "SystemExit":
                 # An exit prints no traceback, so there is no chain to show.
@@ -5405,6 +5720,7 @@ def analyze(
 
     findings: list[dict] = []
     corpus: list[tuple[str, ast.AST]] = []
+    _STATS.clear()
     for path in files:
         findings.extend(analyze_file(path, project_root, checks, corpus))
 
@@ -5446,6 +5762,22 @@ def analyze(
         top = directory.lstrip("/").split("/")[0] or "."
         by_top_directory[top] = by_top_directory.get(top, 0) + 1
 
+    # One line per check that ran: what it reported and suppressed, and --
+    # for the checks that count their candidates -- what it considered and
+    # why it passed some over. `considered: null` means "not counted", so a
+    # zero is never mistaken for "checked and clean" or the reverse.
+    per_check: dict[str, dict] = {}
+    for name in sorted(checks or (set(_CHECKS) | set(_PROJECT_CHECKS))):
+        stats = _STATS.get(name)
+        if stats is None and name in _COUNTED_CHECKS:
+            stats = {"considered": 0, "skipped": {}}
+        per_check[name] = {
+            "reported": by_shape.get(name, 0),
+            "suppressed": suppressed_counts.get(name, {}),
+            "considered": stats["considered"] if stats else None,
+            "skipped": dict(sorted(stats["skipped"].items())) if stats else None,
+        }
+
     result = build_envelope(project_root, scan_root, files_total, len(files), selection)
     result["summary"] = {
         "total_findings": len(findings),
@@ -5467,6 +5799,7 @@ def analyze(
         "suppressed_by_differential": dict(sorted(suppressed_counts.items())),
         "checks_run": sorted(checks or (set(_CHECKS) | set(_PROJECT_CHECKS))),
         "excluded_patterns": sorted(selection.exclude_patterns),
+        "per_check": per_check,
     }
     result["findings"] = findings
     result["suppressed"] = suppressed

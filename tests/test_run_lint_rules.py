@@ -160,6 +160,34 @@ class TestSuppressionDetails(unittest.TestCase):
         out = mod.suppression_details("E722", "except:  # noqa: E722")
         self.assertTrue(out["suppression_is_dismissal_signal"])
 
+    def test_type_ignore_and_coverage_pragma_are_not_signals(self):
+        # They address mypy and coverage: a B006 under `# pragma: no cover`
+        # was dismissed as if the author had considered the ruff rule.
+        for line in (
+            "def f(x=[]):  # pragma: no cover",
+            "def f(x=[]):  # type: ignore[assignment]",
+            "def f(x=[]):  # type: ignore",
+        ):
+            with self.subTest(line=line):
+                out = mod.suppression_details("B006", line)
+                self.assertIsNotNone(out["suppression_comment"])
+                self.assertFalse(out["suppression_names_rule"])
+                self.assertFalse(out["suppression_is_dismissal_signal"])
+
+    def test_a_noqa_after_a_type_ignore_still_counts(self):
+        out = mod.suppression_details(
+            "F401", "import x  # type: ignore[import]  # noqa: F401"
+        )
+        self.assertTrue(out["suppression_names_rule"])
+        self.assertTrue(out["suppression_is_dismissal_signal"])
+
+    def test_pylint_naming_a_ruff_code_is_checked(self):
+        # pylint's W0603 is ruff's PLW0603.
+        out = mod.suppression_details("PLW0603", "global x  # pylint: disable=W0603")
+        self.assertTrue(out["suppression_names_rule"])
+        out = mod.suppression_details("PLW0603", "global x  # pylint: disable=W0611")
+        self.assertFalse(out["suppression_names_rule"])
+
     def test_no_comment(self):
         out = mod.suppression_details("S307", "x = eval(s)")
         self.assertIsNone(out["suppression_comment"])
@@ -177,6 +205,288 @@ class TestSuppressionDetails(unittest.TestCase):
             result = _analyze_with_fake_ruff(root, hits)
         self.assertEqual(result["summary"]["has_suppression_comment"], 2)
         self.assertEqual(result["summary"]["suppression_needs_verification"], 1)
+        self.assertEqual(result["summary"]["suppression_dismissal_signals"], 1)
+
+    def test_a_coverage_pragma_is_not_counted_as_a_dismissal(self):
+        from helpers import TempProject
+
+        source = "def f(x=[]):  # pragma: no cover\n    return x\n"
+        with TempProject({"m.py": source}) as root:
+            hits = [_fake_hit(root, "m.py", 1, "[]", code="B006")]
+            result = _analyze_with_fake_ruff(root, hits)
+        self.assertEqual(result["summary"]["has_suppression_comment"], 1)
+        self.assertEqual(result["summary"]["suppression_dismissal_signals"], 0)
+
+
+PYPROJECT_SELECT_ALL = """\
+[project]
+name = "x"
+
+[tool.ruff.lint]
+# select everything, then opt out
+select = ["ALL"]
+ignore = [
+  "B019",  # we have a few of these, should fix them
+  "DTZ",  # naive datetimes need manual review
+  # complexity metrics we do not use
+  "C901",
+  "PLR0912",
+
+  "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# T201: command-line entry points may print
+"app/cli/**/*.py" = ["T201"]
+
+# INP001: these are scripts
+"bin/*.py" = ["INP001"]
+"dev/*.py" = ["INP001"]
+"models.py" = ["N805"]  # declarative classes, not methods
+"""
+
+
+class TestProjectRuffConfig(unittest.TestCase):
+    """The project's own select/ignore list, with each ignore's stated reason."""
+
+    def _config(self, files):
+        from helpers import TempProject
+
+        with TempProject({}) as root:
+            # Written after TempProject, which writes its own pyproject.toml.
+            for name, text in files.items():
+                (root / name).write_text(text, encoding="utf-8")
+            return mod.parse_project_ruff_config(root)
+
+    def test_select_all_and_each_ignore_reason(self):
+        config = self._config({"pyproject.toml": PYPROJECT_SELECT_ALL})
+        self.assertTrue(config["selects_all"])
+        reasons = {e["rule"]: e["reason"] for e in config["ignore"]}
+        self.assertEqual(reasons["B019"], "we have a few of these, should fix them")
+        self.assertEqual(reasons["DTZ"], "naive datetimes need manual review")
+        # A comment line above a group explains the group.
+        self.assertEqual(reasons["C901"], "complexity metrics we do not use")
+        self.assertEqual(reasons["PLR0912"], "complexity metrics we do not use")
+        # A blank line ends the group: no reason is invented.
+        self.assertIsNone(reasons["E501"])
+
+    def test_per_file_ignores_and_their_reasons(self):
+        config = self._config({"pyproject.toml": PYPROJECT_SELECT_ALL})
+        pfi = {
+            (e["pattern"], e["rule"]): e["reason"] for e in config["per_file_ignores"]
+        }
+        self.assertEqual(
+            pfi[("app/cli/**/*.py", "T201")],
+            "T201: command-line entry points may print",
+        )
+        # One comment block above consecutive keys explains all of them.
+        self.assertEqual(pfi[("bin/*.py", "INP001")], "INP001: these are scripts")
+        self.assertEqual(pfi[("dev/*.py", "INP001")], "INP001: these are scripts")
+        self.assertEqual(pfi[("models.py", "N805")], "declarative classes, not methods")
+
+    def test_ruff_toml_and_extend_select(self):
+        config = self._config(
+            {
+                "ruff.toml": (
+                    "[lint]\n"
+                    'extend-select = ["B"]  # bugbear too\n'
+                    'ignore = ["E721"]  # kept from the old flake8 config\n'
+                ),
+            }
+        )
+        self.assertEqual(config["source"], "ruff.toml")
+        self.assertIsNone(config["select"])
+        self.assertEqual(config["extend_select"], ["B"])
+        self.assertFalse(config["selects_all"])
+        self.assertEqual(
+            mod.project_rule_status("E721", "m.py", config),
+            {
+                "status": "ignored-by-project",
+                "entry": "E721",
+                "reason": "kept from the old flake8 config",
+            },
+        )
+        self.assertEqual(
+            mod.project_rule_status("B006", "m.py", config)["status"],
+            "selected-by-project",
+        )
+        self.assertEqual(
+            mod.project_rule_status("F821", "m.py", config)["status"],
+            "project-default-selection",
+        )
+
+    def test_no_ruff_config(self):
+        self.assertIsNone(self._config({"m.py": "x = 1\n"}))
+        self.assertIsNone(mod.project_rule_status("F821", "m.py", None))
+
+    def test_rule_status_precedence(self):
+        config = self._config({"pyproject.toml": PYPROJECT_SELECT_ALL})
+
+        def status(code, path):
+            return mod.project_rule_status(code, path, config)
+
+        self.assertEqual(status("DTZ005", "app/a.py")["entry"], "DTZ")
+        self.assertEqual(status("F821", "app/a.py")["status"], "selected-by-project")
+        self.assertEqual(
+            status("T201", "app/cli/sub/run.py")["status"], "ignored-for-file"
+        )
+        self.assertEqual(status("T201", "app/cli/run.py")["status"], "ignored-for-file")
+        self.assertEqual(status("T201", "app/web.py")["status"], "selected-by-project")
+        # A pattern without a slash matches the file name anywhere.
+        self.assertEqual(
+            status("N805", "app/x/models.py")["status"], "ignored-for-file"
+        )
+        # A more specific select beats a broader ignore.
+        narrow = {
+            "select": ["DTZ005"],
+            "extend_select": [],
+            "selects_all": False,
+            "ignore": [{"rule": "DTZ", "reason": None}],
+            "per_file_ignores": [],
+        }
+        self.assertEqual(
+            mod.project_rule_status("DTZ005", "a.py", narrow)["status"],
+            "selected-by-project",
+        )
+        self.assertEqual(
+            mod.project_rule_status("DTZ001", "a.py", narrow)["status"],
+            "ignored-by-project",
+        )
+
+
+def _analyze_with_noqa_pass(root, hits, noqa_hits, **kwargs):
+    """Like _analyze_with_fake_ruff, but the --ignore-noqa pass adds hits."""
+    from unittest.mock import patch
+
+    def fake_run_ruff(*args, ignore_noqa=False, **kw):
+        return (list(hits) + (list(noqa_hits) if ignore_noqa else []), "", None)
+
+    with (
+        patch.object(mod, "_run_project_ruff", return_value=([], None)),
+        patch.object(mod, "ruff_version", return_value=mod.PINNED_RUFF_VERSION),
+        patch.object(
+            mod,
+            "validate_rules",
+            return_value={"ok": [], "unknown": [], "removed": [], "preview_gated": []},
+        ),
+        patch.object(mod, "_run_ruff", side_effect=fake_run_ruff),
+    ):
+        return mod.analyze(str(root), **kwargs)
+
+
+class TestNoqaPass(unittest.TestCase):
+    """Hits ruff drops on `# noqa` lines are surfaced as claims to verify."""
+
+    SOURCE = (
+        "import datetime\n"
+        "if x == None:  # noqa: E711\n"
+        "    q = f'select {t}'  # noqa: S608\n"
+        "stamp = datetime.datetime.now()\n"
+    )
+
+    def test_noqa_only_hits_are_listed_apart_from_findings(self):
+        from helpers import TempProject
+
+        with TempProject({"m.py": self.SOURCE}) as root:
+            (root / "pyproject.toml").write_text(PYPROJECT_SELECT_ALL, encoding="utf-8")
+            live = [_fake_hit(root, "m.py", 4, "datetime.now", code="DTZ005")]
+            noqa = [
+                _fake_hit(root, "m.py", 2, "None", code="E711"),
+                _fake_hit(root, "m.py", 3, "f'", code="S608"),
+            ]
+            result = _analyze_with_noqa_pass(root, live, noqa)
+        summary = result["summary"]
+        self.assertEqual(summary["reported"], 1)  # calibrated counts unchanged
+        self.assertEqual(summary["noqa_suppressed"], 2)
+        self.assertEqual(summary["noqa_suppressed_by_code"], {"E711": 1, "S608": 1})
+        # The S608 noqa is a security claim to check.
+        self.assertEqual(summary["noqa_suppressed_needs_verification"], 1)
+        codes = {f["code"]: f for f in result["noqa_suppressed"]}
+        self.assertTrue(codes["E711"]["noqa_suppressed"])
+        self.assertTrue(codes["E711"]["suppression_is_dismissal_signal"])
+        self.assertFalse(codes["S608"]["suppression_is_dismissal_signal"])
+        self.assertTrue(result["noqa_pass"]["ran"])
+
+    def test_the_project_config_labels_every_hit(self):
+        from helpers import TempProject
+
+        with TempProject({"m.py": self.SOURCE}) as root:
+            (root / "pyproject.toml").write_text(PYPROJECT_SELECT_ALL, encoding="utf-8")
+            live = [_fake_hit(root, "m.py", 4, "datetime.now", code="DTZ005")]
+            result = _analyze_with_noqa_pass(root, live, [])
+        hit = result["findings"][0]
+        self.assertEqual(hit["project_config"]["status"], "ignored-by-project")
+        self.assertEqual(
+            hit["project_config"]["reason"], "naive datetimes need manual review"
+        )
+        self.assertIn("selects ALL", result["project_selects_all_note"])
+        self.assertEqual(
+            result["summary"]["project_ignored_rules"],
+            [
+                {
+                    "status": "ignored-by-project",
+                    "entry": "DTZ",
+                    "reason": "naive datetimes need manual review",
+                    "hits": 1,
+                }
+            ],
+        )
+        self.assertEqual(
+            result["summary"]["by_project_status"], {"ignored-by-project": 1}
+        )
+
+    def test_without_a_project_config_nothing_is_claimed(self):
+        from helpers import TempProject
+
+        with TempProject({"m.py": self.SOURCE}) as root:
+            live = [_fake_hit(root, "m.py", 4, "datetime.now", code="DTZ005")]
+            result = _analyze_with_noqa_pass(root, live, [])
+        self.assertIsNone(result["project_ruff_config"])
+        self.assertIsNone(result["summary"]["by_project_status"])
+        self.assertNotIn("project_selects_all_note", result)
+
+    def test_ruff_is_asked_to_ignore_noqa(self):
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+
+        with patch.object(mod.subprocess, "run") as run:
+            run.return_value = MagicMock(stdout="[]", stderr="")
+            mod._run_ruff("ruff", ["F821"], Path("/p"), preview=False, ignore_noqa=True)
+        self.assertIn("--ignore-noqa", run.call_args.args[0])
+
+
+class TestShapeEligibility(unittest.TestCase):
+    """Metric and policy rules are not harvested as novel shapes."""
+
+    def test_metric_and_policy_rules_are_left_out_of_the_harvest(self):
+        from helpers import TempProject
+
+        source = "import os\nassert x\nf(s, x)\n"
+        with TempProject({"m.py": source}) as root:
+            hits = [
+                _fake_hit(root, "m.py", 1, "os", code="F401"),
+                _fake_hit(root, "m.py", 2, "assert", code="S101"),
+                _fake_hit(root, "m.py", 3, "f", code="C901"),
+                _fake_hit(root, "m.py", 3, "s", code="PLR2004"),
+                # A defect-grade rule with no shape is still harvested.
+                _fake_hit(root, "m.py", 3, "x", code="F821"),
+            ]
+            result = _analyze_with_fake_ruff(root, hits, tier=2)
+        summary = result["summary"]
+        self.assertEqual(summary["novel_shape_candidates"], ["F821"])
+        self.assertEqual(
+            summary["shape_ineligible_codes"], ["C901", "F401", "PLR2004", "S101"]
+        )
+        # Still reported: only the harvest changes.
+        self.assertEqual(summary["reported"], 5)
+        eligible = {f["code"]: f["shape_eligible"] for f in result["findings"]}
+        self.assertFalse(eligible["S101"])
+        self.assertTrue(eligible["F821"])
+
+    def test_every_ineligible_rule_is_a_selected_rule(self):
+        for code in mod.SHAPE_INELIGIBLE:
+            with self.subTest(code=code):
+                self.assertIn(code, mod.TIER_1 + mod.TIER_2)
 
 
 class TestNormalize(unittest.TestCase):
@@ -559,6 +869,147 @@ def write_fake_ruff(directory, *, fail):
     return path
 
 
+def write_versioned_ruff(path, version):
+    """An executable that answers `--version` like ruff *version*."""
+    import os
+    import sys
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"#!{sys.executable}\nprint('ruff {version}')\n", encoding="utf-8")
+    os.chmod(path, 0o755)
+    return path
+
+
+class TestRuffBinResolution(unittest.TestCase):
+    """The default ruff is the project's pinned one when it can be found."""
+
+    def _resolve(self, ruff_bin, pin, venv_version="9.9.1"):
+        import os
+        from unittest.mock import patch
+
+        from helpers import TempProject
+
+        with TempProject({"m.py": "x = 1\n"}) as root:
+            local = write_versioned_ruff(root / ".venv" / "bin" / "ruff", venv_version)
+            env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+            with patch.dict(os.environ, env, clear=True):
+                used, how = mod.resolve_ruff_bin(
+                    ruff_bin,
+                    root,
+                    {"version": pin, "source": "uv.lock"} if pin else None,
+                )
+            return used, how, str(local)
+
+    def test_a_venv_ruff_matching_the_pin_is_preferred(self):
+        used, how, local = self._resolve("ruff", "9.9.1")
+        self.assertEqual(used, local)
+        self.assertIn("matches the project's pinned ruff 9.9.1", how["reason"])
+
+    def test_an_explicit_ruff_bin_is_always_used(self):
+        used, how, _ = self._resolve("/opt/ruff", "9.9.1")
+        self.assertEqual(used, "/opt/ruff")
+        self.assertEqual(how["reason"], "explicit --ruff-bin")
+
+    def test_no_match_falls_back_to_path_and_says_so(self):
+        used, how, local = self._resolve("ruff", "9.9.2")
+        self.assertEqual(used, "ruff")
+        self.assertIn("no ruff matching the project's pin 9.9.2", how["reason"])
+        self.assertEqual(how["candidates"][0], {"path": local, "version": "9.9.1"})
+
+    def test_no_pin_keeps_ruff_on_path(self):
+        used, _, _ = self._resolve("ruff", None)
+        self.assertEqual(used, "ruff")
+
+    def test_the_envelope_records_the_choice_and_validation(self):
+        from helpers import TempProject
+
+        with TempProject({"m.py": "x = 1\n"}) as root:
+            result = _analyze_with_fake_ruff(root, [])
+        self.assertEqual(result["ruff_bin"]["used"], "ruff")
+        self.assertTrue(result["version_validated"])
+        self.assertIn(mod.PINNED_RUFF_VERSION, result["validated_versions"])
+
+    def test_the_pin_is_a_validated_version(self):
+        self.assertIn(mod.PINNED_RUFF_VERSION, mod.VALIDATED_RUFF_VERSIONS)
+        self.assertNotEqual(mod.PINNED_RUFF_VERSION, "0.16.0")
+
+
+RECORDING_RUFF = """\
+#!{python}
+import json, os, sys
+
+args = sys.argv[1:]
+with open({log!r}, "a", encoding="utf-8") as log:
+    log.write(json.dumps({{"args": args, "env": os.environ.get("RUFF_NO_CACHE")}}) + "\\n")
+if args[:1] == ["--version"]:
+    print("ruff 0.17.3")
+elif args[:1] == ["rule"]:
+    print("[]")
+else:
+    if "--no-cache" not in args and not os.environ.get("RUFF_NO_CACHE"):
+        # What a real ruff does under `cache-dir = ".cache/ruff"`.
+        os.makedirs(os.path.join({project!r}, ".cache", "ruff"), exist_ok=True)
+    sys.stdout.write("[]")
+"""
+
+
+class TestNoRuffCacheInTheProject(unittest.TestCase):
+    """A project's `cache-dir` must never make ruff write into the checkout."""
+
+    PYPROJECT = '[project]\nname = "x"\n\n[tool.ruff]\ncache-dir = ".cache/ruff"\n'
+
+    def test_every_ruff_invocation_disables_the_cache(self):
+        import json
+        import os
+        import sys
+        import tempfile
+        from pathlib import Path
+
+        from helpers import TempProject
+
+        with (
+            tempfile.TemporaryDirectory() as bindir,
+            TempProject({"pkg/m.py": "x = 1\n"}) as root,
+        ):
+            (root / "pyproject.toml").write_text(self.PYPROJECT, encoding="utf-8")
+            log = Path(bindir) / "calls.jsonl"
+            ruff = Path(bindir) / "ruff"
+            ruff.write_text(
+                RECORDING_RUFF.format(
+                    python=sys.executable, log=str(log), project=str(root)
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(ruff, 0o755)
+            mod.analyze(str(root / "pkg"), ruff_bin=str(ruff), tier=2)
+            mod._run_project_ruff(str(ruff), [root / "pkg" / "m.py"], root)
+            calls = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertFalse((root / ".cache").exists(), "ruff cache written")
+        checks = [c for c in calls if c["args"][:1] == ["check"]]
+        # The tiered pass, the --ignore-noqa pass, the project-config pass.
+        self.assertEqual(len(checks), 3)
+        for call in checks:
+            self.assertIn("--no-cache", call["args"])
+        for call in calls:
+            self.assertEqual(call["env"], "true")
+
+    def test_a_real_ruff_leaves_no_cache(self):
+        import shutil
+
+        from helpers import TempProject
+
+        ruff = shutil.which("ruff")
+        if ruff is None:
+            self.skipTest("no ruff on PATH")
+        with TempProject({"pkg/m.py": "import os\n"}) as root:
+            (root / "pyproject.toml").write_text(self.PYPROJECT, encoding="utf-8")
+            result = mod.analyze(str(root / "pkg"), ruff_bin=ruff, tier=2)
+            if result.get("error"):
+                self.skipTest(f"this ruff cannot lint a temp dir: {result['error']}")
+            self.assertFalse((root / ".cache").exists(), "ruff cache written")
+            self.assertFalse((root / ".ruff_cache").exists())
+
+
 class TestUnlintedPaths(unittest.TestCase):
     """ruff exits 0 with no findings for a path it could not read."""
 
@@ -696,6 +1147,62 @@ class TestYamlSafeLoaderSubclassDismissal(unittest.TestCase):
         reason = "yaml-loader-subclasses-safeloader"
         self.assertEqual(_dismissed_lines(result), {20: reason, 21: reason, 22: reason})
         self.assertEqual(_kept_lines(result), {23, 24, 25})
+
+
+class TestYamlLocalLoaderClassDismissal(unittest.TestCase):
+    """A Loader class defined inside the calling function resolves there."""
+
+    SOURCE = (
+        "import yaml\n"
+        "\n"
+        "class Shadowed(yaml.SafeLoader):\n"
+        "    pass\n"
+        "\n"
+        "def local_safe(f):\n"
+        "    class Local(yaml.SafeLoader):\n"
+        "        pass\n"
+        "    class Derived(Local):\n"
+        "        pass\n"
+        "    def inner():\n"
+        "        return yaml.load(f, Derived)\n"
+        "    return yaml.load(f, Loader=Local), inner()\n"
+        "\n"
+        "def local_unsafe(f):\n"
+        "    class Local(yaml.FullLoader):\n"
+        "        pass\n"
+        "    return yaml.load(f, Local)\n"
+        "\n"
+        "def shadows_a_safe_module_class(f):\n"
+        "    class Shadowed(yaml.Loader):\n"
+        "        pass\n"
+        "    return yaml.load(f, Shadowed)\n"
+        "\n"
+        "def rebound(f, flag):\n"
+        "    class Local(yaml.SafeLoader):\n"
+        "        pass\n"
+        "    if flag:\n"
+        "        Local = yaml.Loader\n"
+        "    return yaml.load(f, Local)\n"
+    )
+
+    def test_local_classes_are_resolved_in_their_scope(self):
+        from helpers import TempProject
+
+        with TempProject({"cfg.py": self.SOURCE}) as root:
+            hits = [
+                _fake_hit(root, "cfg.py", 12, "Derived", code="S506"),
+                _fake_hit(root, "cfg.py", 13, "Local", code="S506"),
+                _fake_hit(root, "cfg.py", 18, "Local", code="S506"),
+                _fake_hit(root, "cfg.py", 23, "Shadowed", code="S506"),
+                _fake_hit(root, "cfg.py", 30, "Local", code="S506"),
+            ]
+            result = _analyze_with_fake_ruff(root, hits)
+        reason = "yaml-loader-subclasses-safeloader"
+        # A local safe Loader, and one derived from it seen from a nested def.
+        self.assertEqual(_dismissed_lines(result), {12: reason, 13: reason})
+        # An unsafe local Loader; a local class shadowing a safe module-level
+        # one; a name rebound to an unsafe loader in the same function.
+        self.assertEqual(_kept_lines(result), {18, 23, 30})
 
 
 class TestClosureCalledSynchronouslyDismissal(unittest.TestCase):
