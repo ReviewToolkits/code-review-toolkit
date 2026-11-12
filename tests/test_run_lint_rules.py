@@ -712,6 +712,62 @@ class TestYamlSafeLoaderSubclassDismissal(unittest.TestCase):
         self.assertEqual(_kept_lines(result), {23, 24, 25})
 
 
+class TestYamlLocalLoaderClassDismissal(unittest.TestCase):
+    """A Loader class defined inside the calling function resolves there."""
+
+    SOURCE = (
+        "import yaml\n"
+        "\n"
+        "class Shadowed(yaml.SafeLoader):\n"
+        "    pass\n"
+        "\n"
+        "def local_safe(f):\n"
+        "    class Local(yaml.SafeLoader):\n"
+        "        pass\n"
+        "    class Derived(Local):\n"
+        "        pass\n"
+        "    def inner():\n"
+        "        return yaml.load(f, Derived)\n"
+        "    return yaml.load(f, Loader=Local), inner()\n"
+        "\n"
+        "def local_unsafe(f):\n"
+        "    class Local(yaml.FullLoader):\n"
+        "        pass\n"
+        "    return yaml.load(f, Local)\n"
+        "\n"
+        "def shadows_a_safe_module_class(f):\n"
+        "    class Shadowed(yaml.Loader):\n"
+        "        pass\n"
+        "    return yaml.load(f, Shadowed)\n"
+        "\n"
+        "def rebound(f, flag):\n"
+        "    class Local(yaml.SafeLoader):\n"
+        "        pass\n"
+        "    if flag:\n"
+        "        Local = yaml.Loader\n"
+        "    return yaml.load(f, Local)\n"
+    )
+
+    def test_local_classes_are_resolved_in_their_scope(self):
+        from helpers import TempProject
+
+        with TempProject({"cfg.py": self.SOURCE}) as root:
+            hits = [
+                _fake_hit(root, "cfg.py", 12, "Derived", code="S506"),
+                _fake_hit(root, "cfg.py", 13, "Local", code="S506"),
+                _fake_hit(root, "cfg.py", 18, "Local", code="S506"),
+                _fake_hit(root, "cfg.py", 23, "Shadowed", code="S506"),
+                _fake_hit(root, "cfg.py", 30, "Local", code="S506"),
+            ]
+            result = _analyze_with_fake_ruff(root, hits)
+        reason = "yaml-loader-subclasses-safeloader"
+        # A local safe Loader, and one derived from it seen from a nested def.
+        self.assertEqual(_dismissed_lines(result), {12: reason, 13: reason})
+        # An unsafe local Loader; a local class shadowing a safe module-level
+        # one; a name rebound to an unsafe loader in the same function.
+        self.assertEqual(_kept_lines(result), {18, 23, 30})
+
+
 class TestClosureCalledSynchronouslyDismissal(unittest.TestCase):
     """B023 on a lambda that a same-file helper calls before returning."""
 

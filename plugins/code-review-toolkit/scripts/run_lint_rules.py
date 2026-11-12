@@ -355,7 +355,8 @@ DISMISSAL_REASONS = {
         "nothing; this is a CLI's normal exit path."
     ),
     "yaml-loader-subclasses-safeloader": (
-        "S506 on a Loader class defined in the same file whose bases are all "
+        "S506 on a Loader class defined in the same file (at module level or in "
+        "a function enclosing the call) whose bases are all "
         "yaml's SafeLoader/CSafeLoader/BaseLoader/CBaseLoader: ruff matches the "
         "loader by name and cannot see the subclass is safe. Constructors the "
         "subclass registers (`add_constructor`) are not checked: review them "
@@ -719,16 +720,41 @@ def _yaml_bindings(tree: ast.Module) -> tuple[set[str], set[str]]:
     return modules, loaders
 
 
-def _safe_yaml_loader_class(
-    tree: ast.Module, name: str, modules: set, loaders: set, seen: set
-) -> bool:
-    if name in seen:
+def _local_class(scope: ast.AST, name: str):
+    """The one ClassDef binding *name* in function *scope*.
+
+    None when *scope* does not bind *name* at all (look outward); False when
+    it binds it some other way, or more than once (unknowable).
+    """
+    if name in _param_names(scope):
         return False
-    seen.add(name)
+    classes: list[ast.ClassDef] = []
+    others = 0
+    for node in _scope_nodes(scope):
+        if isinstance(node, ast.ClassDef) and node.name == name:
+            classes.append(node)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            others += node.name == name
+        elif isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            others += node.id == name
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            others += any(
+                (alias.asname or alias.name.split(".")[0]) == name
+                for alias in node.names
+            )
+        elif isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names:
+            return False
+    if not classes and not others:
+        return None
+    return classes[0] if len(classes) == 1 and not others else False
+
+
+def _module_class(tree: ast.Module, name: str, loaders: set):
+    """The one top-level ClassDef binding *name*, or None."""
     classes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name]
     # Exactly one top-level class, and nothing else binding that name.
     if len(classes) != 1 or name in loaders:
-        return False
+        return None
     others = sum(
         1
         for n in ast.walk(tree)
@@ -740,9 +766,39 @@ def _safe_yaml_loader_class(
             and n.name == name
         )
     )
-    if others != 1 or not classes[0].bases:
+    return classes[0] if others == 1 else None
+
+
+def _safe_yaml_loader_class(
+    tree: ast.Module,
+    name: str,
+    modules: set,
+    loaders: set,
+    seen: set,
+    scopes: tuple = (),
+) -> bool:
+    """Whether *name*, looked up from *scopes* outward, is a safe Loader class.
+
+    *scopes* are the enclosing function scopes, innermost first; the module
+    is always searched last. A Loader defined inside the function that calls
+    ``yaml.load`` resolves there, as Python resolves it.
+    """
+    if (name, len(scopes)) in seen:
         return False
-    for base in classes[0].bases:
+    seen.add((name, len(scopes)))
+    cls, outer = None, ()
+    for i, scope in enumerate(scopes):
+        found = _local_class(scope, name)
+        if found is False:
+            return False
+        if found is not None:
+            cls, outer = found, scopes[i:]
+            break
+    if cls is None:
+        cls = _module_class(tree, name, loaders)
+    if cls is None or not cls.bases:
+        return False
+    for base in cls.bases:
         if isinstance(base, ast.Attribute) and base.attr in _SAFE_YAML_LOADERS:
             root = base.value
             while isinstance(root, ast.Attribute):
@@ -751,12 +807,24 @@ def _safe_yaml_loader_class(
                 continue
             return False
         if isinstance(base, ast.Name):
-            if base.id in loaders:
+            if base.id in loaders and not any(
+                _local_class(scope, base.id) is not None for scope in outer
+            ):
                 continue
-            if _safe_yaml_loader_class(tree, base.id, modules, loaders, seen):
+            if _safe_yaml_loader_class(tree, base.id, modules, loaders, seen, outer):
                 continue
         return False
     return True
+
+
+def _enclosing_functions(ctx: _FileContext, node: ast.AST) -> tuple:
+    """The function scopes enclosing *node*, innermost first."""
+    scopes = []
+    cur = ctx.scope_of(node)
+    while isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        scopes.append(cur)
+        cur = ctx.scope_of(cur)
+    return tuple(scopes)
 
 
 def _yaml_safe_subclass(ctx: _FileContext, line: int, col: int) -> bool:
@@ -766,7 +834,14 @@ def _yaml_safe_subclass(ctx: _FileContext, line: int, col: int) -> bool:
     modules, loaders = _yaml_bindings(ctx.tree)
     if not modules and not loaders:
         return False
-    return _safe_yaml_loader_class(ctx.tree, names[0].id, modules, loaders, set())
+    return _safe_yaml_loader_class(
+        ctx.tree,
+        names[0].id,
+        modules,
+        loaders,
+        set(),
+        _enclosing_functions(ctx, names[0]),
+    )
 
 
 def _enclosing_lambda_call(ctx: _FileContext, line: int, col: int):

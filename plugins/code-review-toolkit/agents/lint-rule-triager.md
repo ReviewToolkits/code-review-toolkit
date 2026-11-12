@@ -104,7 +104,7 @@ prove:
 |---|---|---|
 | `fastapi-dependency-marker` | B008 | The default is `Depends(...)`, `Query(...)` or another FastAPI marker imported from fastapi: the framework's injection idiom. |
 | `raise-systemexit-in-except` | B904 | The raise is the builtin `SystemExit`: no traceback is printed, so a cause would never be shown. |
-| `yaml-loader-subclasses-safeloader` | S506 | The Loader is a class in the same file whose bases are all safe yaml loaders. Its own `add_constructor` handlers are not checked; read them if the file registers any. |
+| `yaml-loader-subclasses-safeloader` | S506 | The Loader is a class in the same file (at module level, or in a function enclosing the call) whose bases are all safe yaml loaders. Its own `add_constructor` handlers are not checked; read them if the file registers any. |
 | `closure-called-synchronously` | B023 | The lambda goes straight to a same-file function (or `self.` method) that only calls that parameter, and is not async or a generator. |
 | `sql-built-from-literals` | S608 | Every value in the query text is a literal or a name bound only to literals: a `",".join(["?"] * n)` placeholder list, a constant table name, a list of literal clauses. |
 
