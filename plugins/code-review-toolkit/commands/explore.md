@@ -250,6 +250,26 @@ hundreds of kilobytes. Dispatch **one consolidation agent** that reads every `ag
 | `publication_sensitive` | `true` when publication should wait for coordination with the project. Cheap and right under doubt; it never makes a finding a security claim |
 | `notes` | dedup decisions, corrections |
 
+Two rules for the consolidation agent, because `findings.json` is what reaches maintainers:
+
+- **Prose is for the maintainer.** `title`, `mechanism`, `failure_scenario` and `introduced_by` carry
+  no agent names, no agent-internal ids (`SFH-3`, an earlier run's labels) and no `||` merge
+  separators. Attribution goes in `agents` and `source_refs`, and merge history in `notes`. A
+  finding may cite another one by its consolidated `id`.
+- **A sensitive id stays private.** A finding without `publication_sensitive` never mentions the id
+  of one that has it, in any field (`notes` and `propagation_gap_of` included): publishing the first
+  would reveal that the second exists. Describe the relation without the id, or mark both sensitive.
+
+Check both mechanically before the file goes anywhere:
+
+```bash
+python3 <plugin_root>/scripts/security_gate.py lint <run_dir>/findings.json
+```
+
+It exits 1 and lists every `agent-name`, `merge-separator`, `internal-id` and `sensitive-ref`
+problem. Fix the text. For an id-like token that isn't an id (a standard's number, a format name),
+pass `--allow TOKEN,TOKEN`.
+
 Tell the consolidation agent to work **report by report into an on-disk working file**
 (`<run_dir>/consolidation-work.json`), appending and merging as it goes, rather than reading every
 report first: 19 reports came to 545 KB, at the edge of one agent's context. Above ~300 KB of

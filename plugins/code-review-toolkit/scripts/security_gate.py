@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The security-claims gate: blind the claims, then check the skeptic's verdicts and sign off.
 
-Two subcommands, one on each side of the `security-claims-skeptic` agent:
+Two subcommands sit on each side of the `security-claims-skeptic` agent, and
+two more check their inputs and outputs:
 
 ``blind`` -- select the findings that make a security claim and strip what
 would anchor the skeptic on the finder's opinion: severity, classification,
@@ -43,8 +44,17 @@ Verdict records (the skeptic's output, a JSON list):
 duplicates, severities above the reference ceiling. Agreement with the people
 who own the threat model is the calibration number that matters.
 
+``lint`` -- publication hygiene of a consolidated findings.json, run before
+anything leaves the run directory. Problems: a maintainer-facing prose field
+(title, mechanism, failure_scenario, introduced_by) that names a review agent,
+carries a ``||`` merge separator, or cites an id that is not a finding in the
+file (an agent's own id, an earlier run's label); and a finding without
+``publication_sensitive`` that mentions the id of one with it (``sensitive-ref``).
+Exits 1 on any problem. ``--allow A,B`` accepts id-like tokens that are not ids.
+
 Usage:
     python security_gate.py blind FINDINGS.json [--threat-model TM.json] [--all]
+    python security_gate.py lint FINDINGS.json [--allow TOKEN,TOKEN]
     python security_gate.py score --verdicts V.json --expected EXPECTED.json
     python security_gate.py signoff --threat-model TM.json --verdicts V.json
         [--claims CLAIMS.json] [--max-disclosure N] [--override REASON]
@@ -536,13 +546,136 @@ def score(verdicts: list[dict], expected: dict[str, dict]) -> dict:
     }
 
 
+# --------------------------------------------------------------------------- lint
+
+# An id-like token: `SF-1`, `R2-004`, `CRT-0001`, `PCC-3a`, `TI1`. Not inside a
+# path or URL, and not the first group of a longer id (`CVE-2024-1234`).
+ID_TOKEN_RE = re.compile(
+    r"(?<![\w/.#-])([A-Z][A-Z0-9]{0,5}-\d{1,4}[a-z]?|[A-Z]{2,5}\d{1,2}[a-z]?)(?![\w-])"
+)
+# Prefixes of public identifiers and technical terms that look like ids.
+_NOT_ID_PREFIXES = frozenset(
+    {
+        "AES", "ASCII", "CP", "CVE", "CWE", "EC", "ES", "GHSA", "HS", "HTTP",
+        "IPV", "ISO", "LATIN", "MD", "OAUTH", "PEP", "PS", "PY", "RFC", "RS",
+        "RSA", "SHA", "SSL", "TLS", "UTF", "WIN", "WCAG", "X", "BASE", "INT",
+        "UINT", "ZIP",
+    }
+)  # fmt: skip
+# Bit widths: `ZIP64`, `INT32`, `BASE64` are formats, not finding ids.
+_BIT_WIDTHS = frozenset({"8", "16", "32", "64"})
+# Fields a maintainer reads. Attribution belongs in `agents` / `source_refs`.
+PROSE_FIELDS = ("title", "mechanism", "failure_scenario", "introduced_by")
+_AGENTS_DIR = Path(__file__).resolve().parent.parent / "agents"
+
+
+def id_tokens(text: str) -> list[str]:
+    """Id-like tokens in *text*, minus standards and technical terms (`UTF-8`, `SHA1`)."""
+    out = []
+    for token in ID_TOKEN_RE.findall(text):
+        prefix = token.split("-", 1)[0] if "-" in token else token
+        digits = re.sub(r"^\D+|[a-z]$", "", prefix)
+        prefix = re.sub(r"\d+[a-z]?$", "", prefix)
+        if prefix in _NOT_ID_PREFIXES or ("-" not in token and digits in _BIT_WIDTHS):
+            continue
+        out.append(token)
+    return out
+
+
+def _strings(value) -> list[str]:
+    """Every string inside a JSON value."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for v in value.values() for s in _strings(v)]
+    if isinstance(value, list):
+        return [s for v in value for s in _strings(v)]
+    return []
+
+
+def _id_pattern(fid: str) -> re.Pattern:
+    # A suffixed id (`X-001a`) is the same finding; `X-0010` is not.
+    return re.compile(r"(?<![A-Za-z0-9_])" + re.escape(fid) + r"[a-z]?(?![A-Za-z0-9_])")
+
+
+def lint(
+    findings: list[dict],
+    *,
+    agent_names: list[str] | None = None,
+    allow: set[str] | frozenset[str] = frozenset(),
+) -> dict:
+    """Publication hygiene of a consolidated findings.json.
+
+    - ``agent-name``, ``merge-separator``, ``internal-id``: a prose field
+      (``PROSE_FIELDS``) names a review agent, carries a ``||`` merge
+      separator, or cites an id that is not a finding in this file (an agent's
+      own finding id, an earlier run's label). Prose is for the maintainer;
+      attribution goes in ``agents`` / ``source_refs``.
+    - ``sensitive-ref``: a finding without ``publication_sensitive`` mentions,
+      in any field, the id of one that has it. Publishing the first would
+      reveal that the second exists.
+    """
+    if agent_names is None:
+        agent_names = sorted(p.stem for p in _AGENTS_DIR.glob("*.md"))
+    agent_res = [
+        (
+            name,
+            re.compile(r"(?<![\w-])" + re.escape(name) + r"(?![\w-])", re.IGNORECASE),
+        )
+        for name in agent_names
+    ]
+    ids = {str(f.get("id")) for f in findings if f.get("id")}
+    sensitive = {
+        str(f["id"]): _id_pattern(str(f["id"]))
+        for f in findings
+        if f.get("id") and f.get("publication_sensitive") is True
+    }
+    problems: list[dict] = []
+
+    def add(fid, field, kind, detail):
+        problems.append({"id": fid, "field": field, "kind": kind, "detail": detail})
+
+    for f in findings:
+        fid = str(f.get("id", "?"))
+        for field in PROSE_FIELDS:
+            for text in _strings(f.get(field)):
+                if "||" in text:
+                    add(fid, field, "merge-separator", "`||` in maintainer-facing text")
+                for name, rx in agent_res:
+                    if rx.search(text):
+                        add(fid, field, "agent-name", name)
+                for token in id_tokens(text):
+                    base = re.sub(r"(?<=\d)[a-z]$", "", token)
+                    if token not in ids and base not in ids and token not in allow:
+                        add(fid, field, "internal-id", token)
+        if f.get("publication_sensitive") is True:
+            continue
+        for field, value in f.items():
+            if field == "id":
+                continue
+            for text in _strings(value):
+                for sid, rx in sensitive.items():
+                    if rx.search(text):
+                        add(fid, field, "sensitive-ref", sid)
+    counts: dict[str, int] = {}
+    for p in problems:
+        counts[p["kind"]] = counts.get(p["kind"], 0) + 1
+    return {
+        "findings_total": len(findings),
+        "sensitive_total": len(sensitive),
+        "problems": problems,
+        "counts": counts,
+        "clean": not problems,
+    }
+
+
 def main(argv: list[str] | None = None) -> None:
     argv = sys.argv[1:] if argv is None else argv
     exit_on_help(argv, __doc__)
-    if not argv or argv[0] not in {"blind", "signoff", "score"}:
+    if not argv or argv[0] not in {"blind", "signoff", "score", "lint"}:
         emit(
             {
-                "error": "first argument must be `blind`, `signoff` or `score` (see --help)"
+                "error": "first argument must be `blind`, `signoff`, `score` or `lint` (see --help)"
             }
         )
         sys.exit(2)
@@ -579,6 +712,14 @@ def main(argv: list[str] | None = None) -> None:
                 }
             )
             return
+        if cmd == "lint":
+            if not positional:
+                emit({"error": "lint needs a findings.json path"})
+                sys.exit(2)
+            allow = {t for t in opts.get("--allow", "").split(",") if t}
+            result = lint(_findings(_load(positional[0])), allow=allow)
+            emit(result)
+            sys.exit(0 if result["clean"] else 1)
         if cmd == "score":
             if "--verdicts" not in opts or "--expected" not in opts:
                 emit({"error": "score needs --verdicts and --expected"})
