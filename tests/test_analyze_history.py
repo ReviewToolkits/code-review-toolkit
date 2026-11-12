@@ -1503,15 +1503,136 @@ class TestUnmergedBranches(unittest.TestCase):
         self.assertEqual([b["branch"] for b in unmerged["branches"]], ["origin/work"])
         self.assertFalse(unmerged["truncated"])
 
+    def _squash_into_main(self, root: Path) -> str:
+        _git(root, "merge", "-q", "--squash", "origin/work")
+        _git(root, "commit", "-qm", "Guard a and add notes (#41)")
+        _git(root, "update-ref", "refs/remotes/origin/main", "HEAD")
+        return _git(root, "rev-parse", "HEAD")
+
+    def _work(self, result):
+        branches = result["unmerged_branches"]["branches"]
+        return next(b for b in branches if b["branch"] == "origin/work")
+
+    def test_live_branch_is_not_squash_merged(self):
+        root = self._repo()
+        work = self._work(mod.analyze([str(root), *_WINDOW, "--no-function"]))
+        self.assertIs(work["squash_merged"], False)
+        self.assertIsNone(work["squash_commit"])
+
+    def test_squash_merged_branch_is_flagged(self):
+        root = self._repo()
+        self._squash_into_main(root)
+        result = mod.analyze([str(root), *_WINDOW, "--no-function"])
+        work = self._work(result)
+        # Per-commit patch ids cannot see a squash.
+        self.assertEqual(work["ahead_patch_unique"], 2)
+        self.assertIs(work["squash_merged"], True)
+        self.assertEqual(work["squash_evidence"], "files-identical")
+        self.assertEqual(result["unmerged_branches"]["squash_merged_count"], 1)
+
+    def test_squash_found_by_patch_id_after_base_moved_on(self):
+        root = self._repo()
+        squash_sha = self._squash_into_main(root)
+        (root / "src" / "a.py").write_text("x = 4\n", encoding="utf-8")
+        _git(root, "commit", "-qam", "Change a again")
+        _git(root, "update-ref", "refs/remotes/origin/main", "HEAD")
+        work = self._work(mod.analyze([str(root), *_WINDOW, "--no-function"]))
+        self.assertIs(work["squash_merged"], True)
+        self.assertEqual(work["squash_evidence"], "patch-id")
+        self.assertEqual(work["squash_commit"], squash_sha[:9])
+
+    def test_branch_with_work_after_the_squash_is_not_merged(self):
+        root = self._repo()
+        self._squash_into_main(root)
+        _git(root, "checkout", "-q", "origin/work")
+        (root / "src" / "b.py").write_text("y = 1\n", encoding="utf-8")
+        _git(root, "add", "src/b.py")
+        _git(root, "commit", "-qm", "Follow-up after review")
+        _git(root, "update-ref", "refs/remotes/origin/work", "HEAD")
+        _git(root, "checkout", "-q", "main")
+        work = self._work(mod.analyze([str(root), *_WINDOW, "--no-function"]))
+        self.assertIs(work["squash_merged"], False)
+
+    def test_branch_landed_in_another_form_is_partly_landed(self):
+        root = self._repo()
+        # Only the code change lands on main; the notes file never does.
+        _git(root, "checkout", "origin/work", "--", "src/a.py")
+        _git(root, "commit", "-qm", "Guard a (#42)")
+        landed = _git(root, "rev-parse", "HEAD")
+        _git(root, "update-ref", "refs/remotes/origin/main", "HEAD")
+        work = self._work(mod.analyze([str(root), *_WINDOW, "--no-function"]))
+        self.assertIs(work["squash_merged"], False)
+        self.assertEqual(
+            work["partly_landed"],
+            {
+                "commit": landed[:9],
+                "files_matched": ["src/a.py"],
+                "files_matched_total": 1,
+                "files_total": 2,
+            },
+        )
+
+    def test_split_diff_by_file(self):
+        diff = (
+            "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n"
+            "diff --git a/gone.py b/gone.py\ndeleted file mode 100644\n"
+            "--- a/gone.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-c\n"
+            "diff --git a/img.png b/img.png\nBinary files differ\n"
+        )
+        self.assertEqual(
+            [path for path, _ in mod._split_diff_by_file(diff)], ["x.py", "gone.py"]
+        )
+
+    def test_branch_cap_names_the_omitted_branches(self):
+        root = self._repo()
+        for name in ("extra1", "extra2"):
+            _git(root, "checkout", "-q", "-b", name, "origin/main")
+            (root / f"{name}.py").write_text("z = 1\n", encoding="utf-8")
+            _git(root, "add", f"{name}.py")
+            _git(root, "commit", "-qm", f"Start {name}")
+            _git(root, "update-ref", f"refs/remotes/origin/{name}", "HEAD")
+        _git(root, "checkout", "-q", "main")
+        result = mod.analyze([str(root), *_WINDOW, "--no-function"], max_branches=1)
+        unmerged = result["unmerged_branches"]
+        self.assertEqual(len(unmerged["branches"]), 1)
+        self.assertTrue(unmerged["truncated"])
+        self.assertEqual(unmerged["max_branches"], 1)
+        listed = {b["branch"] for b in unmerged["branches"]}
+        omitted = set(unmerged["omitted_branches"])
+        self.assertEqual(unmerged["omitted_branches_total"], len(omitted))
+        self.assertTrue(omitted)
+        # Every remote branch is either examined or named as omitted.
+        self.assertLessEqual(
+            {"origin/work", "origin/extra1", "origin/extra2"}, listed | omitted
+        )
+        self.assertFalse(listed & omitted)
+
+    def test_squash_merged_branches_do_not_use_up_the_cap(self):
+        root = self._repo()
+        self._squash_into_main(root)
+        _git(root, "checkout", "-q", "-b", "live", "origin/main")
+        (root / "live.py").write_text("z = 1\n", encoding="utf-8")
+        _git(root, "add", "live.py")
+        # Older than the squashed branch, so it is examined after it.
+        env = {**os.environ, "GIT_COMMITTER_DATE": "2001-01-01T12:00:00+00:00"}
+        subprocess.run(
+            ["git", "commit", "-qm", "Start live work"],
+            cwd=str(root),
+            env=env,
+            check=True,
+            capture_output=True,
+        )
+        _git(root, "update-ref", "refs/remotes/origin/live", "HEAD")
+        _git(root, "checkout", "-q", "main")
+        result = mod.analyze([str(root), *_WINDOW, "--no-function"], max_branches=1)
+        names = {b["branch"] for b in result["unmerged_branches"]["branches"]}
+        self.assertEqual(names, {"origin/work", "origin/live"})
+
     def test_no_branches_flag_skips(self):
         root = self._repo()
         result = mod.analyze([str(root), *_WINDOW, "--no-function", "--no-branches"])
         self.assertFalse(result["unmerged_branches"]["available"])
         self.assertIn("--no-branches", result["unmerged_branches"]["reason"])
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestHardeningSubjects(unittest.TestCase):
@@ -1748,3 +1869,7 @@ class TestUnknownNote(unittest.TestCase):
         notes = " ".join(result["notes"])
         self.assertIn("are `unknown`", notes)
         self.assertNotIn("re-run with --key-type", notes)
+
+
+if __name__ == "__main__":
+    unittest.main()

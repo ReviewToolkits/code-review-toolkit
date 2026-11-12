@@ -1806,6 +1806,226 @@ def _default_branch(git_root: Path) -> str | None:
     return None
 
 
+_MAX_SQUASH_SCAN = 500
+_MAX_OMITTED_LISTED = 200
+
+
+def _split_diff_by_file(diff_text: str) -> list[tuple[str, str]]:
+    """[(path, chunk)] for each file section of a unified diff.
+
+    The path is the new name (`+++ b/...`), or the old one for a deletion.
+    Sections with no text change (mode-only, binary) are skipped.
+    """
+    sections: list[list[str]] = []
+    for line in diff_text.splitlines(keepends=True):
+        if line.startswith("diff --git ") or not sections:
+            sections.append([])
+        sections[-1].append(line)
+    result = []
+    for lines in sections:
+        new = old = None
+        for line in lines:
+            if line.startswith("+++ b/"):
+                new = line[6:].rstrip("\n")
+            elif line.startswith("--- a/"):
+                old = line[6:].rstrip("\n")
+            elif line.startswith("@@"):
+                break
+        path = new or old
+        if path:
+            result.append((path, "".join(lines)))
+    return result
+
+
+class SquashDetector:
+    """Says whether a branch's combined change already landed on base.
+
+    A squash merge lands a branch as one commit, so the per-commit patch ids
+    of `--cherry-mark` never match it, and the branch keeps looking like
+    unmerged work. Read-only checks, against the branch's combined diff
+    (merge-base to tip):
+
+    - `files-identical`: every file the branch changes is identical at base's
+      tip (blob ids compare equal), so base already has the branch's version.
+    - `patch-id`: one base commit made after the branch's last commit carries,
+      file by file, the same patch (`git patch-id --stable`, which ignores
+      line numbers and whitespace) for every file the branch changes. This
+      names the squash commit; extra files in it (a regenerated catalog) do
+      not matter.
+
+    When only some files match one base commit, `partly_landed` names that
+    commit and the files: the branch was likely landed in another form, or
+    superseded. Compare before citing it as unmerged work.
+
+    Nothing is written to the repository. Base commits' patch ids are
+    computed once and shared across branches.
+    """
+
+    def __init__(self, git_root: Path, base: str, max_scan: int = _MAX_SQUASH_SCAN):
+        self.git_root = git_root
+        self.base = base
+        self.max_scan = max_scan
+        # Base commit sha -> {path: per-file patch id}.
+        self._file_pids: dict[str, dict[str, str]] = {}
+
+    def _patch_ids(self, chunks: list[tuple[str, str]]) -> list[str | None]:
+        """Per-chunk patch ids, from one `git patch-id` run."""
+        if not chunks:
+            return []
+        stream = "".join(
+            f"commit {i + 1:040x}\n\n{chunk}" for i, (_, chunk) in enumerate(chunks)
+        )
+        result = subprocess.run(
+            ["git", "patch-id", "--stable"],
+            cwd=str(self.git_root),
+            input=stream,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=_GIT_TIMEOUT,
+            check=False,
+        )
+        pids: list[str | None] = [None] * len(chunks)
+        if result.returncode != 0:
+            return pids
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) == 2:
+                index = int(fields[1], 16) - 1
+                if 0 <= index < len(chunks):
+                    pids[index] = fields[0]
+        return pids
+
+    def _load_base(self, shas: list[str]) -> None:
+        todo = [sha for sha in shas if sha not in self._file_pids]
+        if not todo:
+            return
+        for sha in todo:
+            self._file_pids[sha] = {}
+        shown = _run_git(
+            ["show", "--no-color", "--no-ext-diff", "--format=%x00%H", *todo],
+            self.git_root,
+            timeout=_GIT_TIMEOUT * 4,
+        )
+        if shown.returncode != 0:
+            return
+        owners: list[tuple[str, str]] = []
+        chunks: list[tuple[str, str]] = []
+        for block in shown.stdout.split("\x00")[1:]:
+            sha, _, diff_text = block.partition("\n")
+            for path, chunk in _split_diff_by_file(diff_text):
+                owners.append((sha.strip(), path))
+                chunks.append((path, chunk))
+        for (sha, path), pid in zip(owners, self._patch_ids(chunks)):
+            if pid:
+                self._file_pids.setdefault(sha, {})[path] = pid
+
+    def _files_identical(self, branch: str, files: list[str]) -> bool:
+        def blobs(ref: str) -> dict[str, str] | None:
+            out = _run_git(["ls-tree", "-z", ref, "--", *files], self.git_root)
+            if out.returncode != 0:
+                return None
+            entries = {}
+            for item in out.stdout.split("\x00"):
+                meta, _, path = item.partition("\t")
+                if path:
+                    entries[path] = meta.split()[-1]
+            return entries
+
+        at_branch, at_base = blobs(branch), blobs(self.base)
+        return at_branch is not None and at_branch == at_base
+
+    def check(self, branch: str) -> dict:
+        """{"squash_merged", "squash_evidence", "squash_commit", "partly_landed"}.
+
+        `squash_merged` is None when the checks could not run.
+        """
+        result: dict = {
+            "squash_merged": None,
+            "squash_evidence": None,
+            "squash_commit": None,
+            "partly_landed": None,
+        }
+        try:
+            mb = _run_git(["merge-base", self.base, branch], self.git_root)
+            if mb.returncode != 0 or not mb.stdout.strip():
+                return result
+            merge_base = mb.stdout.strip()
+            combined = _run_git(
+                [
+                    "diff",
+                    "--no-color",
+                    "--no-ext-diff",
+                    "--no-renames",
+                    merge_base,
+                    branch,
+                ],
+                self.git_root,
+            )
+            if combined.returncode != 0:
+                return result
+            sections = _split_diff_by_file(combined.stdout)
+            if not sections:
+                return result
+            files = [path for path, _ in sections]
+            if self._files_identical(branch, files):
+                result.update(squash_merged=True, squash_evidence="files-identical")
+                return result
+            branch_pids = dict(zip(files, self._patch_ids(sections)))
+            tip_date = _run_git(
+                ["log", "-1", "--format=%cI", branch], self.git_root
+            ).stdout.strip()
+            # The squash lands after the branch's last commit; a day of slack
+            # covers clock skew.
+            since = []
+            try:
+                when = datetime.fromisoformat(tip_date) - timedelta(days=1)
+                since = [f"--since={when.isoformat()}"]
+            except ValueError:
+                pass
+            listed = _run_git(
+                [
+                    "rev-list",
+                    "--no-merges",
+                    "--reverse",
+                    *since,
+                    f"{merge_base}..{self.base}",
+                ],
+                self.git_root,
+            )
+            if listed.returncode != 0:
+                return result
+            shas = listed.stdout.split()[: self.max_scan]
+            self._load_base(shas)
+        except subprocess.TimeoutExpired:
+            return result
+        best_sha, best = None, []
+        for sha in shas:
+            landed = self._file_pids.get(sha, {})
+            matched = [
+                f
+                for f in files
+                if branch_pids.get(f) and landed.get(f) == branch_pids[f]
+            ]
+            if len(matched) > len(best):
+                best_sha, best = sha, matched
+        result["squash_merged"] = False
+        if best_sha and len(best) == len(files):
+            result.update(
+                squash_merged=True,
+                squash_evidence="patch-id",
+                squash_commit=best_sha[:9],
+            )
+        elif best_sha:
+            result["partly_landed"] = {
+                "commit": best_sha[:9],
+                "files_matched": best[:_MAX_UNMERGED_FILES],
+                "files_matched_total": len(best),
+                "files_total": len(files),
+            }
+        return result
+
+
 def find_unmerged_branches(
     git_root: Path,
     rel_scope: str = ".",
@@ -1863,8 +2083,10 @@ def find_unmerged_branches(
     scope_args = ["--", rel_scope] if rel_scope != "." else []
     branches: list[dict] = []
     examined = 0
+    squash = SquashDetector(git_root, base)
+    live = 0  # unmerged branches not already squash-merged: what the cap counts
     for name, date in candidates:
-        if len(branches) >= max_branches or _check_script_timeout():
+        if live >= max_branches or _check_script_timeout():
             break
         examined += 1
         try:
@@ -1931,9 +2153,16 @@ def find_unmerged_branches(
         changed = (
             [f for f in files.stdout.splitlines() if f] if files.returncode == 0 else []
         )
+        squashed = squash.check(name)
+        if not squashed["squash_merged"]:
+            live += 1
         branches.append(
             {
                 "branch": name,
+                # True: the branch's combined change is already on base (a
+                # squash merge, or the same files landed another way), so it
+                # is not unmerged work even though `ahead` > 0.
+                **squashed,
                 # Raw commit count (`rev-list base..branch`). A branch rebased
                 # or cherry-picked onto base still counts every copy here;
                 # `ahead_patch_unique` is the work base does not have.
@@ -1956,20 +2185,31 @@ def find_unmerged_branches(
                 "files_in_scope": changed[:_MAX_UNMERGED_FILES],
             }
         )
+    omitted = [name for name, _ in candidates[examined:]]
     return {
         "available": True,
         "base": base,
         "remote_branches_total": len(candidates),
         "remote_branches_examined": examined,
         "unmerged_count": len(branches),
+        "squash_merged_count": sum(1 for b in branches if b["squash_merged"]),
         "truncated": examined < len(candidates),
+        # Branches are examined newest first (by last commit date), and the
+        # listing stops after `max_branches` unmerged ones that are not
+        # squash-merged, or at the script timeout. The rest are named here, unexamined: they may or may not
+        # be merged.
+        "max_branches": max_branches,
+        "omitted_branches": omitted[:_MAX_OMITTED_LISTED],
+        "omitted_branches_total": len(omitted),
         "note": (
             "Commits on remote branches that are not in the base branch, as "
             "of the last fetch (this script never fetches). Treat them as "
             "prior art: a finding may already be fixed, or attempted, there. "
             "A commit with patch_in_base true is a copy of a commit base "
             "already has (cherry-pick or rebase), so it is not unmerged work; "
-            "`ahead_patch_unique` counts the rest."
+            "`ahead_patch_unique` counts the rest. A branch with "
+            "squash_merged true already landed as a whole (squash merge): "
+            "compare only what it gained after `squash_commit`, if anything."
         ),
         "branches": branches,
     }
@@ -2139,8 +2379,16 @@ def parse_args(argv: list[str]) -> dict:
     return args
 
 
-def analyze(argv: list[str] | None = None) -> dict:
-    """Main analysis function. Returns the result dict."""
+def analyze(
+    argv: list[str] | None = None,
+    *,
+    max_branches: int = _MAX_UNMERGED_BRANCHES,
+) -> dict:
+    """Main analysis function. Returns the result dict.
+
+    `max_branches` caps how many unmerged remote branches are listed (the
+    rest are named in `unmerged_branches.omitted_branches`).
+    """
     global _SCRIPT_START
     _SCRIPT_START = time.monotonic()
 
@@ -2316,6 +2564,7 @@ def analyze(argv: list[str] | None = None) -> dict:
             git_root,
             _relative_scope(scan_root, git_root),
             key_types,
+            max_branches=max_branches,
         )
 
     # Build result.
