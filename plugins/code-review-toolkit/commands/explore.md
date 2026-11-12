@@ -280,8 +280,10 @@ final pass merges the partials.
 [`security-gate`](security-gate.md) has signed it off.** The consolidation step records claims; the
 gate judges them blind against the project's own threat model and precedents.
 
-Then **spot-check it yourself**: re-read a sample of locations (all FIX findings if feasible), and
-every finding whose agents disagreed. The deduplication and contradiction rules below are the
+Then **check the locations mechanically**: run `check_locations.py` (in the plugin's `scripts/`
+directory) on `findings.json`. It validates every finding's `path:line` range at the reviewed
+commit, whatever its classification. Then **spot-check it yourself**: re-read a sample of locations
+(all FIX findings if feasible), and every finding whose agents disagreed. The deduplication and contradiction rules below are the
 consolidation agent's instructions.
 
 **Labels that leave the run carry the run id.** Short ids repeat across runs and projects (two

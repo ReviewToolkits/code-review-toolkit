@@ -219,9 +219,9 @@ automatically:
   nothing. Cite another memory entry only by its `<run>/<id>` label. The builder resolves ids it
   can match to labels and replaces the rest with `[earlier-run ref]` (listed on stderr).
 
-`status` is one of `confirmed` (verified true positive), `reported` (raised upstream), `fixed`, or
-`candidate` (unverified — **not** folded into future briefings). Only the first three are treated as
-established. This schema matches `crate-local/findings.json` in the `*-review-findings` companion
+`status` is one of `confirmed` (verified true positive), `reproduced` (a reproducer shows it),
+`reported` (raised upstream), `fixed`, or `candidate` (unverified — **not** folded into future
+briefings). All but `candidate` are treated as established. This schema matches `crate-local/findings.json` in the `*-review-findings` companion
 repositories, so a project's memory can be lifted into a findings repo unchanged.
 
 ## Extending the catalogs

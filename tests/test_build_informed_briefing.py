@@ -175,6 +175,19 @@ class TestProjectMemory(unittest.TestCase):
         self.assertNotIn("CRT-0002", out)
         self.assertIn("1 confirmed of 2 recorded", out)
 
+    def test_reproduced_entries_are_established(self):
+        memory = [
+            {
+                "id": "CRT-0003",
+                "status": "reproduced",
+                "title": "t",
+                "location": "c.py:3",
+            }
+        ]
+        out = mod.build_briefing([], "", memory)
+        self.assertIn("**CRT-0003**", out)
+        self.assertIn("1 confirmed of 1 recorded", out)
+
     def test_missing_memory_is_empty(self):
         with TempProject({"mod.py": ""}) as root:
             self.assertEqual(mod._load_project_findings(str(root)), [])

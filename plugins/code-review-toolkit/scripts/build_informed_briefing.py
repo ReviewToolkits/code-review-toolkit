@@ -79,7 +79,7 @@ from security_gate import ID_TOKEN_RE, id_tokens  # noqa: E402
 _DATA = Path(__file__).resolve().parent.parent / "data"
 
 # Findings whose status means "already established -- confirm, don't re-derive".
-_CONFIRMED_STATUS = {"confirmed", "reported", "fixed"}
+_CONFIRMED_STATUS = {"confirmed", "reproduced", "reported", "fixed"}
 
 # Where a reviewed project accumulates its own findings memory between runs.
 _PROJECT_MEMORY = Path(".code-review") / "findings.json"
@@ -88,6 +88,9 @@ _PROJECT_MEMORY = Path(".code-review") / "findings.json"
 DEFAULT_AGENT_BUDGET = 80_000
 
 _SEVERITY_ORDER = {"FIX": 0, "CONSIDER": 1, "POLICY": 2}
+
+# Bytes kept free for the note that lists what the budget trimmed.
+_TRIM_NOTE_RESERVE = 400
 
 # False-positive taxonomy sections (by heading prefix) and the agents that read
 # them in full. Every other agent gets the entry titles and the file path.
@@ -299,9 +302,10 @@ TRIAGE_RULES = """\
    scenario (inputs → wrong outcome). A finding you cannot make concrete is a
    hypothesis; label it as one or drop it.
 7. **NEVER edit the reviewed tree.** Not to patch-test, not to mutation-test,
-   not "just to check". Work on a copy:
+   not "just to check". Work on a copy, in a fresh directory under the run's
+   own scratch area:
 
-       mkdir -p /tmp/repro && git -C <project> archive HEAD | tar -x -C /tmp/repro
+       d=$(mktemp -d -p <run_dir>/tmp repro.XXXXXX) && git -C <project> archive HEAD | tar -x -C "$d"
 
    A review often runs many agents over one checkout at once. A file you
    modified is a file every other agent then reads wrongly, and one of them
@@ -869,6 +873,8 @@ def build_briefing(
     trimmed: list[str] = []
     state: dict = {}
     text, labels = assemble()
+    # Room for the closing "trimmed" note, which is written after the fitting.
+    fit = budget - min(_TRIM_NOTE_RESERVE, budget // 4)
     if budget and size(text) > budget:
         n_theirs = sum(
             1
@@ -893,14 +899,14 @@ def build_briefing(
             ("every shape shortened", "compact", 2),
         ]
         for name, key, value in steps:
-            if size(text) <= budget:
+            if size(text) <= fit:
                 break
             if key.endswith("_limit"):
                 if not value:
                     continue
                 keep = _largest_fitting(
                     value,
-                    lambda k, key=key: size(assemble(**{**state, key: k})[0]) <= budget,
+                    lambda k, key=key: size(assemble(**{**state, key: k})[0]) <= fit,
                 )
                 state[key] = keep
                 trimmed.append(f"{name}: kept {keep} of {value}")
@@ -908,7 +914,7 @@ def build_briefing(
                 state[key] = value
                 trimmed.append(name)
             text, labels = assemble(**state)
-        if size(text) > budget:
+        if size(text) > fit:
             trimmed.append("still over budget")
         text = text.rstrip("\n") + (
             f"\n\n_Briefing trimmed to a {budget}-byte budget: "
