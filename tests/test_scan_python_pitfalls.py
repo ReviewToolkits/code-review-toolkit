@@ -2300,6 +2300,57 @@ class TestIntegrityErrorWithoutRollback(unittest.TestCase):
         self.assertNotIn(self.shape, shapes(reraise))
 
 
+_MODELS = (
+    "from sqlalchemy.dialects.postgresql import JSONB\n"
+    "from sqlalchemy.ext.mutable import MutableDict\n"
+    "from sqlalchemy.orm import Mapped, mapped_column\n"
+    "class Ticket(Base):\n"
+    "    details: Mapped[dict] = mapped_column(JSONB)\n"
+    "    notes: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSONB))\n"
+    "    def mark(self):\n"
+    "        self.details['seen'] = True\n"
+    "class Draft:\n"
+    "    def __init__(self):\n"
+    "        self.details = {}\n"
+    "    def mark(self):\n"
+    "        self.details['seen'] = True\n"
+)
+
+
+class TestUntrackedJsonColumnMutation(unittest.TestCase):
+    shape = "in-place-mutation-of-untracked-json-column"
+
+    def _scan(self, views: str) -> list[dict]:
+        with TempProject({"pkg/models.py": _MODELS, "pkg/views.py": views}) as root:
+            found = mod.analyze(str(root))["findings"]
+        return [f for f in found if f["shape"] == self.shape]
+
+    def test_in_place_writes_in_another_module(self):
+        found = self._scan(
+            "def close(ticket, now):\n"
+            "    ticket.details['closed_at'] = now\n"
+            "    ticket.details.update(state='closed')\n"
+            "    ticket.notes['closed_at'] = now\n"
+        )
+        self.assertEqual(
+            sorted((f["file"], f["line"]) for f in found),
+            [("pkg/models.py", 8), ("pkg/views.py", 2), ("pkg/views.py", 3)],
+        )
+
+    def test_flag_modified_and_reassignment_are_silent(self):
+        found = self._scan(
+            "from sqlalchemy.orm.attributes import flag_modified\n"
+            "def close(ticket, now):\n"
+            "    ticket.details['closed_at'] = now\n"
+            "    flag_modified(ticket, 'details')\n"
+            "def reopen(ticket, now):\n"
+            "    ticket.details = {**ticket.details, 'reopened_at': now}\n"
+        )
+        self.assertEqual([f for f in found if f["file"] == "pkg/views.py"], [])
+
+    def test_same_name_on_a_plain_class_is_silent(self):
+        found = self._scan("x = 1\n")
+        self.assertNotIn(13, [f["line"] for f in found])
 
 
 if __name__ == "__main__":

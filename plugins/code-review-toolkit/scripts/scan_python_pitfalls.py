@@ -4999,9 +4999,134 @@ def _check_integrity_error_without_rollback(tree: ast.AST) -> list[dict]:
     return out
 
 
+_COLUMN_FACTORIES = frozenset({"Column", "mapped_column"})
+_JSON_COLUMN_TYPES = frozenset({"JSON", "JSONB", "ARRAY", "HSTORE"})
+_MUTATION_TRACKERS = frozenset(
+    {"MutableDict", "MutableList", "MutableSet", "as_mutable"}
+)
+
+
+def _json_columns(
+    corpus: list[tuple[str, ast.AST]],
+) -> tuple[dict[str, set[str]], set[str]]:
+    """Mapped JSON-like columns: attr -> declaring classes (untracked), and
+    the attribute names some model declares with mutation tracking."""
+    untracked: dict[str, set[str]] = {}
+    tracked: set[str] = set()
+    for _rel, tree in corpus:
+        for cls in ast.walk(tree):
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            for stmt in cls.body:
+                if isinstance(stmt, ast.AnnAssign) and isinstance(
+                    stmt.target, ast.Name
+                ):
+                    name, value = stmt.target.id, stmt.value
+                elif (
+                    isinstance(stmt, ast.Assign)
+                    and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name)
+                ):
+                    name, value = stmt.targets[0].id, stmt.value
+                else:
+                    continue
+                if not (
+                    isinstance(value, ast.Call)
+                    and _call_tail(value) in _COLUMN_FACTORIES
+                ):
+                    continue
+                used = {
+                    n.id if isinstance(n, ast.Name) else n.attr
+                    for n in ast.walk(value)
+                    if isinstance(n, (ast.Name, ast.Attribute))
+                }
+                if used & _MUTATION_TRACKERS:
+                    tracked.add(name)
+                elif used & _JSON_COLUMN_TYPES:
+                    untracked.setdefault(name, set()).add(cls.name)
+    return untracked, tracked
+
+
+def _mutated_attribute(node: ast.AST) -> ast.Attribute | None:
+    """`x.attr[k] = v`, `del x.attr[k]`, `x.attr[k] += 1`, `x.attr.update(...)`."""
+    targets: list[ast.AST] = []
+    if isinstance(node, (ast.Assign, ast.Delete)):
+        targets = list(node.targets)
+    elif isinstance(node, ast.AugAssign):
+        targets = [node.target]
+    for target in targets:
+        if isinstance(target, ast.Subscript) and isinstance(
+            target.value, ast.Attribute
+        ):
+            return target.value
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in _MUTATING_METHODS
+        and isinstance(node.func.value, ast.Attribute)
+    ):
+        return node.func.value
+    return None
+
+
+def _check_untracked_json_column_mutation(
+    corpus: list[tuple[str, ast.AST]],
+) -> list[dict]:
+    """In-place change to a JSON/JSONB/ARRAY column with no mutation tracking."""
+    untracked, tracked = _json_columns(corpus)
+    columns = {k: v for k, v in untracked.items() if k not in tracked}
+    if not columns:
+        return []
+    out: list[dict] = []
+    for rel, tree in corpus:
+        owners: dict[int, str] = {}  # id(function) -> enclosing class name
+        for cls in ast.walk(tree):
+            if isinstance(cls, ast.ClassDef):
+                for item in cls.body:
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        owners[id(item)] = cls.name
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            nodes = list(_walk_same_scope(fn))
+            if any(
+                isinstance(n, ast.Call) and _call_tail(n) == "flag_modified"
+                for n in nodes
+            ):
+                continue
+            for node in nodes:
+                attr = _mutated_attribute(node)
+                if attr is None or attr.attr not in columns:
+                    continue
+                receiver = _dotted_name(attr.value)
+                if (
+                    receiver in ("self", "cls")
+                    and owners.get(id(fn)) not in columns[attr.attr]
+                ):
+                    continue  # another class's attribute of the same name
+                models = "/".join(sorted(columns[attr.attr]))
+                finding = _finding(
+                    "in-place-mutation-of-untracked-json-column",
+                    "FIX",
+                    "medium",
+                    node,
+                    f"{ast.unparse(attr)} is changed in place, but {models}."
+                    f"{attr.attr} is a JSON-like column without MutableDict/"
+                    f"MutableList and nothing calls flag_modified(): the change is "
+                    f"never flushed",
+                    "reassign the attribute, call flag_modified(obj, name), or wrap "
+                    "the column type in MutableDict.as_mutable(); fine for an object "
+                    "that is not flushed yet",
+                )
+                finding["file"] = rel
+                out.append(finding)
+    return out
+
+
 _PROJECT_CHECKS = {
     "divergent-sentinel-across-parallel-modules": _check_divergent_sentinel,
     "unguarded-inverse-of-guarded-operation": _check_unguarded_inverse,
+    "in-place-mutation-of-untracked-json-column": _check_untracked_json_column_mutation,
 }
 
 

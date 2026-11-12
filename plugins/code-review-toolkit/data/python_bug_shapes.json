@@ -2817,6 +2817,67 @@
       "differential": "A handler that re-raises the same exception (bare `raise`) lets the framework roll back, which is fine. A try whose database work runs inside `begin_nested()`, or a handler whose caller always discards the session, is fine.",
       "detected_by": "scan_python_pitfalls.py",
       "detectability": "implemented"
+    },
+    {
+      "id": "trigger-maintained-column-read-stale",
+      "title": "A column a database trigger rewrites is read from the ORM's in-memory object after the write that fired the trigger",
+      "agent": "python-pitfall-scanner",
+      "severity": "FIX",
+      "pattern": "A migration creates a BEFORE INSERT/UPDATE trigger that sets column C (`NEW.changed_at = now()` on UPDATE OF email, `NEW.name = normalize(NEW.name)`). The model maps C without `server_onupdate=FetchedValue()` (or `eager_defaults`), so after `obj.<trigger column> = x; session.flush()` the identity map still holds the old C. Code in the same request then reads `obj.C` and stores or compares it (a session timestamp, a cache key, an audit record).",
+      "guarded_twin": "`session.flush(); session.refresh(obj)` before reading C (often with a comment like 'pick up the new value'), or `FetchedValue()` on the column.",
+      "hunt": "List every CREATE TRIGGER in the migrations and the columns it assigns. Grep the Python for reads of each such attribute, and for each read look for a preceding write in the same request or task to a column that fires the trigger, with no refresh or expire between them. Include writes hidden in services (a password rehash on login, normalisation on insert).",
+      "expected": "the value read equals the value the database just stored.",
+      "caught_as": "SILENT -- a stale value persisted elsewhere; for session timestamps, a fresh session invalidated on the next request.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): a login-time password-hash upgrade fired a trigger that bumped a password-changed timestamp; the login recorded the stale in-memory value in the session, and the next request invalidated the new session."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "SQLAlchemy docs, Fetching Server-Generated Defaults (FetchedValue, eager_defaults)"
+      ],
+      "differential": "A read in a later request or transaction, or after the attribute was expired (refresh, commit, expire_all), sees the new value.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "in-place-mutation-of-untracked-json-column",
+      "title": "A JSON/JSONB/ARRAY column without mutation tracking is changed in place, so the change is never flushed",
+      "agent": "python-pitfall-scanner",
+      "severity": "FIX",
+      "pattern": "`obj.col[key] = v`, `obj.col.update(...)`, `obj.col.append(...)` where `col` is `mapped_column(JSONB)` / `Column(JSON)` / `ARRAY(...)` NOT wrapped in `MutableDict.as_mutable(...)` / `MutableList`, and no `flag_modified(obj, 'col')` follows. SQLAlchemy records no attribute history for an in-place change, so the UPDATE omits the column. Tests that assert on the same in-memory object pass.",
+      "guarded_twin": "A sibling column declared `MutableDict.as_mutable(JSONB)`, reassignment (`obj.col = {**obj.col, key: v}`), or `flag_modified(obj, 'col')` after the change.",
+      "hunt": "Collect every JSON/JSONB/ARRAY mapped column and whether it is Mutable-wrapped. Grep subscript assignments and mutating methods on `.<col>`, including through an alias (`d = obj.col; d[k] = v`). Check whether the tests re-read from the database (expire_all, a new session) or assert on the object they mutated.",
+      "expected": "the mutation is persisted.",
+      "caught_as": "SILENT -- the change is visible for the rest of the request and gone after it.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): an admin workflow wrote completed/cancelled timestamps into a plain JSONB column in place, and nothing was persisted; the scanner check finds exactly those sites."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "SQLAlchemy docs, Mutation Tracking (sqlalchemy.ext.mutable): in-place changes to JSON values are not detected unless the type is wrapped"
+      ],
+      "differential": "Fine when the column is Mutable-wrapped, when `flag_modified` is called, or when the object is transient (not yet flushed, so the whole value is inserted). The scanner skips attribute names that some model declares tracked, and nested mutation (`obj.col[a][b] = v`) even of a MutableDict is a separate, manual hunt.",
+      "detected_by": "scan_python_pitfalls.py",
+      "detectability": "implemented"
+    },
+    {
+      "id": "raw-value-compared-with-normalized-column",
+      "title": "A raw value is compared with (or used to look up) a column the database normalises",
+      "agent": "python-pitfall-scanner",
+      "severity": "FIX",
+      "pattern": "A model has a raw column and a normalised twin (`name` and `normalized_name`), or a trigger normalises a column on write. One query compares the raw input with the normalised column, or the normalised input with the raw column. Variant spellings miss: a lookup silently skips rows, an existence check passes and the insert then violates a unique constraint on the normalised value.",
+      "guarded_twin": "The sibling query that normalises both sides with the same function (`func.normalize(Model.name) == func.normalize(value)`), or that compares like with like.",
+      "hunt": "List each column pair (raw / normalised) and each trigger that normalises. Grep every filter on either column and check that the compared value went through the same normalisation. Feed variant spellings (case, separators) through each path.",
+      "expected": "every spelling of a name resolves to the same row.",
+      "caught_as": "SILENT -- rows skipped by a maintenance job or a search update; sometimes a unique violation that aborts a whole batch.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): an incremental reindex filtered the raw name column but was always given normalised names, so it silently skipped every item whose name was not already normalised."
+      ],
+      "validation": "confirmed",
+      "references": [],
+      "differential": "A comparison where the input is already guaranteed normalised (it came from the normalised column) is fine.",
+      "detected_by": null,
+      "detectability": "agent-only"
     }
   ]
 }
