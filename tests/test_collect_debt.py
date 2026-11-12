@@ -449,7 +449,14 @@ class TestConfigDebt(unittest.TestCase):
     def test_summary_counts(self):
         self.assertEqual(
             self.out["summary"]["config_debt"],
-            {"pins": 4, "routine_caps": 1, "suppressions": 5, "ci": 3, "markers": 1},
+            {
+                "pins": 4,
+                "routine_caps": 1,
+                "suppressions": 5,
+                "ci": 3,
+                "markers": 1,
+                "warning_filters": 2,
+            },
         )
 
 
@@ -534,6 +541,127 @@ class TestTrackerKeyResolution(unittest.TestCase):
         self.assertEqual(keys["ABC-2"]["unmerged_commits"], 1)
         self.assertEqual(keys["ABC-1"]["unmerged_commits"], 0)
         self.assertEqual(keys["ABC-1"]["commits"], 1)
+
+
+class TestMarkersOutsideHashComments(unittest.TestCase):
+    """Markers were read only from `#` comments in .py files."""
+
+    @classmethod
+    def setUpClass(cls):
+        files = {
+            "pkg/__init__.py": "",
+            "pkg/api.py": (
+                "def lookup(key):\n"
+                '    """Find a record.\n'
+                "\n"
+                "    TODO: support more than one key per call.\n"
+                "    # TODO: already a hash marker, counted once\n"
+                '    """\n'
+                '    help_url = "TODO"\n'
+                '    label = "a todo list is not a marker"\n'
+                "    return key\n"
+            ),
+            "pkg/templates/page.html": (
+                "<div>\n"
+                "{# TODO: paginate this table #}\n"
+                "<!-- FIXME the badge overlaps on narrow screens -->\n"
+                "<p>TODO in visible text is content, not a marker</p>\n"
+                "</div>\n"
+            ),
+            "pkg/static/site.scss": "// TODO drop this override\n.a { color: red; }\n",
+            "pkg/static/plain.css": "/* HACK: works around a layout bug */\n.b {}\n",
+            "pkg/static/app.js": (
+                "const url = 'http://example.test/TODO';\n"
+                "// FIXME: retry on failure\n"
+                "/*\n * XXX keep in sync with the server\n */\n"
+            ),
+            "pkg/static/vendor/lib.js": "// TODO vendored, not ours\n",
+            "pkg/static/app.min.js": "// TODO minified bundle\n",
+        }
+        with TempProject(files) as root:
+            cls.out = _run_main([str(root / "pkg")])
+        cls.items = [
+            (i["file"], i["line"], i["category"], i.get("source", "comment"))
+            for i in cls.out["items"]
+        ]
+
+    def test_template_stylesheet_and_script_comments(self):
+        found = {i for i in self.items if i[3] in ("template", "stylesheet", "script")}
+        self.assertEqual(
+            found,
+            {
+                ("pkg/templates/page.html", 2, "TODO", "template"),
+                ("pkg/templates/page.html", 3, "FIXME", "template"),
+                ("pkg/static/site.scss", 1, "TODO", "stylesheet"),
+                ("pkg/static/plain.css", 1, "HACK", "stylesheet"),
+                ("pkg/static/app.js", 2, "FIXME", "script"),
+                ("pkg/static/app.js", 4, "XXX", "script"),
+            },
+        )
+
+    def test_docstring_and_placeholder_string(self):
+        self.assertIn(("pkg/api.py", 4, "TODO", "docstring"), self.items)
+        self.assertIn(("pkg/api.py", 7, "TODO", "string"), self.items)
+
+    def test_no_double_count_and_no_prose_match(self):
+        at_line_5 = [i for i in self.items if i[:2] == ("pkg/api.py", 5)]
+        self.assertEqual(at_line_5, [("pkg/api.py", 5, "TODO", "comment")])
+        self.assertFalse([i for i in self.items if i[:2] == ("pkg/api.py", 8)])
+
+    def test_summary_reports_sources_and_files(self):
+        summary = self.out["summary"]
+        self.assertEqual(
+            summary["non_python_files_scanned"],
+            {"script": 1, "stylesheet": 2, "template": 1},
+        )
+        self.assertEqual(summary["by_source"]["template"], 2)
+
+
+class TestWarningFilterEntries(unittest.TestCase):
+    """filterwarnings was listed as one joined value with no ages."""
+
+    def test_each_entry_with_its_comment(self):
+        pyproject = (
+            '[project]\nname = "x"\n'
+            "[tool.pytest.ini_options]  # a note after the header\n"
+            "filterwarnings = [\n"
+            '  "error",\n'
+            "  # upstream issue: the library still calls the old API\n"
+            "  '''ignore:old 'api' call:DeprecationWarning''',\n"
+            '  "ignore::UserWarning:somelib",\n'
+            "]\n"
+        )
+        with TempProject({"pkg/__init__.py": ""}) as root:
+            (root / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+            (root / "pytest.ini").write_text(
+                "[pytest]\nfilterwarnings =\n    ignore::ResourceWarning\n",
+                encoding="utf-8",
+            )
+            out = _run_main([str(root / "pkg")])
+        filters = out["config_debt"]["warning_filters"]
+        self.assertEqual(
+            [(f["file"], f["line"], f["action"]) for f in filters],
+            [
+                ("pyproject.toml", 5, "error"),
+                ("pyproject.toml", 7, "ignore"),
+                ("pyproject.toml", 8, "ignore"),
+                ("pytest.ini", 3, "ignore"),
+            ],
+        )
+        self.assertEqual(
+            filters[1]["entry"], "ignore:old 'api' call:DeprecationWarning"
+        )
+        self.assertEqual(
+            filters[1]["comment_above"],
+            "upstream issue: the library still calls the old API",
+        )
+        self.assertEqual(filters[1]["age"], "unknown")  # no git here
+        # The header comment no longer hides the section from the
+        # suppression inventory either.
+        settings = {
+            (s["tool"], s["setting"]) for s in out["config_debt"]["suppressions"]
+        }
+        self.assertIn(("pytest", "filterwarnings"), settings)
 
 
 if __name__ == "__main__":

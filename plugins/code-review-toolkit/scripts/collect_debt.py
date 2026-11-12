@@ -27,6 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scan_common import (  # noqa: E402
+    _is_excluded,
     discover_python_files,
     find_project_root,
     parse_common_args,
@@ -192,6 +193,203 @@ def scan_file(filepath: Path, project_root: Path, use_git: bool) -> list[dict]:
             items.append(item)
 
     return items
+
+
+# --- markers outside `#` comments -------------------------------------------
+#
+# A TODO is not always a `#` comment in a .py file: templates, stylesheets and
+# scripts have their own comment syntaxes, a docstring can carry a `Todo:`
+# section, and a placeholder string (`"TODO: fill in"`) is debt that ships.
+
+_DEBT_WORDS = r"(TODO|FIXME|HACK|WORKAROUND|XXX)"
+# A marker that opens a comment line, as `#\s*TODO` does for Python.
+_LINE_MARKER = re.compile(rf"^[\s*!-]*{_DEBT_WORDS}\b[:\s]*(.*)", re.IGNORECASE)
+# A placeholder string: the value itself starts with the marker.
+_STRING_MARKER = re.compile(r"^\s*(TODO|FIXME)\b[:\s]*(.*)", re.DOTALL)
+
+_TEMPLATE_SUFFIXES = frozenset({".html", ".htm", ".jinja", ".jinja2", ".j2", ".xml"})
+_STYLESHEET_SUFFIXES = frozenset({".css", ".scss", ".sass", ".less"})
+_SCRIPT_SUFFIXES = frozenset({".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx"})
+_VENDORED_DIRS = frozenset({"vendor", "vendored", "third_party", "bower_components"})
+_BLOCK_COMMENT = re.compile(r"/\*(.*?)\*/", re.DOTALL)
+_LINE_COMMENT = re.compile(r"(?<![:\\'\"\w])//(.*)")
+_TEMPLATE_COMMENT = re.compile(
+    r"\{#(.*?)#\}|<!--(.*?)-->|\{%-?\s*comment\s*-?%\}(.*?)\{%-?\s*endcomment",
+    re.DOTALL,
+)
+
+
+def _text_kind(path: Path) -> str | None:
+    suffix = path.suffix.lower()
+    if suffix in _TEMPLATE_SUFFIXES:
+        return "template"
+    if suffix in _STYLESHEET_SUFFIXES:
+        return "stylesheet"
+    if suffix in _SCRIPT_SUFFIXES:
+        return "script"
+    return None
+
+
+def discover_text_debt_files(scan_root: Path) -> list[Path]:
+    """Templates, stylesheets and scripts under *scan_root*, minus excluded,
+    vendored and minified files."""
+    if not scan_root.is_dir():
+        return []
+    found: list[Path] = []
+    for path in sorted(scan_root.rglob("*")):
+        if _text_kind(path) is None or not path.is_file():
+            continue
+        if _is_excluded(path, scan_root) or ".min." in path.name:
+            continue
+        parts = path.relative_to(scan_root).parts
+        if set(parts) & _VENDORED_DIRS:
+            continue
+        found.append(path)
+    return found
+
+
+def _comment_spans(text: str, kind: str, line_comments: bool) -> list[tuple[int, str]]:
+    """``(offset, body)`` of every comment in a template/stylesheet/script.
+    *line_comments*: `//` starts a comment (scripts, SCSS, Less; not CSS)."""
+    spans: list[tuple[int, str]] = []
+    if kind == "template":
+        for match in _TEMPLATE_COMMENT.finditer(text):
+            for group in (1, 2, 3):
+                if match.group(group) is not None:
+                    spans.append((match.start(group), match.group(group)))
+        return spans
+    for match in _BLOCK_COMMENT.finditer(text):
+        spans.append((match.start(1), match.group(1)))
+    if line_comments:
+        covered = [(m.start(), m.end()) for m in _BLOCK_COMMENT.finditer(text)]
+        for match in _LINE_COMMENT.finditer(text):
+            if not any(a <= match.start() < b for a, b in covered):
+                spans.append((match.start(1), match.group(1)))
+    return spans
+
+
+def _marker_item(
+    rel: str, lines: list[str], number: int, category: str, text: str, source: str
+) -> dict:
+    return {
+        "file": rel,
+        "line": number,
+        "category": category.upper().replace("WORKAROUND", "HACK"),
+        "text": text.strip()[:200],
+        "full_line": lines[number - 1].rstrip() if number <= len(lines) else "",
+        "context_before": lines[number - 2].strip() if number > 1 else "",
+        "context_after": lines[number].strip() if number < len(lines) else "",
+        "source": source,
+    }
+
+
+def _add_age(item: dict, filepath: Path, project_root: Path, use_git: bool) -> dict:
+    blame = _git_blame_line(filepath, item["line"], project_root) if use_git else None
+    if blame:
+        item["author"] = blame["author"]
+        item["date"] = blame["date"]
+        item["age"] = _classify_age(blame["date"])
+    else:
+        item["age"] = "unknown"
+    return item
+
+
+def scan_text_file(filepath: Path, project_root: Path, use_git: bool) -> list[dict]:
+    """Debt markers in the comments of a template, stylesheet or script."""
+    kind = _text_kind(filepath)
+    if kind is None:
+        return []
+    try:
+        if filepath.stat().st_size > _MAX_DOC_BYTES:
+            return []
+        text = filepath.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    lines = text.splitlines()
+    rel = str(filepath.relative_to(project_root))
+    items: list[dict] = []
+    seen: set[int] = set()
+    line_comments = kind == "script" or filepath.suffix.lower() != ".css"
+    for offset, body in _comment_spans(text, kind, line_comments):
+        first = text.count("\n", 0, offset) + 1
+        for index, line in enumerate(body.splitlines()):
+            match = _LINE_MARKER.match(line)
+            number = first + index
+            if match and number not in seen:
+                seen.add(number)
+                item = _marker_item(
+                    rel, lines, number, match.group(1), match.group(2), kind
+                )
+                items.append(_add_age(item, filepath, project_root, use_git))
+    return sorted(items, key=lambda i: i["line"])
+
+
+def _docstring_nodes(tree: ast.AST) -> set[int]:
+    found: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                found.add(id(body[0].value))
+    return found
+
+
+def scan_python_strings(
+    filepath: Path, project_root: Path, use_git: bool
+) -> list[dict]:
+    """Markers that open a docstring line (`TODO: ...`, a `Todo:` section) and
+    placeholder strings whose value starts with TODO or FIXME. A line the `#`
+    patterns already matched is not counted twice."""
+    try:
+        source = filepath.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(source)
+    except (OSError, SyntaxError, ValueError, RecursionError):
+        return []
+    lines = source.splitlines()
+    rel = str(filepath.relative_to(project_root))
+    docstrings = _docstring_nodes(tree)
+    hash_categories = ("TODO", "FIXME", "HACK", "XXX")
+
+    def counted(number: int) -> bool:
+        line = lines[number - 1] if 0 < number <= len(lines) else ""
+        return any(_MARKER_PATTERNS[c].search(line) for c in hash_categories)
+
+    items: list[dict] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+            continue
+        if id(node) in docstrings:
+            for index, line in enumerate(node.value.splitlines()):
+                match = _LINE_MARKER.match(line)
+                number = node.lineno + index
+                if match and not counted(number):
+                    items.append(
+                        _marker_item(
+                            rel,
+                            lines,
+                            number,
+                            match.group(1),
+                            match.group(2),
+                            "docstring",
+                        )
+                    )
+            continue
+        match = _STRING_MARKER.match(node.value)
+        if match and not counted(node.lineno):
+            items.append(
+                _marker_item(
+                    rel, lines, node.lineno, match.group(1), match.group(2), "string"
+                )
+            )
+    items.sort(key=lambda i: i["line"])
+    return [_add_age(item, filepath, project_root, use_git) for item in items]
 
 
 # --- tracker keys ----------------------------------------------------------
@@ -602,7 +800,8 @@ _REQUIREMENT = re.compile(
     r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*(\[[^\]]*\])?\s*((?:[<>=!~]=?=?\s*[^,;\s]+\s*,?\s*)+)"
 )
 _QUOTED = re.compile(r'"([^"\n]*)"|\'([^\'\n]*)\'')
-_SECTION = re.compile(r"^\s*\[+\s*([^\]]+?)\s*\]+\s*$")
+# A section header, optionally followed by a comment (`[tool.x]  # note`).
+_SECTION = re.compile(r"^\s*\[+\s*([^\]]+?)\s*\]+\s*(?:#.*)?$")
 
 # (tool, setting) pairs that switch a check off project-wide. A section whose
 # name ends in `per-file-ignores` is a suppression on every line.
@@ -945,6 +1144,107 @@ def collect_config_debt(project_root: Path) -> dict:
     return result
 
 
+_TOML_STRING = re.compile(
+    r"'''(.*?)'''"
+    r'|"""(.*?)"""'
+    r'|"((?:[^"\\]|\\.)*)"'
+    r"|'([^']*)'"
+)
+_PYTEST_CONFIGS = ("pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini")
+
+
+def _filter_entries(
+    lines: list[str], start: int, is_toml: bool
+) -> list[tuple[int, str, str | None]]:
+    """``(line index, entry, comment above)`` for each `filterwarnings` entry
+    of the setting on ``lines[start]``."""
+    entries: list[tuple[int, str, str | None]] = []
+    comment: list[str] = []
+    _, _, first = lines[start].partition("=")
+    if is_toml:
+        depth = 0
+        index = start
+        text = first
+        while True:
+            stripped = text.strip()
+            if stripped.startswith("#"):
+                comment.append(stripped.lstrip("#").strip())
+            else:
+                for match in _TOML_STRING.finditer(text.split(" #", 1)[0]):
+                    value = next(g for g in match.groups() if g is not None)
+                    entries.append((index, value, " ".join(comment) or None))
+                    comment = []
+                if not stripped:
+                    comment = []
+            depth += text.count("[") - text.count("]")
+            if depth <= 0 or index + 1 >= len(lines):
+                break
+            index += 1
+            text = lines[index]
+        return entries
+    if first.strip():
+        entries.append((start, first.strip(), None))
+    index = start + 1
+    while index < len(lines) and lines[index][:1] in (" ", "\t"):
+        stripped = lines[index].strip()
+        if not stripped:
+            break
+        if stripped.startswith("#"):
+            comment.append(stripped.lstrip("#").strip())
+        else:
+            entries.append((index, stripped, " ".join(comment) or None))
+            comment = []
+        index += 1
+    return entries
+
+
+def collect_warning_filters(project_root: Path, use_git: bool) -> list[dict]:
+    """Each pytest `filterwarnings` entry on its own, with its age.
+
+    The suppressions list shows the setting as one joined value; a stale
+    `ignore` is debt one entry at a time, so each gets its line, its action,
+    the comment above it (often a link to the upstream issue) and its age.
+    """
+    out: list[dict] = []
+    for name in _PYTEST_CONFIGS:
+        path = project_root / name
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        is_toml = path.suffix == ".toml"
+        section = ""
+        for i, line in enumerate(lines):
+            header = _SECTION.match(line)
+            if header:
+                section = header.group(1)
+                continue
+            key, sep, _ = line.partition("=")
+            if not sep or key.strip().strip('"').lower() != "filterwarnings":
+                continue
+            if _tool_of(section, path.name) != "pytest" and not (
+                name == "pytest.ini" or section.lower() == "pytest"
+            ):
+                continue
+            for index, entry, comment in _filter_entries(lines, i, is_toml):
+                item = {
+                    "file": name,
+                    "line": index + 1,
+                    "entry": entry[:300],
+                    "action": entry.split(":", 1)[0].strip().lower(),
+                    "comment_above": comment[:200] if comment else None,
+                }
+                blame = (
+                    _git_blame_line(path, index + 1, project_root) if use_git else None
+                )
+                item["date"] = blame["date"] if blame else None
+                item["age"] = _classify_age(blame["date"]) if blame else "unknown"
+                out.append(item)
+    return out
+
+
 def _extract_options(argv: list[str]) -> tuple[list[str], str | None]:
     """Pull ``--key-regex PATTERN`` out of argv, returning the remainder."""
     rest: list[str] = []
@@ -987,12 +1287,23 @@ def main() -> None:
     all_items: list[dict] = []
     for f in all_files:
         all_items.extend(scan_file(f, project_root, use_git))
+        all_items.extend(scan_python_strings(f, project_root, use_git))
+    # Templates, stylesheets and scripts carry markers in their own comments.
+    text_files = discover_text_debt_files(scan_root)
+    text_files_by_kind: dict[str, int] = {}
+    for f in text_files:
+        all_items.extend(scan_text_file(f, project_root, use_git))
+        kind = _text_kind(f) or "other"
+        text_files_by_kind[kind] = text_files_by_kind.get(kind, 0) + 1
 
     # Aggregate stats.
     by_category: dict[str, int] = {}
     by_age: dict[str, int] = {}
     by_file: dict[str, int] = {}
+    by_source: dict[str, int] = {}
     for item in all_items:
+        source = item.get("source", "comment")
+        by_source[source] = by_source.get(source, 0) + 1
         cat = item["category"]
         by_category[cat] = by_category.get(cat, 0) + 1
         age = item.get("age", "unknown")
@@ -1014,6 +1325,10 @@ def main() -> None:
             "by_category": dict(sorted(by_category.items(), key=lambda x: -x[1])),
             "by_age": dict(sorted(by_age.items(), key=lambda x: -x[1])),
             "files_with_debt": len(by_file),
+            # Where markers were found: `comment` (a `#` comment), `docstring`,
+            # `string` (a placeholder value), `template`, `stylesheet`, `script`.
+            "by_source": dict(sorted(by_source.items(), key=lambda x: -x[1])),
+            "non_python_files_scanned": dict(sorted(text_files_by_kind.items())),
             "top_files": [{"file": f, "count": c} for f, c in top_files],
         },
         "items": all_items,
@@ -1022,10 +1337,17 @@ def main() -> None:
         # TODO-style comments in config, requirements and CI files.
         "config_debt": collect_config_debt(project_root),
     }
+    # Each pytest filterwarnings entry on its own, with its age.
+    output["config_debt"]["warning_filters"] = collect_warning_filters(
+        project_root, use_git
+    )
     output["summary"]["config_debt"] = {
         key: len(output["config_debt"][key])
-        for key in ("pins", "routine_caps", "suppressions", "ci", "markers")
-    }
+        for key in (
+            "pins", "routine_caps", "suppressions", "ci", "markers",
+            "warning_filters",
+        )
+    }  # fmt: skip
     if key_pattern is not None:
         output["tracker_keys"] = collect_tracker_keys(
             project_root, all_files, key_pattern, use_git

@@ -24,7 +24,7 @@ where `<plugin_root>` is the root of the code-review-toolkit plugin directory.
 Parse the JSON output. This gives you all explicit debt markers with full text, file/line locations, surrounding context, git blame author/date, and age classification. Use this as your factual foundation — do not re-grep for these markers manually.
 
 Key fields:
-- `items`: complete list of markers, each with `category`, `text`, `full_line`, `context_before`, `context_after`, `age`, `author`, `date`
+- `items`: complete list of markers, each with `category`, `text`, `full_line`, `context_before`, `context_after`, `age`, `author`, `date`. Markers outside `#` comments carry a `source`: `docstring` (a line of a docstring opens with the marker, such as a `Todo:` section), `string` (a placeholder value such as `"TODO"` that ships to users), `template` (`{# #}`, `<!-- -->`, `{% comment %}`), `stylesheet` (`/* */`, and `//` in SCSS/Less) or `script` (`/* */`, `//`). Vendored and minified files are skipped. `summary.by_source` counts them and `summary.non_python_files_scanned` says how many templates, stylesheets and scripts were read
 - `summary.total_markers`: total count
 - `summary.by_category`: counts per category (TODO, FIXME, HACK, XXX, NOQA, TYPE_IGNORE, PRAGMA_NO_COVER, NOSEC, PYLINT_DISABLE, SKIP, XFAIL). SKIP covers `@unittest.skip*`, `@pytest.mark.skip`/`skipif` (also as `@mark.skip`), `pytest.skip()`, `pytest.importorskip()` and `self.skipTest()`; XFAIL covers `@pytest.mark.xfail`, `pytest.xfail()` and `@unittest.expectedFailure`
 - `summary.by_age`: counts per age bucket (fresh/growing/stale/ancient/unknown)
@@ -43,6 +43,9 @@ Key fields:
     (`uses:` at a branch or with no ref) in CI files. A job allowed to fail is a gate that no longer
     gates: say which check it is
   - `markers`: TODO/FIXME/HACK/XXX comments in those files
+  - `warning_filters`: each pytest `filterwarnings` entry on its own (`entry`, `action`,
+    `comment_above`, `age`). An `ignore` entry whose comment links an upstream issue is a workaround:
+    check whether the issue is fixed in the installed version, and report stale ones with their age
 
 **Tracker keys.** Many projects track deferred work by key (`ABC-12`, `PROJ-7`, `R2-4`) in an issue
 tracker or a ROADMAP, and cite the key in code instead of writing TODO; a low marker count then
