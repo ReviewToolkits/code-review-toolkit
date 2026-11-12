@@ -580,6 +580,22 @@ def _returns(name: str, body: list[ast.stmt]) -> bool:
     return False
 
 
+# Per-check bookkeeping for the summary's `per_check`: how many candidates a
+# check looked at and why it passed over some, so "no findings" can be told
+# apart from "nothing considered". analyze() resets it; a check that records
+# nothing reports `considered: null` (not instrumented), never 0.
+_STATS: dict[str, dict] = {}
+
+
+def _note(shape: str, event: str, reason: str = "") -> None:
+    """Record that *shape* considered a candidate, or skipped one for *reason*."""
+    entry = _STATS.setdefault(shape, {"considered": 0, "skipped": {}})
+    if event == "considered":
+        entry["considered"] += 1
+    else:
+        entry["skipped"][reason] = entry["skipped"].get(reason, 0) + 1
+
+
 def _finding(
     shape: str,
     severity: str,
@@ -1009,42 +1025,125 @@ def _attribute_mutated_anywhere(tree: ast.AST, attr: str) -> bool:
     return False
 
 
+# Constructors that build a fresh mutable container. `x = set()` at class level
+# is the same shared object as `x = set([])` or `x = {}`.
+_MUTABLE_CONSTRUCTORS = frozenset(
+    {"list", "dict", "set", "defaultdict", "OrderedDict", "deque", "Counter"}
+)
+# Bare names a constructor may take without making the value opaque:
+# `defaultdict(list)`, `deque(maxlen=10)`.
+_CONSTRUCTOR_ARG_NAMES = frozenset(
+    {"list", "dict", "set", "int", "float", "str", "bool", "tuple", "frozenset"}
+)
+# Base-class names of declarative (ORM/schema) classes: their class attributes
+# are configuration a metaclass reads once, not per-instance state.
+_DECLARATIVE_BASE_SUFFIXES = ("Base", "Model", "DeclarativeBase", "Schema")
+
+
+def _is_mutable_value(value: ast.expr) -> bool:
+    """A list/dict/set literal, or a container constructor with plain arguments."""
+    if isinstance(value, (ast.List, ast.Dict, ast.Set)):
+        return True
+    if not isinstance(value, ast.Call):
+        return False
+    if _call_tail(value) not in _MUTABLE_CONSTRUCTORS:
+        return False
+    args = [*value.args, *(kw.value for kw in value.keywords)]
+    return all(
+        isinstance(a, ast.Constant)
+        or (isinstance(a, ast.Name) and a.id in _CONSTRUCTOR_ARG_NAMES)
+        for a in args
+    )
+
+
+def _is_classvar(annotation: ast.expr | None) -> bool:
+    """`ClassVar[...]` / `typing.ClassVar[...]`: sharing is declared."""
+    if annotation is None:
+        return False
+    if isinstance(annotation, ast.Subscript):
+        annotation = annotation.value
+    return _dotted_name(annotation).split(".")[-1] == "ClassVar"
+
+
+def _is_declarative_class(cls: ast.ClassDef) -> bool:
+    """An ORM/schema-style class: a declarative base, or a mapped table."""
+    for base in cls.bases:
+        if _dotted_name(base).split(".")[-1].endswith(_DECLARATIVE_BASE_SUFFIXES):
+            return True
+    return any(
+        isinstance(stmt, ast.Assign)
+        and any(
+            isinstance(t, ast.Name) and t.id == "__tablename__" for t in stmt.targets
+        )
+        for stmt in cls.body
+    )
+
+
 def _check_class_level_mutable(tree: ast.AST) -> list[dict]:
     out: list[dict] = []
+    shape = "class-level-mutable-attribute"
     for cls in ast.walk(tree):
         if not isinstance(cls, ast.ClassDef):
             continue
         if _decorator_names(cls) & _DATACLASS_DECORATORS:
             continue
+        declarative = _is_declarative_class(cls)
         for stmt in cls.body:
             targets: list[ast.expr] = []
             value: ast.expr | None = None
+            annotation: ast.expr | None = None
             if isinstance(stmt, ast.Assign):
                 targets, value = stmt.targets, stmt.value
             elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
                 targets, value = [stmt.target], stmt.value
-            if value is None or not isinstance(value, (ast.List, ast.Dict, ast.Set)):
+                annotation = stmt.annotation
+            if value is None or not _is_mutable_value(value):
                 continue
             for tgt in targets:
                 if not isinstance(tgt, ast.Name):
                     continue
+                _note(shape, "considered")
                 # The defect requires an actual mutation. ALL_CAPS reads as a
                 # constant, and an attribute never mutated in this module is
                 # declarative class config (the menu_specs/Meta pattern seen
                 # throughout idlelib) -- downgrade rather than drop, since the
                 # mutation could live in another module.
                 mutated = _attribute_mutated_anywhere(tree, tgt.id)
-                if mutated:
+                dunder = tgt.id.startswith("__") and tgt.id.endswith("__")
+                suppressed = None
+                if _is_classvar(annotation):
+                    if mutated:
+                        conf = "medium"
+                        why = (
+                            "annotated ClassVar, so the sharing is declared; a "
+                            "defect only if per-instance state was meant"
+                        )
+                    else:
+                        conf, why = "low", "annotated ClassVar and never mutated"
+                        suppressed = "annotated-classvar"
+                elif mutated:
                     conf, why = (
                         "high",
                         "the shared object is mutated in this module -- state bleeds "
                         "between instances",
                     )
+                elif dunder:
+                    # `__table_args__`, `__acl__`, `__slots__`, `__all__`: a
+                    # protocol hook a framework or the interpreter reads, and
+                    # on web apps most of this shape's output.
+                    conf, why = "low", "dunder hook, never mutated in this module"
+                    suppressed = "dunder-hook-not-mutated"
                 elif tgt.id.isupper():
                     conf, why = (
                         "low",
                         "ALL_CAPS and no mutation seen: reads as a constant (prefer a "
                         "tuple/frozenset to make that explicit)",
+                    )
+                elif declarative:
+                    conf = "low"
+                    why = (
+                        "declarative (ORM/schema) class and no mutation seen: "
+                        "configuration its base reads once"
                     )
                 else:
                     conf, why = (
@@ -1053,17 +1152,18 @@ def _check_class_level_mutable(tree: ast.AST) -> list[dict]:
                         "config, possibly overridden by subclasses -- confirm nothing "
                         "elsewhere mutates it",
                     )
-                out.append(
-                    _finding(
-                        "class-level-mutable-attribute",
-                        "FIX",
-                        conf,
-                        stmt,
-                        f"{cls.name}.{tgt.id} is a mutable class attribute shared by every "
-                        f"instance",
-                        why,
-                    )
+                finding = _finding(
+                    shape,
+                    "FIX",
+                    conf,
+                    stmt,
+                    f"{cls.name}.{tgt.id} is a mutable class attribute shared by every "
+                    f"instance",
+                    why,
                 )
+                if suppressed:
+                    finding["suppressed"] = suppressed
+                out.append(finding)
     return out
 
 

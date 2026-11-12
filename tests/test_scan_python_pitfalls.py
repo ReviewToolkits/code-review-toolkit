@@ -355,6 +355,90 @@ class TestClassLevelMutable(unittest.TestCase):
             "class-level-mutable-attribute", shapes("class C:\n    NAME = 'x'\n")
         )
 
+    def _clm(self, src):
+        return [x for x in scan(src) if x["shape"] == "class-level-mutable-attribute"]
+
+    def test_annotated_constructor_calls_are_found(self):
+        # `tags: set[str] = set()` was missed while `items = []` was reported.
+        src = (
+            "import collections\n"
+            "from collections import defaultdict, deque\n"
+            "class C:\n"
+            "    tags: set[str] = set()\n"
+            "    seen = dict()\n"
+            "    order = list()\n"
+            "    groups = defaultdict(list)\n"
+            "    recent = deque(maxlen=10)\n"
+            "    counts = collections.Counter()\n"
+            "    def add(self, t):\n"
+            "        self.tags.add(t)\n"
+        )
+        found = {f["message"].split()[0]: f["confidence"] for f in self._clm(src)}
+        self.assertEqual(
+            set(found),
+            {"C.tags", "C.seen", "C.order", "C.groups", "C.recent", "C.counts"},
+        )
+        self.assertEqual(found["C.tags"], "high")  # mutated in a method
+
+    def test_a_constructor_with_a_computed_argument_is_not_assumed_mutable(self):
+        # `list(DEFAULTS)` copies, but from what? Out of scope for this check.
+        self.assertEqual(self._clm("class C:\n    x = list(load())\n"), [])
+        self.assertEqual(self._clm("class C:\n    x = frozenset()\n"), [])
+
+    def test_dunder_hooks_are_suppressed_not_reported(self):
+        src = (
+            "class Item(Base):\n"
+            "    __tablename__ = 'items'\n"
+            "    __table_args__ = {'schema': 'app'}\n"
+            "    __acl__ = []\n"
+        )
+        with TempProject({"mod.py": src}) as root:
+            result = mod.analyze(str(root / "mod.py"))
+        self.assertEqual(
+            [
+                f
+                for f in result["findings"]
+                if f["shape"] == "class-level-mutable-attribute"
+            ],
+            [],
+        )
+        self.assertEqual(
+            result["summary"]["suppressed_by_differential"][
+                "class-level-mutable-attribute"
+            ],
+            {"dunder-hook-not-mutated": 2},
+        )
+
+    def test_a_mutated_dunder_is_still_reported(self):
+        src = (
+            "class Registry:\n"
+            "    __registry__ = {}\n"
+            "    def register(self, k, v):\n"
+            "        self.__registry__[k] = v\n"
+        )
+        f = self._clm(src)
+        self.assertEqual(f[0]["confidence"], "high")
+
+    def test_classvar_declares_the_sharing(self):
+        src = (
+            "from typing import ClassVar\n"
+            "class C:\n"
+            "    plugins: ClassVar[list] = []\n"
+            "    names: ClassVar[set[str]] = set()\n"
+            "    def add(self, p):\n"
+            "        self.plugins.append(p)\n"
+        )
+        found = {f["message"].split()[0]: f["confidence"] for f in self._clm(src)}
+        # Mutated: still reported, but the author declared it shared.
+        self.assertEqual(found, {"C.plugins": "medium"})
+
+    def test_declarative_class_attributes_are_low(self):
+        src = "class Base(DeclarativeBase):\n    type_annotation_map = {int: 'x'}\n"
+        self.assertEqual(self._clm(src)[0]["confidence"], "low")
+        # The same attribute on an ordinary class stays medium.
+        src = "class Plain:\n    type_annotation_map = {int: 'x'}\n"
+        self.assertEqual(self._clm(src)[0]["confidence"], "medium")
+
 
 class TestBareExcept(unittest.TestCase):
     def test_bare_except(self):
