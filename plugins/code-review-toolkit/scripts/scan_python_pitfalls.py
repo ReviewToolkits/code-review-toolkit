@@ -1522,14 +1522,22 @@ _REPORTING_HINTS = (
 
 
 def _handler_exits(handler: ast.ExceptHandler) -> bool:
-    """True if the handler re-raises, or calls something that raises or exits."""
-    for node in ast.walk(handler):
-        if isinstance(node, ast.Raise):
+    """True if the handler always re-raises or exits.
+
+    Only unconditional statements count: a `raise` at the handler's top
+    level, or a final top-level call to something that raises or exits
+    (`sys.exit(...)`, `abort(...)`, `raise_for_status()`). A raise inside a
+    branch or a nested def, or a `fail(...)` followed by a `return`, leaves a
+    path on which the failure is swallowed.
+    """
+    body = handler.body
+    if any(isinstance(stmt, ast.Raise) for stmt in body):
+        return True
+    last = body[-1] if body else None
+    if isinstance(last, ast.Expr) and isinstance(last.value, ast.Call):
+        tail = _call_tail(last.value)
+        if tail in _RAISING_CALL_TAILS or tail.startswith("raise_"):
             return True
-        if isinstance(node, ast.Call):
-            tail = _call_tail(node)
-            if tail in _RAISING_CALL_TAILS or tail.startswith("raise_"):
-                return True
     return False
 
 
@@ -5292,29 +5300,42 @@ def _check_integrity_error_without_rollback(tree: ast.AST) -> list[dict]:
             caught = _caught_tails(handler) & _INTEGRITY_ERRORS
             if not caught or _call_tails(handler.body) & _SESSION_RECOVERY_CALLS:
                 continue
-            reraises = any(
-                isinstance(sub, ast.Raise)
-                and (
-                    sub.exc is None
-                    or (isinstance(sub.exc, ast.Name) and sub.exc.id == handler.name)
-                )
+            raises = [
+                sub
                 for stmt in handler.body
                 for sub in ast.walk(stmt)
-            )
-            if reraises:
-                continue  # the framework sees the error and rolls back
+                if isinstance(sub, ast.Raise)
+            ]
+            if any(
+                r.exc is None
+                or (isinstance(r.exc, ast.Name) and r.exc.id == handler.name)
+                for r in raises
+            ):
+                continue  # re-raised: the framework sees it and rolls back
+            # A conversion (`raise Conflict() from e`) is fine when the new
+            # exception reaches the framework, and the defect when a caller
+            # catches it and keeps using the session. Statically unknowable:
+            # report it at low confidence, with where to look.
+            converted = bool(raises)
             out.append(
                 _finding(
                     "integrity-error-caught-without-rollback",
                     "FIX",
-                    "medium",
+                    "low" if converted else "medium",
                     handler,
                     f"{min(caught)} is handled without session.rollback() or a "
                     f"savepoint: the transaction is aborted, so the next use of the "
-                    f"session raises PendingRollbackError",
+                    f"session raises PendingRollbackError"
+                    + (
+                        " (converted to another exception: a defect only if a "
+                        "caller catches it and keeps using the session)"
+                        if converted
+                        else ""
+                    ),
                     "roll back first in the handler, or flush inside "
-                    "session.begin_nested(); dismiss if the caller always discards the "
-                    "session",
+                    "session.begin_nested(); for a conversion, follow the new "
+                    "exception to the code that catches it; dismiss if the caller "
+                    "always discards the session",
                 )
             )
     return out

@@ -715,6 +715,29 @@ class TestExceptExceptionTooBroad(unittest.TestCase):
         f = [x for x in scan(src) if x["shape"] == "except-exception-too-broad"]
         self.assertEqual(f[0]["confidence"], "high")
 
+    def test_fail_then_return_is_not_an_exit(self):
+        # job.fail() marks a row and the handler carries on: swallowed.
+        src = (
+            "def run(job, o):\n    try:\n        return o.flush()\n"
+            "    except Exception as e:\n        job.fail(str(e))\n        return None\n"
+        )
+        self.assertIn("except-exception-too-broad", shapes(src))
+
+    def test_conditional_raise_is_not_an_exit(self):
+        src = (
+            "def run(o, strict):\n    try:\n        return o.flush()\n"
+            "    except Exception:\n        if strict:\n            raise\n"
+            "        return None\n"
+        )
+        self.assertIn("except-exception-too-broad", shapes(src))
+
+    def test_unconditional_reraise_is_an_exit(self):
+        src = (
+            "def run(o):\n    try:\n        return o.flush()\n"
+            "    except Exception:\n        o.reset()\n        raise\n"
+        )
+        self.assertNotIn("except-exception-too-broad", shapes(src))
+
     def test_base_exception_also_flagged(self):
         src = "def f(o):\n    try:\n        o.flush()\n    except BaseException:\n        pass\n"
         self.assertIn("except-exception-too-broad", shapes(src))
@@ -2519,6 +2542,18 @@ class TestIntegrityErrorWithoutRollback(unittest.TestCase):
         found = [f for f in scan(src) if f["shape"] == self.shape]
         self.assertEqual(len(found), 1)
         self.assertEqual(found[0]["line"], 5)
+        # A conversion may reach the framework: low confidence, not medium.
+        self.assertEqual(found[0]["confidence"], "low")
+
+    def test_reraise_of_bound_name_is_silent(self):
+        src = (
+            "def retitle(db, folder, title):\n"
+            "    try:\n"
+            "        db.flush()\n"
+            "    except UniqueViolation as e:\n"
+            "        raise e\n"
+        )
+        self.assertNotIn(self.shape, shapes(src))
 
     def test_returned_error_without_rollback(self):
         src = (
