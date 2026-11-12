@@ -384,5 +384,105 @@ class TestUnknownFlagWarning(unittest.TestCase):
                 assert_no_unknown_flag_warning(self, name, flags)
 
 
+class TestExcludeInMigrationAwareScripts(unittest.TestCase):
+    """count_types, correlate_tests and find_dead_symbols accept --exclude."""
+
+    def test_count_types(self):
+        check_exclude(self, "count_types")
+
+    def test_correlate_tests(self):
+        out = check_exclude(self, "correlate_tests")
+        self.assertNotIn("pkg/vendor/lib.py", out["untested_sources"])
+
+    def test_find_dead_symbols(self):
+        check_exclude(self, "find_dead_symbols")
+
+
+class TestMigrationLayouts(unittest.TestCase):
+    """Migration revisions are entry points, not dead or untested code."""
+
+    def test_dead_symbols_treats_revisions_as_entry_points(self):
+        mod = import_script("find_dead_symbols")
+        with TempProject(MIGRATION_PROJECT) as root:
+            out, _, _ = run_main(mod, [str(root / "pkg")])
+        orphans = [o["file"] for o in out["orphan_files"]]
+        self.assertFalse([o for o in orphans if "migrations" in o], orphans)
+        names = {u["name"] for u in out["unreferenced_symbols"]}
+        self.assertNotIn("upgrade", names)
+        self.assertNotIn("downgrade", names)
+        self.assertEqual(out["summary"]["migration_entry_points"], 3)
+
+    def test_dead_symbols_still_reports_a_real_orphan(self):
+        mod = import_script("find_dead_symbols")
+        files = dict(MIGRATION_PROJECT, **{"pkg/stray.py": "def lonely():\n    pass\n"})
+        with TempProject(files) as root:
+            out, _, _ = run_main(mod, [str(root / "pkg")])
+        self.assertIn("pkg/stray.py", [o["file"] for o in out["orphan_files"]])
+
+    def test_dead_symbols_include_migrations_restores_old_behaviour(self):
+        mod = import_script("find_dead_symbols")
+        with TempProject(MIGRATION_PROJECT) as root:
+            out, _, _ = run_main(mod, [str(root / "pkg"), "--include-migrations"])
+        orphans = [o["file"] for o in out["orphan_files"]]
+        self.assertIn("pkg/migrations/versions/a1b2c3_add.py", orphans)
+
+    def test_correlate_tests_skips_revisions_by_default(self):
+        mod = import_script("correlate_tests")
+        with TempProject(MIGRATION_PROJECT) as root:
+            result = mod.analyze(str(root))
+            kept = mod.analyze(str(root), include_migrations=True)
+        self.assertEqual(result["untested_sources"], ["pkg/__init__.py"])
+        self.assertEqual(result["migration_files_skipped"], 3)
+        self.assertEqual(
+            result["migration_dirs"], ["pkg/migrations", "pkg/migrations/versions"]
+        )
+        self.assertEqual(kept["migration_files_skipped"], 0)
+        self.assertIn("pkg/migrations/versions/a1b2c3_add.py", kept["untested_sources"])
+
+    def test_count_types_skips_revisions(self):
+        with TempProject(MIGRATION_PROJECT) as root:
+            types = import_script("count_types").analyze(str(root / "pkg"))
+            kept = import_script("count_types").analyze(
+                str(root / "pkg"), include_migrations=True
+            )
+        self.assertEqual(types["migration_files_skipped"], 3)
+        self.assertEqual(types["summary"]["total_functions"], 1)
+        self.assertEqual(kept["summary"]["total_functions"], 6)
+
+
+class TestCoverageOmit(unittest.TestCase):
+    """correlate_tests honours the project's coverage `omit` for sources only."""
+
+    FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/core.py": "def work():\n    return 1\n",
+        "pkg/shim.py": "def main():\n    pass\n",
+        "tests/test_core.py": "from pkg.core import work\n\n\ndef test_w():\n    work()\n",
+    }
+
+    def test_omitted_source_is_not_counted_as_untested(self):
+        mod = import_script("correlate_tests")
+        with TempProject(self.FILES) as root:
+            (root / ".coveragerc").write_text(
+                "[run]\nomit =\n    pkg/shim.py\n    tests/*\n", encoding="utf-8"
+            )
+            result = mod.analyze(str(root))
+            ignored = mod.analyze(str(root), coverage_omit=False)
+        self.assertNotIn("pkg/shim.py", result["untested_sources"])
+        self.assertEqual(result["coverage_omit"]["files"], ["pkg/shim.py"])
+        self.assertEqual(result["coverage_omit"]["source"], ".coveragerc [run]")
+        # `tests/*` in omit must not remove the tests themselves.
+        self.assertEqual(result["summary"]["test_files"], 1)
+        self.assertIn("pkg/shim.py", ignored["untested_sources"])
+
+    def test_no_coverage_config_reports_null_source(self):
+        mod = import_script("correlate_tests")
+        with TempProject(self.FILES) as root:
+            result = mod.analyze(str(root))
+        self.assertIsNone(result["coverage_omit"]["source"])
+        self.assertEqual(result["coverage_omit"]["source_files_omitted"], 0)
+        self.assertIn("pkg/shim.py", result["untested_sources"])
+
+
 if __name__ == "__main__":
     unittest.main()

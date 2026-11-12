@@ -6,7 +6,22 @@ defined but never used. Accounts for dynamic dispatch, __all__, magic methods,
 test discovery, and entry points.
 
 Usage:
-    python find_dead_symbols.py [path]
+    python find_dead_symbols.py [path] [--max-files N] [--exclude PAT[,PAT]]
+                                [--include-migrations]
+
+Options:
+    --max-files N         Analyze at most N files
+    --exclude PAT[,PAT]   Leave out files whose project-relative path matches
+                          (repeatable; a plain pattern is a substring, a glob
+                          such as ``vendor/*`` matches at any depth). Excluded
+                          files are not counted and their references are not
+                          read; the envelope reports ``files_excluded``.
+    --include-migrations  Treat schema-migration files (Alembic revisions and
+                          ``env.py``, Django migrations) like any other module.
+                          By default they are ENTRY POINTS: the framework loads
+                          them by path, so they are never orphans and their
+                          ``upgrade``/``downgrade`` are never unreferenced, but
+                          their own imports and references still count.
 """
 
 import ast
@@ -21,6 +36,8 @@ from scan_common import (  # noqa: E402
     _is_excluded,
     discover_python_files,
     find_project_root,
+    parse_scan_args,
+    select_python_files,
 )
 
 
@@ -880,31 +897,24 @@ def base_of(extra: Path, project_root: Path, scan_root: Path) -> Path:
 
 
 def main() -> None:
-    from scan_common import exit_on_help
-
-    exit_on_help(sys.argv[1:], __doc__)
-    max_files = 0  # 0 = no limit
-    positional: list[str] = []
-    argv = sys.argv[1:]
-    i = 0
-    while i < len(argv):
-        if argv[i] == "--max-files" and i + 1 < len(argv):
-            max_files = int(argv[i + 1])
-            i += 2
-        elif argv[i].startswith("--"):
-            i += 1
-        else:
-            positional.append(argv[i])
-            i += 1
-    target = Path(positional[0]) if positional else Path(".")
-    target = target.resolve()
+    args = parse_scan_args(sys.argv[1:], __doc__, flags={"--include-migrations"})
+    max_files = args.max_files  # 0 = no limit
+    target = Path(args.target).resolve()
 
     project_root = find_project_root(target)
     scan_root = target if target.is_dir() else project_root
-    all_files = sorted(discover_python_files(scan_root))
-    files_total = len(all_files)
-    if max_files > 0 and files_total > max_files:
-        all_files = all_files[:max_files]
+    include_migrations = "--include-migrations" in args.flags
+    selection = select_python_files(
+        scan_root,
+        project_root=project_root,
+        max_files=max_files,
+        exclude=args.exclude,
+        migrations="detect",
+    )
+    all_files, files_total = selection.files, selection.files_total
+    # Migration files stay in the scan -- their imports and references keep
+    # other code alive -- but are never reported as dead themselves.
+    entry_point_files = set() if include_migrations else set(selection.migrations or ())
 
     file_analyses = [analyze_file(f, project_root) for f in all_files]
 
@@ -1016,6 +1026,10 @@ def main() -> None:
     orphans = find_orphan_files(
         file_analyses, project_root, external_refs | test_refs | doc_refs
     )
+    if entry_point_files:
+        orphans = [o for o in orphans if o["file"] not in entry_point_files]
+        unreferenced = [u for u in unreferenced if u["file"] not in entry_point_files]
+        test_only = [t for t in test_only if t["file"] not in entry_point_files]
 
     commented_code: list[dict] = []
     for f in all_files:
@@ -1039,7 +1053,10 @@ def main() -> None:
         "files_total": files_total,
         "files_analyzed": len(all_files),
         "files_capped": max_files > 0 and files_total > max_files,
+        **selection.envelope_fields(),
         "summary": {
+            # Migration files read as entry points (0 with --include-migrations).
+            "migration_entry_points": len(entry_point_files),
             "unused_imports": len(unused_imports),
             "unreferenced_symbols": len(unreferenced),
             # Methods are checked; these say how many were, and how many were

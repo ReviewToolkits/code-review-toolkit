@@ -12,7 +12,21 @@ that typed code calls (the boundary where annotating one signature lets the
 checker see a whole call chain).
 
 Usage:
-    python count_types.py [path] [--max-files N]
+    python count_types.py [path] [--max-files N] [--exclude PAT[,PAT]]
+                          [--include-migrations]
+
+Options:
+    --max-files N         Analyze at most N files
+    --exclude PAT[,PAT]   Leave out files whose project-relative path matches
+                          (repeatable; a plain pattern is a substring, a glob
+                          such as ``vendor/*`` matches at any depth). Excluded
+                          files are not counted; the envelope reports
+                          ``files_excluded`` and ``exclude_matches``.
+    --include-migrations  Keep schema-migration files (Alembic revisions and
+                          ``env.py``, Django migrations). They are skipped by
+                          default and reported as ``migration_files_skipped``:
+                          a framework loads them by path, and hundreds of
+                          near-identical revision modules swamp the counts.
 """
 
 from __future__ import annotations
@@ -26,10 +40,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scan_common import (  # noqa: E402
     build_envelope,
-    discover_python_files,
     emit,
     find_project_root,
-    parse_common_args,
+    parse_scan_args,
+    select_python_files,
 )
 
 # Bare (unparameterized) container names reported as `untyped_containers`.
@@ -1308,14 +1322,24 @@ def _count_alias_uses(index: _SymbolIndex) -> dict:
     return uses
 
 
-def analyze(target: str, *, max_files: int = 0) -> dict:
+def analyze(
+    target: str,
+    *,
+    max_files: int = 0,
+    exclude: list[str] | None = None,
+    include_migrations: bool = False,
+) -> dict:
     target_path = Path(target).resolve()
     project_root = find_project_root(target_path)
     scan_root = target_path if target_path.is_dir() else project_root
-    all_files = sorted(discover_python_files(scan_root))
-    files_total = len(all_files)
-    if max_files > 0 and files_total > max_files:
-        all_files = all_files[:max_files]
+    selection = select_python_files(
+        scan_root,
+        project_root=project_root,
+        max_files=max_files,
+        exclude=exclude,
+        migrations="detect" if include_migrations else "skip",
+    )
+    all_files, files_total = selection.files, selection.files_total
 
     # Pass 1: every module's aliases and imports, so an alias defined in one
     # module resolves where another module imports it.
@@ -1417,7 +1441,9 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
     aliases = _alias_inventory(index, alias_uses)
 
     output = {
-        **build_envelope(project_root, scan_root, files_total, len(all_files)),
+        **build_envelope(
+            project_root, scan_root, files_total, len(all_files), selection
+        ),
         "summary": {
             "total_functions": len(all_functions),
             "public_functions": len(public_funcs),
@@ -1484,8 +1510,15 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
 
 
 def main() -> None:
-    target, max_files = parse_common_args(sys.argv[1:], __doc__)
-    emit(analyze(target, max_files=max_files))
+    args = parse_scan_args(sys.argv[1:], __doc__, flags={"--include-migrations"})
+    emit(
+        analyze(
+            args.target,
+            max_files=args.max_files,
+            exclude=args.exclude,
+            include_migrations="--include-migrations" in args.flags,
+        )
+    )
 
 
 if __name__ == "__main__":
