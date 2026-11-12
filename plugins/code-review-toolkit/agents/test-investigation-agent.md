@@ -46,11 +46,13 @@ Parse the JSON output. Key fields:
   selected after the product fixes'. The list is capped (`bug_fix_tests_total` is the real count), but selection draws
   from all of them. Within each tier, tests are taken round-robin across files; concurrency, cancellation, rollback,
   lock and timeout tests come first in the error/boundary tier
-- `untested_similar_functions[]`: Functions similar to tested ones but with no tests
+- `untested_similar_functions[]`: Functions similar to tested ones but with no tests. One with `reached_indirectly`
+  (`via`: the tested function that calls it directly, such as a route handler over a service) runs under that test;
+  these are listed last, and the question is whether the test asserts anything about *its* behaviour
 - `similar_functions[]` (per invariant) and `untested_similar_functions[]` list only candidates with a name relation:
   the same name elsewhere (a sibling implementation, an override, or the same operation in another layer) or the
-  same leading words (two for a generic first word such as `get_`; one only with the same shape or a second shared
-  word). Parameter count and module only rank them. They stay within the tested function's top-level directory, skip
+  same leading words (two for a generic first word such as `get_`, `validate_` or `handle_`; one only with the same
+  shape or a second shared word). Parameter count and module only rank them. They stay within the tested function's top-level directory, skip
   private helpers of public functions, bare verbs (`_check` for `_check_spec_version`) and abstract declarations
   (`...`, `raise NotImplementedError`, `@abstractmethod`, `pass` in an ABC or Protocol)
 - `entry_point_siblings[]` (per invariant, and deduplicated at the top level with `sibling_of` and `tested`): other
@@ -58,7 +60,9 @@ Parse the JSON output. Key fields:
   (itself and the same-named functions it calls in deeper layers: route, service, store) calls some project helpers;
   a sibling calls at least two of them (`shared_calls`), or one rare one. `missing_guards` lists the checks the tested
   path makes (`validate_*`, `require_*`, a project predicate in an `if ...: raise`) that the sibling does not: the
-  first place to look for the invariant it fails to keep. Name-based similarity finds none of these
+  first place to look for the invariant it fails to keep. `guard_relation` ranks them: `disjoint` (the sibling
+  validates its input, but with none of the tested guards: the likeliest gap), `partial`, `unguarded` (no guard of its
+  own, often an internal helper), `keeps` (applies every tested guard). Name-based similarity finds none of these
 - `summary`: Aggregate statistics
 - `status`, `test_discovery`, `warnings`: where the tests came from. When the scope (e.g. `pkg/`) holds no tests, the script
   takes them from the project's pytest `testpaths` or a `tests/`/`test/` directory and says so in `warnings`
