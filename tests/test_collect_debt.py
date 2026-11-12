@@ -664,5 +664,82 @@ class TestWarningFilterEntries(unittest.TestCase):
         self.assertIn(("pytest", "filterwarnings"), settings)
 
 
+class TestCanonicalKeys(unittest.TestCase):
+    """Key spellings were not canonicalised, gaps were not reported, and open
+    forge references read as open debt."""
+
+    @classmethod
+    def setUpClass(cls):
+        files = {
+            "pkg/__init__.py": "",
+            "pkg/a.py": (
+                "# ABC-007: retry later\n"
+                "# see https://forge.test/org/repo/issues/41 for context\n"
+                "X = 1\n"
+            ),
+            "ROADMAP.md": (
+                "| Key | Task |\n|---|---|\n"
+                "| ABC-7 | Retry |\n| ABC-1 | One |\n| ABC-2 | Two |\n"
+                "| ABC-4 | Four |\n| ABC-9a | Part a |\n| ABC-9b | Part b |\n"
+                "| ABC-9 | Whole |\n"
+                "Also #41 and #3000 are tracked upstream.\n"
+            ),
+        }
+        with TempProject(files) as root:
+            cls.out = _run_main(
+                [
+                    str(root / "pkg"),
+                    "--key-regex",
+                    r"ABC-\d+[a-z]?|#\d+|https://\S+/issues/\d+",
+                ]
+            )
+        cls.keys = cls.out["tracker_keys"]
+
+    def test_zero_padding_and_forge_url_are_one_key(self):
+        names = {k["key"] for k in self.keys["keys"]}
+        self.assertIn("ABC-7", names)
+        self.assertNotIn("ABC-007", names)
+        self.assertIn("#41", names)
+        self.assertFalse(any(n.startswith("http") for n in names))
+
+    def test_key_variants(self):
+        variants = {(v["key"], v["kind"]): v for v in self.keys["key_variants"]}
+        self.assertEqual(
+            set(variants[("ABC-7", "spelling")]["spellings"]), {"ABC-007", "ABC-7"}
+        )
+        self.assertEqual(
+            variants[("ABC-9", "bare_prefix")]["suffixed"], ["ABC-9a", "ABC-9b"]
+        )
+        self.assertIn(("#41", "spelling"), variants)
+
+    def test_unaccounted_numbers(self):
+        self.assertEqual(self.keys["unaccounted"]["ABC-"]["missing"], [3, 5, 6, 8])
+        self.assertIn("#", self.keys["unaccounted_skipped"])
+
+    def test_open_in_code_is_labelled_unresolved_locally(self):
+        self.assertEqual(self.keys["open_in_code_status"], "unresolved_locally")
+        self.assertIn("#41", self.keys["open_in_code"])
+        self.assertEqual(self.keys["forge_refs_to_check"], ["#41"])
+
+    def test_scope_is_stated(self):
+        self.assertTrue(self.keys["docs_outside_scan_scope"])
+        self.assertTrue(self.out["scan_scope_narrowed"])
+        self.assertIn("tracker_keys (docs)", self.out["read_from_project_root"])
+
+    def test_capture_group_is_the_canonical_key(self):
+        files = {
+            "pkg/__init__.py": "# tracked as https://forge.test/o/r/pull/12\n",
+            "CHANGES.md": "- Fixed in PR-12.\n",
+        }
+        with TempProject(files) as root:
+            out = _run_main(
+                [str(root), "--key-regex", r"(?:https://\S+/pull/|PR-)(?P<key>\d+)"]
+            )
+        keys = out["tracker_keys"]
+        self.assertEqual([k["key"] for k in keys["keys"]], ["12"])
+        self.assertEqual(keys["open_in_code"], [])  # resolved by the changelog
+        self.assertFalse(keys["docs_outside_scan_scope"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -418,6 +418,35 @@ _TICKED_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+\[[xX]\]\s")
 _STRUCK_CELL = re.compile(r"^~~.+~~$")
 
 
+# A forge issue or pull-request URL: its key is `#N`, so it meets the `#N`
+# mentions in changelogs and commit messages.
+_FORGE_URL = re.compile(
+    r"https?://\S+?/(?:-/)?(?:issues|pull|pulls|merge_requests)/(\d+)\b\S*"
+)
+_LEADING_ZEROS = re.compile(r"(?<!\d)0+(?=\d)")
+
+
+def canonical_key(match: re.Match[str]) -> str:
+    """The key a `--key-regex` match stands for.
+
+    A named group `key` (or else the first group that matched) is the key,
+    when the regex has groups; a forge URL becomes `#N`; zero padding in a
+    number is dropped (`ABC-007` and `ABC-7` are one key).
+    """
+    text = match.group(0)
+    if match.re.groups:
+        named = match.groupdict().get("key")
+        group = (
+            named if named is not None else next((g for g in match.groups() if g), None)
+        )
+        if group:
+            text = group
+    forge = _FORGE_URL.fullmatch(text)
+    if forge:
+        text = f"#{forge.group(1)}"
+    return _LEADING_ZEROS.sub("", text)
+
+
 def _row_keys(line: str, pattern: re.Pattern[str]) -> tuple[set[str], bool]:
     """``(keys the line is about, whether it marks them done)``.
 
@@ -431,14 +460,14 @@ def _row_keys(line: str, pattern: re.Pattern[str]) -> tuple[set[str], bool]:
     if stripped.startswith("|"):
         cells = [c.strip() for c in stripped.strip("|").split("|")]
         for index, cell in enumerate(cells):
-            own = {m.group(0) for m in pattern.finditer(cell)}
+            own = {canonical_key(m) for m in pattern.finditer(cell)}
             if own:
                 others = cells[:index] + cells[index + 1 :]
                 return own, any(_STRUCK_CELL.match(c) for c in others if c)
         return set(), False
     if _TICKED_ITEM.match(line):
         first = pattern.search(line)
-        return ({first.group(0)} if first else set()), True
+        return ({canonical_key(first)} if first else set()), True
     return set(), False
 
 
@@ -542,7 +571,7 @@ def _git_log_mentions(
         if len(parts) < 3:
             continue
         ref, date = parts[0], parts[1]
-        for key in {m.group(0) for m in pattern.finditer(" ".join(parts[2:]))}:
+        for key in {canonical_key(m) for m in pattern.finditer(" ".join(parts[2:]))}:
             entry = mentions.setdefault(
                 key, {"commits": 0, "last_date": None, "refs": set()}
             )
@@ -559,11 +588,96 @@ def _natural_key(key: str) -> list:
     return [int(p) if p.isdigit() else p for p in re.split(r"(\d+)", key)]
 
 
+def key_variants(
+    spellings: dict[str, dict[str, list[str]]], seen: set[str]
+) -> list[dict]:
+    """Keys written more than one way, and bare keys beside lettered parts."""
+    out: list[dict] = []
+    for key in sorted(spellings, key=_natural_key):
+        forms = spellings[key]
+        if len(forms) > 1:
+            out.append(
+                {
+                    "key": key,
+                    "kind": "spelling",
+                    "spellings": dict(sorted(forms.items())),
+                }
+            )
+    for key in sorted(seen, key=_natural_key):
+        if not key[-1:].isdigit():
+            continue
+        suffixed = sorted(
+            k
+            for k in seen
+            if len(k) == len(key) + 1
+            and k.startswith(key)
+            and k[-1].isalpha()
+            and k[-1].islower()
+        )
+        if suffixed:
+            out.append(
+                {
+                    "key": key,
+                    "kind": "bare_prefix",
+                    "suffixed": suffixed,
+                    "spellings": dict(sorted(spellings.get(key, {}).items())),
+                }
+            )
+    return out
+
+
+_MAX_GAP_RANGE = 2000
+_MAX_GAPS_LISTED = 100
+
+
+def unaccounted_numbers(seen: set[str]) -> tuple[dict, dict]:
+    """``({prefix: gap info}, {prefix: why skipped})`` for numbered keys.
+
+    `#N` keys are skipped: on a forge, most numbers belong to issues nobody
+    cites in the code, so the gaps say nothing.
+    """
+    numbers: dict[str, set[int]] = {}
+    for key in seen:
+        match = re.fullmatch(r"(.*?)(\d+)[a-z]?", key)
+        if match:
+            numbers.setdefault(match.group(1), set()).add(int(match.group(2)))
+    gaps: dict[str, dict] = {}
+    skipped: dict[str, str] = {}
+    for prefix in sorted(numbers):
+        seen_numbers = numbers[prefix]
+        if prefix in ("#", "") or prefix.endswith("#"):
+            skipped[prefix or "(bare number)"] = "forge numbers: gaps are expected"
+            continue
+        if len(seen_numbers) < 3:
+            continue
+        low, high = min(seen_numbers), max(seen_numbers)
+        if high - low > _MAX_GAP_RANGE:
+            skipped[prefix] = f"range {low}-{high} too wide to list"
+            continue
+        if len(seen_numbers) * 2 < high - low + 1:
+            skipped[prefix] = (
+                f"sparse: {len(seen_numbers)} of {high - low + 1} numbers seen"
+            )
+            continue
+        missing = [n for n in range(low, high + 1) if n not in seen_numbers]
+        if missing:
+            gaps[prefix] = {
+                "min": low,
+                "max": high,
+                "seen": len(seen_numbers),
+                "missing_count": len(missing),
+                "missing": missing[:_MAX_GAPS_LISTED],
+            }
+    return gaps, skipped
+
+
 def collect_tracker_keys(
     project_root: Path,
     py_files: list[Path],
     pattern: re.Pattern[str],
     use_git: bool,
+    *,
+    scan_root: Path | None = None,
 ) -> dict:
     """Inventory every tracker key cited in code comments, docstrings and docs.
 
@@ -574,6 +688,13 @@ def collect_tracker_keys(
     none of those resolution signals is listed in ``open_in_code``.
     """
     keys: dict[str, dict] = {}
+    # canonical key -> spelling -> "file:line" locations
+    spellings: dict[str, dict[str, list[str]]] = {}
+
+    def spelled(key: str, match: re.Match[str], where: str) -> None:
+        places = spellings.setdefault(key, {}).setdefault(match.group(0), [])
+        if len(places) < _MAX_REFS_PER_KEY:
+            places.append(where)
 
     def entry(key: str) -> dict:
         return keys.setdefault(
@@ -597,7 +718,9 @@ def collect_tracker_keys(
         rel = str(path.relative_to(project_root))
         for line, text in _python_comment_lines(path):
             for match in pattern.finditer(text):
-                item = entry(match.group(0))
+                key = canonical_key(match)
+                spelled(key, match, f"{rel}:{line}")
+                item = entry(key)
                 item["code_ref_count"] += 1
                 if len(item["code_refs"]) < _MAX_REFS_PER_KEY:
                     item["code_refs"].append(
@@ -617,7 +740,7 @@ def collect_tracker_keys(
         is_planning = path.name.lower().startswith(_PLANNING_STEMS)
         for number, line in enumerate(text.splitlines(), 1):
             struck = {
-                m.group(0)
+                canonical_key(m)
                 for span in _STRIKE.finditer(line)
                 for m in pattern.finditer(span.group(1))
             }
@@ -625,7 +748,8 @@ def collect_tracker_keys(
             if row_done:
                 struck |= own
             for match in pattern.finditer(line):
-                key = match.group(0)
+                key = canonical_key(match)
+                spelled(key, match, f"{rel}:{number}")
                 item = entry(key)
                 item["doc_ref_count"] += 1
                 item["in_changelog"] |= is_changelog
@@ -720,6 +844,10 @@ def collect_tracker_keys(
         for k in ordered
         if k["in_planning_doc"] and k["in_changelog"] and not k["struck_through"]
     ]
+    seen_keys = set(keys) | {k["key"] for k in changelog_only}
+    seen_keys |= set(git or {}) | {b["key"] for b in branch_only}
+    variants = key_variants(spellings, seen_keys)
+    gaps, gaps_skipped = unaccounted_numbers(seen_keys)
     return {
         "regex": pattern.pattern,
         "doc_files_scanned": [str(p.relative_to(project_root)) for p in docs],
@@ -727,6 +855,10 @@ def collect_tracker_keys(
             "docs are read from the project root and docs/ whatever the scan "
             "scope; code citations come from the scanned files only"
         ),
+        # True when the scan was narrowed to a sub-directory: the docs (and
+        # their keys) still come from the whole project.
+        "docs_outside_scan_scope": scan_root is not None
+        and scan_root.resolve() != project_root.resolve(),
         "git_log_searched": git is not None,
         "unmerged_branches_searched": unmerged is not None,
         "summary": {
@@ -740,10 +872,23 @@ def collect_tracker_keys(
             "open_in_planning_docs": len(open_in_planning_docs),
             "conflicting_signals": len(conflicting_signals),
             "branch_only": None if unmerged is None else len(branch_only),
+            "key_variants": len(variants),
+            "unaccounted": sum(g["missing_count"] for g in gaps.values()),
         },
         # Cited in code, but no changelog entry, strike-through or commit
-        # mentions it: the keyed equivalent of an open TODO.
+        # mentions it: the keyed equivalent of an open TODO. Unresolved
+        # LOCALLY: a forge issue or PR it names may be closed or merged.
         "open_in_code": open_in_code,
+        "open_in_code_status": "unresolved_locally",
+        "open_in_code_note": (
+            "only local signals were checked (changelog, strike-through, "
+            "commits); the script never contacts the forge. Check each "
+            "forge_refs_to_check number (gh issue view N --json state) "
+            "before reporting it open"
+        ),
+        # `#N` keys among open_in_code: issue or PR numbers whose state only
+        # the forge knows.
+        "forge_refs_to_check": [k for k in open_in_code if re.fullmatch(r"#?\d+", k)],
         # Listed in a roadmap/todo/backlog/plan file, not struck through and in
         # no changelog: planned work still open. `doc_refs[].text` carries the
         # row, which usually names the target version.
@@ -752,6 +897,14 @@ def collect_tracker_keys(
         # Mentioned only by commits on branches not merged into HEAD (local
         # and remote): null when the branches were not searched.
         "branch_only": None if unmerged is None else branch_only,
+        # One key written several ways (`ABC-07` and `ABC-7`, a URL and `#7`,
+        # a capture-group regex), or a bare key beside its lettered parts
+        # (`ABC-5` and `ABC-5a`): each spelling with its locations.
+        "key_variants": variants,
+        # Per key prefix: numbers between the lowest and highest seen that no
+        # code, doc or commit mentions -- lost or unrecorded items.
+        "unaccounted": gaps,
+        "unaccounted_skipped": gaps_skipped,
         # Keys whose every mention is in a changelog; their detail is omitted.
         "changelog_only_keys": [
             k["key"]
@@ -1348,9 +1501,15 @@ def main() -> None:
             "warning_filters",
         )
     }  # fmt: skip
+    # What is read from the project root whatever the scan scope.
+    output["read_from_project_root"] = [
+        "config_debt",
+        *(["tracker_keys (docs)"] if key_pattern is not None else []),
+    ]
+    output["scan_scope_narrowed"] = scan_root.resolve() != project_root.resolve()
     if key_pattern is not None:
         output["tracker_keys"] = collect_tracker_keys(
-            project_root, all_files, key_pattern, use_git
+            project_root, all_files, key_pattern, use_git, scan_root=scan_root
         )
     else:
         # Not measured -- say so instead of omitting the section, so an agent
