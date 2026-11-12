@@ -314,5 +314,30 @@ class TestHistoryFilters(unittest.TestCase):
         self.assertEqual(list(self.mod.filter_log_lines(lines, spec, {})), lines)
 
 
+class TestVultureCapKeepsTheMostConfident(unittest.TestCase):
+    """--max-findings must cut the 60% tier, not the 100% hits printed last."""
+
+    def test_sorted_by_confidence_before_the_cap(self):
+        mod = import_script("run_external_tools")
+        stdout = (
+            "pkg/a.py:1: unused function 'one' (60% confidence)\n"
+            "pkg/a.py:2: unused function 'two' (60% confidence)\n"
+            "pkg/a.py:3: unused function 'three' (60% confidence)\n"
+            "pkg/b.py:9: unused variable 'exc_tb' (100% confidence)\n"
+            "pkg/a.py:7: unused import 'os' (90% confidence)\n"
+        )
+        with (
+            TempProject({"pkg/a.py": "x = 1\n"}) as root,
+            patch.object(mod.subprocess, "run") as run,
+        ):
+            run.return_value = MagicMock(stdout=stdout, stderr="")
+            out = mod.run_vulture(
+                mod.parse_args([str(root), "--max-findings", "2"]), root, root
+            )
+        self.assertEqual([f["name"] for f in out["findings"]], ["exc_tb", "os"])
+        self.assertEqual(out["total_findings"], 5)
+        self.assertTrue(out["findings_capped"])
+
+
 if __name__ == "__main__":
     unittest.main()
