@@ -894,6 +894,58 @@ class TestKeptImports(unittest.TestCase):
         )
 
 
+class TestCommentedCodePrecision(unittest.TestCase):
+    """Prose comments merged with one code-like line were reported as
+    commented-out code."""
+
+    def _blocks(self, body: str) -> list[dict]:
+        with TempProject({"mod.py": "x = 1\n" + body + "y = 2\n"}) as root:
+            return mod.find_commented_code(root / "mod.py", root)
+
+    def test_field_description_prose_is_not_code(self):
+        self.assertEqual(
+            self._blocks(
+                "# started_at = time the request was first seen\n"
+                "# owner = name of the account that sent it\n"
+                "# source = where the request was received from,\n"
+                "#   one of the configured gateways\n"
+            ),
+            [],
+        )
+
+    def test_one_code_line_followed_by_prose_is_not_code(self):
+        self.assertEqual(
+            self._blocks(
+                "# value = compute(item)\n"
+                "# would be simpler, but the helper raises on empty input\n"
+                "# and the caller relies on getting None back instead.\n"
+            ),
+            [],
+        )
+
+    def test_multiline_call_and_indented_block_are_code(self):
+        blocks = self._blocks(
+            "# form = RenameForm(\n"
+            "#    request.POST,\n"
+            "#    service=service,\n"
+            "# )\n"
+            "# if form.validate():\n"
+            "#    service.rename(form.name.data)\n"
+        )
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["code_lines"], 6)
+
+    def test_code_with_a_trailing_note_is_still_code(self):
+        blocks = self._blocks(
+            "# for item in items:\n"
+            "#     total += item.price\n"
+            "#     count += 1\n"
+            "# kept for the old report\n"
+        )
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["code_lines"], 3)
+
+
 
 if __name__ == "__main__":
     unittest.main()

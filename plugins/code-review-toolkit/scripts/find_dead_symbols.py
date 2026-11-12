@@ -13,6 +13,7 @@ import ast
 import json
 import re
 import sys
+import textwrap
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -906,6 +907,66 @@ def find_orphan_files(
     return orphans
 
 
+def _parses(text: str) -> bool:
+    """Whether *text* is Python: as written, or as the header of a block
+    (`if x:`, `def f():`, `else:`) whose body was not part of the run."""
+    candidates = [text]
+    if text.rstrip().endswith(":"):
+        stub = text + "\n" + " " * 4 + "pass"
+        head = text.lstrip().split(None, 1)[0].rstrip(":")
+        if head in ("else", "elif", "except", "finally"):
+            opener = "try" if head in ("except", "finally") else "if x"
+            indent = text[: len(text) - len(text.lstrip())]
+            stub = f"{indent}{opener}:\n{indent}    pass\n{stub}"
+        candidates.append(stub)
+    for candidate in candidates:
+        try:
+            ast.parse(textwrap.dedent(candidate))
+        except (SyntaxError, ValueError, RecursionError):
+            continue
+        return True
+    return False
+
+
+def _code_line_count(comment_lines: list[str]) -> int:
+    """How many lines of a comment run parse as Python once de-commented.
+
+    Lines are grown into the shortest run that parses (a call spread over
+    several lines parses only as a whole); a line that starts no parseable run
+    within 20 lines is prose. A bare phrase that happens to parse (`Note`,
+    `see above`) is not counted: a parsed run must hold a statement that is
+    not just a name, or span more than one line.
+    """
+    body = [re.sub(r"^#\s?", "", line) for line in comment_lines]
+    if _is_code("\n".join(body)):
+        return len(body)
+    count = 0
+    start = 0
+    while start < len(body):
+        for end in range(start + 1, min(len(body), start + 20) + 1):
+            if _is_code("\n".join(body[start:end])):
+                count += end - start
+                start = end
+                break
+        else:
+            start += 1
+    return count
+
+
+def _is_code(chunk: str) -> bool:
+    """*chunk* parses, and is more than bare names (`Note`, `TODO`)."""
+    if not chunk.strip() or not _parses(chunk):
+        return False
+    try:
+        stmts = ast.parse(textwrap.dedent(chunk)).body
+    except (SyntaxError, ValueError, RecursionError):
+        return True  # a block header: it parses only with a stub body
+    return not all(
+        isinstance(st, ast.Expr) and isinstance(st.value, (ast.Name, ast.Constant))
+        for st in stmts
+    )
+
+
 def find_commented_code(filepath: Path, project_root: Path) -> list[dict]:
     """Find blocks of commented-out code (not documentation comments)."""
     try:
@@ -950,12 +1011,17 @@ def find_commented_code(filepath: Path, project_root: Path) -> list[dict]:
                     block_lines = []
                     break
                 lead -= 1
-            if len(block_lines) >= 3:  # At least 3 consecutive lines.
+            code_lines = _code_line_count(block_lines) if len(block_lines) >= 3 else 0
+            # At least 3 lines, and most of them must parse as Python once the
+            # `#` is removed: the pattern match alone merged prose comments
+            # with one code-like line (`x = value of the ...`) into a "block".
+            if code_lines >= 3 and code_lines * 2 > len(block_lines):
                 blocks.append({
                     "file": rel,
                     "line_start": block_start,
                     "line_end": block_start + len(block_lines) - 1,
                     "line_count": len(block_lines),
+                    "code_lines": code_lines,
                     "preview": block_lines[0][:80],
                 })
             i = j
