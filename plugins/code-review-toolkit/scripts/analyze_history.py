@@ -2268,7 +2268,7 @@ def unknown_note(commits: list[dict], unknown: int) -> str:
             "fix:feature ratio."
         )
     return head + (
-        f"Only {keyed} of them carry a tracker key, so --key-type will not "
+        f"Tracker keys are on only {keyed} of them, so --key-type will not "
         "help. The classifier reads subjects only; read the commits in "
         "unknown_touching_source (unknown commits that change Python files) "
         "and classify them by hand before quoting a fix:feature ratio."
