@@ -1102,7 +1102,7 @@
       "severity": "CONSIDER",
       "pattern": "`See `foo()` for details`, `:func:`bar``, 'the `package` parameter' -- naming an entity that has been renamed or deleted. The dangerous variant is when an UNRELATED entity of the same name survives elsewhere in the project: the reference then resolves in the reader's head to the wrong thing, which is worse than a dangling pointer.",
       "guarded_twin": "None -- but the check is mechanical: extract the referenced name, then test whether it exists in the module, the package, or the builtins.",
-      "hunt": "Grep every docstring for backticked identifiers, `:func:`/`:meth:`/`:class:` roles, and the phrases 'see', 'as in', 'like', 'the ... parameter'. Resolve each name against the current tree. Then check the survivors for the same-name-elsewhere trap. Cheap enough to run in CI, and in the confirmed corpus this was the single most productive query in an entire documentation audit.",
+      "hunt": "Grep every docstring for backticked identifiers, `:func:`/`:meth:`/`:class:` roles, and the phrases 'see', 'as in', 'like', 'the ... parameter'. Resolve each name against the current tree. Then check the survivors for the same-name-elsewhere trap. Cheap enough to run in CI, and in the confirmed corpus this was the single most productive query in an entire documentation audit. survey_docstrings.py lists the candidates in `dead_references` (names that resolve nowhere in the project, with the stdlib and installed packages excluded where they can be resolved); triage each for the same-name-elsewhere trap.",
       "expected": "every name a docstring cites resolves to the thing it means.",
       "caught_as": "NEVER at runtime. Surfaces as a reader chasing a name that is not there, or worse, finding a different one.",
       "confirmed_examples": [
@@ -1111,8 +1111,8 @@
       "validation": "confirmed",
       "references": [],
       "differential": "A reference to a genuinely external entity (a stdlib function, another project) is not dead -- resolve against the environment before reporting. Prose that happens to be backticked is not a reference. A documented parameter missing from the signature belongs to `refactor-changed-behaviour-doc-did-not`.",
-      "detected_by": null,
-      "detectability": "implementable"
+      "detected_by": "survey_docstrings.py",
+      "detectability": "implemented"
     },
     {
       "id": "generated-doc-propagates-a-source-error",
@@ -2994,6 +2994,24 @@
       "differential": "An ACL denial that carries a reason the view renders, or an explicit check that is defence in depth with identical wording, is fine.",
       "detected_by": null,
       "detectability": "agent-only"
+    },
+    {
+      "id": "task-arg-normalisation-mismatch",
+      "title": "A background task is enqueued with a normalised key, and its body compares it against the raw or display form",
+      "agent": "pattern-consistency-checker",
+      "severity": "FIX",
+      "pattern": "The call site normalises an identifier before enqueueing a task (`.delay(canonicalize(name))`, a lower-cased email, a slug), and the task body looks the record up by the raw or display column (`filter(Model.name == name)`), or the reverse. Every record whose raw and normalised forms differ is silently skipped: the task runs, finds nothing, and returns.",
+      "guarded_twin": "Sibling tasks that look up by the normalised column, or that receive the record's primary key instead of a name.",
+      "hunt": "For each task, bind the arguments its call sites pass to the task's parameters, then follow each parameter into the body's queries and comparisons. map_wiring.py's `tasks` section lists call sites with their argument expressions next to each task. Flag a parameter that is normalised at the call site and compared unnormalised in the body, or the reverse.",
+      "expected": "the task resolves the same record the caller meant, whatever the record's spelling.",
+      "caught_as": "SILENT: the task succeeds with no effect for the affected records; only a record with a mixed-case or punctuated name shows it.",
+      "differential": "Not a defect when the column the body queries is itself normalised (a functional index, a stored canonical column), or when the call site and body use the same normaliser.",
+      "confirmed_examples": [],
+      "references": [],
+      "aliases": [],
+      "detectability": "agent-only",
+      "detected_by": null,
+      "validation": "documented"
     },
     {
       "id": "append-slash-redirect-swallows-deliberate-404",

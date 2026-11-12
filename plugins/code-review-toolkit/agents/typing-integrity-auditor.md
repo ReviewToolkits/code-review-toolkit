@@ -182,20 +182,21 @@ typed in some functions and bare in others). For the top few:
 
 Report each experiment as `callee(param: T)` → N new errors. One that adds nothing is one line.
 
-For a parameter name that recurs across the project (`request` in every view), `check_typing.analyze()`
-packages the experiment: `boundary_map={"request": "pkg.mod.Request"}` (or a list of
-`untyped_boundaries` sites with an `annotation` filled in) annotates every bare match in an export
-without moving a line, `boundary_stubs=DIR` puts a minimal `.pyi` for a silenced library first on
-`MYPYPATH`, and `boundary_flags=["--check-untyped-defs"]` adds flags (what a labelled pass with them
-already found is subtracted). `boundary_overlay_findings` lists what mypy adds, at the original
-paths and lines; `overlay_artifact: true` marks errors the annotation itself causes (a `None`
-default). `extra_passes=[FLAG, ...]` adds labelled passes for other flags, and `cache_dir=DIR` (in
-your private directory) keeps the cache so a second run is fast. Until the script has flags for
-these, call it from Python, with the same private directory `$d`:
+For a parameter name that recurs across the project (`request` in every view), check_typing.py
+packages the experiment. `--boundary-map FILE` (JSON: `{"request": "pkg.mod.Request"}`, or a list
+of `untyped_boundaries` sites with an `annotation` filled in) annotates every bare match in an
+export without moving a line; `--boundary-stubs DIR` puts a minimal `.pyi` for a silenced library
+first on `MYPYPATH`; `--boundary-flag=--check-untyped-defs` adds flags (what a labelled pass with
+them already found is subtracted). `boundary_overlay_findings` lists what mypy adds, at the
+original paths and lines; `overlay_artifact: true` marks errors the annotation itself causes (a
+`None` default). `--extra-pass=FLAG` (repeatable) adds labelled passes for other flags, and
+`--cache-dir DIR` (in your private directory) keeps the cache so a second run is fast. Attach
+mypy flags with `=`: `--extra-pass --strict-equality` is read as two options.
 
 ```bash
-python3 -c 'import json, sys; sys.path.insert(0, "<plugin_root>/scripts"); import check_typing as c; json.dump(c.analyze(sys.argv[1], mypy_bin=sys.argv[2], cache_dir=sys.argv[3] + "/cache", boundary_map={"request": "pkg.mod.Request"}), sys.stdout)' \
-  [scope] [mypy-bin] "$d" > "$d/overlay.json" 2> "$d/overlay.err"; echo "exit=$?"
+echo '{"request": "pkg.mod.Request"}' > "$d/boundary.json"
+python3 <plugin_root>/scripts/check_typing.py [scope] --mypy-bin [mypy-bin] --cache-dir "$d/cache" \
+  --boundary-map "$d/boundary.json" > "$d/overlay.json" 2> "$d/overlay.err"; echo "exit=$?"
 ```
 
 ## Phase 4 — Stale ignores, correctly measured

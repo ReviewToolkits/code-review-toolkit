@@ -303,6 +303,7 @@ Note: Simple functions with obvious correctness are ACCEPTABLE even without test
 
 These rules apply to every script call this agent makes.
 
+- **Scope.** `--exclude PAT[,PAT]` (repeatable) leaves generated, vendored or out-of-scope trees out of every count; the envelope's `files_excluded` says how many. correlate_tests.py skips migration files (`migration_files_skipped`) and honours the project's coverage `omit` (`coverage_omit`), so neither shows up as untested source; quote both counts next to the coverage ratio.
 - **Timeout.** Give the Bash call `timeout: 300000` (5 min). The 120 s default kills the script on
   large projects. If it may run longer still, use `run_in_background` and wait for the completion
   notification rather than polling.

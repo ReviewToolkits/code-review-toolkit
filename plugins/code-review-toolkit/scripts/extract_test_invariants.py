@@ -48,7 +48,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from analyze_history import classify_commit_detail  # noqa: E402
+from analyze_history import classify_commit_detail, parse_key_types  # noqa: E402
 from correlate_tests import (  # noqa: E402
     HTTP_VERBS,
     best_routes,
@@ -2067,6 +2067,16 @@ def _int_flag(args, flag: str, default: int | None) -> int | None:
         raise ValueError(f"{flag} requires an integer, got '{raw}'") from None
 
 
+def _key_types(specs: list[str] | None) -> dict[str, str] | None:
+    """`--key-type B=fix,F=feature` (repeatable), as analyze_history reads it."""
+    if not specs:
+        return None
+    types: dict[str, str] = {}
+    for spec in specs:
+        types.update(parse_key_types(spec))
+    return types
+
+
 def main() -> None:
     """CLI entry point."""
     args = parse_scan_args(
@@ -2083,6 +2093,7 @@ def main() -> None:
             "--max-bug-fix-groups",
             "--source",
             "--tests",
+            "--key-type",
         },
     )
     try:
@@ -2108,6 +2119,7 @@ def main() -> None:
             source_roots=args.values.get("--source"),
             test_roots=args.values.get("--tests"),
             exclude=args.exclude,
+            key_types=_key_types(args.values.get("--key-type")),
         )
         if result.get("bug_fix_scan", {}).get("status") == "no_git_history":
             warn(

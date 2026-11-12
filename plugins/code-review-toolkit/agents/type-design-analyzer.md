@@ -67,8 +67,8 @@ These are actual type errors — places where the type checker determined that t
 
 1. **Type errors validate your design assessment**: If your qualitative analysis rated a type's Invariant Enforcement at 8/10 but mypy found 3 type errors in its constructor, the enforcement is weaker than it appeared. Adjust your rating.
 
-2. **Type errors reveal annotation accuracy**: Your coverage analysis from count_types.py counts how many functions are annotated. mypy reveals how many of those annotations are *correct*. A function with 100% annotation coverage that has type errors is worse than an unannotated function. **The annotation-accuracy line in the template needs mypy data** (here, or from typing-integrity-auditor's `check_typing.py` run). `count_types.analyze(scope, mypy_json=FILE)` does the join (FILE is either script's JSON, or mypy's `--output json`): `annotation_accuracy` has `fully_annotated_functions`, `annotated_functions_with_type_errors` and the functions ranked by errors. Until the script has a flag for it, run it from Python into your private directory:
-   `python3 -c 'import json, sys; sys.path.insert(0, "<plugin_root>/scripts"); import count_types as c; json.dump(c.analyze(sys.argv[1], mypy_json=sys.argv[2]), sys.stdout)' [scope] [mypy.json] > "$d/accuracy.json"`.
+2. **Type errors reveal annotation accuracy**: Your coverage analysis from count_types.py counts how many functions are annotated. mypy reveals how many of those annotations are *correct*. A function with 100% annotation coverage that has type errors is worse than an unannotated function. **The annotation-accuracy line in the template needs mypy data** (here, or from typing-integrity-auditor's `check_typing.py` run). `count_types.py --mypy-json FILE` does the join (FILE is either script's JSON, or mypy's `--output json`): `annotation_accuracy` has `fully_annotated_functions`, `annotated_functions_with_type_errors` and the functions ranked by errors. Write it into your private directory:
+   `python3 <plugin_root>/scripts/count_types.py [scope] --mypy-json [mypy.json] > "$d/accuracy.json"`.
    Without mypy data, write "not measured" — never derive it from coverage alone.
 
    **A clean mypy run is not a checked codebase.** Without `check_untyped_defs`, mypy skips the body of every function with no annotation at all, so attribute access on models and request objects inside them is never checked. check_typing.py's `summary.unchecked_untyped_bodies` says how many bodies a clean run never looked at; quote it beside any "mypy passes" statement.
@@ -299,6 +299,7 @@ by definition as well as by name.
 
 These rules apply to every script call this agent makes.
 
+- **Scope.** `--exclude PAT[,PAT]` (repeatable) leaves generated, vendored or out-of-scope trees out of every count; the envelope's `files_excluded` says how many. count_types.py skips migration files unless `--include-migrations`, so revision modules don't dominate the counts.
 - **Timeout.** Give the Bash call `timeout: 300000` (5 min). The 120 s default kills the script on
   large projects. If it may run longer still, use `run_in_background` and wait for the completion
   notification rather than polling.

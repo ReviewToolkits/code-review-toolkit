@@ -67,7 +67,7 @@ Filter vulture output for all findings:
 - Vulture catches unused code inside function bodies that our script misses (unused local variables, unreachable code after returns)
 - Vulture uses confidence percentages, and every finding carries its own `confidence`. `vulture.by_confidence` and `vulture.by_type` bucket them. Map 90%+ to high confidence and 80-89% to medium.
 - **60% is where unused functions, methods, classes and attributes live.** Vulture scores them no higher, because it cannot see dynamic dispatch. The script runs at `--min-confidence 60` so they appear; at 80 every one was dropped. Treat a 60% hit as a candidate, not a finding: Grep for the name (including `getattr` strings, framework registration, and tests) before you classify it.
-- **When `vulture.script_cross_check` is not null**, the run was given this agent's `find_dead_symbols.py` JSON, and every hit carries `script_status`. `unreferenced` = the script reports it too: corroborated. `test_only` = only tests reference it: CONSIDER, as for `referenced_only_from_tests`. `excluded` (with `script_excluded_reason`) or `referenced_or_excluded` = the script found a reference or left the symbol out on purpose (framework base, registering decorator, dispatch prefix): dismiss it unless you can show the reference or exclusion is wrong. `not_checked` = a variable, attribute or import the script does not check: triage it yourself. A null `script_cross_check` means no cross-check ran, not that nothing overlapped.
+- **When `vulture.script_cross_check` is not null**, the run was given this agent's `find_dead_symbols.py` JSON, and every hit carries `script_status`. `unreferenced` = the script reports it too: corroborated. `test_only` = only tests reference it: CONSIDER, as for `referenced_only_from_tests`. `excluded` (with `script_excluded_reason`) or `referenced_or_excluded` = the script found a reference or left the symbol out on purpose (framework base, registering decorator, dispatch prefix): dismiss it unless you can show the reference or exclusion is wrong. `not_checked` = a variable, attribute or import the script does not check: triage it yourself. A null `script_cross_check` means no cross-check ran, not that nothing overlapped. To run it: `python3 <plugin_root>/scripts/run_external_tools.py [scope] --tools vulture --dead-symbols "$d/out.json"`, after this agent's own run.
 
 **Deduplication**: When vulture and our script flag the same symbol, merge and note both sources. When they disagree (one flags, the other doesn't), investigate the discrepancy and use your judgment.
 
@@ -255,6 +255,7 @@ For each finding, rate your **confidence** that it's genuinely dead:
 
 These rules apply to every script call this agent makes.
 
+- **Scope.** `--exclude PAT[,PAT]` (repeatable) leaves generated, vendored or out-of-scope trees out of every count; the envelope's `files_excluded` says how many. Migration revision files count as entry points, so their `upgrade`/`downgrade` are never reported dead; `migration_dirs` in the output lists what was recognised.
 - **Timeout.** Give the Bash call `timeout: 300000` (5 min). The 120 s default kills the script on
   large projects. If it may run longer still, use `run_in_background` and wait for the completion
   notification rather than polling.

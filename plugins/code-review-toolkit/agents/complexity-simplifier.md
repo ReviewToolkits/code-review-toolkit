@@ -293,6 +293,7 @@ For each group worth reporting: the copies (file:lines, function), `exact`/`rena
 
 These rules apply to every script call this agent makes.
 
+- **Scope.** `--exclude PAT[,PAT]` (repeatable) leaves generated, vendored or out-of-scope trees out of every count; the envelope's `files_excluded` says how many. measure_complexity.py skips migration files unless `--include-migrations`; on an export without `.git`, pass `--git-dir <checkout>` or the churn weighting is missing (it warns on stderr).
 - **Timeout.** Give the Bash call `timeout: 300000` (5 min). The 120 s default kills the script on
   large projects. If it may run longer still, use `run_in_background` and wait for the completion
   notification rather than polling.

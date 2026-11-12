@@ -18,6 +18,8 @@ Options:
                       the output says when the cap applied
     --no-function     Skip function-level churn (file-level only, faster)
     --no-branches     Skip the unmerged remote branch listing
+    --max-branches N  List at most N unmerged remote branches (default: 30);
+                      the rest are named in omitted_branches
     --sweep-files N   A commit touching more than N files is a sweep, left
                       out of co_change_count_excluding_sweeps (default: 10)
     --key-type SPEC   Map tracker-key prefixes, or single keys, to commit
@@ -2397,6 +2399,7 @@ def parse_args(argv: list[str]) -> dict:
         "no_branches": False,
         "sweep_files": SWEEP_FILES,
         "key_types": {},
+        "max_branches": None,
         "exclude": [],
         "exclude_authors": [],
         "include_generated": False,
@@ -2475,6 +2478,16 @@ def parse_args(argv: list[str]) -> dict:
             key = "exclude" if arg == "--exclude" else "exclude_authors"
             args[key] = split_patterns([*args[key], argv[i + 1]])
             i += 2
+        elif arg == "--max-branches" and i + 1 < len(argv):
+            try:
+                args["max_branches"] = int(argv[i + 1])
+            except ValueError:
+                print(
+                    f"Error: --max-branches requires an integer, got '{argv[i + 1]}'",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            i += 2
         elif arg == "--key-type" and i + 1 < len(argv):
             try:
                 args["key_types"].update(parse_key_types(argv[i + 1]))
@@ -2513,6 +2526,8 @@ def analyze(
     if argv is None:
         argv = sys.argv[1:]
     args = parse_args(argv)
+    if args["max_branches"] is not None:
+        max_branches = args["max_branches"]
 
     scan_root = Path(args["path"]).resolve()
     project_root = find_project_root(scan_root)

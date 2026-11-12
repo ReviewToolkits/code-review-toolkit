@@ -2202,7 +2202,42 @@ def main() -> None:
         default=0,
         help="check only the first N discovered files (files_capped says so)",
     )
+    parser.add_argument(
+        "--extra-pass",
+        action="append",
+        default=[],
+        metavar="FLAG",
+        help="add a labelled pass for a mypy flag; attach it with = (--extra-pass=--strict-equality); repeatable",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        default=None,
+        help="keep mypy's cache here for later runs (default: a private temp dir)",
+    )
+    parser.add_argument(
+        "--boundary-map",
+        default=None,
+        metavar="FILE",
+        help="JSON for the typed-boundary overlay ({param: type} or a list of sites)",
+    )
+    parser.add_argument(
+        "--boundary-stubs", default=None, metavar="DIR", help="stubs for the overlay"
+    )
+    parser.add_argument(
+        "--boundary-flag",
+        action="append",
+        default=[],
+        metavar="FLAG",
+        help="extra mypy flag for the overlay pass, attached with = (--boundary-flag=--check-untyped-defs); repeatable",
+    )
     args = parser.parse_args()
+    boundary_map = None
+    if args.boundary_map:
+        try:
+            boundary_map = json.loads(Path(args.boundary_map).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            emit({"error": f"--boundary-map: {exc}", "status": "FAILED"})
+            sys.exit(2)
     try:
         result = analyze(
             args.target,
@@ -2213,6 +2248,11 @@ def main() -> None:
             unused_ignores_pass=not args.no_unused_ignores_pass,
             untyped_defs_pass=not args.no_untyped_defs_pass,
             silenced_imports_pass=not args.no_silenced_imports_pass,
+            extra_passes=args.extra_pass or None,
+            cache_dir=args.cache_dir,
+            boundary_map=boundary_map,
+            boundary_stubs=args.boundary_stubs,
+            boundary_flags=args.boundary_flag or None,
         )
         emit(result)
         sys.exit(1 if result["status"] == "FAILED" else 0)
