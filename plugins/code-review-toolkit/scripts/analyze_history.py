@@ -74,6 +74,7 @@ CLASSIFICATION_RULES: list[tuple[str, list[str]]] = [
             "leak(?:s|ed|ing)?",
             "races?",
             "segfaults?",
+            "deadlocks?",
             "fail(?:s|ed|ing|ure|ures)?",
         ],
     ),

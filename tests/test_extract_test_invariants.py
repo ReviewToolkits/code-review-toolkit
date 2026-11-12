@@ -789,12 +789,10 @@ class TestSelectionSpread(unittest.TestCase):
             "[fix] handle empty input",
             "Avoid a deadlock when closing the pool",
             "Close the race between flush and read",
-            "Roll back on cancel: rollback partial writes",
-            "Bound the request timeout",
         ):
-            self.assertTrue(mod._FIX_COMMIT_RE.search(subject), subject)
+            self.assertTrue(mod.is_fix_commit(subject), subject)
         for subject in ("Add a prefix option", "Refactor the dispatch table"):
-            self.assertIsNone(mod._FIX_COMMIT_RE.search(subject), subject)
+            self.assertFalse(mod.is_fix_commit(subject), subject)
 
 
 def _git(root, *args, env=None):
@@ -837,6 +835,23 @@ class TestBugFixAttribution(unittest.TestCase):
         self.assertEqual(total, 1)
         self.assertEqual(entries[0]["test_functions"], ["test_flush_race_regression"])
         self.assertEqual(entries[0]["attribution"], "function")
+
+    def test_keyed_fix_commit_is_found_with_key_types(self):
+        old = "def test_existing():\n    assert True\n"
+        new = old + "\n\ndef test_empty_batch():\n    assert True\n"
+        with TempProject({"pkg/core.py": "X = 1\n", "tests/test_core.py": old}) as root:
+            _git(root, "init", "-q", "-b", "main")
+            _git(root, "add", "-A")
+            _git(root, "commit", "-q", "-m", "Add core")
+            (root / "tests/test_core.py").write_text(new, encoding="utf-8")
+            (root / "pkg/core.py").write_text("X = 2\n", encoding="utf-8")
+            _git(root, "commit", "-q", "-am", "[core] Batch the empty case (B7)")
+            plain = mod.analyze(str(root), with_git=True)
+            keyed = mod.analyze(str(root), with_git=True, key_types={"B": "fix"})
+        self.assertEqual(plain["bug_fix_tests"], [])
+        self.assertEqual(
+            [e["test_functions"] for e in keyed["bug_fix_tests"]], [["test_empty_batch"]]
+        )
 
 
 # Two ways to install a record: create validates the spec first; restore
@@ -974,6 +989,50 @@ class TestFixCommitClassification(unittest.TestCase):
     def test_untyped_subject_without_vocabulary(self):
         self.assertFalse(mod.is_fix_commit("feat(cli: add a quiet flag"))
         self.assertFalse(mod.is_fix_commit("Add a prefix option"))
+
+    def test_hardening_subjects_are_fixes(self):
+        for subject in (
+            "Require a confirmed calendar before sharing it",
+            "Reject meeting invites that end before they start",
+            "Pin each device to its first sync folder",
+            "Validate time zones in imported events",
+            "restore the reminder queue after a worker restart",
+        ):
+            with self.subTest(subject=subject):
+                self.assertTrue(mod.is_fix_commit(subject))
+
+    def test_broad_words_and_lint_sweeps_are_not_fixes(self):
+        for subject in (
+            "Bump the lock file",
+            "Add a timeout option to the client",
+            "Make the thread pool size configurable",
+            "Fixed all pylint warnings",
+            "fix isort and formatting",
+            "fix(docs): correct the install command",
+        ):
+            with self.subTest(subject=subject):
+                self.assertFalse(mod.is_fix_commit(subject))
+
+    def test_tracker_keys_map_to_fixes(self):
+        subject = "[db] Batch the row writes (B12)"
+        self.assertFalse(mod.is_fix_commit(subject))
+        self.assertTrue(mod.is_fix_commit(subject, {"B": "fix"}))
+        self.assertFalse(mod.is_fix_commit(subject, {"B": "feature"}))
+
+    def test_agrees_with_the_history_classifier(self):
+        history = import_script("analyze_history")
+        for subject in (
+            "Guard against a missing organizer field",
+            "Close the race between flush and read",
+            "Bump the lock file",
+            "chore: fix a typo (#12)",
+            "Add docstrings to the parser",
+        ):
+            with self.subTest(subject=subject):
+                self.assertEqual(
+                    mod.is_fix_commit(subject),
+                    history.classify_commit(subject) == "fix",
+                )
 
 
 class TestTestOnlyFixesRankLast(unittest.TestCase):

@@ -20,6 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from analyze_history import classify_commit_detail  # noqa: E402
 from correlate_tests import (  # noqa: E402
     HTTP_VERBS,
     best_routes,
@@ -1276,47 +1277,18 @@ def _is_strong_signal_test(name: str, file: str = "") -> bool:
     return any(w.startswith(_STRONG_SIGNAL_WORDS) for w in _name_words(name, file))
 
 
-# Bug-fix commit subjects: whole words (`fix`, `fixes`, `[fix]`) and word
-# prefixes, so `prefix` or `dispatch` do not count.
-_FIX_COMMIT_RE = re.compile(
-    r"\b(?:fix|bug|crash|leak|error|patch|regress|race|cancel|rollback|"
-    r"concurren|lock|deadlock|timeout|thread)",
-    re.IGNORECASE,
-)
-
-# A conventional-commit type (`fix:`, `chore(deps)!:`, even a malformed
-# `feat(scope:`) and bracket tags (`[fix][cli]`, `[test]`).
-_COMMIT_TYPE_RE = re.compile(r"^\s*([A-Za-z]+)(?:\([^):]*\)?)?!?:")
-_COMMIT_TAG_RE = re.compile(r"\[([A-Za-z]+)\]")
-_FIX_TYPES = frozenset({"fix", "fixes", "fixed", "bugfix", "hotfix", "bug"})
-# Commit types that are not product fixes, whatever their subject says
-# (`chore: fix a typo`, `ci: fix the build`, `[test] Raise a timeout`).
-_NON_FIX_TYPES = frozenset({
-    "chore", "ci", "docs", "doc", "style", "test", "tests", "build",
-    "refactor", "perf", "bench", "benchmark", "benchmarks", "release",
-    "deps", "revert", "wip", "lint", "typo", "feat", "feature",
-})
-
-
-def is_fix_commit(subject: str) -> bool:
+def is_fix_commit(subject: str, key_types: dict[str, str] | None = None) -> bool:
     """True when a commit subject describes a bug fix.
 
-    A conventional-commit type or a bracket tag decides when it names a
-    known type: `fix`/`hotfix` (or a `[fix]` tag) is a fix, `chore`, `ci`,
-    `test`, `docs`, `[bench]` and the like are not, even when the subject
-    says "fix". Only an untyped subject falls back to the fix vocabulary
-    (`_FIX_COMMIT_RE`).
+    Delegates to analyze_history's classifier, so the history agent and this
+    script agree on what a fix is: a conventional type or bracket tag decides
+    first (`chore: fix a typo` is not a fix), then tracker keys mapped by
+    `key_types` (`B=fix`), then the subject's verb ("Reject X when Y" is a
+    fix, "Fixed the pylint warnings" a lint sweep). Broad words that do not
+    name a defect (lock, thread, timeout) no longer count: "Bump the lock
+    file" and "Add a timeout option" were selected as bug fixes.
     """
-    types: list[str] = []
-    match = _COMMIT_TYPE_RE.match(subject)
-    if match:
-        types.append(match.group(1).lower())
-    types += [t.lower() for t in _COMMIT_TAG_RE.findall(subject)]
-    if any(t in _FIX_TYPES for t in types):
-        return True
-    if any(t in _NON_FIX_TYPES for t in types):
-        return False
-    return bool(_FIX_COMMIT_RE.search(subject))
+    return classify_commit_detail(subject, key_types)["type"] == "fix"
 
 
 # Directories whose files are never product code: a fix commit touching only
@@ -1374,12 +1346,14 @@ def _tests_touched(source: str, added: list[tuple[int, int]]) -> list[str]:
 
 
 def _get_bug_fix_tests(
-    test_files: list[Path], project_root: Path
+    test_files: list[Path],
+    project_root: Path,
+    key_types: dict[str, str] | None = None,
 ) -> tuple[list[dict], int]:
     """Identify the tests that bug-fix commits added or changed, using git.
 
-    A commit counts as a fix per `is_fix_commit`: its conventional type or
-    tag, else its subject's fix vocabulary. `touches_source` is False when
+    A commit counts as a fix per `is_fix_commit` (analyze_history's
+    classifier, with `key_types` mapping tracker keys to types). `touches_source` is False when
     the commit changed no product file (only tests, benchmarks, tooling). For each test file it touched, the diff's added lines
     name the test functions it changed (`test_functions`, with
     `attribution: "function"`); when no test function was touched (a fixture
@@ -1396,7 +1370,7 @@ def _get_bug_fix_tests(
     fix_commits: list[tuple[str, str]] = []
     for line in log.strip().split("\n"):
         sha, _, msg = line.partition(" ")
-        if sha and msg and is_fix_commit(msg):
+        if sha and msg and is_fix_commit(msg, key_types):
             fix_commits.append((sha, msg))
 
     test_rel_paths = set()
@@ -1664,8 +1638,18 @@ def _tested_location(tested: dict, source_functions: dict[str, list[dict]]) -> d
             "name": tested["function"].rsplit(".", 1)[-1]}
 
 
-def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
-    """Run test invariant extraction and return structured results."""
+def analyze(
+    target: str,
+    *,
+    max_files: int = 0,
+    with_git: bool = False,
+    key_types: dict[str, str] | None = None,
+) -> dict:
+    """Run test invariant extraction and return structured results.
+
+    `key_types` maps tracker-key prefixes or keys to commit types, as
+    analyze_history's `--key-type` does (`{"B": "fix"}`), for `with_git`.
+    """
     target_path = Path(target).resolve()
     project_root = find_project_root(target_path)
     scan_root = target_path if target_path.is_dir() else target_path.parent
@@ -1726,7 +1710,7 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
     bug_fix_tests_total = 0
     if with_git:
         bug_fix_tests, bug_fix_tests_total = _get_bug_fix_tests(
-            test_files, project_root
+            test_files, project_root, key_types
         )
 
     # Select high-value tests from ALL bug-fix tests; only the printed list
