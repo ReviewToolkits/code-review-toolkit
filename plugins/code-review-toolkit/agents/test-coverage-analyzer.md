@@ -47,7 +47,11 @@ Key fields:
   `tests_with_runtime_skip` and `files_with_module_level_skip` are skips decided at run time (`pytest.skip()`,
   `importorskip`) that no static count includes
 - `test_details`: per-test-file class/method inventory including `skipped_methods`, `skipped_standalone_tests`,
-  `markers`, `matched_sources` (by name), `imported_sources` (by import) and `route_matched_sources` (by URL)
+  `markers`, `matched_sources` (by name), `imported_sources` (by import) and `route_matched_sources` (by URL).
+  `name_match` says how the name match was made: `unique`, `mirrored` (one of several same-named sources, picked by
+  the test's directories: `tests/unit/accounts/test_views.py` → `pkg/accounts/views.py`) or `ambiguous` (several,
+  none picked, so none counts by name; `name_match_candidates` lists them). `summary.ambiguous_name_matches` counts
+  the ambiguous ones: read their imports before calling a candidate tested or untested
 
 ## External Tool Integration
 

@@ -127,7 +127,7 @@ class TestReportProblemsAreVisible(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             a, b = Path(tmp) / "v1", Path(tmp) / "v2"
             for d in (a, b):
-                _write(d, "correlate_tests", {"source_coverage": []})
+                _write(d, "some_new_script", {"source_coverage": []})
             result = mod.analyze([str(a), str(b)])
             self.assertTrue(
                 any("no finding lists registered" in n for n in result["notes"])
@@ -339,6 +339,141 @@ class TestSuppressedReclassification(unittest.TestCase):
         )
         self.assertEqual(result["summary"]["added"], 1)
         self.assertEqual(result["summary"]["newly_suppressed"], 0)
+
+
+class TestEveryFindingListIsKeyed(unittest.TestCase):
+    """The typing lists, the concurrency scanner, complexity clones and the
+    newer scripts were not compared at all: a run that lost or gained those
+    findings diffed as stable."""
+
+    def test_new_typing_lists_are_compared(self):
+        old = {
+            "check_typing": {
+                "silenced_import_findings": [
+                    {"file": "a.py", "module": "yaml", "code": "import-untyped"}
+                ],
+                "dependency_drift_findings": [],
+                "untyped_body_findings": [],
+            },
+            "count_types": {
+                "untyped_boundaries": [
+                    {"file": "s.py", "callee": "run", "param": "req", "line": 3}
+                ],
+                "inconsistent_parameters": [{"param": "session"}],
+            },
+        }
+        new = {
+            "check_typing": {
+                "silenced_import_findings": [],
+                "dependency_drift_findings": [
+                    {"file": "b.py", "code": "call-arg", "line": 7}
+                ],
+                "untyped_body_findings": [
+                    {"file": "c.py", "code": "operator", "line": 2}
+                ],
+            },
+            "count_types": {
+                "untyped_boundaries": [
+                    {"file": "s.py", "callee": "run", "param": "req", "line": 9}
+                ],
+                "inconsistent_parameters": [{"param": "session"}],
+            },
+        }
+        result = _diff_dirs(old, new)
+        by = result["by_source"]
+        self.assertEqual(len(by["check_typing.silenced_import_findings"]["gone"]), 1)
+        self.assertEqual(len(by["check_typing.dependency_drift_findings"]["added"]), 1)
+        self.assertEqual(len(by["check_typing.untyped_body_findings"]["added"]), 1)
+        boundaries = by["count_types.untyped_boundaries"]
+        self.assertEqual(boundaries["added"], [])
+        self.assertEqual(boundaries["moved"][0]["line_was"], 3)
+        self.assertEqual(by["count_types.inconsistent_parameters"]["unchanged"], 1)
+
+    def test_concurrency_findings_are_keyed_by_function(self):
+        def hit(function: str, line: int) -> dict:
+            return {
+                "file": "w.py",
+                "shape": "unguarded-shared-state",
+                "function": function,
+                "line": line,
+            }
+
+        result = _diff_dirs(
+            {"scan_concurrency": {"findings": [hit("Pool.put", 10)]}},
+            {
+                "scan_concurrency": {
+                    "findings": [hit("Pool.put", 14), hit("Pool.get", 30)]
+                }
+            },
+        )
+        by = result["by_source"]["scan_concurrency.findings"]
+        self.assertEqual([a["function"] for a in by["added"]], ["Pool.get"])
+        self.assertEqual(len(by["moved"]), 1)
+
+    def test_clone_groups_are_nested_and_keyed_by_their_places(self):
+        def group(*places: tuple[str, str], line: int = 1) -> dict:
+            return {
+                "kind": "exact",
+                "copies": len(places),
+                "locations": [
+                    {"file": f, "function": fn, "line_start": line} for f, fn in places
+                ],
+            }
+
+        old = group(("a.py", "f"), ("b.py", "g"))
+        same = group(("b.py", "g"), ("a.py", "f"), line=40)
+        other = group(("c.py", "h"), ("d.py", "k"))
+        result = _diff_dirs(
+            {"measure_complexity": {"clones": {"groups": [old]}}},
+            {"measure_complexity": {"clones": {"groups": [same, other]}}},
+        )
+        by = result["by_source"]["measure_complexity.clones.groups"]
+        self.assertEqual(by["unchanged"], 1)
+        self.assertEqual(len(by["added"]), 1)
+
+    def test_nested_sequence_lists_are_compared(self):
+        result = _diff_dirs(
+            {"map_exceptions": {"leads": {"raised_never_caught": ["AError"]}}},
+            {
+                "map_exceptions": {
+                    "leads": {"raised_never_caught": ["AError", "BError"]}
+                }
+            },
+        )
+        by = result["by_source"]["map_exceptions.leads.raised_never_caught"]
+        self.assertEqual(len(by["added"]), 1)
+
+    def test_an_unregistered_list_is_noted_not_dropped_silently(self):
+        payload = {"findings": [], "brand_new_findings": [{"file": "a.py"}]}
+        result = _diff_dirs({"run_lint_rules": payload}, {"run_lint_rules": payload})
+        self.assertTrue(
+            any("run_lint_rules.brand_new_findings" in n for n in result["notes"])
+        )
+
+    def test_inventory_only_script_says_so(self):
+        payload = {"handlers": [{"file": "a.py", "line": 1}]}
+        result = _diff_dirs(
+            {"survey_error_handling": payload}, {"survey_error_handling": payload}
+        )
+        self.assertTrue(
+            any(
+                n.startswith("survey_error_handling: inventory only")
+                for n in result["notes"]
+            )
+        )
+
+    def test_cap_flag_in_the_summary_is_noticed(self):
+        item = {"file": "a.py", "function": "f", "similar_to": "g"}
+        result = _diff_dirs(
+            {
+                "extract_test_invariants": {
+                    "untested_similar_functions": [item],
+                    "summary": {"untested_similar_functions_capped": True},
+                }
+            },
+            {"extract_test_invariants": {"untested_similar_functions": [item]}},
+        )
+        self.assertTrue(any("capped" in n for n in result["notes"]))
 
 
 if __name__ == "__main__":

@@ -264,3 +264,192 @@ class TestChangelog(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# diff_findings coverage: every list a script prints is either compared by
+# the regression gate or declared inventory. A findings list the gate does not
+# know about makes a run that lost those findings diff as "stable".
+# ---------------------------------------------------------------------------
+
+_FAKE_TOOL = """#!{python}
+import sys
+args = sys.argv[1:]
+if args == ["--version"]:
+    print("{name} 9.9.9")
+elif "{name}" == "mypy":
+    print("Success: no issues found in 1 source file")
+else:
+    print("[]")
+"""
+
+_DIFF_FIXTURE = {
+    "pkg/__init__.py": "",
+    "pkg/core.py": (
+        '"""Core."""\n'
+        "import threading\n"
+        "_lock = threading.Lock()\n"
+        "class Store:\n"
+        "    def put(self, key, value=[]):\n"
+        "        try:\n"
+        "            with _lock:\n"
+        "                value.append(key)\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "        return value\n"
+        "def build(x: int) -> int:\n"
+        "    if x < 0:\n"
+        "        raise ValueError('negative')\n"
+        "    return Store().put(x)\n"
+    ),
+    "tests/test_core.py": (
+        "import unittest\n"
+        "from pkg.core import build\n"
+        "class TestBuild(unittest.TestCase):\n"
+        "    def test_build_rejects_negative(self):\n"
+        "        with self.assertRaises(ValueError):\n"
+        "            build(-1)\n"
+    ),
+}
+
+
+class TestDiffFindingsCoversEveryScript(unittest.TestCase):
+    """Run each script on a small project; every top-level list it prints
+    must be registered in diff_findings as findings or as inventory."""
+
+    def _fake(self, bin_dir: Path, name: str) -> str:
+        import stat
+        import sys
+
+        path = bin_dir / name
+        path.write_text(_FAKE_TOOL.format(python=sys.executable, name=name))
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+        return str(path)
+
+    def _outputs(self, root: Path, bin_dir: Path) -> dict[str, dict]:
+        import subprocess
+        import sys
+
+        from helpers import import_script
+
+        pkg = str(root / "pkg")
+        (root / "known.tsv").write_text(
+            "K1\tpkg/core.py:5\tmutable-default-argument\tFIX\topen\n"
+        )
+        (root / "coverage.json").write_text(
+            json.dumps(
+                {
+                    "meta": {"branch_coverage": False},
+                    "files": {
+                        "pkg/core.py": {"executed_lines": [5], "missing_lines": []}
+                    },
+                }
+            )
+        )
+        (root / "findings.json").write_text(
+            json.dumps([{"id": "F1", "file": "pkg/core.py", "line": 5}])
+        )
+        special = {
+            "analyze_history": lambda m: m.analyze([str(root), "--days", "36500"]),
+            "run_external_tools": lambda m: m.analyze(
+                [pkg, "--skip", "ruff,mypy,vulture,coverage"]
+            ),
+            "check_typing": lambda m: m.analyze(
+                pkg, mypy_bin=self._fake(bin_dir, "mypy")
+            ),
+            "run_lint_rules": lambda m: m.analyze(
+                pkg, ruff_bin=self._fake(bin_dir, "ruff")
+            ),
+            "check_known_findings": lambda m: m.analyze(
+                pkg, catalog=str(root / "known.tsv")
+            ),
+            "annotate_findings": lambda m: m.analyze(
+                str(root), findings_path=str(root / "findings.json"), no_branches=True
+            ),
+            "map_findings_coverage": lambda m: m.analyze(
+                str(root),
+                coverage=str(root / "coverage.json"),
+                findings=[str(root / "findings.json")],
+            ),
+            "find_threat_model": lambda m: m.analyze(str(root), network=False),
+            "extract_test_invariants": lambda m: m.analyze(str(root)),
+            "correlate_tests": lambda m: m.analyze(str(root)),
+        }
+        outputs = {}
+        for script in sorted(p.stem for p in _SCRIPTS.glob("*.py")):
+            df = import_script("diff_findings")
+            if script in df._NOT_DIFFED:
+                continue
+            mod = import_script(script)
+            if script in special:
+                outputs[script] = special[script](mod)
+            elif hasattr(mod, "analyze"):
+                outputs[script] = mod.analyze(pkg)
+            else:  # main() does the work: run it as the agents do
+                out = subprocess.run(
+                    [sys.executable, "-B", str(_SCRIPTS / f"{script}.py"), pkg],
+                    capture_output=True,
+                    text=True,
+                    cwd=bin_dir,
+                    timeout=120,
+                    check=False,
+                )
+                outputs[script] = json.loads(out.stdout or "{}")
+        return outputs
+
+    def test_every_script_is_registered(self):
+        from helpers import import_script
+
+        df = import_script("diff_findings")
+        known = (
+            set(df._FINDING_LISTS)
+            | set(df._SEQUENCE_LISTS)
+            | set(df._INVENTORY_LISTS)
+            | set(df._NOT_DIFFED)
+        )
+        missing = sorted(p.stem for p in _SCRIPTS.glob("*.py") if p.stem not in known)
+        self.assertEqual(
+            missing,
+            [],
+            "Script(s) unknown to diff_findings: register their finding lists in "
+            "_FINDING_LISTS (with a key), their inventory in _INVENTORY_LISTS, or "
+            "the script in _NOT_DIFFED with the reason.",
+        )
+
+    def test_every_printed_list_has_a_key_or_an_explicit_skip(self):
+        import subprocess
+        import tempfile
+
+        from helpers import TempProject, import_script
+
+        df = import_script("diff_findings")
+        with TempProject(_DIFF_FIXTURE) as root, tempfile.TemporaryDirectory() as bins:
+            env = {
+                "GIT_AUTHOR_NAME": "t",
+                "GIT_AUTHOR_EMAIL": "t@example.invalid",
+                "GIT_COMMITTER_NAME": "t",
+                "GIT_COMMITTER_EMAIL": "t@example.invalid",
+                "HOME": str(root),
+                "PATH": "/usr/bin:/bin",
+            }
+            for args in (
+                ["init", "-q"],
+                ["add", "-A"],
+                ["commit", "-q", "-m", "fix: initial"],
+            ):
+                subprocess.run(["git", *args], cwd=root, env=env, check=True)
+            outputs = self._outputs(root, Path(bins))
+        problems = []
+        for script, data in outputs.items():
+            if not isinstance(data, dict) or data.get("error"):
+                problems.append(f"{script}: did not run ({data.get('error')})")
+                continue
+            for name in df.unregistered_lists(script, data):
+                problems.append(f"{script}.{name}")
+        self.assertEqual(
+            problems,
+            [],
+            "Top-level list(s) diff_findings neither compares nor declares as "
+            "inventory. Add a key to _FINDING_LISTS / _SEQUENCE_LISTS, or the "
+            "name to _INVENTORY_LISTS.",
+        )
