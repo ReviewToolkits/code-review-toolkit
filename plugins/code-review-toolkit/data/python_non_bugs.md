@@ -488,3 +488,103 @@ after the work is done. A review flagged exactly this, and a control test refute
 - With a deferring offload the hazard is the reverse. The deferred `CancelledError` (a
   `BaseException`) skips `except Exception` arms, so a release placed only in those arms leaks the
   slot.
+
+### 49. A unique-constraint pre-check without a lock *(a large web application with an ORM and a task queue)*
+
+**Looks like:** `db-check-then-insert-without-unique-constraint` -- `SELECT ... first()` then
+`add()` on a miss, with no `FOR UPDATE`.
+
+**Why it is not a bug:** when a UNIQUE constraint covers exactly the looked-up columns, with the same
+normalisation, the database rejects the second insert. If the framework retries an `IntegrityError`
+(a retry-on-conflict request wrapper) or the code handles it, the collision becomes the pre-check's
+own friendly error on the retry. The pre-check exists for the message, not for safety.
+
+**Real bug:** the check's columns or normalisation differ from the constraint's (a wider tuple, a
+raw versus a normalised name), there is no constraint, or a non-idempotent side effect (an external
+customer created, an email sent) runs between the check and the insert.
+
+### 50. A test-then-hit limiter documented as soft, with an atomic backstop
+
+**Looks like:** `rate-limiter-test-then-hit` -- `limiter.test()` before the work, `limiter.hit()`
+after it.
+
+**Why it is not a bug:** some limits deliberately count only successes (a creation quota), accept
+the burst, and bound it with a second limiter that is charged atomically (`if not attempts.hit():`)
+before the work. A comment that calls the first check optimistic is the usual tell.
+
+**Real bug:** no atomic limiter is charged first on that path, or the limiter guards guessing
+(passwords, one-time codes, recovery codes), where a burst is the attack.
+
+### 51. A task enqueued inside a request transaction, where the task base class defers publishing
+
+**Looks like:** `external-side-effect-inside-db-transaction` -- `task.delay(...)` called before the
+request commits, so the worker could run before the data it needs exists, or run for a change that
+rolled back.
+
+**Why it is not a bug:** many projects give their task base class an `apply_async` that defers
+publishing to an after-commit hook whenever a request transaction is active. The call site looks
+early; the message leaves only after a successful commit.
+
+**Real bug:** the deferral itself has the residual risks -- the hook swallows publish errors
+(`after-commit-hook-swallows-errors`), and the task's own retries go through the same deferral
+(`task-retry-dropped-by-after-commit-publish`). Read the base class before dismissing.
+
+### 52. A bulk delete in a path guarded to match nothing
+
+**Looks like:** `bulk-dml-bypasses-session-hooks` -- `Query.delete()` on a model whose cache or
+search side effects run from session flush hooks.
+
+**Why it is not a bug (yet):** the only caller guarantees the statement matches zero rows (it runs
+after a check that the container is empty, or after the per-object path already removed the rows).
+Nothing bypasses the hooks today.
+
+**Real bug:** any caller can reach it with rows present. Report the guarded case as a latent
+CONSIDER and cite the guard, so the next change to the caller does not silently make it live.
+
+### 53. An ACL twin that lacks a guard its consumer re-checks
+
+**Looks like:** `acl-preempts-explicit-check` or a consistency finding -- one principal type's ACL
+entry grants a permission without a condition that another type's entry applies.
+
+**Why it is not a bug:** the permission's only consumer re-checks the condition explicitly, with
+the same outcome for every principal type. The ACL difference is defence in depth, not a gap.
+
+**Real bug:** some consumer of the permission does not re-check the condition, or the two paths
+give different errors for the same condition (that is `acl-preempts-explicit-check`).
+
+### 54. An enum value split for grandfathering
+
+**Looks like:** `user-doc-claim-not-implemented-by-access-control` -- the docs describe a status's
+behaviour, and objects in an older status of the same family behave differently.
+
+**Why it is not a bug:** a new status value got the new behaviour while the old value keeps the old
+one on purpose, so existing objects are not changed retroactively, and the introducing commit says
+so. Docs that describe only the new value are a low-severity doc note.
+
+**Real bug:** the split is not explained anywhere (commit, comment, migration), or the old value was
+meant to be migrated and the migration never ran.
+
+### 55. `RUF027` on a translation placeholder
+
+**Looks like:** `interpolation-placeholder-without-f-prefix` -- `_("Deleted ${name}")` or
+`gettext("Hello {user}")` has braces and a name in scope, so ruff suggests an `f` prefix.
+
+**Why it is not a bug:** the placeholder is resolved after the catalog lookup, through the
+translation's `mapping=` or a `.format()` on the translated text (`string.Template`-style `${name}`
+in some frameworks). Adding the `f` would break the lookup: that is
+`translation-lookup-of-interpolated-string`.
+
+**Discriminator:** the string is the first argument of a translation call (or its result is
+formatted later), or the braces are preceded by `$`. **Real bug:** the string reaches output with
+no formatting step at all.
+
+### 56. `DTZ005` on `datetime.now().timestamp()`
+
+**Looks like:** a time-zone-dependent clock read (`local-clock-compared-with-utc-store`,
+`naive-datetime-in-a-persisted-artifact`).
+
+**Why it is not a bug:** a naive local `now()` converts back to the same epoch value, so
+`datetime.now().timestamp()` equals `time.time()` whatever the TZ.
+
+**Discriminator:** the value's only use is `.timestamp()`. **Real bug:** the naive value itself is
+compared, subtracted, formatted or stored.

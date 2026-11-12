@@ -26,7 +26,8 @@ likely-defects and strong smells; run it only when tier 1 is exhausted or the us
 
 | Field | What it means for your report |
 |---|---|
-| `version_matches_pin` false | Every count below is **non-comparable** with a calibrated run. Say so in the report; do not silently compare against a previous run's numbers. |
+| `version_matches_pin` false and `version_validated` false | Every count below is **non-comparable** with a calibrated run. Say so in the report; do not silently compare against a previous run's numbers. (`version_validated` true: the tiers were re-validated on this version, see `validated_versions`, so the counts compare.) |
+| `ruff_bin.reason` | Which ruff ran and why. By default the script prefers a ruff matching the project's pin (the active virtualenv's, or an in-tree `.venv`); "no ruff matching" means it fell back to PATH. |
 | `project_ruff_pin` set, and `version_matches_project_pin` false | The project runs a different ruff than this run did (its lock file, pre-commit rev or requirements say which). See "Two pins" below. |
 | `rule_validation.unknown` non-empty | Codes ruff does not recognise — a stale selection. Report it. |
 | `rule_validation.removed` non-empty | Rules deleted from ruff. **A membership test would have passed for these**; they are found by reading `status`. Report and stop selecting them. |
@@ -34,6 +35,10 @@ likely-defects and strong smells; run it only when tier 1 is exhausted or the us
 | `stderr` non-empty | Remapped codes and no-effect selections warn here and nowhere else. Read it. |
 | `error` non-null | The run is incomplete. An incomplete lint pass reported as clean is worse than no pass. |
 | `unlinted` non-empty | ruff could not read those paths ("Failed to lint" on stderr), and it still exits 0 with no findings. A sandboxed ruff, such as the snap package, cannot read `/tmp`. `error` is set. Re-run with `--ruff-bin` pointing at a different ruff; never report those paths as clean. |
+
+**Use the review venv's ruff.** When `brief.md` records the Phase 0 review venv and the project
+pins ruff, pass `--ruff-bin <venv>/bin/ruff`: that venv lives outside the checkout, so the script
+cannot find it by itself.
 
 **Two pins.** When the project pins a ruff (`project_ruff_pin.version`) that is not the toolkit's
 `pinned_version`, one run cannot be both comparable with the calibration and true to the project.
@@ -75,7 +80,10 @@ Every finding carries `shape_id`.
 and written down that they meant it. On coverage.py, 6 of 19 tier-1 findings carried one and **every
 one was a deliberate idiom** — `open = open  # pylint: disable=redefined-builtin`, which captures the
 builtin at import time so later mocking cannot break the module. Dismiss those *with the author's
-stated reason*, do not re-litigate them.
+stated reason*, do not re-litigate them. Count from `summary.suppression_dismissal_signals`, not
+`summary.has_suppression_comment`: the latter also counts a `# type: ignore` or a
+`# pragma: no cover` on the line, which address mypy and coverage and say nothing about the ruff
+rule (`suppression_names_rule: false`, not a signal).
 
 **A suppression on a security rule (`S…`) or any `# nosec` is a claim to check, not a dismissal.**
 The calibration above was all `redefined-builtin`; it does not transfer. A `# nosec` asserts that a
@@ -91,6 +99,22 @@ the rule exists for. For these hits `suppression_is_dismissal_signal` is false. 
 3. `summary.suppression_needs_verification` is how many hits need this. Say in the report how many
    you checked.
 
+**The project's own ruff config is a signal too.** Every hit carries `project_config` (null when the
+project has no ruff config): `ignored-by-project` or `ignored-for-file` with the `entry` it falls
+under and the `reason` the maintainers wrote next to it, `selected-by-project`,
+`not-selected-by-project`, or `project-default-selection`. `summary.project_ignored_rules` groups
+the ignored hits by entry. Read the reason before triaging: "impossible for us to fix here" argues
+for dismissal; "we should probably fix these" or "needs manual review" is the maintainers asking
+for exactly the review you are doing, so verify those hits rather than dismiss them. When
+`project_selects_all_note` is present, the project selects ALL: every hit is a rule it ignores, a
+`# noqa` site, or an excluded file, never something its lint missed. Say so in the report.
+
+**`noqa_suppressed` lists the hits ruff drops on `# noqa` lines** (found by a second
+`--ignore-noqa` pass; `summary.noqa_suppressed` is null if that pass did not run). They are not in
+`findings` or the calibrated counts. Apply the suppression rules above to each: a noqa naming the
+rule on a non-security hit is the author's considered exception; a security rule, a `nosec`, or a
+noqa naming other rules is a claim to verify (`summary.noqa_suppressed_needs_verification`).
+
 **The script has already dismissed some mechanical classes.** `dismissed` holds hits moved out of
 `findings`, each with a `dismissal_reason` that `dismissal_reasons` explains. `summary.total`
 still counts them, so it stays comparable with the calibrated totals. `summary.reported` is what is
@@ -101,7 +125,7 @@ prove:
 |---|---|---|
 | `fastapi-dependency-marker` | B008 | The default is `Depends(...)`, `Query(...)` or another FastAPI marker imported from fastapi: the framework's injection idiom. |
 | `raise-systemexit-in-except` | B904 | The raise is the builtin `SystemExit`: no traceback is printed, so a cause would never be shown. |
-| `yaml-loader-subclasses-safeloader` | S506 | The Loader is a class in the same file whose bases are all safe yaml loaders. Its own `add_constructor` handlers are not checked; read them if the file registers any. |
+| `yaml-loader-subclasses-safeloader` | S506 | The Loader is a class in the same file (at module level, or in a function enclosing the call) whose bases are all safe yaml loaders. Its own `add_constructor` handlers are not checked; read them if the file registers any. |
 | `closure-called-synchronously` | B023 | The lambda goes straight to a same-file function (or `self.` method) that only calls that parameter, and is not async or a generator. |
 | `sql-built-from-literals` | S608 | Every value in the query text is a literal or a name bound only to literals: a `",".join(["?"] * n)` placeholder list, a constant table name, a list of literal clauses. |
 
@@ -137,7 +161,10 @@ saying so briefly is better than omitting them.
 ## Phase 4 — Harvest new shapes (the highest-value step)
 
 Read `summary.novel_shape_candidates`: defect-grade rules that fired and have **no catalogued shape**.
-Roughly 30 selected rules are in this position.
+Roughly 30 selected rules are in this position. Metric and policy rules (`C901`, `PLR09xx`,
+`PLR2004`, `PLC0415`, `S101`, `F401`) can never become a shape: their hits carry
+`shape_eligible: false`, are still reported, and are listed in `summary.shape_ineligible_codes`
+instead of the harvest.
 
 For each one where you confirm a true positive, write a candidate catalog entry in the
 `data/python_bug_shapes.json` field structure — `pattern`, `guarded_twin`, `hunt`, `expected`,
@@ -151,19 +178,25 @@ Known-productive candidates from the benchmark runs that are still uncatalogued:
   dismissed mechanically (`sql-built-from-literals`), so the hits that remain interpolate a value
   from outside the file or from a parameter.
 
-Two former candidates are now catalogued, and their hits carry a `shape_id`, so merge them in
-Phase 2 instead of proposing them again: **`B905`** (`zip()` without `strict=`) →
-`zip-truncates-on-length-mismatch`, and **`DTZ005`/`DTZ006`** (naive `datetime.now()` /
-`fromtimestamp()`) → `naive-datetime-in-a-persisted-artifact`. The shapes are narrower than the
-rules: apply each shape's `differential`. A naive timestamp that never leaves the process is not
-that shape.
+Former candidates that are now catalogued carry a `shape_id`, so merge them in Phase 2 instead of
+proposing them again: **`B905`** (`zip()` without `strict=`) → `zip-truncates-on-length-mismatch`;
+the DTZ clock rules; and the preview-only **`RUF027`** (braces without an `f` prefix) →
+`interpolation-placeholder-without-f-prefix`. The shapes are narrower than the rules: apply each
+shape's `differential`.
+
+The DTZ rules can be either of two shapes, so their findings list both in `candidate_shapes`:
+**`DTZ001`/`DTZ005`/`DTZ006`/`DTZ011`** (a naive `now()`, `fromtimestamp()`, `datetime(...)` or
+`date.today()`) is `naive-datetime-in-a-persisted-artifact` when the value is written somewhere
+other programs read, `local-clock-compared-with-utc-store` when it is compared with or stored
+against naive-UTC database values, and neither when it never leaves the process (or its only use
+is `.timestamp()`). Follow the value to decide.
 
 ## Phase 5 — Report
 
 ```markdown
 ## Lint-derived findings ([N] tier-1 of [M] rules, ruff [version])
 
-[If version_matches_pin is false, or rule_validation is not clean, say so HERE, first.]
+[If version_matches_pin and version_validated are both false, or rule_validation is not clean, say so HERE, first.]
 
 ### Confirmed defects
 | Code | File:line | Failure scenario | Shape |
@@ -193,6 +226,13 @@ Preview-gated rules that did not run; unknown or removed codes; a non-matching r
 - `--isolated` is on by default so a project's own ruff config cannot silently alter the selection.
   This makes results comparable across projects, and it means findings the project has configured
   away will still appear — dismiss those as POLICY, citing their config.
+
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.
 
 ## Running the script
 

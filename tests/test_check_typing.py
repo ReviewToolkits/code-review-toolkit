@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -24,7 +25,8 @@ if args == ["--version"]:
     print("mypy 9.9.9 (compiled: no)")
     sys.exit(0)
 with open(os.environ["FAKE_MYPY_LOG"], "a") as log:
-    log.write(json.dumps({{"argv": args, "cwd": os.getcwd()}}) + "\\n")
+    log.write(json.dumps({{"argv": args, "cwd": os.getcwd(),
+                           "mypypath": os.environ.get("MYPYPATH")}}) + "\\n")
 cache = args[args.index("--cache-dir") + 1] if "--cache-dir" in args else ".mypy_cache"
 os.makedirs(cache, exist_ok=True)
 with open(os.path.join(cache, "marker"), "w") as fh:
@@ -35,10 +37,13 @@ key = ""
 if "--config-file" in args and "ignore-missing-imports-off" in args[args.index("--config-file") + 1]:
     key = "silenced"
 for flag in ("--disallow-any-unimported", "--warn-unreachable", "--warn-unused-ignores",
-             "--check-untyped-defs"):
+             "--check-untyped-defs", *[k for k in responses if k.startswith("--")]):
     if flag in args:
         key = flag
+if any("boundary-overlay" in a for a in args):
+    key = "overlay"
 out = responses.get(key, responses.get("", ""))
+out = out.replace("{{TARGET_REL}}", os.path.relpath(args[-1]))
 sys.stdout.write(out)
 sys.exit(1 if ": error:" in out else 0)
 """
@@ -222,6 +227,49 @@ class TestParseOutput(unittest.TestCase):
             "a.py:3: error: Cannot assign to a method  [method-assign]\n"
         )
         self.assertEqual([f["kind"] for f in findings], ["defect"] * 3)
+
+
+class TestMiscFamiliesAndSilentAny(unittest.TestCase):
+    """`misc` mixed an Any base class (checking silently stops) with
+    lost-narrowing noise, and a failed overload's Any result was not flagged."""
+
+    _OUT = (
+        'a.py:3: error: Variable "lib.Base" is not valid as a type  [valid-type]\n'
+        'a.py:3: error: Invalid base class "Base"  [misc]\n'
+        'a.py:5: error: Class cannot subclass "Model" (has type "Any")  [misc]\n'
+        'a.py:9: error: "None" not callable  [misc]\n'
+        "a.py:11: error: Cannot determine type of x  [misc]\n"
+        'a.py:12: error: No overload variant of "get" of "dict" matches '
+        'argument type "int"  [call-overload]\n'
+    )
+
+    def test_misc_is_split_by_message(self):
+        findings, _ = mod.parse_output(self._OUT)
+        self.assertEqual(
+            [f.get("misc_family") for f in findings],
+            [None, "any-subclass", "any-subclass", "none-not-callable", "other", None],
+        )
+
+    def test_silent_any_cases_are_tagged(self):
+        findings, _ = mod.parse_output(self._OUT)
+        self.assertEqual(
+            [f.get("silent_any") for f in findings],
+            [None, "any-subclass", "any-subclass", None, None, "failed-overload"],
+        )
+
+    def test_summary_counts_them(self):
+        files = {"pkg/__init__.py": "", "pkg/m.py": "x = 1\n"}
+        out = (
+            'pkg/m.py:1: error: Invalid base class "Base"  [misc]\n'
+            'pkg/m.py:2: error: "None" not callable  [misc]\n'
+            "Found 2 errors in 1 file (checked 2 source files)\n"
+        )
+        result, _ = _run(files, {"": out})
+        self.assertEqual(
+            result["summary"]["misc_by_family"],
+            {"any-subclass": 1, "none-not-callable": 1},
+        )
+        self.assertEqual(result["summary"]["silent_any"], 1)
 
 
 class TestFailureIsNeverClean(unittest.TestCase):
@@ -657,6 +705,415 @@ class TestSilencedImports(unittest.TestCase):
             Path(info["executable"]).resolve(), Path(sys.executable).resolve()
         )
         self.assertTrue(info["site_packages"])
+
+
+_PHANTOM_SRC = (
+    "from typing import TYPE_CHECKING\n"  # 1
+    "from untyped_lib import Thing\n"  # 2
+    "from otherlib import Widget\n"  # 3
+    "if TYPE_CHECKING:\n"  # 4
+    "    from pkg.plugins import Reporter\n"  # 5
+    "    from nowhere import Gadget\n"  # 6
+    "    from devonly import Tool\n"  # 7
+    "def f(a: Thing, b: 'Reporter') -> None: ...\n"  # 8
+    "def g(x) -> Widget: ...\n"  # 9
+    "class Base(Gadget): ...\n"  # 10
+    "class C(Base): ...\n"  # 11
+    "def h(v: Unknown, t: Tool) -> None: ...\n"  # 12
+    "from typing import Optional\n"  # 13
+    "def k(a: Optional[Thing]) -> None: ...\n"  # 14
+)
+_UNFOLLOWED = 'becomes "Any" due to an unfollowed import  [no-any-unimported]\n'
+_PHANTOM_HITS = (
+    f'pkg/m.py:8: error: Argument 1 to "f" {_UNFOLLOWED}'
+    f'pkg/m.py:8: error: Argument 2 to "f" {_UNFOLLOWED}'
+    f"pkg/m.py:9: error: Return type {_UNFOLLOWED}"
+    f"pkg/m.py:11: error: Base type Base {_UNFOLLOWED}"
+    f'pkg/m.py:12: error: Argument 1 to "h" {_UNFOLLOWED}'
+    f'pkg/m.py:12: error: Argument 2 to "h" {_UNFOLLOWED}'
+    f'pkg/m.py:14: error: Argument 1 to "k" {_UNFOLLOWED}'
+    "Found 7 errors in 1 file (checked 2 source files)\n"
+)
+_SILENCED_OUT = (
+    'pkg/m.py:2: error: Skipping analyzing "untyped_lib": module is installed, '
+    "but missing library stubs or py.typed marker  [import-untyped]\n"
+    "pkg/m.py:7: error: Cannot find implementation or library stub for module "
+    'named "devonly"  [import-not-found]\n'
+    "Found 2 errors in 1 file (checked 2 source files)\n"
+)
+
+
+class TestPhantomOrigins(unittest.TestCase):
+    """Hundreds of phantom hits on a project that silences untyped libraries,
+    none real: each hit now says whether its module exists at all."""
+
+    _FILES: ClassVar[dict[str, str]] = {
+        "mypy.ini": "[mypy]\nignore_missing_imports = True\n",
+        "pkg/__init__.py": "",
+        "pkg/m.py": _PHANTOM_SRC,
+        # Installed-looking third-party packages, found on the search path.
+        "untyped_lib/__init__.py": "",
+        "otherlib.py": "",
+    }
+
+    def _result(self):
+        result, _ = _run(
+            self._FILES,
+            {
+                "": "Success: no issues found in 2 source files\n",
+                "--disallow-any-unimported": _PHANTOM_HITS,
+                "silenced": _SILENCED_OUT,
+            },
+        )
+        return result
+
+    def test_each_hit_is_traced_to_its_module_and_origin(self):
+        result = self._result()
+        hits = result["phantom_import_findings"]
+        self.assertEqual(
+            [
+                (f["phantom_modules"], f["phantom_origin"], f["real_phantom"])
+                for f in hits
+            ],
+            [
+                (["untyped_lib"], "silenced-by-config", False),
+                (["pkg.plugins"], "module-missing", True),
+                (["otherlib"], "importable-unfollowed", False),
+                # A local base class is followed to the import behind it.
+                (["nowhere"], "module-missing", True),
+                ([], "unresolved-name", False),
+                # Not installed here, but the config silences it on purpose.
+                (["devonly"], "module-missing", False),
+                # `typing` exists and is not silenced; the Any is untyped_lib's.
+                (["typing", "untyped_lib"], "silenced-by-config", False),
+            ],
+        )
+
+    def test_real_phantoms_are_counted_separately(self):
+        summary = self._result()["summary"]
+        self.assertEqual(summary["phantom_imports"], 7)
+        self.assertEqual(summary["phantom_imports_real"], 2)
+        self.assertEqual(summary["phantom_missing_modules"], ["nowhere", "pkg.plugins"])
+        self.assertEqual(
+            summary["phantom_imports_by_origin"],
+            {
+                "importable-unfollowed": 1,
+                "module-missing": 3,
+                "silenced-by-config": 2,
+                "unresolved-name": 1,
+            },
+        )
+        self.assertEqual(summary["phantom_origin_basis"], "silenced-imports-pass")
+
+    def test_no_hits_is_a_measured_zero(self):
+        result, _ = _run(_PKG, {"": _BASE_ERR + _ONE_ERROR})
+        self.assertEqual(result["summary"]["phantom_imports_real"], 0)
+
+    def test_skipped_pass_is_null(self):
+        result, _ = _run(_PKG, {"": _BASE_ERR + _ONE_ERROR}, strict_pass=False)
+        self.assertIsNone(result["summary"]["phantom_imports_real"])
+
+    def test_unaskable_interpreter_is_not_a_clean_zero(self):
+        with TempProject({"pkg/m.py": _PHANTOM_SRC}) as root:
+            hit = {
+                "file": str(root / "pkg/m.py"),
+                "line": 9,
+                "message": "Return type x",
+            }
+            summary = mod.classify_phantoms([hit], set(), set(), None, [], [root])
+        self.assertEqual(hit["phantom_origin"], "not-measured")
+        self.assertTrue(summary["basis"].startswith("not-measured"))
+
+
+def _dist(site: Path, name: str, version: str, files: list[str]) -> None:
+    info = site / f"{name.replace('-', '_')}-{version}.dist-info"
+    info.mkdir(parents=True)
+    (info / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
+    )
+    (info / "RECORD").write_text("".join(f"{f},,\n" for f in files))
+    for f in files:
+        (site / f).parent.mkdir(parents=True, exist_ok=True)
+        (site / f).write_text("")
+
+
+class TestStaleStubPackages(unittest.TestCase):
+    """A types-* package shadowing a library that now ships its own inline
+    types went unnoticed: mypy checks against the stub, not the library."""
+
+    def _site(self, root: Path) -> Path:
+        site = root / "site"
+        # Runtime ships py.typed and a stub package still shadows it: stale.
+        _dist(site, "fancylib", "3.0", ["fancylib/__init__.py", "fancylib/py.typed"])
+        _dist(site, "types-fancylib", "1.2", ["fancylib-stubs/__init__.pyi"])
+        # Runtime without py.typed: the stubs are the only types. Not stale.
+        _dist(site, "plainlib", "1.0", ["plainlib/__init__.py"])
+        _dist(site, "types-plainlib", "1.0", ["plainlib-stubs/__init__.pyi"])
+        # Stubs for something not installed: nothing to shadow.
+        _dist(site, "ghost-stubs", "0.1", ["ghost-stubs/__init__.pyi"])
+        # A partial stub package is listed, but says so.
+        _dist(site, "typedlib", "2.0", ["typedlib/__init__.py", "typedlib/py.typed"])
+        _dist(site, "typedlib-stubs", "2.0", ["typedlib-stubs/__init__.pyi"])
+        (site / "typedlib-stubs" / "py.typed").write_text("partial\n")
+        return site
+
+    def test_only_stubs_shadowing_inline_types_are_listed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            site = self._site(Path(tmp))
+            entries, reason = mod.stale_stub_packages(sys.executable, [str(site)])
+        self.assertIsNone(reason)
+        self.assertEqual(
+            [(e["stub_distribution"], e["module"], e["stub_partial"]) for e in entries],
+            [
+                ("types-fancylib", "fancylib", False),
+                ("typedlib-stubs", "typedlib", True),
+            ],
+        )
+        self.assertEqual(entries[0]["runtime_distribution"], "fancylib")
+        self.assertEqual(entries[0]["runtime_version"], "3.0")
+        self.assertEqual(entries[0]["stub_version"], "1.2")
+
+    def test_unknown_interpreter_is_null_with_a_reason(self):
+        entries, reason = mod.stale_stub_packages(None)
+        self.assertIsNone(entries)
+        self.assertIn("not measured", reason)
+
+    def test_reported_in_the_output(self):
+        result, _ = _run(_PKG, {"": _BASE_ERR + _ONE_ERROR})
+        self.assertIsInstance(result["stale_stub_packages"], list)
+        self.assertEqual(
+            result["summary"]["stale_stub_packages"], len(result["stale_stub_packages"])
+        )
+
+
+class TestExtraPassesAndCacheDir(unittest.TestCase):
+    """There was no way to add a labelled mypy pass or to choose (and keep)
+    the cache directory."""
+
+    _EXTRA = "pkg/m.py:2: error: Item None has no attribute  [union-attr]\n"
+
+    def test_extra_pass_is_labelled_and_diffed_against_the_baseline(self):
+        result, flags_seen = _run(
+            _PKG,
+            {
+                "": _BASE_ERR + _ONE_ERROR,
+                "--strict-optional": _BASE_ERR + self._EXTRA + _TWO_ERRORS,
+            },
+            extra_passes=["--strict-optional"],
+        )
+        extra = result["extra_pass_findings"]
+        self.assertEqual([f["pass"] for f in extra], ["extra:strict-optional"])
+        self.assertEqual(extra[0]["code"], "union-attr")
+        self.assertEqual(result["summary"]["extra_passes"], {"strict-optional": 1})
+        self.assertEqual(result["summary"]["total"], 1)
+        self.assertEqual(sum("--strict-optional" in f for f in flags_seen), 1)
+
+    def test_bad_and_duplicate_flags(self):
+        result, flags_seen = _run(
+            _PKG,
+            {"": _BASE_ERR + _ONE_ERROR},
+            extra_passes=["--config-file=x.ini", "strict", "--warn-unreachable"],
+        )
+        self.assertEqual(
+            [r["flag"] for r in result["summary"]["extra_passes_rejected"]],
+            ["--config-file=x.ini", "strict"],
+        )
+        # Already a built-in labelled pass: run once, not twice.
+        self.assertEqual(sum("--warn-unreachable" in f for f in flags_seen), 1)
+        self.assertEqual(result["summary"]["extra_passes"], {})
+
+    def test_cache_dir_is_used_and_kept(self):
+        with tempfile.TemporaryDirectory() as cache:
+            with TempProject(_PKG) as root, FakeMypy(_CLEAN_RUN) as fake:
+                result = mod.analyze(
+                    str(root / "pkg"), mypy_bin=str(fake.bin), cache_dir=cache
+                )
+                dirs = [
+                    c["argv"][c["argv"].index("--cache-dir") + 1] for c in fake.calls()
+                ]
+            self.assertTrue(all(d.startswith(cache) for d in dirs))
+            self.assertTrue(any(Path(cache).iterdir()))
+            self.assertTrue(result["summary"]["cache_dir_kept"])
+
+    def test_cache_dir_inside_the_project_is_refused(self):
+        with TempProject(_PKG) as root, FakeMypy(_CLEAN_RUN) as fake:
+            result = mod.analyze(
+                str(root / "pkg"), mypy_bin=str(fake.bin), cache_dir=str(root / "c")
+            )
+            self.assertEqual(result["status"], "FAILED")
+            self.assertFalse((root / "c").exists())
+            self.assertEqual(fake.calls(), [])
+
+
+_BOUNDARY_SRC = (
+    "def view(request, x=1):\n"  # 1
+    "    return request.missing\n"  # 2
+    "def typed(request: int):\n"  # 3
+    "    return request\n"  # 4
+    "async def handler(ctx, request=None):\n"  # 5
+    "    return ctx\n"  # 6
+)
+
+
+class TestBoundaryOverlay(unittest.TestCase):
+    """The typed-boundary overlay (annotate request parameters in an export,
+    re-run mypy, read what it adds) was a manual recipe."""
+
+    def test_bare_parameters_are_annotated_without_moving_lines(self):
+        with TempProject({"pkg/__init__.py": "", "pkg/v.py": _BOUNDARY_SRC}) as root:
+            export = root.parent / (root.name + "-export")
+            try:
+                mod._export_tree(root, export)
+                applied = mod.apply_boundary_overlay(
+                    export,
+                    root,
+                    [root / "pkg/v.py"],
+                    {"request": "web.req.Request", "nobody": "x.Y"},
+                )
+                lines = (export / "pkg/v.py").read_text().splitlines()
+            finally:
+                shutil.rmtree(export, ignore_errors=True)
+        self.assertEqual(
+            [(e["line"], e["param"]) for e in applied["sites_annotated"]],
+            [(1, "request"), (5, "request")],
+        )
+        self.assertEqual(lines[0], 'def view(request: "_crt_boundary_0.Request", x=1):')
+        self.assertEqual(
+            lines[4], 'async def handler(ctx, request: "_crt_boundary_0.Request"=None):'
+        )
+        self.assertEqual(lines[2], "def typed(request: int):")
+        self.assertEqual(len(lines), 7)
+        self.assertEqual(
+            lines[6], "import web.req as _crt_boundary_0  # crt boundary overlay"
+        )
+        self.assertEqual(applied["unmatched"], ["nobody"])
+
+    def test_explicit_sites_from_untyped_boundaries(self):
+        with TempProject({"pkg/__init__.py": "", "pkg/v.py": _BOUNDARY_SRC}) as root:
+            export = root.parent / (root.name + "-export")
+            try:
+                mod._export_tree(root, export)
+                applied = mod.apply_boundary_overlay(
+                    export,
+                    root,
+                    [root / "pkg/v.py"],
+                    [
+                        {
+                            "file": "pkg/v.py",
+                            "line": 5,
+                            "param": "ctx",
+                            "annotation": "a.Ctx",
+                        }
+                    ],
+                )
+            finally:
+                shutil.rmtree(export, ignore_errors=True)
+        self.assertEqual(
+            [(e["line"], e["param"], e["type"]) for e in applied["sites_annotated"]],
+            [(5, "ctx", "a.Ctx")],
+        )
+
+    def test_overlay_pass_reports_what_the_annotation_exposes(self):
+        files = {"pkg/__init__.py": "", "pkg/m.py": _BOUNDARY_SRC}
+        exposed = (
+            'pkg/m.py:2: error: "Request" has no attribute "missing"  [attr-defined]\n'
+        )
+        artifact = (
+            "pkg/m.py:5: error: Incompatible default for argument "
+            '"request"  [assignment]\n'
+        )
+        with (
+            TempProject(files) as root,
+            FakeMypy(
+                {
+                    "": _CLEAN_RUN[""],
+                    "overlay": exposed + artifact + _TWO_ERRORS,
+                }
+            ) as fake,
+        ):
+            result = mod.analyze(
+                str(root / "pkg"),
+                mypy_bin=str(fake.bin),
+                boundary_map={"request": "web.req.Request"},
+                boundary_stubs="/stubs/dir",
+            )
+            overlay_calls = [
+                c
+                for c in fake.calls()
+                if any("boundary-overlay" in a for a in c["argv"])
+            ]
+            # The reviewed tree is never edited.
+            self.assertEqual((root / "pkg/m.py").read_text(), _BOUNDARY_SRC)
+        self.assertEqual(len(overlay_calls), 1)
+        self.assertTrue(overlay_calls[0]["mypypath"].startswith("/stubs/dir"))
+        summary = result["summary"]["boundary_overlay"]
+        self.assertTrue(summary["ran"])
+        self.assertEqual(summary["sites_annotated"], 2)
+        self.assertEqual(summary["added"], 1)
+        found = result["boundary_overlay_findings"]
+        self.assertEqual([f["overlay_artifact"] for f in found], [False, True])
+        self.assertEqual(found[0]["pass"], "boundary-overlay")
+        self.assertEqual(result["summary"]["total"], 0)
+
+    def test_paths_under_the_callers_cwd_map_back_to_the_project(self):
+        files = {"pkg/__init__.py": "", "pkg/m.py": _BOUNDARY_SRC}
+        exposed = '{TARGET_REL}/m.py:2: error: "Request" has no attribute "x"  [attr-defined]\n'
+        with (
+            tempfile.TemporaryDirectory() as cwd,
+            TempProject(files) as root,
+            FakeMypy({"": _CLEAN_RUN[""], "overlay": exposed + _ONE_ERROR}) as fake,
+        ):
+            result = run_in(
+                cwd,
+                mod.analyze,
+                str(root / "pkg"),
+                mypy_bin=str(fake.bin),
+                cache_dir=str(Path(cwd) / "cache"),
+                boundary_map={"request": "web.req.Request"},
+            )
+            self.assertEqual(
+                result["boundary_overlay_findings"][0]["file"],
+                str((root / "pkg" / "m.py").resolve()),
+            )
+
+    def test_overlay_flags_subtract_the_matching_labelled_pass(self):
+        files = {"pkg/__init__.py": "", "pkg/m.py": _BOUNDARY_SRC}
+        body = "pkg/m.py:6: error: Unsupported operand  [operator]\n"
+        exposed = 'pkg/m.py:2: error: "Request" has no attribute "x"  [attr-defined]\n'
+        with (
+            TempProject(files) as root,
+            FakeMypy(
+                {
+                    "": _CLEAN_RUN[""],
+                    "--check-untyped-defs": body + _ONE_ERROR,
+                    "overlay": body + exposed + _TWO_ERRORS,
+                }
+            ) as fake,
+        ):
+            result = mod.analyze(
+                str(root / "pkg"),
+                mypy_bin=str(fake.bin),
+                boundary_map={"request": "web.req.Request"},
+                boundary_flags=["--check-untyped-defs", "--pretty"],
+            )
+            overlay_argv = next(
+                c["argv"]
+                for c in fake.calls()
+                if any("boundary-overlay" in a for a in c["argv"])
+            )
+        self.assertIn("--check-untyped-defs", overlay_argv)
+        self.assertNotIn("--pretty", overlay_argv)
+        self.assertEqual(
+            [f["code"] for f in result["boundary_overlay_findings"]], ["attr-defined"]
+        )
+        self.assertEqual(
+            result["summary"]["extra_passes_rejected"][0]["for"], "boundary-overlay"
+        )
+
+    def test_not_requested_is_null(self):
+        result, _ = _run(_PKG, {"": _BASE_ERR + _ONE_ERROR})
+        self.assertIsNone(result["summary"]["boundary_overlay"])
+        self.assertEqual(result["boundary_overlay_findings"], [])
 
 
 class TestDeriveConfig(unittest.TestCase):

@@ -7,6 +7,33 @@ that should satisfy the same invariants but may not be tested.
 
 Usage:
     python extract_test_invariants.py [path] [--max-files N] [--with-git]
+        [--git-dir PATH] [--since DATE] [--max-commits N] [--max-fix-commits N]
+        [--all] [--max-tests N] [--max-bug-fix-groups N]
+        [--source DIR] [--tests DIR] [--exclude PAT[,PAT]]
+
+Options:
+    --max-files N           Analyze at most N files under the scan root
+    --with-git              Find the tests that bug-fix commits added or changed
+    --git-dir PATH          Read that history from this checkout (or its .git)
+    --repo PATH             instead of the scanned tree -- an export has no
+                            .git. PATH is the checkout directory matching the
+                            project root; files are matched by relative path.
+                            With --with-git and no usable history the bug-fix
+                            counts are null and a warning goes to stderr.
+    --since DATE            Only commits after DATE (git's --since syntax);
+                            with it, --max-commits applies only if given
+    --max-commits N         Scan the last N commits for fixes (default 100)
+    --max-fix-commits N     Examine at most N fix commits (default 30)
+    --all                   No commit limits: the whole history
+    --max-tests N           Select N test functions to extract (default 30)
+    --max-bug-fix-groups N  Print N bug-fix entries (default 15; selection
+                            always draws from all of them)
+    --source DIR            Source root(s) for the functions tests map to
+                            (repeatable; default: the scan root)
+    --tests DIR             Test root(s) to extract from (repeatable; default:
+                            the scan root, then the project's test dirs)
+    --exclude PAT[,PAT]     Leave out files whose project-relative path matches
+                            (repeatable; substring, or a glob at any depth)
 """
 
 import ast
@@ -14,12 +41,14 @@ import json
 import re
 import subprocess
 import sys
+import warnings
 from collections import defaultdict
 from http import HTTPStatus
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from analyze_history import classify_commit_detail, parse_key_types  # noqa: E402
 from correlate_tests import (  # noqa: E402
     HTTP_VERBS,
     best_routes,
@@ -35,8 +64,11 @@ from correlate_tests import (  # noqa: E402
 )
 from scan_common import (  # noqa: E402
     build_envelope,
-    collect_python_files,
     find_project_root,
+    history_root_arg,
+    parse_scan_args,
+    select_python_files,
+    warn,
 )
 
 # ---------------------------------------------------------------------------
@@ -297,6 +329,9 @@ _GENERIC_TOKENS = frozenset({
     "get", "set", "run", "add", "new", "make", "main", "call", "init", "load",
     "save", "read", "write", "open", "close", "start", "stop", "test", "check",
     "update", "create", "delete", "list", "is", "has", "to", "from", "do",
+    # Verbs that open half the names in a service layer: `verify_token` and
+    # `verify_signature` share a word, not an operation.
+    "verify", "validate", "handle", "process",
 })
 _SKIP_CALLS = frozenset({
     "setUp", "tearDown", "patch", "MagicMock", "Mock", "AsyncMock",
@@ -1187,6 +1222,26 @@ class CallIndex:
                 for name in calls:
                     self.callers[name].add(key)
 
+    def direct_callees(
+        self, keys: set[tuple[str, str]]
+    ) -> dict[tuple[str, str], tuple[str, str]]:
+        """Functions one call below *keys*, each mapped to one caller in *keys*.
+
+        Calls resolve by last name, so a name is followed only when it is
+        distinctive or defined once: `run` called from a tested function
+        does not make every `run` in the project reached.
+        """
+        reached: dict[tuple[str, str], tuple[str, str]] = {}
+        for key in sorted(keys):
+            for name in sorted(self.calls.get(key, ())):
+                targets = self.defs.get(name, set())
+                if not (_distinctive(name) or len(targets) == 1):
+                    continue
+                for target in sorted(targets):
+                    if target not in keys and target not in self.abstract:
+                        reached.setdefault(target, key)
+        return reached
+
     def chain(self, key: tuple[str, str]) -> list[tuple[str, str]]:
         """*key* and the same-named functions it reaches through calls.
 
@@ -1211,7 +1266,18 @@ class CallIndex:
         return found
 
     def siblings(self, key: tuple[str, str], max_results: int = 5) -> list[dict]:
-        """Other entry points into the operation *key* performs."""
+        """Other entry points into the operation *key* performs.
+
+        Ranked by how the sibling's guards relate to the tested path's
+        (`guard_relation`): first an entry point that validates its input
+        but applies NONE of the tested guards (`disjoint`: it checks, just
+        not this), then one that applies some (`partial`), then one with no
+        guards of its own (`unguarded`), and last one that keeps every
+        tested guard (`keeps`). Within a tier, public functions come first,
+        then siblings sharing more of the sinks the tested path calls under a
+        guard, then those sharing the rarer helpers. Every sibling missing a
+        guard therefore comes before any that keeps them all.
+        """
         if key not in self.calls:
             return []
         chain = self.chain(key)
@@ -1223,6 +1289,11 @@ class CallIndex:
                     sinks[name] = fan_in
         chain_names = {member[1].rsplit(".", 1)[-1] for member in chain}
         tested_guards = set().union(*(self.guards[m] for m in chain))
+        # Sinks a guard-applying member of the chain calls: the operation the
+        # guard protects.
+        guarded_sinks = {
+            name for m in chain if self.guards[m] for name in self.calls[m]
+        }
         shared: dict[tuple[str, str], list[str]] = defaultdict(list)
         for name in sinks:
             for caller in self.callers[name]:
@@ -1237,6 +1308,15 @@ class CallIndex:
             if len(names) < 2 and sinks[names[0]] > _RARE_SINK_FAN_IN:
                 continue
             missing = sorted(tested_guards - self.guards[caller] - self.calls[caller])
+            own = self.guards[caller]
+            if not missing:
+                relation = "keeps"
+            elif not own:
+                relation = "unguarded"
+            elif own & tested_guards:
+                relation = "partial"
+            else:
+                relation = "disjoint"
             results.append({
                 "function": caller[1],
                 "file": caller[0],
@@ -1245,14 +1325,28 @@ class CallIndex:
                 # Guards the tested path applies that this entry point does
                 # not: the invariant most likely to be missing here.
                 "missing_guards": missing,
+                "guard_relation": relation,
+                "shared_guarded_sinks": sum(1 for n in names if n in guarded_sinks),
                 "score": round(sum(1 / sinks[n] for n in names), 3),
             })
-        # Public functions first: they are the entry points a caller reaches.
-        results.sort(key=lambda r: (
-            r["function"].rsplit(".", 1)[-1].startswith("_"),
-            -r["score"], r["file"], r["function"],
-        ))
+        results.sort(key=sibling_rank)
         return results[:max_results]
+
+
+_GUARD_RELATION_RANK = {"disjoint": 0, "partial": 1, "unguarded": 2, "keeps": 3}
+
+
+def sibling_rank(r: dict) -> tuple:
+    """Sort key for entry-point siblings (see `CallIndex.siblings`)."""
+    return (
+        _GUARD_RELATION_RANK.get(r.get("guard_relation", "keeps"), 3),
+        # Public functions first: they are the entry points a caller reaches.
+        r["function"].rsplit(".", 1)[-1].startswith("_"),
+        -r.get("shared_guarded_sinks", 0),
+        -r["score"],
+        r["file"],
+        r["function"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1276,47 +1370,18 @@ def _is_strong_signal_test(name: str, file: str = "") -> bool:
     return any(w.startswith(_STRONG_SIGNAL_WORDS) for w in _name_words(name, file))
 
 
-# Bug-fix commit subjects: whole words (`fix`, `fixes`, `[fix]`) and word
-# prefixes, so `prefix` or `dispatch` do not count.
-_FIX_COMMIT_RE = re.compile(
-    r"\b(?:fix|bug|crash|leak|error|patch|regress|race|cancel|rollback|"
-    r"concurren|lock|deadlock|timeout|thread)",
-    re.IGNORECASE,
-)
-
-# A conventional-commit type (`fix:`, `chore(deps)!:`, even a malformed
-# `feat(scope:`) and bracket tags (`[fix][cli]`, `[test]`).
-_COMMIT_TYPE_RE = re.compile(r"^\s*([A-Za-z]+)(?:\([^):]*\)?)?!?:")
-_COMMIT_TAG_RE = re.compile(r"\[([A-Za-z]+)\]")
-_FIX_TYPES = frozenset({"fix", "fixes", "fixed", "bugfix", "hotfix", "bug"})
-# Commit types that are not product fixes, whatever their subject says
-# (`chore: fix a typo`, `ci: fix the build`, `[test] Raise a timeout`).
-_NON_FIX_TYPES = frozenset({
-    "chore", "ci", "docs", "doc", "style", "test", "tests", "build",
-    "refactor", "perf", "bench", "benchmark", "benchmarks", "release",
-    "deps", "revert", "wip", "lint", "typo", "feat", "feature",
-})
-
-
-def is_fix_commit(subject: str) -> bool:
+def is_fix_commit(subject: str, key_types: dict[str, str] | None = None) -> bool:
     """True when a commit subject describes a bug fix.
 
-    A conventional-commit type or a bracket tag decides when it names a
-    known type: `fix`/`hotfix` (or a `[fix]` tag) is a fix, `chore`, `ci`,
-    `test`, `docs`, `[bench]` and the like are not, even when the subject
-    says "fix". Only an untyped subject falls back to the fix vocabulary
-    (`_FIX_COMMIT_RE`).
+    Delegates to analyze_history's classifier, so the history agent and this
+    script agree on what a fix is: a conventional type or bracket tag decides
+    first (`chore: fix a typo` is not a fix), then tracker keys mapped by
+    `key_types` (`B=fix`), then the subject's verb ("Reject X when Y" is a
+    fix, "Fixed the pylint warnings" a lint sweep). Broad words that do not
+    name a defect (lock, thread, timeout) no longer count: "Bump the lock
+    file" and "Add a timeout option" were selected as bug fixes.
     """
-    types: list[str] = []
-    match = _COMMIT_TYPE_RE.match(subject)
-    if match:
-        types.append(match.group(1).lower())
-    types += [t.lower() for t in _COMMIT_TAG_RE.findall(subject)]
-    if any(t in _FIX_TYPES for t in types):
-        return True
-    if any(t in _NON_FIX_TYPES for t in types):
-        return False
-    return bool(_FIX_COMMIT_RE.search(subject))
+    return classify_commit_detail(subject, key_types)["type"] == "fix"
 
 
 # Directories whose files are never product code: a fix commit touching only
@@ -1357,7 +1422,11 @@ def _git(args: list[str], cwd: Path, timeout: int = 10) -> str | None:
 def _tests_touched(source: str, added: list[tuple[int, int]]) -> list[str]:
     """Names of the test functions whose body overlaps an added line range."""
     try:
-        tree = ast.parse(source)
+        # Old versions of a file (--all reaches years back) may carry invalid
+        # escapes: their SyntaxWarnings would only be noise on stderr.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return []
     names: list[str] = []
@@ -1374,29 +1443,48 @@ def _tests_touched(source: str, added: list[tuple[int, int]]) -> list[str]:
 
 
 def _get_bug_fix_tests(
-    test_files: list[Path], project_root: Path
+    test_files: list[Path],
+    project_root: Path,
+    *,
+    git_root: Path | None = None,
+    since: str | None = None,
+    max_commits: int | None = 100,
+    max_fix_commits: int | None = 30,
+    stats: dict | None = None,
+    key_types: dict[str, str] | None = None,
 ) -> tuple[list[dict], int]:
     """Identify the tests that bug-fix commits added or changed, using git.
 
-    A commit counts as a fix per `is_fix_commit`: its conventional type or
-    tag, else its subject's fix vocabulary. `touches_source` is False when
+    A commit counts as a fix per `is_fix_commit` (analyze_history's
+    classifier, with `key_types` mapping tracker keys to types). `touches_source` is False when
     the commit changed no product file (only tests, benchmarks, tooling). For each test file it touched, the diff's added lines
     name the test functions it changed (`test_functions`, with
     `attribution: "function"`); when no test function was touched (a fixture
     or helper changed) the entry keeps `test_functions: []` and
     `attribution: "file"`. Returns ``(entries, total)``; the caller caps the
     list it prints, never the list it selects from.
+
+    History is read from *git_root* (default *project_root*); test files are
+    matched by their path relative to *project_root*. *since* and
+    *max_commits* bound the log scanned, *max_fix_commits* the fix commits
+    examined (None: no bound). *stats*, when given, receives what was scanned.
     """
-    log = _git(
-        ["log", "--format=%H %s", "-100", "--", "*.py"], project_root, timeout=30
-    )
+    git_root = git_root or project_root
+    log_args = ["log", "--format=%H %s"]
+    if since:
+        log_args.append(f"--since={since}")
+    if max_commits is not None:
+        log_args.append(f"-{max_commits}")
+    log = _git([*log_args, "--", "*.py"], git_root, timeout=120)
     if log is None:
+        if stats is not None:
+            stats["status"] = "git_log_failed"
         return [], 0
 
     fix_commits: list[tuple[str, str]] = []
     for line in log.strip().split("\n"):
         sha, _, msg = line.partition(" ")
-        if sha and msg and is_fix_commit(msg):
+        if sha and msg and is_fix_commit(msg, key_types):
             fix_commits.append((sha, msg))
 
     test_rel_paths = set()
@@ -1407,9 +1495,18 @@ def _get_bug_fix_tests(
             pass
 
     bug_fix_tests: list[dict] = []
-    for sha, msg in fix_commits[:30]:
+    if stats is not None:
+        stats.update(
+            commits_scanned=sum(1 for line in log.splitlines() if line.strip()),
+            commit_cap=max_commits,
+            since=since,
+            fix_commits_found=len(fix_commits),
+            fix_commit_cap=max_fix_commits,
+            fix_commits_examined=len(fix_commits[:max_fix_commits]),
+        )
+    for sha, msg in fix_commits[:max_fix_commits]:
         changed = _git(
-            ["diff-tree", "--no-commit-id", "-r", "--name-only", sha], project_root
+            ["diff-tree", "--no-commit-id", "-r", "--name-only", sha], git_root
         )
         changed_files = (changed or "").strip().split("\n")
         # A fix that changed only tests, benchmarks or tooling encodes
@@ -1419,13 +1516,13 @@ def _get_bug_fix_tests(
             if changed_file not in test_rel_paths:
                 continue
             diff = _git(["show", "-U0", "--format=", sha, "--", changed_file],
-                        project_root) or ""
+                        git_root) or ""
             added = [
                 (int(start), int(start) + max(int(count or 1), 1) - 1)
                 for start, count in _HUNK_RE.findall(diff)
                 if count != "0"
             ]
-            at_commit = _git(["show", f"{sha}:{changed_file}"], project_root) or ""
+            at_commit = _git(["show", f"{sha}:{changed_file}"], git_root) or ""
             functions = _tests_touched(at_commit, added)
             bug_fix_tests.append({
                 "test_file": changed_file,
@@ -1664,18 +1761,63 @@ def _tested_location(tested: dict, source_functions: dict[str, list[dict]]) -> d
             "name": tested["function"].rsplit(".", 1)[-1]}
 
 
-def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
-    """Run test invariant extraction and return structured results."""
+def _files_under(roots: list[str], project_root: Path, exclude) -> list[Path]:
+    """The .py files under each of *roots* (resolved; missing roots skipped)."""
+    found: list[Path] = []
+    for root in roots:
+        path = Path(root).resolve()
+        if not path.exists():
+            warn(f"root {root} does not exist; ignored")
+            continue
+        selection = select_python_files(path, project_root=project_root, exclude=exclude)
+        for f in selection.files:
+            if f not in found:
+                found.append(f)
+    return found
+
+
+def analyze(
+    target: str,
+    *,
+    max_files: int = 0,
+    with_git: bool = False,
+    git_dir: str | None = None,
+    since: str | None = None,
+    max_commits: int | None = 100,
+    max_fix_commits: int | None = 30,
+    max_tests: int = 30,
+    max_bug_fix_groups: int = _BUG_FIX_LIST_CAP,
+    source_roots: list[str] | None = None,
+    test_roots: list[str] | None = None,
+    exclude: list[str] | None = None,
+    key_types: dict[str, str] | None = None,
+) -> dict:
+    """Run test invariant extraction and return structured results.
+
+    `key_types` maps tracker-key prefixes or keys to commit types, as
+    analyze_history's `--key-type` does (`{"B": "fix"}`), for `with_git`.
+    """
     target_path = Path(target).resolve()
     project_root = find_project_root(target_path)
     scan_root = target_path if target_path.is_dir() else target_path.parent
 
-    all_files, files_total = collect_python_files(scan_root, max_files)
+    selection = select_python_files(
+        scan_root, project_root=project_root, max_files=max_files, exclude=exclude
+    )
+    all_files, files_total = selection.files, selection.files_total
 
     test_named_sources: list[Path] = []
     source_files, test_files = classify_files(
         all_files, project_root, test_named_sources
     )
+    # Explicit roots replace what the scan root gave: --tests is all test code,
+    # --source keeps only the source side of what it holds.
+    if source_roots:
+        source_files = classify_files(
+            _files_under(source_roots, project_root, exclude), project_root
+        )[0]
+    if test_roots:
+        test_files = _files_under(test_roots, project_root, exclude)
 
     # A package is usually reviewed on its own (`pkg/`) while its tests live
     # beside it (`tests/`). Finding none under the scan root must not read as
@@ -1689,9 +1831,11 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
             + ", ".join(str(f.relative_to(project_root)) for f in test_named_sources)
         )
     test_discovery: dict = {"method": "scan_root", "roots": []}
+    if test_roots:
+        test_discovery = {"method": "--tests", "roots": list(test_roots)}
     # Test files that define no test (a lone `tests/__init__.py`, helpers)
     # are not tests to extract from: look further, as if there were none.
-    if not any(defines_tests(f) for f in test_files):
+    if not any(defines_tests(f) for f in test_files) and not test_roots:
         found: list[Path] = []
         roots: list[str] = []
         how: str | None = None
@@ -1723,16 +1867,37 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
 
     # Get bug-fix tests if git is available
     bug_fix_tests: list[dict] = []
-    bug_fix_tests_total = 0
+    bug_fix_tests_total: int | None = 0
+    history_root, _ = history_root_arg(git_dir, project_root, scan_root)
+    bug_fix_scan: dict = {"status": "not_requested", "git_root": None}
     if with_git:
-        bug_fix_tests, bug_fix_tests_total = _get_bug_fix_tests(
-            test_files, project_root
-        )
+        bug_fix_scan = {"status": "ok", "git_root": str(history_root)}
+        if _git(["rev-parse", "--is-inside-work-tree"], history_root) is None:
+            # An export has no .git: zero bug-fix tests here is unmeasured,
+            # not "no fix ever added a test".
+            bug_fix_tests_total = None
+            bug_fix_scan["status"] = "no_git_history"
+            warnings.append(
+                f"--with-git: no git repository at {history_root}, so bug-fix "
+                "tests were NOT measured (the counts are null). For an export, "
+                "pass --git-dir <checkout>."
+            )
+        else:
+            bug_fix_tests, bug_fix_tests_total = _get_bug_fix_tests(
+                test_files,
+                project_root,
+                git_root=history_root,
+                since=since,
+                max_commits=max_commits,
+                max_fix_commits=max_fix_commits,
+                stats=bug_fix_scan,
+                key_types=key_types,
+            )
 
     # Select high-value tests from ALL bug-fix tests; only the printed list
     # is capped.
-    selected = select_tests(all_test_info, bug_fix_tests, max_tests=30)
-    bug_fix_tests = bug_fix_tests[:_BUG_FIX_LIST_CAP]
+    selected = select_tests(all_test_info, bug_fix_tests, max_tests=max_tests)
+    bug_fix_tests = bug_fix_tests[:max_bug_fix_groups]
 
     call_index = CallIndex(source_files, project_root, source_functions)
 
@@ -1772,6 +1937,10 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
         for t in all_test_info
         if t.get("tested_function")
     }
+    # A function a tested function calls directly runs under that test (a
+    # service called by a tested route handler): not "untested", though its
+    # own behaviour may not be asserted. Marked, and listed after the rest.
+    reached = call_index.direct_callees(tested_funcs)
     untested_similar: list[dict] = []
     for test in selected:
         tested = test.get("tested_function")
@@ -1791,6 +1960,12 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
                     "invariant_types": test["invariant_types"],
                     "similarity_reason": sim["similarity_reason"],
                 })
+                via = reached.get((sim["file"], sim["function"]))
+                if via is not None:
+                    untested_similar[-1]["reached_indirectly"] = {
+                        "via": via[1],
+                        "file": via[0],
+                    }
 
     # Deduplicate untested_similar by function name
     seen: set[tuple[str, str]] = set()
@@ -1799,28 +1974,37 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
         if (item["file"], item["function"]) not in seen:
             seen.add((item["file"], item["function"]))
             deduped.append(item)
+    deduped.sort(key=lambda item: "reached_indirectly" in item)
     untested_similar_total = len(deduped)
     untested_similar = deduped[:20]
 
-    entry_points: list[dict] = []
-    seen_entry: set[tuple[str, str]] = set()
+    pairs: list[dict] = []
     for inv in invariants:
         for sib in inv["entry_point_siblings"]:
             key = (sib["file"], sib["function"])
-            if key in seen_entry:
-                continue
-            seen_entry.add(key)
-            entry_points.append({
+            pairs.append({
                 **sib,
                 "sibling_of": inv["tested_function"]["function"],
                 "tested_in": inv["file"],
                 "tested": key in tested_funcs,
                 "invariant_types": inv["invariant_types"],
             })
+    # Each sibling once, with its most telling pair, most telling first: the
+    # pairs most likely to be missing a guard come before the cap below.
+    pairs.sort(key=sibling_rank)
+    entry_points: list[dict] = []
+    seen_entry: set[tuple[str, str]] = set()
+    for pair in pairs:
+        key = (pair["file"], pair["function"])
+        if key not in seen_entry:
+            seen_entry.add(key)
+            entry_points.append(pair)
     entry_points_total = len(entry_points)
 
     return {
-        **build_envelope(project_root, scan_root, files_total, len(all_files)),
+        **build_envelope(
+            project_root, scan_root, files_total, len(all_files), selection
+        ),
         # "no_tests_found" when no test file was found anywhere: an empty
         # result then means "not measured", not "no invariants".
         "status": "ok" if test_files else "no_tests_found",
@@ -1832,6 +2016,8 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
             "source_functions": sum(len(v) for v in source_functions.values()),
             "total_test_functions": len(all_test_info),
             "selected_test_functions": len(selected),
+            "max_tests": max_tests,
+            "tests_capped": len(all_test_info) > len(selected),
             "invariants_extracted": sum(
                 t["behavioral_assertion_count"] for t in selected
             ),
@@ -1844,13 +2030,26 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
             "untested_similar_functions": len(untested_similar),
             "untested_similar_functions_total": untested_similar_total,
             "untested_similar_functions_capped": untested_similar_total > 20,
+            # Of the total: called directly by a tested function.
+            "untested_similar_reached_indirectly": sum(
+                1 for item in deduped if "reached_indirectly" in item
+            ),
             "entry_point_siblings": min(entry_points_total, 20),
             "entry_point_siblings_total": entry_points_total,
             "entry_point_siblings_capped": entry_points_total > 20,
-            "bug_fix_tests_found": len(bug_fix_tests),
+            "bug_fix_tests_found": (
+                len(bug_fix_tests) if bug_fix_tests_total is not None else None
+            ),
             "bug_fix_tests_total": bug_fix_tests_total,
-            "bug_fix_tests_capped": bug_fix_tests_total > _BUG_FIX_LIST_CAP,
+            "bug_fix_tests_cap": max_bug_fix_groups,
+            "bug_fix_tests_capped": (
+                bug_fix_tests_total is not None
+                and bug_fix_tests_total > max_bug_fix_groups
+            ),
         },
+        # What --with-git read: status (ok / no_git_history / not_requested),
+        # the history root, and the commit window and caps actually applied.
+        "bug_fix_scan": bug_fix_scan,
         "invariants": invariants,
         "bug_fix_tests": bug_fix_tests,
         "untested_similar_functions": untested_similar,
@@ -1858,31 +2057,76 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
     }
 
 
+def _int_flag(args, flag: str, default: int | None) -> int | None:
+    raw = args.value(flag)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"{flag} requires an integer, got '{raw}'") from None
+
+
+def _key_types(specs: list[str] | None) -> dict[str, str] | None:
+    """`--key-type B=fix,F=feature` (repeatable), as analyze_history reads it."""
+    if not specs:
+        return None
+    types: dict[str, str] = {}
+    for spec in specs:
+        types.update(parse_key_types(spec))
+    return types
+
+
 def main() -> None:
     """CLI entry point."""
-    from scan_common import exit_on_help
-
-    exit_on_help(sys.argv[1:], __doc__)
+    args = parse_scan_args(
+        sys.argv[1:],
+        __doc__,
+        flags={"--with-git", "--all"},
+        value_flags={
+            "--git-dir",
+            "--repo",
+            "--since",
+            "--max-commits",
+            "--max-fix-commits",
+            "--max-tests",
+            "--max-bug-fix-groups",
+            "--source",
+            "--tests",
+            "--key-type",
+        },
+    )
     try:
-        max_files = 0
-        with_git = False
-        positional: list[str] = []
-        argv = sys.argv[1:]
-        i = 0
-        while i < len(argv):
-            if argv[i] == "--max-files" and i + 1 < len(argv):
-                max_files = int(argv[i + 1])
-                i += 2
-            elif argv[i] == "--with-git":
-                with_git = True
-                i += 1
-            elif argv[i].startswith("--"):
-                i += 1
-            else:
-                positional.append(argv[i])
-                i += 1
-        target = positional[0] if positional else "."
-        result = analyze(target, max_files=max_files, with_git=with_git)
+        since = args.value("--since")
+        unbounded = "--all" in args.flags
+        # --since bounds the window by date; the count cap then applies only
+        # when asked for explicitly.
+        default_commits = None if (unbounded or since) else 100
+        result = analyze(
+            args.target,
+            max_files=args.max_files,
+            with_git="--with-git" in args.flags,
+            git_dir=args.value("--git-dir") or args.value("--repo"),
+            since=since,
+            max_commits=_int_flag(args, "--max-commits", default_commits),
+            max_fix_commits=_int_flag(
+                args, "--max-fix-commits", None if unbounded else 30
+            ),
+            max_tests=_int_flag(args, "--max-tests", 30),
+            max_bug_fix_groups=_int_flag(
+                args, "--max-bug-fix-groups", _BUG_FIX_LIST_CAP
+            ),
+            source_roots=args.values.get("--source"),
+            test_roots=args.values.get("--tests"),
+            exclude=args.exclude,
+            key_types=_key_types(args.values.get("--key-type")),
+        )
+        if result.get("bug_fix_scan", {}).get("status") == "no_git_history":
+            warn(
+                f"--with-git found no git history at "
+                f"{result['bug_fix_scan']['git_root']}; bug-fix tests were not "
+                "measured. For an export, pass --git-dir <checkout>."
+            )
         json.dump(result, sys.stdout, indent=2)
         sys.stdout.write("\n")
     except Exception as e:

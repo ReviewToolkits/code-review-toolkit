@@ -7,6 +7,7 @@ none. Several shapes need a call chain, so fixtures span functions and modules.
 
 import unittest
 from textwrap import dedent
+from typing import ClassVar
 
 from helpers import TempProject, import_script
 
@@ -1465,5 +1466,349 @@ class TestEnvelopeAndOptions(unittest.TestCase):
                 self.assertEqual(catalog[check]["detected_by"], "scan_concurrency.py")
 
 
+class TestRateLimiterTestThenHit(unittest.TestCase):
+    shape = "rate-limiter-test-then-hit"
+
+    def test_test_before_work_and_hit_after(self):
+        found = of(
+            scan(
+                """
+                def post_comment(request, limiter, text):
+                    if not limiter.test(request.ip):
+                        raise TooMany()
+                    check_spam(text)
+                    limiter.hit(request.ip)
+                """
+            ),
+            self.shape,
+        )
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["confidence"], "medium")
+        self.assertEqual(found[0]["line"], 3)
+
+    def test_hit_first_then_test_is_the_guarded_twin(self):
+        # Charge, then check the incremented count: concurrent requests are all
+        # counted before any is admitted.
+        src = """
+        def fetch_page(request, limiter):
+            limiter.hit(request.ip)
+            if not limiter.test(request.ip):
+                raise TooMany()
+            return render_page(request)
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+    def test_atomic_hit_gate_is_silent(self):
+        src = """
+        def signup(request, limiter):
+            if not limiter.hit(request.ip):
+                raise TooMany()
+            create_profile(request)
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+    def test_hit_in_an_earlier_branch_does_not_count_as_charged_first(self):
+        src = """
+        def send_digest(request, limiter, member):
+            if member.muted:
+                limiter.hit(member.id)
+                return {}
+            if not limiter.test(member.id):
+                raise TooMany()
+            deliver_digest(member)
+            limiter.hit(member.id)
+        """
+        self.assertEqual(len(of(scan(src), self.shape)), 1)
+
+    def test_pair_split_across_methods_is_low_confidence(self):
+        src = """
+        class Gateway:
+            def _check_quota(self, key):
+                if not self.limiters["api"].test(key):
+                    raise TooMany()
+
+            def _charge_quota(self, key):
+                self.limiters["api"].hit(key)
+
+            def call(self, key, payload):
+                self._check_quota(key)
+                if not slow_backend(payload):
+                    self._charge_quota(key)
+                    return False
+                return True
+        """
+        found = of(scan(src), self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["confidence"], "low")
+        self.assertEqual(found[0]["function"], "Gateway._check_quota")
+
+    def test_limiter_wrapper_class_is_silent(self):
+        src = """
+        class RateLimiter:
+            def test(self, *ids):
+                return self._strategy.test(self._limit, *ids)
+
+            def hit(self, *ids):
+                return self._strategy.hit(self._limit, *ids)
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+
+class TestSharedStoreReadModifyWrite(unittest.TestCase):
+    shape = "read-modify-write-on-shared-store"
+
+    def test_get_modify_set_of_one_key(self):
+        found = of(
+            scan(
+                """
+                import json
+
+                def append_event(redis, order_id, event):
+                    raw = redis.get(f"order:{order_id}")
+                    events = json.loads(raw or "[]")
+                    events.append(event)
+                    redis.set(f"order:{order_id}", json.dumps(events))
+                """
+            ),
+            self.shape,
+        )
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["line"], 8)
+
+    def test_counter_through_setex(self):
+        src = """
+        def bump(self, key):
+            count = int(self.cache.get(key) or 0)
+            self.cache.setex(key, 60, count + 1)
+        """
+        self.assertEqual(len(of(scan(src), self.shape)), 1)
+
+    def test_cache_aside_fill_is_silent(self):
+        # The value written on a miss is computed fresh, not derived from the read.
+        src = """
+        def lookup(cache, key):
+            value = cache.get(key)
+            if value is None:
+                value = expensive(key)
+                cache.set(key, value)
+            return value
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+    def test_atomic_increment_is_silent(self):
+        src = """
+        def bump(redis, key):
+            redis.incr(key)
+            return redis.get(key)
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+    def test_watch_transaction_is_silent(self):
+        src = """
+        def bump(redis, key):
+            redis.watch(key)
+            count = int(redis.get(key) or 0)
+            redis.set(key, count + 1)
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+    def test_different_key_and_non_store_receiver_are_silent(self):
+        src = """
+        def copy(redis, config, a, b):
+            v = redis.get(a)
+            redis.set(b, v)
+            level = config.get("log", "level")
+            config.set("log", "level", level + "!")
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+
+class TestSessionLevelSet(unittest.TestCase):
+    shape = "session-level-set-leaks-through-pooled-connection"
+
+    def test_session_set_in_request_code(self):
+        found = of(
+            scan(
+                """
+                from sqlalchemy import text
+
+                def export_report(request):
+                    request.db.execute(text("SET statement_timeout = '45s'"))
+                    build_export(request)
+                """
+            ),
+            self.shape,
+        )
+        self.assertEqual(len(found), 1)
+        self.assertIn("statement_timeout", found[0]["message"])
+
+    def test_set_local_and_set_config_are_silent(self):
+        src = """
+        from sqlalchemy import text
+
+        def export_report(request):
+            request.db.execute(text("SET LOCAL statement_timeout = '45s'"))
+            request.db.execute(text("SELECT set_config('statement_timeout', '1s', true)"))
+            request.db.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+    def test_migrations_and_pool_listeners_are_silent(self):
+        files = {
+            "pkg/migrations/env.py": """
+            def run(connection):
+                connection.execute("SET lock_timeout = 4000")
+            """,
+            "pkg/db.py": """
+            from sqlalchemy import event
+
+            @event.listens_for(engine, "connect")
+            def on_connect(dbapi_connection, record):
+                dbapi_connection.execute("SET search_path TO app")
+            """,
+        }
+        self.assertEqual(of(scan_project(files)["findings"], self.shape), [])
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestModelApplicability(unittest.TestCase):
+    """No in-process concurrency must not read as a clean result."""
+
+    def test_nothing_to_model_says_so(self):
+        out = scan_project({"pkg/mod.py": "def f(x):\n    return x + 1\n"})
+        summary = out["summary"]
+        self.assertFalse(summary["model_applicable"])
+        self.assertIn("not a clean result", summary["model_note"])
+        self.assertEqual(summary["concurrency_evidence"]["locks_declared"], 0)
+
+    def test_a_threaded_project_is_applicable(self):
+        out = scan_project({"pkg/mod.py": _GUARDED_CLASS.format(body="pass")})
+        self.assertTrue(out["summary"]["model_applicable"])
+        self.assertNotIn("model_note", out["summary"])
+
+    def test_thread_starts_and_async_count_as_concurrency(self):
+        for src in (
+            "import threading\ndef go(f):\n    threading.Thread(target=f).start()\n",
+            "async def handler():\n    return 1\n",
+            (
+                "from concurrent.futures import ThreadPoolExecutor\n"
+                "def go(f):\n    with ThreadPoolExecutor() as ex:\n        ex.submit(f)\n"
+            ),
+        ):
+            with self.subTest(src=src):
+                out = scan_project({"pkg/mod.py": src})
+                self.assertTrue(out["summary"]["model_applicable"])
+
+    def test_distributed_lock_subclasses_and_sites_are_listed(self):
+        src = """
+        from redis.lock import Lock
+        import filelock
+
+        class JobLock(Lock):
+            def __init__(self, client):
+                super().__init__(client, "job-lock")
+
+        class NightlyLock(JobLock):
+            pass
+
+        def run(client):
+            with JobLock(client):
+                pass
+
+        def nightly(client):
+            with NightlyLock(client):
+                pass
+
+        def export(path):
+            with filelock.FileLock(path + ".lock"):
+                pass
+
+        def refresh(client):
+            with client.lock("refresh", timeout=30):
+                pass
+
+        def unrelated(store):
+            with store.transaction():
+                pass
+        """
+        out = scan_project({"pkg/tasks.py": src})
+        summary = out["summary"]
+        locks = summary["distributed_locks"]
+        self.assertEqual(
+            [(c["class"], c["base"]) for c in locks["classes"]],
+            [
+                ("pkg.tasks.JobLock", "redis.lock.Lock"),
+                ("pkg.tasks.NightlyLock", "pkg.tasks.JobLock"),
+            ],
+        )
+        self.assertEqual(
+            [(site["function"], site["via"]) for site in locks["sites"]],
+            [
+                ("run", "class"),
+                ("nightly", "class"),
+                ("export", "class"),
+                ("refresh", "client-lock-method"),
+            ],
+        )
+        # Not in-process concurrency: the model still does not apply, and the
+        # note points at the sites.
+        self.assertFalse(summary["model_applicable"])
+        self.assertIn("4 distributed-lock site(s)", summary["model_note"])
+
+
+class TestSlowLockWitness(unittest.TestCase):
+    """The "meanwhile" holder a finding cites is the slowest, not the first."""
+
+    _FILES: ClassVar[dict] = {
+        "pkg/store.py": """
+            import subprocess, threading
+
+            class Store:
+                def __init__(self):
+                    self._state = threading.Lock()
+
+                def save_settings(self, path):
+                    with self._state:
+                        with open(path, "w") as fh:  # a quick, by-design hold
+                            fh.write("x")
+
+                def archive(self, src):
+                    with self._state:
+                        subprocess.run(["tar", "czf", "out.tgz", src])
+
+                def flush_metrics(self):
+                    with self._state:
+                        pass
+            """,
+        "pkg/app.py": """
+            import asyncio
+            from pkg.store import Store
+
+            async def flush_periodically(store: Store):
+                while True:
+                    await asyncio.sleep(10)
+                    store.flush_metrics()
+            """,
+    }
+
+    def test_the_slowest_holder_is_the_witness(self):
+        out = scan_project(self._FILES)
+        found = of(out["findings"], "transitive-blocking-call-in-async")
+        self.assertEqual(len(found), 1)
+        meanwhile = [step for step in found[0]["chain"] if "meanwhile" in step]
+        self.assertEqual(len(meanwhile), 1)
+        # The subprocess holder, not the file write found first in the file.
+        self.assertIn("archive", meanwhile[0])
+
+    def test_every_holder_is_listed_slowest_first(self):
+        holders = scan_project(self._FILES)["summary"]["slow_lock_holders"]
+        entry = holders["Store._state"]
+        self.assertEqual(entry["holders"], 2)
+        self.assertEqual(
+            [(h["category"], h["strong"]) for h in entry["top"]],
+            [("subprocess", True), ("file-io", True)],
+        )
+        self.assertIn("archive", entry["top"][0]["at"])

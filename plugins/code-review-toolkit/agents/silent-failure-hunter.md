@@ -250,6 +250,45 @@ them in the code that produces a verdict, a count, a report or an exit status:
 Report these with the same severity scale. A false success in a verdict (a test runner, a
 validator, a health check) is usually CRITICAL.
 
+### Step 3d: Framework failure paths (web apps, task queues)
+
+In a web application or a task worker, many silent failures live in how the framework handles a
+failure, not in an `except` block. Find the transaction boundary first (transaction-per-request
+middleware such as `pyramid_tm` or Django `ATOMIC_REQUESTS`, a task base class, an explicit
+`with transaction`), then check:
+
+- **Side effects inside the transaction** (`external-side-effect-inside-db-transaction`). For each
+  call to an external system (email, chat webhook, helpdesk, payment API, object store) made before
+  commit: does its failure roll back the essential change, or does a later failure roll back the
+  database while the external effect stays? A notification that can undo the action it reports is
+  the common case.
+- **Work deferred to after-commit hooks** (`after-commit-hook-swallows-errors`). Hooks run after the
+  commit succeeded, so the transaction manager logs and swallows their exceptions. Ask who notices
+  when a hook fails, and what retries it.
+- **Retries through the task framework** (`task-retry-dropped-by-after-commit-publish`). If the task
+  base class defers publishing to an after-commit hook, a task's own `retry()` is parked on the
+  transaction that the retry aborts. Read the base class's `apply_async` and the worker's
+  transaction wrapper before trusting any `retry(`/`autoretry_for`.
+- **Request-level retries** (a retry-on-conflict wrapper re-running a view): a non-transactional
+  side effect before the retry point happens twice.
+- **Error exits after a flush.** A caught `IntegrityError` without a rollback
+  (`integrity-error-caught-without-rollback`, scanner-backed) and an error response *returned*
+  after a mutation (`error-exit-after-flushed-mutation`): the first turns a friendly error into a
+  500, the second commits half a change.
+- **Parser limits that escape validation** (`int-max-str-digits-escapes-parser-validation`): an
+  `int()` of an unbounded digit run raises a plain `ValueError` above 4300 digits, which a handler
+  for the parser's own error class does not catch.
+
+### Step 3e: Error mapping under mutated input (validators)
+
+For code that validates uploaded or structured input (archives, metadata, manifests, request
+payloads), reading each handler does not show which bad inputs escape the error mapping. Mutate a
+valid fixture instead, with the harness in `<plugin_root>/docs/mutation-fuzzer.md`: it drops,
+retypes, resizes and corrupts one part at a time, submits each mutation through the project's own
+entry point in an export, and classifies the outcome as accepted, rejected (the documented
+4xx-style failure) or crashed. A crash on a client mistake is a finding; so is a mutation that is
+accepted although the spec forbids it. Keep the harness output as the reproduction.
+
 ### Step 4: Assess Impact
 
 For each finding, consider:
@@ -315,12 +354,20 @@ For each:
 - **Python-specific**: Python's exception model has unique pitfalls (bare except catching SystemExit, StopIteration semantics, exception chaining). Flag these specifically.
 - **Cap output**: Report at most 10 critical, 10 high, and 15 medium issues in the summary. If there are more, note the total count. When run as part of `explore` with a run directory, write **every** critical and high finding to your report file: the consolidation step needs them all.
 - **Be actionable**: Every finding should include a specific fix, not just "handle this error better."
+- **Proving "nothing was logged"**: `caplog.set_level(logging.DEBUG)` sets only the root logger. A project logger that sets its own level at import still drops lower records, so a "nothing logged" assertion passes without capturing anything. Pass `logger="<the module's logger name>"`, or assert at WARNING and above, and first show one record you know is emitted (see `<plugin_root>/docs/reproduction-convention.md`).
 
 ### Classification Guide
 - **FIX**: Silent failure that hides bugs, causes data corruption, or produces silently wrong results (e.g., bare except with pass, swallowed exception in data pipeline)
 - **CONSIDER**: Error handling that works but could be improved — overly broad catches, missing traceback in logs, generic error messages
 - **POLICY**: Project-wide error handling strategy decisions (e.g., adopt a custom exception hierarchy, standardize logging levels for errors)
 - **ACCEPTABLE**: Intentional broad catches in appropriate contexts — top-level CLI handlers, cleanup code, logging utilities where suppression is the correct behavior
+
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.
 
 ## Running the script
 

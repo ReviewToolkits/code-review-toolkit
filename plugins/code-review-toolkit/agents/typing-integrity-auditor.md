@@ -84,6 +84,16 @@ On coverage.py this found exactly 3 errors in 1 file — every one caused by
 Three annotations that had stopped checking anything. The same flag on `_pyrepl` added **zero**,
 which is what makes it a real finding rather than a flag that fires everywhere.
 
+Each hit carries `phantom_origin`, traced from its annotation to the import behind the name:
+`module-missing` (the module does not exist on mypy's search path), `silenced-by-config` (it exists;
+`ignore_missing_imports` made it `Any` on purpose), `importable-unfollowed` (it exists, nothing in the
+config silences it: a `# type: ignore` on the import, no stubs) or `unresolved-name`.
+`summary.phantom_imports_real` counts the hits whose module is missing (an own-package module always
+counts), and `phantom_missing_modules` names them. Start there; report `silenced-by-config` hits as one
+line per module under silenced imports, not as phantoms. A `module-missing` hit with
+`real_phantom: false` is a dependency the config silences and this environment lacks: an
+environment gap, not a typo.
+
 Read the pass in light of `effective_flags.ignore_missing_imports`. When it is null (the option is
 off), a missing module already fails the baseline as `import-not-found`, and a 0 from this pass is
 uninformative rather than reassuring — say so. An unresolved **quoted** forward reference
@@ -101,6 +111,15 @@ packages are silently `Any` — this pass is the inventory.
 0) means the config never sets the option, so nothing was silenced; null means not measured, and
 `silenced_imports_reason` says why. For each module, say whether stubs exist (`types-<name>`), so
 the fix is "install stubs", not "stop ignoring".
+
+### Stale stub packages
+
+`stale_stub_packages` lists installed `types-*` / `*-stubs` distributions whose library now ships its
+own inline types (`py.typed`). mypy prefers the stub, so the project is checked against it, and an
+old stub describes an old API. Compare `stub_version` with `runtime_version`; a `stub_partial: true`
+stub is merged with the inline types and matters less. To see what the stub hides, check the
+project in a scratch environment without it (never uninstall from the project's venv) and diff.
+`summary.stale_stub_packages` is null when mypy's interpreter could not be asked.
 
 For each phantom import: resolve the name against the actual package tree, propose the correction,
 and **verify the correction introduces no new errors** before proposing it.
@@ -137,6 +156,16 @@ the config already checks them). These are real errors in code the project's own
 at. Classify them like baseline defects, but report them in their own section: the project has not
 opted in to them.
 
+### Errors whose result is silently Any
+
+`misc` is split by message (`misc_family`, counted in `summary.misc_by_family`). `any-subclass`
+("Invalid base class", "Class cannot subclass ... Any") makes the class an `Any` subclass: every
+attribute access on it stops being checked, and the usual fix is importing the real base class under
+`TYPE_CHECKING`. `none-not-callable` is mostly lost narrowing (a callable probed through a bool); check
+the guard before calling it a defect. Findings with `silent_any` (also `call-overload`: a call no
+overload accepts, whose result mypy then treats as `Any`) leave the code after them unchecked even
+when the error itself is ignored; `summary.silent_any` counts them.
+
 ### Annotate the untyped boundary, then re-run
 
 When the code at a boundary is unannotated, mypy cannot prove anything about it, and the defects
@@ -152,6 +181,23 @@ typed in some functions and bare in others). For the top few:
 4. New errors inside the callee are defects the missing annotation was hiding. Read each one.
 
 Report each experiment as `callee(param: T)` → N new errors. One that adds nothing is one line.
+
+For a parameter name that recurs across the project (`request` in every view), check_typing.py
+packages the experiment. `--boundary-map FILE` (JSON: `{"request": "pkg.mod.Request"}`, or a list
+of `untyped_boundaries` sites with an `annotation` filled in) annotates every bare match in an
+export without moving a line; `--boundary-stubs DIR` puts a minimal `.pyi` for a silenced library
+first on `MYPYPATH`; `--boundary-flag=--check-untyped-defs` adds flags (what a labelled pass with
+them already found is subtracted). `boundary_overlay_findings` lists what mypy adds, at the
+original paths and lines; `overlay_artifact: true` marks errors the annotation itself causes (a
+`None` default). `--extra-pass=FLAG` (repeatable) adds labelled passes for other flags, and
+`--cache-dir DIR` (in your private directory) keeps the cache so a second run is fast. Attach
+mypy flags with `=`: `--extra-pass --strict-equality` is read as two options.
+
+```bash
+echo '{"request": "pkg.mod.Request"}' > "$d/boundary.json"
+python3 <plugin_root>/scripts/check_typing.py [scope] --mypy-bin [mypy-bin] --cache-dir "$d/cache" \
+  --boundary-map "$d/boundary.json" > "$d/overlay.json" 2> "$d/overlay.err"; echo "exit=$?"
+```
 
 ## Phase 4 — Stale ignores, correctly measured
 
@@ -224,6 +270,13 @@ ignore_missing_imports [global / per-module / off] · interpreter [mypy_python.e
   this agent exists to prevent.
 - An in-tree CPython `Lib/` subpackage will always FAIL with a stdlib-shadowing error. That is
   expected; `failure_reason` explains the symlink-staging workaround.
+
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.
 
 ## Running the script
 

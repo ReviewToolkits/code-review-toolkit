@@ -118,9 +118,13 @@ Tell every agent its report path and its artifacts directory, and these rules, v
 - **The reviewed checkout is read-only.** No edits, no `git checkout`/`switch`/`stash`/`worktree`,
   and no tool caches left behind (`.ruff_cache`, `.mypy_cache`, `__pycache__` from running code).
   To run or patch code, export a copy: `git -C <project> archive HEAD | tar -x -C <private dir>`.
-- **Scratch work goes in a private `mktemp -d`**, never a fixed name in a shared directory: agents
-  run in parallel and overwrite each other's files. Set `TMPDIR` to that private directory when
-  running the project's own code, so its temp files don't spill into a shared `/tmp`.
+- **Scratch work goes in a private directory under `<run_dir>/tmp/`**, never a fixed name in a
+  shared directory: agents run in parallel and overwrite each other's files, and a shared `/tmp`
+  gets cleaned mid-run. Start each Bash command that makes scratch with
+  `mkdir -p <run_dir>/tmp && export TMPDIR=<run_dir>/tmp;` (shell state does not survive between
+  calls), so `mktemp -d "${TMPDIR:-/tmp}/..."` lands there. Set `TMPDIR` to your private directory
+  when running the project's own code, and give any loop that creates directories a
+  `trap 'rm -rf "$d"' EXIT`.
 - **Anything worth keeping goes in `artifacts/<agent>/`**: a reproducer left in a temp directory is
   lost when the run ends. Delete your private temp directory when you finish.
 - **Your report file is required.** Write the full report to your `agents/<agent>.md` path. This
@@ -239,16 +243,37 @@ hundreds of kilobytes. Dispatch **one consolidation agent** that reads every `ag
 
 | Field | Content |
 |---|---|
-| `id` | stable id (`<PREFIX>-001`), ordered FIX → CONSIDER → POLICY, worst failure first |
+| `id` | stable id (`<PREFIX>-001`), ordered FIX → CONSIDER → POLICY, worst failure first. Classify by the rubric in `<plugin_root>/docs/finding-fields.md` (FIX = observable wrong outcome + trigger), whatever class the agent gave |
 | `title`, `classification`, `status` | status per the reproduction convention: `candidate` / `confirmed` / `reproduced` / `refuted` |
 | `locations` | `path:line` list, checked against the file |
 | `mechanism`, `failure_scenario` | how it fails; concrete inputs → wrong outcome |
 | `agents`, `source_refs` | who found it, and where in their reports |
 | `repro` | artifact paths, if reproduced |
 | `propagation_gap_of`, `prior_art`, `introduced_by` | fix-propagation and history context |
+| `branch_status` | per unmerged branch that touches the finding's files: `fixed` / `partially-fixed` / `unchanged` / `moved` / `worse`, and whether the reproducer confirmed it (Step 2) |
 | `security_claim` | `{attacker, preconditions, gain}`, **empty unless all three can be named concretely**. Touching auth, rate limits or uploads is not a claim; "would help an attacker" is not a claim |
 | `publication_sensitive` | `true` when publication should wait for coordination with the project. Cheap and right under doubt; it never makes a finding a security claim |
 | `notes` | dedup decisions, corrections |
+
+Two rules for the consolidation agent, because `findings.json` is what reaches maintainers:
+
+- **Prose is for the maintainer.** `title`, `mechanism`, `failure_scenario` and `introduced_by` carry
+  no agent names, no agent-internal ids (`SFH-3`, an earlier run's labels) and no `||` merge
+  separators. Attribution goes in `agents` and `source_refs`, and merge history in `notes`. A
+  finding may cite another one by its consolidated `id`.
+- **A sensitive id stays private.** A finding without `publication_sensitive` never mentions the id
+  of one that has it, in any field (`notes` and `propagation_gap_of` included): publishing the first
+  would reveal that the second exists. Describe the relation without the id, or mark both sensitive.
+
+Check both mechanically before the file goes anywhere:
+
+```bash
+python3 <plugin_root>/scripts/security_gate.py lint <run_dir>/findings.json
+```
+
+It exits 1 and lists every `agent-name`, `merge-separator`, `internal-id` and `sensitive-ref`
+problem. Fix the text. For an id-like token that isn't an id (a standard's number, a format name),
+pass `--allow TOKEN,TOKEN`.
 
 Tell the consolidation agent to work **report by report into an on-disk working file**
 (`<run_dir>/consolidation-work.json`), appending and merging as it goes, rather than reading every
@@ -260,29 +285,130 @@ final pass merges the partials.
 [`security-gate`](security-gate.md) has signed it off.** The consolidation step records claims; the
 gate judges them blind against the project's own threat model and precedents.
 
-Then **spot-check it yourself**: re-read a sample of locations (all FIX findings if feasible), and
-every finding whose agents disagreed. The deduplication and contradiction rules below are the
+Then **check the locations mechanically**: run `check_locations.py` (in the plugin's `scripts/`
+directory) on `findings.json`. It validates every finding's `path:line` range at the reviewed
+commit, whatever its classification. Then **spot-check it yourself**: re-read a sample of locations
+(all FIX findings if feasible), and every finding whose agents disagreed. The deduplication and contradiction rules below are the
 consolidation agent's instructions.
 
-#### Step 2: Re-anchor against unmerged branches
+**Labels that leave the run carry the run id.** Short ids repeat across runs and projects (two
+reviews can each have an `SF-1`), and one handed over bare can bring a fact from the wrong review
+into a slice agent's prompt. In every handoff (reproduction slices, prior art, the security gate,
+a later run's memory), cite a finding as `<run_id>/<id>`, e.g. `proj_v3/PRJ-014`, and give its
+title with it. Agent-internal ids never leave the run: map them to the consolidated id first.
 
-For every FIX finding, check each unmerged branch that touches its files
+**Second look at single-finder findings.** A finding only one agent reached is the least likely to
+be found again: in one measured re-run, about half of the single-finder items came back (77% of the
+FIX ones), against about 90% of the items two or more agents had found. A miss on re-run means the
+area wasn't covered well, so its siblings probably weren't either. After consolidation:
+
+1. List the FIX findings, and the findings with a `security_claim`, whose `agents` has one entry.
+2. Group them by area (module or package).
+3. Dispatch one targeted agent per area, preferably of a different type from the finder (a
+   silent-failure-hunter over a python-pitfall-scanner finding on an error path, a
+   pattern-consistency-checker over a consistency-auditor one). Give it the area and the shapes of
+   the findings there, not the findings themselves, and ask for defects of those shapes and their
+   siblings.
+4. Consolidate its report like any other. A re-found finding gains the second agent in `agents`;
+   a new one is a new finding. Note in `notes` which findings stayed single-finder.
+
+When the review is planned up front, the cheaper version is overlap: give each high-risk area
+(auth, payments, data deletion, anything security-relevant) two agents whose scopes both cover it.
+
+#### Step 2: Check locations, then re-anchor against unmerged branches
+
+First check every finding's locations mechanically, whatever its classification:
+
+```bash
+python3 <plugin_root>/scripts/check_locations.py <project> --findings <run_dir>/findings.json --commit <reviewed sha>
+```
+
+It reports each `path:line` range that runs past the end of its file, names a missing path (with
+the one file that matches, when there is one), or is prose where a location belongs. Correct or
+drop each one: a spot check finds only what it samples.
+
+Then, for every FIX finding, check each unmerged branch that touches its files
 (`git diff --stat <default>...<branch> -- <file>`): `fixed`, `partially-fixed`, `unchanged`,
 `moved`, or `worse`. Re-run the finding's reproducer against an export of each branch that claims a
 fix (and of the default branch as the control). Record `branch_status` per finding. A finding
 already fixed on a branch is reported as "fixed on `<branch>`, not merged", not as live.
+`annotate_findings.py` (see git-history-analyzer) lists, per finding, which branches change its
+enclosing function.
 
 #### Step 3: Reproduce
 
 Promote what you can from `confirmed` to `reproduced`, following `<plugin_root>/docs/reproduction-convention.md`
 (minimal, deterministic reproducers with a shared harness; races forced with Events, never timed).
 A reproducer that fails to show the defect makes the finding `refuted` (or narrows it): keep it in
-the report with the evidence.
+the report with the evidence. Scratch goes under `<run_dir>/tmp/`, and the harness sets `TMPDIR`
+(the convention's *Where scratch lives*). Above a few dozen findings, reproduce in slices: see
+*Phase 3 pipeline* below.
 
 Try the CONSIDER and POLICY findings too, not only FIX. Look for the concrete behavioural
 consequence of each one: a docs claim run as written, a design choice driven to the input that
 breaks it. A reproduction regularly shows that a judgment call is a defect, and promotes it to FIX.
 When none exists, record that, with the structural evidence.
+
+#### Phase 3 pipeline (large runs)
+
+A run with hundreds of findings reproduces them in slices and folds the results back with these
+scripts, not with ones written for the run:
+
+1. **Freeze the input.** Copy `findings.json` to `findings.pre-repro.json`. Every later step
+   rebuilds from it, so a changed decision is a re-run, not a hand edit.
+2. **Slice** the findings by theme or file area (10–20 each) and write the assignment to
+   `<run_dir>/repro/slices.json`: `{"S01": ["F-001", "F-002"], ...}`.
+3. **Dispatch one reproduction agent per slice.** Tell each its ids, the shared harness,
+   `<plugin_root>/docs/reproduction-convention.md`, and its fragment path
+   `<run_dir>/repro/slice-<NAME>.json` (the convention's *Many slices* section gives the format).
+   It writes its reproducers and that one file, nothing else.
+   **The harness caps concurrent subagents** (20 in one measured session), so queue the slices:
+   launch up to the cap minus one (keep a slot for your own checks), then launch the next slice
+   each time one completes. Record each launch and completion in `<run_dir>/repro/PLAN.md`, so a
+   resumed session knows where the queue stands. Where a workflow tool is available, a loop over
+   the slices with bounded concurrency does the same.
+4. **Merge and check** after each wave, and at the end:
+
+   ```bash
+   python3 <plugin_root>/scripts/merge_fragments.py <run_dir>/findings.pre-repro.json <run_dir>/repro \
+       --assignments <run_dir>/repro/slices.json --root <run_dir>
+   ```
+
+   It reports coverage (slices not yet written are pending, not gaps), verdict counts, proposed
+   reclassifications and problems: an id covered twice or not at all, `reproduced` without a
+   reproducer or with `main` other than `BUG`, a missing file. Fix problems in the fragments, or
+   re-dispatch the slice; never in `findings.json`.
+5. **Verify** a sample yourself: re-run reproducers from a fresh export and compare the verdict
+   lines, and re-check every refutation.
+6. **Decide and apply.** Put rejected proposals and your own overrides in
+   `<run_dir>/repro/decisions.json` (format in the script's `--help`), then:
+
+   ```bash
+   python3 <plugin_root>/scripts/apply_verdicts.py <run_dir>/findings.pre-repro.json <run_dir>/repro \
+       --decisions <run_dir>/repro/decisions.json --root <run_dir> --out <run_dir>/findings.json
+   ```
+
+   It writes nothing while the merge has problems, keeps every changed field's original under
+   `pre_repro`, and prints the class and status mix the summary needs. Run `check_locations.py`
+   again afterwards: corrections change locations.
+7. **Public tree**, only for results that will be published, after `security-gate` and the
+   maintainers' go-ahead:
+
+   ```bash
+   python3 <plugin_root>/scripts/leak_scan.py sensitive <run_dir>/findings.json
+   python3 <plugin_root>/scripts/build_public_tree.py <run_dir>/findings.json --out <new dir> \
+       --prefix <PUBLIC> --commit <reviewed sha> --idmap-out <run_dir>/public-idmap.json \
+       --terms-file <run_dir>/private-terms.txt --id-prefix <each agent prefix from brief.md>
+   ```
+
+   The first fails when a publishable finding mentions the id of a `publication_sensitive` one. The
+   second withholds sensitive findings, security claims, candidates and refuted findings, rewrites
+   internal ids in every spelling (`F-012a`, `test_f_012`), and writes nothing while any text
+   mentions a withheld finding or the leak scan hits. `private-terms.txt` lists private names and
+   paths, one per line. On a rebuild, pass the previous map as `--idmap` so published ids never
+   change. Scan anything you add by hand (a harness, notes) with
+   `leak_scan.py scan <dir> --terms-file ... --id-prefix ... --public-prefix <PUBLIC>`.
+8. **Clean up**: delete `<run_dir>/tmp/`, and any test databases left by killed teardowns.
 
 #### Deduplication and Conflict Resolution
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The security-claims gate: blind the claims, then check the skeptic's verdicts and sign off.
 
-Two subcommands, one on each side of the `security-claims-skeptic` agent:
+Two subcommands sit on each side of the `security-claims-skeptic` agent, and
+two more check their inputs and outputs:
 
 ``blind`` -- select the findings that make a security claim and strip what
 would anchor the skeptic on the finder's opinion: severity, classification,
@@ -9,8 +10,9 @@ would anchor the skeptic on the finder's opinion: severity, classification,
 locations, the evidence, and the claim itself (``security_claim: {attacker,
 preconditions, gain}``), which the skeptic must check rather than accept. With
 ``--threat-model``, each claim also gets the project's precedents whose wording
-overlaps it most (``precedent_hints``): the cheapest way to catch a claim that
-repeats an audit finding the project already published or accepted.
+overlaps it most (``precedent_hints``, at most two, ranked by distinctive words
+and shared mechanism class): the cheapest way to catch a claim that repeats an
+audit finding the project already published or accepted.
 
 ``signoff`` -- validate the verdicts against the threat model and print the
 machine-readable line, the first line of `SECURITY-GATE.md`:
@@ -42,8 +44,17 @@ Verdict records (the skeptic's output, a JSON list):
 duplicates, severities above the reference ceiling. Agreement with the people
 who own the threat model is the calibration number that matters.
 
+``lint`` -- publication hygiene of a consolidated findings.json, run before
+anything leaves the run directory. Problems: a maintainer-facing prose field
+(title, mechanism, failure_scenario, introduced_by) that names a review agent,
+carries a ``||`` merge separator, or cites an id that is not a finding in the
+file (an agent's own id, an earlier run's label); and a finding without
+``publication_sensitive`` that mentions the id of one with it (``sensitive-ref``).
+Exits 1 on any problem. ``--allow A,B`` accepts id-like tokens that are not ids.
+
 Usage:
     python security_gate.py blind FINDINGS.json [--threat-model TM.json] [--all]
+    python security_gate.py lint FINDINGS.json [--allow TOKEN,TOKEN]
     python security_gate.py score --verdicts V.json --expected EXPECTED.json
     python security_gate.py signoff --threat-model TM.json --verdicts V.json
         [--claims CLAIMS.json] [--max-disclosure N] [--override REASON]
@@ -56,6 +67,7 @@ vulnerability or hardening; ``--all`` takes every finding.
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -197,33 +209,121 @@ def _words(text: str) -> set[str]:
     return {_stem(w) for w in _WORD_RE.findall(text.lower()) if w not in _STOP}
 
 
-def precedent_hints(
-    finding: dict, precedents: list[dict], limit: int = 3
-) -> list[dict]:
-    """Precedents whose title shares the most words with the claim (Jaccard-like)."""
-    text = " ".join(
+# Mechanism classes: the vulnerability mechanism a title names, whatever the
+# wording ("decompression bomb" and "denial of service" are one class). A shared
+# class weighs more than a shared noun: two claims about tokens share a domain,
+# two claims about a replay share a mechanism.
+MECHANISM_CLASSES = {
+    "denial-of-service": ("denial", "dos", "bomb", "exhaust", "redos", "unbounded"),
+    "race": ("race", "toctou", "concurren"),
+    "authorization": ("authoriz", "permission", "privileg", "escalat", "idor", "acl"),
+    "authentication": ("authent", "mfa", "totp", "2fa"),
+    "injection": ("inject", "xss", "escap", "unescap", "sanitiz", "shell"),
+    "disclosure": ("leak", "disclos", "expos", "reveal", "enumerat"),
+    "replay": ("replay", "nonce"),
+    "bypass": ("bypass", "circumvent", "evad"),
+    "rate-limit": ("rate", "throttl", "brute"),
+    "signature": ("signatur", "hmac", "verif"),
+    "redirect": ("redirect", "ssrf"),
+    "audit-trail": ("audit",),
+    "parser-mismatch": ("parser", "confus", "mismatch", "normaliz"),
+    "weak-crypto": ("hash", "sha1", "md5", "weak"),
+}
+# A hint must carry this much of the precedent title's (weighted) wording.
+HINT_MIN_SCORE = 0.4
+# Hints scoring below this fraction of the best one for the same claim are noise.
+HINT_RELATIVE_CUTOFF = 0.6
+HINT_LIMIT = 2
+
+
+def _mechanisms(words: set[str]) -> set[str]:
+    return {
+        name
+        for name, stems in MECHANISM_CLASSES.items()
+        if any(w.startswith(stems) for w in words)
+    }
+
+
+def _claim_text(finding: dict) -> str:
+    return " ".join(
         str(finding.get(k) or "") for k in ("title", "mechanism", "failure_scenario")
     )
+
+
+def _terms(text: str) -> set[str]:
+    """Words of *text* plus a ``~class`` term for each mechanism class it names."""
     words = _words(text)
+    return words | {f"~{m}" for m in _mechanisms(words)}
+
+
+def term_weights(documents: list[str]) -> dict[str, float]:
+    """Inverse document frequency over *documents* (precedent titles and claims).
+
+    A word in half the documents ("token", "account" in a web application's
+    audit) tells two texts apart far less than a word in two of them.
+    """
+    df: dict[str, int] = {}
+    for doc in documents:
+        for term in _terms(doc):
+            df[term] = df.get(term, 0) + 1
+    n = len(documents)
+    return {t: math.log((n + 1) / (c + 1)) + 0.1 for t, c in df.items()}
+
+
+def precedent_hints(
+    finding: dict,
+    precedents: list[dict],
+    limit: int = HINT_LIMIT,
+    *,
+    weights: dict[str, float] | None = None,
+) -> list[dict]:
+    """Precedents whose title shares the most distinctive wording with the claim.
+
+    Each shared word counts by its rarity (``weights``, IDF over the precedent
+    titles and claims), and a shared mechanism class counts double. A hint needs
+    two shared words, a score of at least ``HINT_MIN_SCORE`` (the weighted
+    fraction of the precedent title covered), and a score within
+    ``HINT_RELATIVE_CUTOFF`` of the claim's best hint; at most *limit* are kept.
+    """
+    if weights is None:
+        weights = term_weights(
+            [p.get("title", "") for p in precedents] + [_claim_text(finding)]
+        )
+    default = max(weights.values(), default=1.0)
+
+    def weight(term: str) -> float:
+        w = weights.get(term, default)
+        return 2 * w if term.startswith("~") else w
+
+    words = _terms(_claim_text(finding))
     scored = []
     for p in precedents:
-        pw = _words(p.get("title", ""))
+        pw = _terms(p.get("title", ""))
         if not pw or not words:
             continue
         shared = pw & words
-        score = len(shared) / len(pw)
-        if len(shared) >= 2 and score >= 0.33:  # two of a six-word title
-            scored.append((score, p, sorted(shared)))
+        plain = sorted(t for t in shared if not t.startswith("~"))
+        if len(plain) < 2:
+            continue
+        score = sum(weight(t) for t in shared) / sum(weight(t) for t in pw)
+        if score >= HINT_MIN_SCORE:
+            mechanisms = sorted(t[1:] for t in shared if t.startswith("~"))
+            scored.append((score, p, plain, mechanisms))
     scored.sort(key=lambda t: -t[0])
+    if scored:
+        best = scored[0][0]
+        scored = [t for t in scored if t[0] >= HINT_RELATIVE_CUTOFF * best]
     return [
         {
             "id": p.get("id"),
             "title": p.get("title"),
             "severity": p.get("severity"),
             "status": p.get("status") or p.get("state"),
-            "shared_words": shared,
+            "score": round(score, 2),
+            "shared_words": plain,
+            "shared_mechanisms": mechanisms,
         }
-        for _, p, shared in scored[:limit]
+        for score, p, plain, mechanisms in scored[:limit]
     ]
 
 
@@ -234,6 +334,14 @@ def blind(
     take_all: bool = False,
 ) -> list[dict]:
     out = []
+    weights = (
+        term_weights(
+            [p.get("title", "") for p in precedents]
+            + [_claim_text(f) for f in findings]
+        )
+        if precedents
+        else None
+    )
     for f in findings:
         if not take_all and not makes_claim(f):
             continue
@@ -244,7 +352,7 @@ def blind(
             "security_claim", {"attacker": "", "preconditions": "", "gain": ""}
         )
         if precedents:
-            record["precedent_hints"] = precedent_hints(f, precedents)
+            record["precedent_hints"] = precedent_hints(f, precedents, weights=weights)
         out.append(record)
     return out
 
@@ -438,13 +546,136 @@ def score(verdicts: list[dict], expected: dict[str, dict]) -> dict:
     }
 
 
+# --------------------------------------------------------------------------- lint
+
+# An id-like token: `SF-1`, `R2-004`, `CRT-0001`, `PCC-3a`, `TI1`. Not inside a
+# path or URL, and not the first group of a longer id (`CVE-2024-1234`).
+ID_TOKEN_RE = re.compile(
+    r"(?<![\w/.#-])([A-Z][A-Z0-9]{0,5}-\d{1,4}[a-z]?|[A-Z]{2,5}\d{1,2}[a-z]?)(?![\w-])"
+)
+# Prefixes of public identifiers and technical terms that look like ids.
+_NOT_ID_PREFIXES = frozenset(
+    {
+        "AES", "ASCII", "CP", "CVE", "CWE", "EC", "ES", "GHSA", "HS", "HTTP",
+        "IPV", "ISO", "LATIN", "MD", "OAUTH", "PEP", "PS", "PY", "RFC", "RS",
+        "RSA", "SHA", "SSL", "TLS", "UTF", "WIN", "WCAG", "X", "BASE", "INT",
+        "UINT", "ZIP",
+    }
+)  # fmt: skip
+# Bit widths: `ZIP64`, `INT32`, `BASE64` are formats, not finding ids.
+_BIT_WIDTHS = frozenset({"8", "16", "32", "64"})
+# Fields a maintainer reads. Attribution belongs in `agents` / `source_refs`.
+PROSE_FIELDS = ("title", "mechanism", "failure_scenario", "introduced_by")
+_AGENTS_DIR = Path(__file__).resolve().parent.parent / "agents"
+
+
+def id_tokens(text: str) -> list[str]:
+    """Id-like tokens in *text*, minus standards and technical terms (`UTF-8`, `SHA1`)."""
+    out = []
+    for token in ID_TOKEN_RE.findall(text):
+        prefix = token.split("-", 1)[0] if "-" in token else token
+        digits = re.sub(r"^\D+|[a-z]$", "", prefix)
+        prefix = re.sub(r"\d+[a-z]?$", "", prefix)
+        if prefix in _NOT_ID_PREFIXES or ("-" not in token and digits in _BIT_WIDTHS):
+            continue
+        out.append(token)
+    return out
+
+
+def _strings(value) -> list[str]:
+    """Every string inside a JSON value."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for v in value.values() for s in _strings(v)]
+    if isinstance(value, list):
+        return [s for v in value for s in _strings(v)]
+    return []
+
+
+def _id_pattern(fid: str) -> re.Pattern:
+    # A suffixed id (`X-001a`) is the same finding; `X-0010` is not.
+    return re.compile(r"(?<![A-Za-z0-9_])" + re.escape(fid) + r"[a-z]?(?![A-Za-z0-9_])")
+
+
+def lint(
+    findings: list[dict],
+    *,
+    agent_names: list[str] | None = None,
+    allow: set[str] | frozenset[str] = frozenset(),
+) -> dict:
+    """Publication hygiene of a consolidated findings.json.
+
+    - ``agent-name``, ``merge-separator``, ``internal-id``: a prose field
+      (``PROSE_FIELDS``) names a review agent, carries a ``||`` merge
+      separator, or cites an id that is not a finding in this file (an agent's
+      own finding id, an earlier run's label). Prose is for the maintainer;
+      attribution goes in ``agents`` / ``source_refs``.
+    - ``sensitive-ref``: a finding without ``publication_sensitive`` mentions,
+      in any field, the id of one that has it. Publishing the first would
+      reveal that the second exists.
+    """
+    if agent_names is None:
+        agent_names = sorted(p.stem for p in _AGENTS_DIR.glob("*.md"))
+    agent_res = [
+        (
+            name,
+            re.compile(r"(?<![\w-])" + re.escape(name) + r"(?![\w-])", re.IGNORECASE),
+        )
+        for name in agent_names
+    ]
+    ids = {str(f.get("id")) for f in findings if f.get("id")}
+    sensitive = {
+        str(f["id"]): _id_pattern(str(f["id"]))
+        for f in findings
+        if f.get("id") and f.get("publication_sensitive")
+    }
+    problems: list[dict] = []
+
+    def add(fid, field, kind, detail):
+        problems.append({"id": fid, "field": field, "kind": kind, "detail": detail})
+
+    for f in findings:
+        fid = str(f.get("id", "?"))
+        for field in PROSE_FIELDS:
+            for text in _strings(f.get(field)):
+                if "||" in text:
+                    add(fid, field, "merge-separator", "`||` in maintainer-facing text")
+                for name, rx in agent_res:
+                    if rx.search(text):
+                        add(fid, field, "agent-name", name)
+                for token in id_tokens(text):
+                    base = re.sub(r"(?<=\d)[a-z]$", "", token)
+                    if token not in ids and base not in ids and token not in allow:
+                        add(fid, field, "internal-id", token)
+        if f.get("publication_sensitive"):
+            continue
+        for field, value in f.items():
+            if field == "id":
+                continue
+            for text in _strings(value):
+                for sid, rx in sensitive.items():
+                    if rx.search(text):
+                        add(fid, field, "sensitive-ref", sid)
+    counts: dict[str, int] = {}
+    for p in problems:
+        counts[p["kind"]] = counts.get(p["kind"], 0) + 1
+    return {
+        "findings_total": len(findings),
+        "sensitive_total": len(sensitive),
+        "problems": problems,
+        "counts": counts,
+        "clean": not problems,
+    }
+
+
 def main(argv: list[str] | None = None) -> None:
     argv = sys.argv[1:] if argv is None else argv
     exit_on_help(argv, __doc__)
-    if not argv or argv[0] not in {"blind", "signoff", "score"}:
+    if not argv or argv[0] not in {"blind", "signoff", "score", "lint"}:
         emit(
             {
-                "error": "first argument must be `blind`, `signoff` or `score` (see --help)"
+                "error": "first argument must be `blind`, `signoff`, `score` or `lint` (see --help)"
             }
         )
         sys.exit(2)
@@ -481,6 +712,14 @@ def main(argv: list[str] | None = None) -> None:
                 }
             )
             return
+        if cmd == "lint":
+            if not positional:
+                emit({"error": "lint needs a findings.json path"})
+                sys.exit(2)
+            allow = {t for t in opts.get("--allow", "").split(",") if t}
+            result = lint(_findings(_load(positional[0])), allow=allow)
+            emit(result)
+            sys.exit(0 if result["clean"] else 1)
         if cmd == "score":
             if "--verdicts" not in opts or "--expected" not in opts:
                 emit({"error": "score needs --verdicts and --expected"})

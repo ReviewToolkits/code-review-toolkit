@@ -35,17 +35,21 @@ as an empty result. "No advisories" and "could not ask" are different facts.
 
 Usage:
     python find_threat_model.py [scope] [--repo OWNER/REPO] [--no-network]
-        [--advisories-json PATH] [--issues-json PATH] [--format json|md]
-        [--max-files N]
+        [--advisories-json PATH] [--issues-json PATH] [--audit-doc PATH ...]
+        [--format json|md] [--max-files N]
 
 `--advisories-json` / `--issues-json` read a saved `gh api` response instead of
-querying (offline runs and tests). `--repo` defaults to the `origin` remote
+querying (offline runs and tests). `--audit-doc` (repeatable) adds an audit
+report saved outside the tree -- an HTML page from the firm or a funder, or a
+Markdown/RST file holding the finding table copied out of a PDF; its rows become
+precedents with the file path as their `source`. `--repo` defaults to the `origin` remote
 when it is a GitHub URL.
 """
 
 from __future__ import annotations
 
 import html
+import itertools
 import json
 import re
 import subprocess
@@ -244,8 +248,10 @@ def _is_html(path: Path) -> bool:
 
 
 def _html_to_text(text: str) -> str:
-    """Crude HTML -> Markdown-ish text: headings become `#` lines, tags dropped."""
+    """Crude HTML -> Markdown-ish text: headings become `#` lines, tables pipe
+    tables, other tags dropped."""
     text = re.sub(r"(?is)<(script|style)\b.*?</\1>", "", text)
+    text = _html_tables_to_pipe(text)
     text = re.sub(r"(?is)\{#.*?#\}", "", text)
     text = re.sub(
         r"(?is)<h([1-6])\b[^>]*>(.*?)</h\1>",
@@ -337,16 +343,171 @@ def _bullets(body: list[str], limit: int = 25) -> list[str]:
 
 # --------------------------------------------------------------------------- tables
 
+# Audit reports publish their finding tables in whatever markup the site uses.
+# Each converter below rewrites one kind as a pipe table, which the one parser
+# (`parse_finding_tables`) then reads.
+
+_HTML_TABLE_RE = re.compile(r"(?is)<table\b[^>]*>(.*?)</table>")
+_HTML_ROW_RE = re.compile(r"(?is)<tr\b[^>]*>(.*?)</tr>")
+_HTML_CELL_RE = re.compile(r"(?is)<t([hd])\b[^>]*>(.*?)</t\1>")
+_HTML_LINK_RE = re.compile(r"(?is)<a\b[^>]*\bhref=[\"']([^\"']*)[\"'][^>]*>(.*?)</a>")
+_GRID_BORDER_RE = re.compile(r"^\s*\+(?:[-=]+\+)+\s*$")
+_SIMPLE_BORDER_RE = re.compile(r"^\s*=+(?:\s+=+)+\s*$")
+
+
+def _pipe_row(cells: list[str]) -> str:
+    return "| " + " | ".join(c.replace("|", "/") for c in cells) + " |"
+
+
+def _pipe_table(header: list[str], rows: list[list[str]]) -> list[str]:
+    return [
+        _pipe_row(header),
+        "|" + "---|" * len(header),
+        *(_pipe_row(r) for r in rows),
+        "",
+    ]
+
+
+def _html_tables_to_pipe(text: str) -> str:
+    """Rewrite every HTML ``<table>`` as a pipe table; links become Markdown links."""
+
+    def cell_text(raw: str) -> str:
+        raw = _HTML_LINK_RE.sub(lambda m: f"[{m.group(2)}]({m.group(1)})", raw)
+        return " ".join(html.unescape(_TAG_RE.sub(" ", raw)).split())
+
+    def convert(match: re.Match) -> str:
+        rows = [
+            [cell_text(c.group(2)) for c in _HTML_CELL_RE.finditer(row.group(1))]
+            for row in _HTML_ROW_RE.finditer(match.group(1))
+        ]
+        rows = [r for r in rows if r]
+        if len(rows) < 2:
+            return match.group(0)
+        return "\n" + "\n".join(_pipe_table(rows[0], rows[1:])) + "\n"
+
+    return _HTML_TABLE_RE.sub(convert, text)
+
+
+def _grid_table(lines: list[str]) -> list[str]:
+    """An RST grid table (``+---+`` borders) as pipe-table lines."""
+    border = lines[0]
+    cuts = [i for i, ch in enumerate(border) if ch == "+"]
+    header: list[str] | None = None
+    rows: list[list[str]] = []
+    current: list[list[str]] = []
+    for line in lines[1:]:
+        if _GRID_BORDER_RE.match(line):
+            if current:
+                rows.append([" ".join(" ".join(parts).split()) for parts in current])
+            current = []
+            if "=" in line and header is None and rows:
+                header = rows.pop()
+            continue
+        cells = [line[a + 1 : b] for a, b in itertools.pairwise(cuts)]
+        if not current:
+            current = [[] for _ in cells]
+        for parts, cell in zip(current, cells):
+            parts.append(cell.strip().strip("|").strip())
+    if header is None and rows:
+        header = rows.pop(0)
+    return _pipe_table(header, rows) if header and rows else []
+
+
+def _simple_table(lines: list[str]) -> list[str]:
+    """An RST simple table (``=====  =====`` borders) as pipe-table lines."""
+    spans = [m.span() for m in re.finditer(r"=+", lines[0])]
+    starts = [a for a, _ in spans]
+
+    def split(line: str) -> list[str]:
+        bounds = [*starts[1:], None]
+        return [line[a:b].strip() for a, b in zip(starts, bounds)]
+
+    borders = [i for i, line in enumerate(lines) if _SIMPLE_BORDER_RE.match(line)]
+    body_from = borders[1] + 1 if len(borders) >= 3 else 1
+    header_lines = lines[1 : borders[1]] if len(borders) >= 3 else []
+    rows: list[list[str]] = []
+    for line in lines[body_from:]:
+        if _SIMPLE_BORDER_RE.match(line) or not line.strip():
+            continue
+        cells = split(line)
+        if rows and not cells[0]:  # continuation of the previous row
+            rows[-1] = [" ".join(x for x in pair if x) for pair in zip(rows[-1], cells)]
+        else:
+            rows.append(cells)
+    header = split(header_lines[0]) if header_lines else (rows.pop(0) if rows else [])
+    return _pipe_table(header, rows) if header and rows else []
+
+
+def _list_table(lines: list[str]) -> list[str]:
+    """An RST ``.. list-table::`` directive as pipe-table lines."""
+    rows: list[list[str]] = []
+    for line in lines[1:]:
+        m = re.match(r"^\s*\*\s+-\s*(.*)$", line)
+        if m:
+            rows.append([m.group(1).strip()])
+            continue
+        m = re.match(r"^\s*-\s*(.*)$", line)
+        if m and rows:
+            rows[-1].append(m.group(1).strip())
+        elif line.strip() and rows and not line.lstrip().startswith(":"):
+            rows[-1][-1] = (rows[-1][-1] + " " + line.strip()).strip()
+    return _pipe_table(rows[0], rows[1:]) if len(rows) >= 2 else []
+
+
+def _rst_tables_to_pipe(text: str) -> str:
+    """Rewrite RST grid, simple and list tables as pipe tables."""
+    lines = text.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if _GRID_BORDER_RE.match(line):
+            j = i + 1
+            while j < len(lines) and lines[j].lstrip().startswith(("+", "|")):
+                j += 1
+            converted = _grid_table(lines[i:j])
+            out += converted or lines[i:j]
+            i = j
+            continue
+        if _SIMPLE_BORDER_RE.match(line):
+            # Header border, header, border, rows, closing border; or no header.
+            borders, j = 1, i + 1
+            while j < len(lines):
+                if _SIMPLE_BORDER_RE.match(lines[j]):
+                    borders += 1
+                    nxt = lines[j + 1] if j + 1 < len(lines) else ""
+                    if borders >= 2 and (not nxt.strip() or borders == 3):
+                        j += 1
+                        break
+                j += 1
+            converted = _simple_table(lines[i:j])
+            out += converted or lines[i:j]
+            i = j
+            continue
+        if re.match(r"^\s*\.\.\s+list-table::", line):
+            j = i + 1
+            while j < len(lines) and (not lines[j].strip() or lines[j][:1].isspace()):
+                j += 1
+            converted = _list_table(lines[i:j])
+            out += converted or lines[i:j]
+            i = j
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
 
 def parse_finding_tables(text: str) -> list[dict]:
-    """Rows of every pipe table whose header has a severity-like column.
+    """Rows of every finding table whose header has a severity-like column.
 
-    Each row becomes ``{id, title, severity, difficulty, status, fix_refs}``
-    with Markdown links stripped; ``fix_refs`` keeps their targets (the PR that
-    remediated a finding is often only a link in the status cell).
+    Pipe tables are read directly; HTML tables and RST grid, simple and list
+    tables are rewritten as pipe tables first. Each row becomes ``{id, title,
+    severity, difficulty, status, fix_refs}`` with Markdown links stripped;
+    ``fix_refs`` keeps their targets (the PR that remediated a finding is often
+    only a link in the status cell).
     """
     rows: list[dict] = []
-    lines = text.splitlines()
+    lines = _rst_tables_to_pipe(_html_tables_to_pipe(text)).splitlines()
     i = 0
     while i < len(lines) - 1:
         header, sep = lines[i], lines[i + 1]
@@ -459,6 +620,36 @@ def find_policy(root: Path, docs: list[Path]) -> list[dict]:
     return out
 
 
+def _audit_record(path: Path, source: str, raw: str, text: str, title: str) -> dict:
+    """One audit document: its finding table rows become precedents."""
+    firms = sorted({f for f in AUDIT_FIRMS if f.lower() in text.lower()})
+    links = sorted({u.rstrip(".,;") for u in AUDIT_LINK_RE.findall(raw)})
+    precedents = [
+        {
+            "id": r.get("id") or "",
+            "title": r.get("title") or "",
+            "severity": r["severity"],
+            "difficulty": r.get("difficulty"),
+            "status": _norm_status(r.get("status", "")),
+            "status_raw": r.get("status"),
+            "fix_refs": [u for u in r["fix_refs"] if u.startswith("http")],
+            "source": source,
+        }
+        for r in parse_finding_tables(text)
+    ]
+    return {
+        "path": source,
+        "title": title,
+        "firms": firms,
+        "report_links": links[:10],
+        "findings": precedents,
+        "severity_counts": _count(p["severity"] for p in precedents),
+        "accepted": [
+            p["id"] or p["title"] for p in precedents if p["status"] == "accepted"
+        ],
+    }
+
+
 def find_audits(root: Path, docs: list[Path]) -> tuple[list[dict], list[dict]]:
     """Audit reports (with their finding tables) and incident reports."""
     audits, incidents = [], []
@@ -469,42 +660,35 @@ def find_audits(root: Path, docs: list[Path]) -> tuple[list[dict], list[dict]]:
         text = _html_to_text(raw) if _is_html(path) else raw
         title = _title_of(text, path)
         head = title + " " + path.stem.replace("-", " ").replace("_", " ")
-        firms = sorted({f for f in AUDIT_FIRMS if f.lower() in text.lower()})
-        links = sorted({u.rstrip(".,;") for u in AUDIT_LINK_RE.findall(raw)})
-        rows = parse_finding_tables(text)
+        record = _audit_record(path, relative_to_root(path, root), raw, text, title)
         mentions_audit = bool(AUDIT_RE.search(text)) or "audit" in head.lower()
-        if mentions_audit and (rows or firms or links):
-            precedents = [
-                {
-                    "id": r.get("id") or "",
-                    "title": r.get("title") or "",
-                    "severity": r["severity"],
-                    "difficulty": r.get("difficulty"),
-                    "status": _norm_status(r.get("status", "")),
-                    "status_raw": r.get("status"),
-                    "fix_refs": [u for u in r["fix_refs"] if u.startswith("http")],
-                    "source": relative_to_root(path, root),
-                }
-                for r in rows
-            ]
-            audits.append(
-                {
-                    "path": relative_to_root(path, root),
-                    "title": title,
-                    "firms": firms,
-                    "report_links": links[:10],
-                    "findings": precedents,
-                    "severity_counts": _count(p["severity"] for p in precedents),
-                    "accepted": [
-                        p["id"] or p["title"]
-                        for p in precedents
-                        if p["status"] == "accepted"
-                    ],
-                }
-            )
+        if mentions_audit and (
+            record["findings"] or record["firms"] or record["report_links"]
+        ):
+            audits.append(record)
         elif INCIDENT_RE.search(head):
             incidents.append({"path": relative_to_root(path, root), "title": title})
     return audits, incidents
+
+
+def read_external_audits(paths: list[str]) -> tuple[list[dict], list[str]]:
+    """Audit reports saved outside the tree (a firm's or funder's page, a table
+    copied out of a PDF): every given file is taken as an audit."""
+    audits, errors = [], []
+    for name in paths:
+        path = Path(name).expanduser()
+        raw = _read(path)
+        if not raw:
+            errors.append(f"audit document not readable: {name}")
+            continue
+        text = _html_to_text(raw) if _is_html(path) else raw
+        record = _audit_record(path, str(path), raw, text, _title_of(text, path))
+        if not record["findings"]:
+            errors.append(
+                f"audit document {name}: no finding table with a severity column"
+            )
+        audits.append(record)
+    return audits, errors
 
 
 def find_engagement_rules(root: Path, docs: list[Path], limit: int = 20) -> list[dict]:
@@ -676,6 +860,7 @@ def analyze(
     network: bool = True,
     advisories_path: str | None = None,
     issues_path: str | None = None,
+    audit_docs: list[str] | None = None,
 ) -> dict:
     _, project_root, scan_root = resolve_target(target)
     all_docs = list(_iter_docs(scan_root))
@@ -684,6 +869,9 @@ def analyze(
 
     policy = find_policy(project_root, docs)
     audits, incidents = find_audits(project_root, docs)
+    external, external_errors = read_external_audits(audit_docs or [])
+    audits += external
+    errors += external_errors
     references = find_references(project_root, docs)
     engagement = find_engagement_rules(project_root, docs)
     commits = find_security_commits(project_root)
@@ -908,6 +1096,7 @@ def main(argv: list[str] | None = None) -> None:
         "network": True,
         "advisories_path": None,
         "issues_path": None,
+        "audit_docs": [],
     }
     fmt, max_files, positional = "json", 0, []
     valued = {
@@ -918,7 +1107,10 @@ def main(argv: list[str] | None = None) -> None:
     i = 0
     while i < len(argv):
         arg = argv[i]
-        if arg in valued and i + 1 < len(argv):
+        if arg == "--audit-doc" and i + 1 < len(argv):
+            opts["audit_docs"].append(argv[i + 1])
+            i += 2
+        elif arg in valued and i + 1 < len(argv):
             opts[valued[arg]] = argv[i + 1]
             i += 2
         elif arg == "--format" and i + 1 < len(argv):

@@ -25,6 +25,14 @@ python3 <plugin_root>/scripts/extract_test_invariants.py [scope] --with-git
 
 where `<plugin_root>` is the root of the code-review-toolkit plugin directory.
 
+- **An export has no `.git`.** If `[scope]` is an exported copy, add `--git-dir <checkout>` (the checkout directory
+  that matches the export's project root). Without history, `bug_fix_scan.status` is `no_git_history` and the
+  bug-fix counts are `null`: say "bug-fix tests not measured", never "no bug-fix tests".
+- **Raise the caps on a large suite.** By default 30 tests are selected (`summary.max_tests`, `tests_capped`), the last
+  100 commits and 30 fix commits are read (`bug_fix_scan`), and 15 bug-fix entries are printed. Use `--max-tests N`,
+  `--since DATE` / `--max-commits N` / `--max-fix-commits N` / `--all`, and `--max-bug-fix-groups N`. When tests live
+  outside the scan root under an unusual name, pass `--tests DIR` (and `--source DIR`).
+
 Parse the JSON output. Key fields:
 
 - `invariants[]`: Selected test functions with extracted assertions, invariant types, tested function mapping, and pre-computed similar functions.
@@ -46,11 +54,13 @@ Parse the JSON output. Key fields:
   selected after the product fixes'. The list is capped (`bug_fix_tests_total` is the real count), but selection draws
   from all of them. Within each tier, tests are taken round-robin across files; concurrency, cancellation, rollback,
   lock and timeout tests come first in the error/boundary tier
-- `untested_similar_functions[]`: Functions similar to tested ones but with no tests
+- `untested_similar_functions[]`: Functions similar to tested ones but with no tests. One with `reached_indirectly`
+  (`via`: the tested function that calls it directly, such as a route handler over a service) runs under that test;
+  these are listed last, and the question is whether the test asserts anything about *its* behaviour
 - `similar_functions[]` (per invariant) and `untested_similar_functions[]` list only candidates with a name relation:
   the same name elsewhere (a sibling implementation, an override, or the same operation in another layer) or the
-  same leading words (two for a generic first word such as `get_`; one only with the same shape or a second shared
-  word). Parameter count and module only rank them. They stay within the tested function's top-level directory, skip
+  same leading words (two for a generic first word such as `get_`, `validate_` or `handle_`; one only with the same
+  shape or a second shared word). Parameter count and module only rank them. They stay within the tested function's top-level directory, skip
   private helpers of public functions, bare verbs (`_check` for `_check_spec_version`) and abstract declarations
   (`...`, `raise NotImplementedError`, `@abstractmethod`, `pass` in an ABC or Protocol)
 - `entry_point_siblings[]` (per invariant, and deduplicated at the top level with `sibling_of` and `tested`): other
@@ -58,7 +68,9 @@ Parse the JSON output. Key fields:
   (itself and the same-named functions it calls in deeper layers: route, service, store) calls some project helpers;
   a sibling calls at least two of them (`shared_calls`), or one rare one. `missing_guards` lists the checks the tested
   path makes (`validate_*`, `require_*`, a project predicate in an `if ...: raise`) that the sibling does not: the
-  first place to look for the invariant it fails to keep. Name-based similarity finds none of these
+  first place to look for the invariant it fails to keep. `guard_relation` ranks them: `disjoint` (the sibling
+  validates its input, but with none of the tested guards: the likeliest gap), `partial`, `unguarded` (no guard of its
+  own, often an internal helper), `keeps` (applies every tested guard). Name-based similarity finds none of these
 - `summary`: Aggregate statistics
 - `status`, `test_discovery`, `warnings`: where the tests came from. When the scope (e.g. `pkg/`) holds no tests, the script
   takes them from the project's pytest `testpaths` or a `tests/`/`test/` directory and says so in `warnings`
@@ -106,6 +118,23 @@ Find the producer (the constructor, parser or upstream function the real caller 
 through it. If it cannot produce the value, the test is out of range: rerun the scenario with an input the producer
 does generate (in an exported copy). A defect that appears only then is a FIX the test was hiding. A defect that
 appears only with the impossible input is ACCEPTABLE.
+
+**Tests that call a view directly skip the rules its decorators and the framework enforce.** A unit test that calls
+`my_view(request)` bypasses everything wrapped around the view at registration: decorators (`@login_required`,
+a re-authentication check, `@csrf_protect`, a rate limiter), view derivers or middleware options set on the registration
+(`require_csrf=True`, `require_methods=`, a duplicate-key check on form posts), permission and predicate arguments
+(`permission=`, `request_method=`, `accept=`). Those rules are invariants too, and the direct-call test never sees
+them. For each tested view:
+
+1. List its registration: the decorators on the function, the `@view_config(...)`/`@app.route(...)` arguments, and
+   the derivers or middleware the project applies to every view (find them where the app is configured; on a web
+   app `map_wiring.py`'s `routes.declared` gives each route's `permissions` and `methods`).
+2. Write each rule as an invariant the direct-call tests do not exercise: "POST to this view without a CSRF token is
+   rejected", "a form with a repeated key is rejected", "the view requires re-authentication".
+3. Check whether any test drives the view through the app (a functional test client) and so exercises the rule. If
+   none does, check the sibling views: a rule enforced by a decorator on most siblings and missing from one is a
+   FIX candidate; a rule enforced only by a deriver the direct-call test skipped is an untested invariant
+   (CONSIDER), not a violation.
 
 ### Phase 3: Source Mapping and Similar Function Discovery
 
@@ -234,6 +263,13 @@ exactly what invariants to check.]
 6. **Side-by-side evidence is essential.** Every FIX finding must show the test code, the tested code where the invariant holds, and the violating code. Without this evidence, the finding is not actionable.
 
 7. **Bug-fix tests deserve the most attention.** If the script identified bug-fix tests, analyze ALL of them before moving to other tiers. A test written to prevent a regression is the strongest possible signal about what can go wrong.
+
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.
 
 ## Running the script
 

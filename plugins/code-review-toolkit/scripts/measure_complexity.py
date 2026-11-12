@@ -16,13 +16,29 @@ It also reports `clones`: groups of near-identical statement windows
 
 Usage:
     python measure_complexity.py [path] [--max-files N] [--key-type SPEC]
-                                 [--no-clones]
+                                 [--no-clones] [--exclude PAT[,PAT]]
+                                 [--include-migrations] [--git-dir PATH]
 
 Options:
-    --max-files N     Analyze at most N files
-    --key-type SPEC   Tracker-key prefixes (or single keys) that mark a commit's
-                      type, as in analyze_history.py (e.g. B=fix)
-    --no-clones       Skip near-duplicate block detection
+    --max-files N         Analyze at most N files
+    --key-type SPEC       Tracker-key prefixes (or single keys) that mark a
+                          commit's type, as in analyze_history.py (e.g. B=fix)
+    --no-clones           Skip near-duplicate block detection
+    --exclude PAT[,PAT]   Leave out files whose project-relative path matches
+                          (repeatable; a plain pattern is a substring, a glob
+                          such as ``vendor/*`` matches at any depth). Excluded
+                          files are not counted; the envelope reports
+                          ``files_excluded`` and ``exclude_matches``.
+    --include-migrations  Keep schema-migration files (Alembic revisions and
+                          ``env.py``, Django migrations). Skipped by default and
+                          reported as ``migration_files_skipped``.
+    --git-dir PATH        Read history from this checkout (or its ``.git``)
+    --repo PATH           instead of the scanned tree -- for an export, which
+                          has no ``.git``. PATH must be the checkout directory
+                          that corresponds to the scanned project root: files
+                          are matched by their path relative to it. Without
+                          usable history every verdict is ``unknown`` and a
+                          warning is printed on stderr.
 """
 
 import ast
@@ -45,8 +61,11 @@ from analyze_history import (  # noqa: E402
     parse_unified_diff,
 )
 from scan_common import (  # noqa: E402
-    discover_python_files,
     find_project_root,
+    history_root_arg,
+    parse_scan_args,
+    select_python_files,
+    warn,
 )
 
 _SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
@@ -348,9 +367,56 @@ def _param_count(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
     return count
 
 
+# A flat accumulator or validator: many independent top-level blocks, none
+# carrying much of the load. "Validate field A; validate field B; ..." sums to
+# a high cognitive complexity, but a reader holds one block at a time, so it
+# ranked above genuinely tangled code on a validation project.
+_FLAT_MIN_BLOCKS = 6
+_FLAT_MAX_SHARE = 0.35
+# Nine copies of a five-deep loop nest are not flat, however evenly the load
+# spreads: deep nesting is what flatness is contrasted with.
+_FLAT_MAX_DEPTH = 4
+
+
+def flatness(func_node: ast.AST, nesting_depth: int) -> dict:
+    """How the function's cognitive load spreads over its top-level blocks.
+
+    Each top-level statement is scored on its own (cognitive complexity is
+    additive across siblings). Returns `top_level_blocks` (statements with a
+    non-zero score), `largest_block_cognitive`, `largest_block_share` (null
+    when nothing scores) and `flat`: at least _FLAT_MIN_BLOCKS scoring blocks,
+    no block above _FLAT_MAX_SHARE of the total, and `nesting_depth` at most
+    _FLAT_MAX_DEPTH.
+    """
+    scores = []
+    for stmt in getattr(func_node, "body", []):
+        visitor = _CognitiveVisitor()
+        visitor.visit(stmt)
+        scores.append(visitor.score)
+    total = sum(scores)
+    largest = max(scores, default=0)
+    share = round(largest / total, 2) if total else None
+    blocks = sum(1 for score in scores if score > 0)
+    return {
+        "top_level_blocks": blocks,
+        "largest_block_cognitive": largest,
+        "largest_block_share": share,
+        "flat": share is not None
+        and blocks >= _FLAT_MIN_BLOCKS
+        and share <= _FLAT_MAX_SHARE
+        and nesting_depth <= _FLAT_MAX_DEPTH,
+    }
+
+
 def _compute_score(metrics: dict) -> float:
-    """Compute an overall complexity score (1-10) from individual metrics."""
+    """Compute an overall complexity score (1-10) from individual metrics.
+
+    For a flat function (`metrics["flat"]`), the cognitive term reads the
+    largest top-level block instead of the sum, and the branch-count term is
+    dropped: both only counted the independent checks again.
+    """
     score = 1.0
+    flat = bool(metrics.get("flat"))
 
     # Line count contribution (>50 is notable, >100 is high, >200 is critical).
     lc = metrics["line_count"]
@@ -378,7 +444,7 @@ def _compute_score(metrics: dict) -> float:
         score += 1.0
 
     # Cognitive complexity (>15 is notable, >30 is high, >50 is critical).
-    cc = metrics["cognitive_complexity"]
+    cc = metrics["largest_block_cognitive"] if flat else metrics["cognitive_complexity"]
     if cc > 50:
         score += 3.0
     elif cc > 30:
@@ -387,7 +453,7 @@ def _compute_score(metrics: dict) -> float:
         score += 1.0
 
     # Branch count (>10 is notable).
-    if metrics["branch_count"] > 10:
+    if metrics["branch_count"] > 10 and not flat:
         score += 1.0
 
     # Local variables (>10 is notable).
@@ -518,6 +584,7 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
             "return_count": _count_returns(node),
             "local_variable_count": _count_local_variables(node),
             "cognitive_complexity": cognitive_v.score,
+            **flatness(node, nesting_v.max_depth),
         }
 
         segments = qualname.split(".")[:-1]
@@ -546,6 +613,9 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
             "decorator_count": len(node.decorator_list),
             "metrics": metrics,
             "score": round(_compute_score(metrics), 1),
+            # The score without the flat discount; equal to `score` unless
+            # `metrics.flat` is true.
+            "score_undiscounted": round(_compute_score({**metrics, "flat": False}), 1),
         }
 
     # Every function at any depth: module level, methods, nested classes, and
@@ -1279,45 +1349,37 @@ def find_clones(
 
 
 def main() -> None:
-    from scan_common import exit_on_help
-
-    exit_on_help(sys.argv[1:], __doc__)
-    max_files = 0  # 0 = no limit
-    positional: list[str] = []
-    argv = sys.argv[1:]
-    i = 0
+    args = parse_scan_args(
+        sys.argv[1:],
+        __doc__,
+        flags={"--no-clones", "--include-migrations"},
+        value_flags={"--key-type", "--git-dir", "--repo"},
+    )
+    max_files = args.max_files  # 0 = no limit
     key_types: dict[str, str] = {}
-    no_clones = False
-    while i < len(argv):
-        if argv[i] == "--max-files" and i + 1 < len(argv):
-            max_files = int(argv[i + 1])
-            i += 2
-        elif argv[i] == "--key-type" and i + 1 < len(argv):
-            # Same meaning as analyze_history's flag: tracker-key prefixes
-            # that mark a commit's type, e.g. B=fix.
-            try:
-                key_types.update(parse_key_types(argv[i + 1]))
-            except ValueError as exc:
-                print(f"Error: {exc}", file=sys.stderr)
-                sys.exit(2)
-            i += 2
-        elif argv[i] == "--no-clones":
-            no_clones = True
-            i += 1
-        elif argv[i].startswith("--"):
-            i += 1
-        else:
-            positional.append(argv[i])
-            i += 1
-    target = Path(positional[0]) if positional else Path(".")
-    target = target.resolve()
+    # Same meaning as analyze_history's flag: tracker-key prefixes that mark a
+    # commit's type, e.g. B=fix.
+    for spec in args.values.get("--key-type", []):
+        try:
+            key_types.update(parse_key_types(spec))
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(2)
+    no_clones = "--no-clones" in args.flags
+    target = Path(args.target).resolve()
 
     project_root = find_project_root(target)
     scan_root = target if target.is_dir() else project_root
-    all_files = sorted(discover_python_files(scan_root))
-    files_total = len(all_files)
-    if max_files > 0 and files_total > max_files:
-        all_files = all_files[:max_files]
+    selection = select_python_files(
+        scan_root,
+        project_root=project_root,
+        max_files=max_files,
+        exclude=args.exclude,
+        migrations="detect" if "--include-migrations" in args.flags else "skip",
+    )
+    all_files, files_total = selection.files, selection.files_total
+    git_dir = args.value("--git-dir") or args.value("--repo")
+    history_root, history_scan_root = history_root_arg(git_dir, project_root, scan_root)
 
     file_analyses = [analyze_file(f, project_root) for f in all_files]
     clone_inputs: list[tuple[str, ast.AST]] = []
@@ -1344,10 +1406,17 @@ def main() -> None:
     test_funcs = [f for f in all_functions if f["is_test"]]
 
     hotspots = [f for f in source_funcs if f["score"] >= 5.0]
-    history_meta = cross_with_history(hotspots[:30], project_root, key_types=key_types)
+    history_meta = cross_with_history(hotspots[:30], history_root, key_types=key_types)
     history_meta["top_fixed_functions"] = top_fixed_functions(
-        source_funcs, project_root, scan_root, key_types=key_types
+        source_funcs, history_root, history_scan_root, key_types=key_types
     )
+    history_meta["history_root"] = str(history_root)
+    if history_meta.get("history_available") is False:
+        warn(
+            f"no usable git history at {history_root}: every hotspot verdict is "
+            "`unknown`. For an export, pass --git-dir <checkout> to read the "
+            "history from the real repository."
+        )
 
     output = {
         "project_root": str(project_root),
@@ -1355,6 +1424,7 @@ def main() -> None:
         "files_total": files_total,
         "files_analyzed": len(all_files),
         "files_capped": max_files > 0 and files_total > max_files,
+        **selection.envelope_fields(),
         "summary": {
             "total_functions": len(all_functions),
             "source_functions": len(source_funcs),

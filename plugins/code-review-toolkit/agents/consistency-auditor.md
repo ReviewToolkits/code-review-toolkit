@@ -103,9 +103,85 @@ they *do*:
 - Does one validate, normalize or check permissions where its siblings do?
 - Does one clean up on the error path where its siblings do?
 
+Start with `diff_siblings.py`, which makes the comparison systematic instead of depending on
+which files you happen to read:
+
+```bash
+python3 <plugin_root>/scripts/diff_siblings.py [scope] [--min-group 4] [--min-share 0.75]
+```
+
+- `sibling_outliers`: siblings are the methods of one class, the functions or methods sharing a
+  name prefix (`create_*`), and the functions project-wide sharing a registering decorator
+  (`decorator @route`). Each entry is a `feature` that `present_in` of `group_size` siblings have
+  and `missing_from` lacks: a call (`call:audit`), a decorator or one of its keywords
+  (`decorator_kwarg:route(permission=)`, `...(require_csrf=False)`), a keyword passed to a call
+  (`kwarg:client.get(timeout=)`), a context manager (`with:self._lock`) or an early-exit guard
+  (`guard:request.user`). A missing permission keyword, lock or timeout on one route or one method
+  is exactly the outlier this phase hunts.
+- `helper_bypasses`: per class, a `helper` that `callers` methods use to reach a
+  `wrapped_attribute` (an attribute, or a method shown as `name()`), and the methods `bypassing`
+  it by touching that resource directly. A method that reaches the database, the connection or the
+  lock without the helper every other method goes through is the classic damaging
+  outlier. Lifecycle methods (`open`, `close`, `reset`, ...) and the helper's own sub-helpers are
+  left out; a method that deliberately takes another path (a stronger lock, say) is a
+  legitimate difference: say so and dismiss it.
+
+Both lists are ranked candidates, not findings: read each sibling and decide whether it needs the
+missing feature. `summary.groups_examined` says how many sibling groups were compared; when
+`sibling_outliers` exceeds `sibling_outliers_listed`, say how many were left out.
+
 The majority behavior is the project's own standard; the outlier is the candidate bug. Leave
 general "same concern, different approach" analysis across modules to pattern-consistency-checker:
 this agent's job is the side-by-side comparison of close siblings, within a module or class.
+
+### Phase 2c: Error exits after a mutation (transaction-per-request frameworks)
+
+Where the framework commits every request that returns normally (`pyramid_tm`, Django
+`ATOMIC_REQUESTS`, a task wrapper), how a handler *exits* after a mutation decides what commits.
+For each view or task that changes state, list its exits after the first mutation, including
+mutations inside the services it calls:
+
+- An error response, redirect or flash that is **returned** commits the half-done change; one that
+  is **raised** aborts it (`error-exit-after-flushed-mutation`). Compare with sibling views: the
+  majority usually raise, or roll back before returning.
+- A caught `IntegrityError`/`UniqueViolation` with no `rollback()` or savepoint leaves the session
+  unusable, so the friendly error path ends in a 500 (`integrity-error-caught-without-rollback`;
+  the pitfall scanner flags the plain form). Follow a converted exception to the caller that
+  catches it.
+- A broad `except` around a write, an audit event and an email that flashes "unexpected error" and
+  returns: whatever ran before the failure commits.
+
+Check the framework's commit veto (abort on 4xx/5xx) before reporting: with one, an error response
+commits nothing.
+
+The same sibling comparison applies to the data layer: a child fetched by id without checking it
+belongs to the URL's parent (`child-by-id-without-parent-check`), a group-owned object deletable
+only by its creator (`creator-scoped-delete-of-group-scoped-object`), and a container delete that
+skips the per-member events its single-member twin emits
+(`aggregate-delete-skips-per-member-side-effects`). These are the catalogued shapes this agent
+owns; in informed mode, hunt them first.
+
+### Phase 2d: Framework wiring on web applications
+
+On a web application, the siblings that must agree include the two ends of each piece of
+framework wiring: the place a setting is written and the places it is read, a route's declared
+permission and the permission its siblings require, an event's emitter and its handlers' payload
+keys. Run the wiring cross-reference (see [Running the script](#running-the-script)) and compare
+within each family:
+
+```bash
+python3 <plugin_root>/scripts/map_wiring.py [scope]
+```
+
+- `routes.declared`: group the routes of one resource and compare their `permissions`, `methods`
+  and `renderers`. A sibling route with a weaker permission, or none, is the outlier to check.
+- `settings.read_never_written` with `default_at_every_read: false`, and keys read with different
+  defaults at different sites (compare the `read_at` sites of one key).
+- `signals.keys_read_not_sent` and `signals.attributes_read_not_set`: a handler that reads a payload
+  key or event attribute no emitter provides.
+
+A section with `"status": "not_detected"` was not checked: say so instead of reporting no
+divergence. `<plugin_root>/docs/registry-diff.md` confirms a lead against the booted app.
 
 ### Phase 3: Check Against Explicit Rules
 
@@ -193,6 +269,13 @@ For each:
 - **Cap your output**: Report at most 5 high-severity, 5 medium-severity, and 10 low-severity items in the summary. Offer to provide more detail on specific categories.
 - **Be specific**: Always include file paths and line numbers. "Some files use bare except" is useless; "src/runner.py:142, src/fetcher.py:89 use bare except while 12 other exception handlers use specific types" is actionable.
 
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.
+
 ## Running the script
 
 These rules apply to every script call this agent makes.
@@ -208,6 +291,9 @@ These rules apply to every script call this agent makes.
   d=$(mktemp -d "${TMPDIR:-/tmp}/crt-consistency-auditor.XXXXXX") && echo "$d" &&
   python3 <plugin_root>/scripts/survey_conventions.py [scope] [options] > "$d/out.json" 2> "$d/out.err"; echo "exit=$?"
   ```
+
+  Run `diff_siblings.py` the same way, into the same directory under another name
+  (`> "$d/siblings.json" 2> "$d/siblings.err"`).
 
   Each Bash call is a fresh shell: a `$$` suffix or a shell variable does not survive into the next
   call. Reuse the literal path `echo` printed. Put your own scratch files in the same directory,

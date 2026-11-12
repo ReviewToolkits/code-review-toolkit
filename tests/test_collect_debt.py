@@ -449,7 +449,14 @@ class TestConfigDebt(unittest.TestCase):
     def test_summary_counts(self):
         self.assertEqual(
             self.out["summary"]["config_debt"],
-            {"pins": 4, "routine_caps": 1, "suppressions": 5, "ci": 3, "markers": 1},
+            {
+                "pins": 4,
+                "routine_caps": 1,
+                "suppressions": 5,
+                "ci": 3,
+                "markers": 1,
+                "warning_filters": 2,
+            },
         )
 
 
@@ -534,6 +541,419 @@ class TestTrackerKeyResolution(unittest.TestCase):
         self.assertEqual(keys["ABC-2"]["unmerged_commits"], 1)
         self.assertEqual(keys["ABC-1"]["unmerged_commits"], 0)
         self.assertEqual(keys["ABC-1"]["commits"], 1)
+
+
+def _commit(root, message, author, date):
+    import os
+    import subprocess
+
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": author,
+        "GIT_AUTHOR_EMAIL": "a@example.com",
+        "GIT_COMMITTER_NAME": author,
+        "GIT_COMMITTER_EMAIL": "a@example.com",
+        "GIT_AUTHOR_DATE": date,
+        "GIT_COMMITTER_DATE": date,
+    }
+    for args in (["add", "-A"], ["commit", "-q", "-m", message]):
+        subprocess.run(["git", *args], cwd=str(root), env=env, check=True)
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+class TestBlame(unittest.TestCase):
+    """Markers are dated by one blame per file, skipping listed reformats."""
+
+    def _project(self, root):
+        import subprocess
+
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(root), check=True)
+        (root / "mod.py").write_text(
+            "def f():\n    return 1  # TODO: handle zero\n"
+            "def g():\n    return 2  # FIXME: overflow\n",
+            encoding="utf-8",
+        )
+        _commit(root, "Add mod", "Early Author", "2015-03-01T12:00:00+00:00")
+        # A reformat: same code, new layout.
+        (root / "mod.py").write_text(
+            "def f():\n    return 1   # TODO: handle zero\n"
+            "def g():\n    return 2   # FIXME: overflow\n",
+            encoding="utf-8",
+        )
+        return _commit(root, "Reformat", "Format Bot", "2025-06-01T12:00:00+00:00")
+
+    def test_reformat_owns_the_lines_without_an_ignore_file(self):
+        with TempProject({}) as root:
+            self._project(root)
+            items = mod.scan_file(root / "mod.py", root, use_git=True)
+        self.assertEqual({i["author"] for i in items}, {"Format Bot"})
+
+    def test_ignore_revs_file_skips_the_reformat(self):
+        with TempProject({}) as root:
+            reformat = self._project(root)
+            (root / ".git-blame-ignore-revs").write_text(
+                f"# mass reformat\n{reformat}\n", encoding="utf-8"
+            )
+            blamer = mod.Blamer(root)
+            items = mod.scan_file(root / "mod.py", root, use_git=True, blamer=blamer)
+        self.assertEqual(blamer.ignore_revs_file, root / ".git-blame-ignore-revs")
+        self.assertEqual({i["author"] for i in items}, {"Early Author"})
+        self.assertEqual({i["date"][:4] for i in items}, {"2015"})
+        self.assertEqual({i["age"] for i in items}, {"ancient"})
+
+    def test_each_file_is_blamed_once(self):
+        with TempProject({}) as root:
+            self._project(root)
+            blamer = mod.Blamer(root)
+            items = mod.scan_file(root / "mod.py", root, use_git=True, blamer=blamer)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(blamer.files_blamed, 1)
+        self.assertIsNone(blamer.ignore_revs_file)
+
+    def test_parse_porcelain_reuses_metadata_by_sha(self):
+        sha = "a" * 40
+        text = (
+            f"{sha} 1 1 2\nauthor Ann\nauthor-time 0\nsummary s\n"
+            "filename m.py\n\tx = 1\n"
+            f"{sha} 2 2\n\ty = 2\n"
+        )
+        lines = mod.parse_blame_porcelain(text)
+        self.assertEqual(lines[2]["author"], "Ann")
+        self.assertEqual(lines[1]["date"], "1970-01-01T00:00:00+00:00")
+
+
+class TestMarkersOutsideHashComments(unittest.TestCase):
+    """Markers were read only from `#` comments in .py files."""
+
+    @classmethod
+    def setUpClass(cls):
+        files = {
+            "pkg/__init__.py": "",
+            "pkg/api.py": (
+                "def lookup(key):\n"
+                '    """Find a record.\n'
+                "\n"
+                "    TODO: support more than one key per call.\n"
+                "    # TODO: already a hash marker, counted once\n"
+                '    """\n'
+                '    help_url = "TODO"\n'
+                '    label = "a todo list is not a marker"\n'
+                "    return key\n"
+            ),
+            "pkg/templates/page.html": (
+                "<div>\n"
+                "{# TODO: paginate this table #}\n"
+                "<!-- FIXME the badge overlaps on narrow screens -->\n"
+                "<p>TODO in visible text is content, not a marker</p>\n"
+                "</div>\n"
+            ),
+            "pkg/static/site.scss": "// TODO drop this override\n.a { color: red; }\n",
+            "pkg/static/plain.css": "/* HACK: works around a layout bug */\n.b {}\n",
+            "pkg/static/app.js": (
+                "const url = 'http://example.test/TODO';\n"
+                "// FIXME: retry on failure\n"
+                "/*\n * XXX keep in sync with the server\n */\n"
+            ),
+            "pkg/static/vendor/lib.js": "// TODO vendored, not ours\n",
+            "pkg/static/app.min.js": "// TODO minified bundle\n",
+        }
+        with TempProject(files) as root:
+            cls.out = _run_main([str(root / "pkg")])
+        cls.items = [
+            (i["file"], i["line"], i["category"], i.get("source", "comment"))
+            for i in cls.out["items"]
+        ]
+
+    def test_template_stylesheet_and_script_comments(self):
+        found = {i for i in self.items if i[3] in ("template", "stylesheet", "script")}
+        self.assertEqual(
+            found,
+            {
+                ("pkg/templates/page.html", 2, "TODO", "template"),
+                ("pkg/templates/page.html", 3, "FIXME", "template"),
+                ("pkg/static/site.scss", 1, "TODO", "stylesheet"),
+                ("pkg/static/plain.css", 1, "HACK", "stylesheet"),
+                ("pkg/static/app.js", 2, "FIXME", "script"),
+                ("pkg/static/app.js", 4, "XXX", "script"),
+            },
+        )
+
+    def test_docstring_and_placeholder_string(self):
+        self.assertIn(("pkg/api.py", 4, "TODO", "docstring"), self.items)
+        self.assertIn(("pkg/api.py", 7, "TODO", "string"), self.items)
+
+    def test_no_double_count_and_no_prose_match(self):
+        at_line_5 = [i for i in self.items if i[:2] == ("pkg/api.py", 5)]
+        self.assertEqual(at_line_5, [("pkg/api.py", 5, "TODO", "comment")])
+        self.assertFalse([i for i in self.items if i[:2] == ("pkg/api.py", 8)])
+
+    def test_summary_reports_sources_and_files(self):
+        summary = self.out["summary"]
+        self.assertEqual(
+            summary["non_python_files_scanned"],
+            {"script": 1, "stylesheet": 2, "template": 1},
+        )
+        self.assertEqual(summary["by_source"]["template"], 2)
+
+
+class TestWarningFilterEntries(unittest.TestCase):
+    """filterwarnings was listed as one joined value with no ages."""
+
+    def test_each_entry_with_its_comment(self):
+        pyproject = (
+            '[project]\nname = "x"\n'
+            "[tool.pytest.ini_options]  # a note after the header\n"
+            "filterwarnings = [\n"
+            '  "error",\n'
+            "  # upstream issue: the library still calls the old API\n"
+            "  '''ignore:old 'api' call:DeprecationWarning''',\n"
+            '  "ignore::UserWarning:somelib",\n'
+            "]\n"
+        )
+        with TempProject({"pkg/__init__.py": ""}) as root:
+            (root / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+            (root / "pytest.ini").write_text(
+                "[pytest]\nfilterwarnings =\n    ignore::ResourceWarning\n",
+                encoding="utf-8",
+            )
+            out = _run_main([str(root / "pkg")])
+        filters = out["config_debt"]["warning_filters"]
+        self.assertEqual(
+            [(f["file"], f["line"], f["action"]) for f in filters],
+            [
+                ("pyproject.toml", 5, "error"),
+                ("pyproject.toml", 7, "ignore"),
+                ("pyproject.toml", 8, "ignore"),
+                ("pytest.ini", 3, "ignore"),
+            ],
+        )
+        self.assertEqual(
+            filters[1]["entry"], "ignore:old 'api' call:DeprecationWarning"
+        )
+        self.assertEqual(
+            filters[1]["comment_above"],
+            "upstream issue: the library still calls the old API",
+        )
+        self.assertEqual(filters[1]["age"], "unknown")  # no git here
+        # The header comment no longer hides the section from the
+        # suppression inventory either.
+        settings = {
+            (s["tool"], s["setting"]) for s in out["config_debt"]["suppressions"]
+        }
+        self.assertIn(("pytest", "filterwarnings"), settings)
+
+
+class TestCanonicalKeys(unittest.TestCase):
+    """Key spellings were not canonicalised, gaps were not reported, and open
+    forge references read as open debt."""
+
+    @classmethod
+    def setUpClass(cls):
+        files = {
+            "pkg/__init__.py": "",
+            "pkg/a.py": (
+                "# ABC-007: retry later\n"
+                "# see https://forge.test/org/repo/issues/41 for context\n"
+                "X = 1\n"
+            ),
+            "ROADMAP.md": (
+                "| Key | Task |\n|---|---|\n"
+                "| ABC-7 | Retry |\n| ABC-1 | One |\n| ABC-2 | Two |\n"
+                "| ABC-4 | Four |\n| ABC-9a | Part a |\n| ABC-9b | Part b |\n"
+                "| ABC-9 | Whole |\n"
+                "Also #41 and #3000 are tracked upstream.\n"
+            ),
+        }
+        with TempProject(files) as root:
+            cls.out = _run_main(
+                [
+                    str(root / "pkg"),
+                    "--key-regex",
+                    r"ABC-\d+[a-z]?|#\d+|https://\S+/issues/\d+",
+                ]
+            )
+        cls.keys = cls.out["tracker_keys"]
+
+    def test_zero_padding_and_forge_url_are_one_key(self):
+        names = {k["key"] for k in self.keys["keys"]}
+        self.assertIn("ABC-7", names)
+        self.assertNotIn("ABC-007", names)
+        self.assertIn("#41", names)
+        self.assertFalse(any(n.startswith("http") for n in names))
+
+    def test_key_variants(self):
+        variants = {(v["key"], v["kind"]): v for v in self.keys["key_variants"]}
+        self.assertEqual(
+            set(variants[("ABC-7", "spelling")]["spellings"]), {"ABC-007", "ABC-7"}
+        )
+        self.assertEqual(
+            variants[("ABC-9", "bare_prefix")]["suffixed"], ["ABC-9a", "ABC-9b"]
+        )
+        self.assertIn(("#41", "spelling"), variants)
+
+    def test_unaccounted_numbers(self):
+        self.assertEqual(self.keys["unaccounted"]["ABC-"]["missing"], [3, 5, 6, 8])
+        self.assertIn("#", self.keys["unaccounted_skipped"])
+
+    def test_open_in_code_is_labelled_unresolved_locally(self):
+        self.assertEqual(self.keys["open_in_code_status"], "unresolved_locally")
+        self.assertIn("#41", self.keys["open_in_code"])
+        self.assertEqual(self.keys["forge_refs_to_check"], ["#41"])
+
+    def test_scope_is_stated(self):
+        self.assertTrue(self.keys["docs_outside_scan_scope"])
+        self.assertTrue(self.out["scan_scope_narrowed"])
+        self.assertIn("tracker_keys (docs)", self.out["read_from_project_root"])
+
+    def test_capture_group_is_the_canonical_key(self):
+        files = {
+            "pkg/__init__.py": "# tracked as https://forge.test/o/r/pull/12\n",
+            "CHANGES.md": "- Fixed in PR-12.\n",
+        }
+        with TempProject(files) as root:
+            out = _run_main(
+                [str(root), "--key-regex", r"(?:https://\S+/pull/|PR-)(?P<key>\d+)"]
+            )
+        keys = out["tracker_keys"]
+        self.assertEqual([k["key"] for k in keys["keys"]], ["12"])
+        self.assertEqual(keys["open_in_code"], [])  # resolved by the changelog
+        self.assertFalse(keys["docs_outside_scan_scope"])
+
+
+class TestOverduePlannedItems(unittest.TestCase):
+    """Roadmap rows targeting a release that already shipped were not flagged."""
+
+    ROADMAP = (
+        "| Key | Task | Target |\n|---|---|---|\n"
+        "| ABC-1 | Faster index | v1.2 |\n"
+        "| ABC-2 | Streaming | 2.0 |\n"
+        "| ABC-3 | Docs pass, after ABC-4 (v1.0) | 3.1 |\n"
+        "| ABC-4 | Cleanup | v1.3.0 |\n"
+        "| ABC-5 | ~~Old work~~ | v0.9 |\n"
+    )
+
+    def _run(self, version_line: str) -> dict:
+        files = {"pkg/__init__.py": "", "ROADMAP.md": self.ROADMAP}
+        with TempProject(files) as root:
+            (root / "pyproject.toml").write_text(
+                f'[project]\nname = "x"\n{version_line}\n', encoding="utf-8"
+            )
+            out = _run_main([str(root), "--key-regex", r"ABC-\d+"])
+        return out["tracker_keys"]["overdue_planned_items"]
+
+    def test_rows_at_or_below_the_current_version(self):
+        overdue = self._run('version = "1.3"')
+        self.assertEqual(overdue["current_version"], "1.3")
+        self.assertEqual(overdue["current_version_source"], "pyproject.toml [project]")
+        self.assertEqual(
+            [(i["key"], i["target_version"]) for i in overdue["items"]],
+            [("ABC-1", "1.2"), ("ABC-4", "1.3")],
+        )
+
+    def test_unknown_version_is_null_with_a_reason(self):
+        overdue = self._run("")
+        self.assertIsNone(overdue["items"])
+        self.assertIn("no static version", overdue["reason"])
+
+
+class TestDependencySpecs(unittest.TestCase):
+    """No inventory of dependency bounds, installed versions or lockfile use."""
+
+    def test_bounds_installed_versions_and_install_sites(self):
+        pyproject = (
+            '[project]\nname = "x"\n'
+            "dependencies = [\n"
+            '  "alpha>=2.0",\n'
+            '  "beta>=1,<2",\n'
+            '  "gamma",\n'
+            "]\n"
+            "[project.optional-dependencies]\n"
+            'test = ["delta~=3.1"]\n'
+        )
+        files = {
+            "pkg/__init__.py": "",
+            "setup.py": "from setuptools import setup\nsetup(install_requires=['epsilon>=0.5'])\n",
+            "Dockerfile": (
+                "FROM python\nRUN pip install -r requirements.lock\nRUN pip install .\n"
+            ),
+            ".github/workflows/ci.yml": "steps:\n  - run: uv sync --frozen\n",
+            "uv.lock": "version = 1\n",
+            ".venv/lib/python3.12/site-packages/alpha-1.5.dist-info/METADATA": "",
+            ".venv/lib/python3.12/site-packages/Beta-1.4.dist-info/METADATA": "",
+        }
+        with TempProject(files) as root:
+            (root / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+            (root / "requirements.lock").write_text(
+                "alpha==1.5 --hash=sha256:0\n", encoding="utf-8"
+            )
+            (root / "requirements.txt").write_text(
+                "-r requirements.lock\n", encoding="utf-8"
+            )
+            import os
+            from unittest import mock
+
+            with mock.patch.dict(os.environ, {"VIRTUAL_ENV": ""}):
+                out = _run_main([str(root / "pkg")])
+        deps = out["dependency_specs"]
+        by_name = {d["name"]: d for d in deps["declared"]}
+        self.assertEqual(set(by_name), {"alpha", "beta", "gamma", "delta", "epsilon"})
+        self.assertEqual(deps["floor_only"], ["alpha", "epsilon"])
+        self.assertEqual(deps["unbounded"], ["gamma"])
+        self.assertEqual(by_name["alpha"]["installed"], "1.5")
+        self.assertTrue(by_name["alpha"]["installed_below_floor"])
+        self.assertFalse(by_name["beta"]["installed_below_floor"])
+        self.assertIsNone(by_name["gamma"]["installed"])
+        self.assertEqual(by_name["delta"]["group"], "optional:test")
+        self.assertIn("uv.lock", deps["lockfiles"])
+        sites = {
+            (s["file"], s["line"]): s["uses_lockfile"] for s in deps["install_sites"]
+        }
+        self.assertEqual(
+            sites,
+            {
+                ("Dockerfile", 2): True,  # -r of a hashed requirements file
+                ("Dockerfile", 3): False,
+                (".github/workflows/ci.yml", 2): True,
+            },
+        )
+
+    def test_setup_cfg_requirements(self):
+        cfg = (
+            "[options]\ninstall_requires =\n    alpha>=1\n    beta\n"
+            "[options.extras_require]\ntest =\n    gamma>=7\n"
+        )
+        with TempProject({"pkg/__init__.py": "", "setup.cfg": cfg}) as root:
+            out = _run_main([str(root)])
+        self.assertEqual(
+            [
+                (d["line"], d["name"], d["group"])
+                for d in out["dependency_specs"]["declared"]
+            ],
+            [
+                (3, "alpha", "dependencies"),
+                (4, "beta", "dependencies"),
+                (7, "gamma", "optional:test"),
+            ],
+        )
+
+    def test_no_project_environment_is_null_not_missing(self):
+        with TempProject({"pkg/__init__.py": ""}) as root:
+            (root / "requirements.txt").write_text("alpha>=1\n", encoding="utf-8")
+            import os
+            from unittest import mock
+
+            with mock.patch.dict(os.environ, {"VIRTUAL_ENV": ""}):
+                out = _run_main([str(root)])
+        deps = out["dependency_specs"]
+        self.assertIsNone(deps["installed_from"])
+        self.assertIn("no project environment", deps["installed_reason"])
+        self.assertIsNone(deps["declared"][0]["installed"])
 
 
 if __name__ == "__main__":

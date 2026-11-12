@@ -590,6 +590,87 @@ class TestContainerCategories(unittest.TestCase):
         )
 
 
+class TestOrmAndInterfaceCategories(unittest.TestCase):
+    """ORM models and interface declarations are inventoried, not left null."""
+
+    def _types(self, source: str) -> dict[str, str | None]:
+        with TempProject({"mod.py": source}) as root:
+            classes = mod.analyze_file(root / "mod.py", root)["classes"]
+        return {c["name"]: c["container_type"] for c in classes}
+
+    def test_declarative_base_and_mapped_models(self):
+        types = self._types(
+            "from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column\n"
+            "class Base(DeclarativeBase):\n    pass\n"
+            "class Widget(Base):\n"
+            "    __tablename__ = 'widgets'\n"
+            "    id: Mapped[int] = mapped_column(primary_key=True)\n"
+            "class Gadget(Base):\n"
+            "    label: 'Mapped[str | None]'\n"
+        )
+        self.assertEqual(
+            types, {"Base": "orm_model", "Widget": "orm_model", "Gadget": "orm_model"}
+        )
+
+    def test_legacy_declarative_base_subclass_by_its_columns(self):
+        # The base is a `declarative_base()` variable: recognised by the body.
+        types = self._types(
+            "from sqlalchemy import Column, Integer\n"
+            "from sqlalchemy.orm import declarative_base\n"
+            "ModelBase = declarative_base()\n"
+            "class Part(ModelBase):\n"
+            "    serial = Column(Integer, nullable=False)\n"
+            "class Stamped:\n"
+            "    created = Column(Integer)\n"
+        )
+        self.assertEqual(types, {"Part": "orm_model", "Stamped": "orm_model"})
+
+    def test_django_style_model(self):
+        types = self._types(
+            "from django.db import models\n"
+            "class Shelf(models.Model):\n    pass\n"
+            "class Book(Shelf):\n    title = models.CharField(max_length=10)\n"
+        )
+        self.assertEqual(types, {"Shelf": "orm_model", "Book": "orm_model"})
+
+    def test_interface_declarations(self):
+        types = self._types(
+            "from zope.interface import Interface, Attribute\n"
+            "class IStorage(Interface):\n"
+            "    def get(key):\n        '''Return the value.'''\n"
+            "class IBlobStorage(IStorage):\n"
+            "    def put(key, blob):\n        pass\n"
+        )
+        self.assertEqual(types, {"IStorage": "interface", "IBlobStorage": "interface"})
+
+    def test_true_negatives(self):
+        types = self._types(
+            "class Model:\n    pass\n"
+            "class Thing(Model):\n    size = 3\n"
+            "class IOHandler(IOBase):\n"
+            "    def read(self):\n        return b''\n"
+            "class Impl(IStorage):\n"
+            "    def get(self, key):\n        return key\n"
+            "class Columns:\n    names = list()\n"
+        )
+        self.assertEqual(
+            types,
+            {
+                "Model": None,
+                "Thing": None,
+                "IOHandler": None,
+                "Impl": None,
+                "Columns": None,
+            },
+        )
+
+    def test_protocol_keeps_priority(self):
+        types = self._types(
+            "from typing import Protocol\nclass HasId(Protocol):\n    id: 'Mapped[int]'\n"
+        )
+        self.assertEqual(types, {"HasId": "Protocol"})
+
+
 class TestModuleCompleteness(unittest.TestCase):
     def test_modules_fully_annotated_is_counted(self):
         out = _analyze_tree(
@@ -828,3 +909,212 @@ class TestUntypedBoundaries(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEnumsThroughProjectBases(unittest.TestCase):
+    """An enum subclassing a project enum mixin was not in the enum inventory."""
+
+    _FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/base.py": (
+            "from enum import Enum\n"
+            "class LabelledEnum(str, Enum):\n"
+            "    def label(self) -> str:\n"
+            "        return self.value.title()\n"
+        ),
+        "pkg/colors.py": (
+            "from pkg.base import LabelledEnum\n"
+            "from pkg import base\n"
+            "class Color(LabelledEnum):\n"
+            "    RED = 'red'\n"
+            "    BLUE = 'blue'\n"
+            "class Shade(Color.__class__):\n"
+            "    pass\n"
+            "class Tone(base.LabelledEnum):\n"
+            "    LOW = 'low'\n"
+            "class Plain:\n"
+            "    RED = 'red'\n"
+            "    LIMIT = 3\n"
+            "    def f(self):\n"
+            "        return 1\n"
+        ),
+    }
+
+    def test_subclasses_of_project_enums_are_enums(self):
+        result = _analyze_tree(self._FILES)
+        self.assertEqual(
+            result["container_inventory"]["Enum"], ["Color", "LabelledEnum", "Tone"]
+        )
+        color = next(
+            c for f in result["files"] for c in f["classes"] if c["name"] == "Color"
+        )
+        self.assertEqual(color["enum_members"], ["RED", "BLUE"])
+        self.assertEqual(color["unannotated_attributes"], [])
+        self.assertEqual(color["enum_via"], "LabelledEnum")
+
+    def test_an_ordinary_class_is_not_an_enum(self):
+        result = _analyze_tree(self._FILES)
+        classes = {c["name"]: c for f in result["files"] for c in f["classes"]}
+        self.assertIsNone(classes["Plain"]["container_type"])
+        self.assertIsNone(classes["Shade"]["container_type"])
+
+
+class TestPrivateClassMembers(unittest.TestCase):
+    """Methods of a private class were counted as unannotated public functions."""
+
+    def test_methods_of_a_private_class_are_private(self):
+        result = _analyze_tree(
+            {
+                "pkg/__init__.py": "",
+                "pkg/m.py": (
+                    "class _Ref:\n"
+                    "    def __init__(self, x):\n"
+                    "        self.x = x\n"
+                    "    def __call__(self):\n"
+                    "        return self.x\n"
+                    "    def run(self):\n"
+                    "        return 1\n"
+                    "class Public:\n"
+                    "    def run(self):\n"
+                    "        return 1\n"
+                ),
+            }
+        )
+        names = [f["name"] for f in result["unannotated_public_functions"]]
+        self.assertEqual(names, ["Public.run"])
+        self.assertEqual(result["summary"]["public_functions"], 1)
+        self.assertEqual(result["summary"]["total_functions"], 4)
+
+
+class TestProtocolDefaultBodies(unittest.TestCase):
+    """A Protocol's default method bodies run only for explicit subclasses;
+    neither the bodies nor the absence of such subclasses was reported."""
+
+    _FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/proto.py": (
+            "from typing import Protocol\n"
+            "class Store(Protocol):\n"
+            "    def get(self, key: str) -> bytes: ...\n"
+            "    def warm(self) -> None:\n"
+            '        """Default no-op."""\n'
+            "        return None\n"
+            "    def close(self) -> None:\n"
+            "        raise NotImplementedError\n"
+            "class Sink(Protocol):\n"
+            "    def flush(self) -> int:\n"
+            "        return 0\n"
+            "class LoudSink(Sink, Protocol):\n"
+            "    def shout(self) -> None: ...\n"
+            "class Pure(Protocol):\n"
+            "    def a(self) -> None:\n"
+            '        """Only a stub."""\n'
+            "    def b(self) -> None:\n"
+            "        pass\n"
+        ),
+        "pkg/impl.py": (
+            "from pkg.proto import LoudSink\n"
+            "class MemoryStore:\n"
+            "    def get(self, key: str) -> bytes:\n"
+            "        return b''\n"
+            "class FileSink(LoudSink):\n"
+            "    def shout(self) -> None:\n"
+            "        print('!')\n"
+        ),
+    }
+
+    def test_protocols_with_bodies_and_their_explicit_subclasses(self):
+        result = _analyze_tree(self._FILES)
+        found = {p["name"]: p for p in result["protocols_with_default_bodies"]}
+        self.assertEqual(sorted(found), ["Sink", "Store"])
+        self.assertEqual(found["Store"]["default_methods"], ["warm"])
+        # Structural conformance (MemoryStore) inherits nothing.
+        self.assertEqual(found["Store"]["explicit_subclasses"], [])
+        self.assertFalse(found["Store"]["bodies_inherited"])
+        # Reached through a protocol that extends it.
+        self.assertEqual(
+            [s["name"] for s in found["Sink"]["explicit_subclasses"]], ["FileSink"]
+        )
+        self.assertTrue(found["Sink"]["bodies_inherited"])
+        self.assertEqual(result["summary"]["protocols_with_default_bodies"], 2)
+        self.assertEqual(result["summary"]["protocols_with_uninherited_bodies"], 1)
+
+
+class TestAnnotationAccuracy(unittest.TestCase):
+    """The annotation-accuracy line (N annotated, M with type errors) needed a
+    join of mypy errors to functions that no script did."""
+
+    _FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/m.py": (
+            "def typed(a: int) -> str:\n"  # 1
+            "    return a\n"  # 2
+            "def bare(a):\n"  # 3
+            "    return a + 'x'\n"  # 4
+            "class C:\n"  # 5
+            "    def method(self, x: int) -> int:\n"  # 6
+            "        def inner(y: int) -> int:\n"  # 7
+            "            return y.nope\n"  # 8
+            "        return x\n"  # 9
+            "    @property\n"  # 10
+            "    def ok(self) -> int:\n"  # 11
+            "        return 1\n"  # 12
+            "X: int = 'a'\n"  # 13
+        ),
+    }
+
+    def _with(self, name: str, payload: str) -> dict:
+        with TempProject({**self._FILES, name: payload}) as root:
+            return mod.analyze(str(root / "pkg"), mypy_json=str(root / name))
+
+    def test_errors_go_to_the_innermost_function(self):
+        check_typing_output = {
+            "mypy_version": "1.0",
+            "summary": {},
+            "findings": [
+                {"file": "pkg/m.py", "line": 2, "code": "return-value", "severity": "error"},
+                {"file": "pkg/m.py", "line": 4, "code": "operator", "severity": "error"},
+                {"file": "pkg/m.py", "line": 8, "code": "attr-defined", "severity": "error"},
+                {"file": "pkg/m.py", "line": 13, "code": "assignment", "severity": "error"},
+                {"file": "pkg/m.py", "line": 3, "code": "no-untyped-def", "severity": "error"},
+                {"file": "other/x.py", "line": 1, "code": "misc", "severity": "error"},
+            ],
+        }
+        result = self._with("ct.json", json.dumps(check_typing_output))
+        acc = result["annotation_accuracy"]
+        self.assertEqual(
+            [(f["name"], f["fully_annotated"]) for f in acc["functions"]],
+            [("typed", True), ("bare", False), ("C.method.inner", True)],
+        )
+        self.assertEqual(acc["annotated_functions_with_type_errors"], 2)
+        self.assertEqual(acc["functions_with_type_errors"], 3)
+        self.assertEqual(acc["errors_outside_functions"], 1)
+        self.assertEqual(acc["errors_outside_scan"], 1)
+        # typed, C.method, inner, C.ok
+        self.assertEqual(acc["fully_annotated_functions"], 4)
+        self.assertEqual(result["summary"]["annotated_functions_with_type_errors"], 2)
+
+    def test_external_tools_and_mypy_json_lines(self):
+        ext = {"mypy": {"findings": [{"file": "pkg/m.py", "line": 12, "code": "x"}]}}
+        result = self._with("ext.json", json.dumps(ext))
+        self.assertEqual(result["annotation_accuracy"]["functions"][0]["name"], "C.ok")
+        lines = "\n".join(
+            json.dumps(e)
+            for e in (
+                {"file": "pkg/m.py", "line": 2, "code": "return-value", "severity": "error"},
+                {"file": "pkg/m.py", "line": 2, "code": None, "severity": "note"},
+            )
+        )
+        result = self._with("mypy.jsonl", lines)
+        self.assertEqual(result["annotation_accuracy"]["errors_read"], 1)
+
+    def test_not_given_is_null_with_a_reason(self):
+        result = _analyze_tree(self._FILES)
+        self.assertIsNone(result["annotation_accuracy"])
+        self.assertIsNone(result["summary"]["annotated_functions_with_type_errors"])
+        self.assertIn("not measured", result["summary"]["annotation_accuracy_reason"])
+
+    def test_unreadable_input_is_not_a_zero(self):
+        result = self._with("bad.json", "this is not json\n")
+        self.assertIsNone(result["annotation_accuracy"])
+        self.assertIn("not measured", result["summary"]["annotation_accuracy_reason"])

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Survey docstrings: coverage, contract accuracy, testable claims, suppressions.
 
-Four inventories for the documentation-auditor, each one mechanical:
+Five inventories for the documentation-auditor, each one mechanical:
 
 - ``coverage``: documented / total public modules, classes, functions, methods
   and HTTP route handlers (a route documented through ``summary=`` or
@@ -21,12 +21,23 @@ Four inventories for the documentation-auditor, each one mechanical:
   ``# pyright: ignore`` / ``# pylint: disable`` / ``# pragma: no cover``
   comments, with the rule ids and the stated reason -- each one is a claim
   ("this rule does not apply here, because ...") to verify.
+- ``dead_references``: names a docstring cites -- a Sphinx role, a ``Raises:``
+  entry, an exception named in prose, a backticked call, dotted path or
+  CamelCase name -- that resolve to nothing the project defines, imports or
+  mentions, nor to a builtin or stdlib module (shape
+  ``dead-cross-reference-in-a-docstring``).
 
 Test files are skipped unless ``--include-tests`` is given. Unparseable files
 are listed under ``skipped``, never silently dropped.
 
 Usage:
     python survey_docstrings.py [path] [--max-files N] [--include-tests]
+        [--exclude PAT[,PAT]]
+
+``--exclude PAT[,PAT]`` (repeatable) leaves out files whose project-relative
+path matches: a plain pattern as a substring, a glob (``vendor/*``) at any
+depth. Excluded files are not counted; the envelope reports ``files_excluded``
+and ``exclude_matches``.
 """
 
 from __future__ import annotations
@@ -47,9 +58,11 @@ from scan_common import (  # noqa: E402
     build_envelope,
     collect_python_files,
     emit,
-    parse_common_args,
+    parse_scan_args,
+    parse_source,
     relative_to_root,
     resolve_target,
+    select_python_files,
 )
 
 _FUNC_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef)
@@ -635,6 +648,278 @@ class ProjectIndex:
 
     def matches(self, raised: str, documented: str) -> bool:
         return documented in self.ancestors(raised)
+
+
+# --------------------------------------------------------------------------
+# Dead cross-references
+# --------------------------------------------------------------------------
+
+_ROLE_REF = re.compile(
+    r":(?:py:)?(func|meth|class|exc|attr|mod|data|obj|const):`[~.!]?([A-Za-z_][\w.]*)(?:\(\))?`"
+)
+_BACKTICK_REF = re.compile(r"(?<![`:\w])``?([A-Za-z_][\w.]*)(\(\))?``?(?![`\w])")
+_CAMEL = re.compile(
+    r"^_?[A-Z][a-z0-9]+[A-Z]\w*$|^_?[A-Z][a-z0-9]{2,}(?:Error|Exception|Warning)$"
+)
+_STDLIB = frozenset(getattr(sys, "stdlib_module_names", ()))
+# "A FooExists exception is raised if ...": a class named in prose.
+_RAISED_PHRASE = re.compile(
+    r"\b([A-Z][A-Za-z0-9_]*[a-z0-9][A-Z][A-Za-z0-9_]*)`*\s+(?:[Ee]xception\s+|[Ee]rror\s+)?"
+    r"(?:is|will\s+be|gets|may\s+be)\s+raised"
+)
+_DOTTED = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+")
+
+
+class ReferenceIndex:
+    """Every name the project binds, its modules and their top-level names,
+    and each class's members -- what a docstring reference resolves against."""
+
+    def __init__(self) -> None:
+        self.names: set[str] = set(dir(builtins)) | {"self", "cls"}
+        # Every identifier the code mentions at all (`zipfile.ZipFile(...)`
+        # makes `ZipFile` a real name even though the project defines none).
+        self.mentioned: set[str] = set()
+        # Dotted string constants and their prefixes: metric, logger and
+        # event names (`"app.cache.hits"`) look like module paths.
+        self.dotted_strings: set[str] = set()
+        self.modules: dict[str, set[str]] = {}
+        self.members: dict[str, set[str]] = {}
+        self.bases: dict[str, set[str]] = {}
+
+    def add(self, rel: str, tree: ast.Module) -> None:
+        mod = module_name(rel).removeprefix("src.")
+        top = self.modules.setdefault(mod, set())
+        for node in tree.body:
+            top |= _bound_names(node)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    bound = alias.asname or alias.name.split(".")[0]
+                    self.names.add(bound)
+                    self.names.add(alias.name.rsplit(".", 1)[-1])
+            elif isinstance(node, (*_FUNC_TYPES, ast.ClassDef)):
+                self.names.add(node.name)
+                if isinstance(node, ast.ClassDef):
+                    self._add_class(node)
+            elif isinstance(node, ast.arg):
+                self.names.add(node.arg)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                self.names.add(node.id)
+            elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store):
+                self.names.add(node.attr)
+            elif isinstance(node, ast.keyword) and node.arg:
+                self.names.add(node.arg)
+            if isinstance(node, ast.Name):
+                self.mentioned.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                self.mentioned.add(node.attr)
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                text = node.value.strip().rstrip(".")
+                if "." in text and _DOTTED.fullmatch(text):
+                    parts = text.split(".")
+                    for cut in range(2, len(parts) + 1):
+                        self.dotted_strings.add(".".join(parts[:cut]))
+
+    def _add_class(self, node: ast.ClassDef) -> None:
+        members = self.members.setdefault(node.name, set())
+        for child in node.body:
+            members |= _bound_names(child)
+        for sub in ast.walk(node):
+            if (
+                isinstance(sub, ast.Attribute)
+                and isinstance(sub.ctx, ast.Store)
+                and isinstance(sub.value, ast.Name)
+                and sub.value.id in ("self", "cls")
+            ):
+                members.add(sub.attr)
+        for base in node.bases:
+            self.bases.setdefault(node.name, set()).add(_name_of(base) or "<expr>")
+
+    @property
+    def packages(self) -> set[str]:
+        return {m.split(".", 1)[0] for m in self.modules}
+
+    def is_package_prefix(self, dotted: str) -> bool:
+        """Whether some project module lives under *dotted*."""
+        prefix = dotted + "."
+        return any(m.startswith(prefix) for m in self.modules)
+
+    def class_has(self, cls: str, member: str) -> bool | None:
+        """Whether *cls* (or a project base of it) defines *member*; None when
+        a base outside the project could supply it."""
+        seen: set[str] = set()
+        stack = [cls]
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            if member in self.members.get(cur, ()):
+                return True
+            for base in self.bases.get(cur, ()):
+                if base in self.members:
+                    stack.append(base)
+                elif base not in ("object", "Exception", "BaseException"):
+                    return None  # a base outside the project may define it
+        return False
+
+    def resolve(self, ref: str) -> str | None:
+        """None when *ref* resolves (or is not the project's to judge), else
+        why it does not."""
+        parts = ref.split(".")
+        head = parts[0]
+        if len(parts) == 1:
+            if (
+                head in self.names
+                or head in self.mentioned
+                or head in _STDLIB
+                or head in self.modules
+            ):
+                return None
+            return "named nowhere in the project's code, the builtins or the stdlib"
+        if ref in self.dotted_strings or any(
+            ".".join(parts[:cut]) in self.dotted_strings for cut in range(2, len(parts))
+        ):
+            return None  # a metric/logger/event name the code spells as a string
+        if head in self.packages:
+            cut, mod = 0, ""
+            for cut in range(len(parts), 0, -1):
+                mod = ".".join(parts[:cut])
+                if mod in self.modules:
+                    break
+            rest = parts[cut:]
+            if not rest:
+                return None
+            if self.is_package_prefix(f"{mod}.{rest[0]}"):
+                return None  # a sub-package (a namespace one has no module)
+            if mod not in self.modules:
+                return f"no module {mod}.{rest[0]}"
+            if "__getattr__" in self.modules[mod]:
+                return None  # PEP 562: the module computes its attributes
+            if rest[0] not in self.modules[mod]:
+                return f"module {mod} has no {rest[0]}"
+            if (
+                len(rest) > 1
+                and rest[0] in self.members
+                and self.class_has(rest[0], rest[1]) is False
+            ):
+                return f"class {rest[0]} has no member {rest[1]}"
+            return None
+        if (
+            head in self.members
+            and head not in _STDLIB
+            and self.class_has(head, parts[1]) is False
+        ):
+            return f"class {head} has no member {parts[1]}"
+        return None  # self.x, a stdlib or third-party path: not judged
+
+
+def _bound_names(node: ast.AST) -> set[str]:
+    """Names a module- or class-level statement binds."""
+    out: set[str] = set()
+    if isinstance(node, (*_FUNC_TYPES, ast.ClassDef)):
+        out.add(node.name)
+    elif isinstance(node, (ast.Import, ast.ImportFrom)):
+        for alias in node.names:
+            out.add(alias.asname or alias.name.split(".")[0])
+    elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            out |= {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
+    elif isinstance(node, (ast.If, ast.Try, ast.With, ast.For)):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.stmt):
+                out |= _bound_names(child)
+        for handler in getattr(node, "handlers", ()):
+            for child in handler.body:
+                out |= _bound_names(child)
+    return out
+
+
+def doc_references(doc: str) -> list[tuple[int, str, str]]:
+    """``(line offset, reference, form)`` for the names a docstring cites:
+    Sphinx roles (`:func:` and friends), `Raises:` entries, and backticked
+    names that look like code -- a call (`name()`), a dotted path or a
+    CamelCase class. Plain backticked words are prose, not references."""
+    out: list[tuple[int, str, str]] = []
+    lines = doc.splitlines()
+    for offset, line in enumerate(lines):
+        if "://" in line:
+            line = re.sub(r"\S+://\S+", " ", line)  # URLs and their #fragments
+        for match in _ROLE_REF.finditer(line):
+            out.append((offset, match.group(2), "role"))
+        for match in _BACKTICK_REF.finditer(_ROLE_REF.sub(" ", line)):
+            name, call = match.group(1), match.group(2)
+            if name.endswith(".") or name.isupper():
+                continue
+            if call or "." in name or _CAMEL.match(name):
+                out.append((offset, name, "backtick"))
+    contract = parse_docstring(doc)
+    named = [(n, "raises") for n in contract.raises]
+    named += [(n, "prose_raises") for n in contract.raises_prose]
+    named += [(m.group(1), "prose_raises") for m in _RAISED_PHRASE.finditer(doc)]
+    for name, form in named:
+        offset = next((i for i, ln in enumerate(lines) if name in ln), 0)
+        if not any(ref == name for _o, ref, _f in out):
+            out.append((offset, name, form))
+    return out
+
+
+def find_dead_references(
+    rel: str, tree: ast.Module, index: ReferenceIndex
+) -> tuple[list[dict], int]:
+    """Docstring references in *tree* that do not resolve, and how many
+    references were checked."""
+    dead: list[dict] = []
+    checked = 0
+
+    def visit(node: ast.AST, qual: str, params: set[str]) -> None:
+        nonlocal checked
+        doc_node = None
+        body = getattr(node, "body", None)
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            doc_node = body[0].value
+        if doc_node is not None:
+            raw_first = doc_node.lineno
+            doc = ast.get_docstring(node, clean=False) or ""
+            for offset, ref, form in doc_references(doc):
+                checked += 1
+                if ref.split(".", 1)[0] in params:
+                    continue
+                reason = index.resolve(ref)
+                if reason:
+                    dead.append(
+                        {
+                            "file": rel,
+                            "line": raw_first + offset,
+                            "function": qual,
+                            "reference": ref,
+                            "form": form,
+                            # A dotted path into the project is unambiguous; a
+                            # bare name may belong to a package not imported.
+                            "confidence": "high" if "." in ref else "medium",
+                            "reason": reason,
+                        }
+                    )
+        for child in getattr(node, "body", []):
+            if isinstance(child, ast.ClassDef):
+                visit(
+                    child,
+                    f"{qual}.{child.name}" if qual != "<module>" else child.name,
+                    set(),
+                )
+            elif isinstance(child, _FUNC_TYPES):
+                names = set(_param_names(child.args))
+                name = f"{qual}.{child.name}" if qual != "<module>" else child.name
+                visit(child, name, names)
+
+    visit(tree, "<module>", set())
+    return dead, checked
 
 
 # --------------------------------------------------------------------------
@@ -1494,10 +1779,19 @@ def _summarize_coverage(surveys: list[FileSurvey]) -> dict:
     }
 
 
-def analyze(target: str, *, max_files: int = 0, include_tests: bool = False) -> dict:
+def analyze(
+    target: str,
+    *,
+    max_files: int = 0,
+    include_tests: bool = False,
+    exclude: list[str] | None = None,
+) -> dict:
     """Survey docstrings under *target* (a directory or a file)."""
     _resolved, project_root, scan_root = resolve_target(target)
-    files, files_total = collect_python_files(scan_root, max_files)
+    selection = select_python_files(
+        scan_root, project_root=project_root, max_files=max_files, exclude=exclude
+    )
+    files, files_total = selection.files, selection.files_total
     skipped_tests: list[str] = []
     unparseable: list[str] = []
     parsed: list[tuple[str, str, ast.Module]] = []
@@ -1517,6 +1811,24 @@ def analyze(target: str, *, max_files: int = 0, include_tests: bool = False) -> 
     index = ProjectIndex()
     for _rel, _source, tree in parsed:
         index.add_module(tree)
+    # Names resolve against the whole project, not only the scanned scope.
+    refs = ReferenceIndex()
+    scanned = {rel for rel, _source, _tree in parsed}
+    for path in collect_python_files(project_root)[0]:
+        rel = relative_to_root(path, project_root)
+        if rel in scanned:
+            continue
+        other = parse_source(path)
+        if other is not None:
+            refs.add(rel, other)
+    dead_refs: list[dict] = []
+    refs_checked = 0
+    for rel, _source, tree in parsed:
+        refs.add(rel, tree)
+    for rel, _source, tree in parsed:
+        found, checked = find_dead_references(rel, tree, refs)
+        dead_refs.extend(found)
+        refs_checked += checked
     surveys = []
     for rel, source, tree in parsed:
         survey = FileSurvey(rel, source, tree, index)
@@ -1538,7 +1850,7 @@ def analyze(target: str, *, max_files: int = 0, include_tests: bool = False) -> 
         return dict(sorted(out.items()))
 
     coverage = _summarize_coverage(surveys)
-    result = build_envelope(project_root, scan_root, files_total, len(files))
+    result = build_envelope(project_root, scan_root, files_total, len(files), selection)
     result["summary"] = {
         "files_surveyed": len(surveys),
         "coverage": {
@@ -1552,11 +1864,14 @@ def analyze(target: str, *, max_files: int = 0, include_tests: bool = False) -> 
         "suppressions": tally(suppressions, "tool"),
         "blanket_suppressions": sum(1 for x in suppressions if x["blanket"]),
         "described_fields": sum(s.described_fields for s in surveys),
+        "docstring_references_checked": refs_checked,
+        "dead_references": len(dead_refs),
     }
     result["coverage"] = coverage
     result["contract_issues"] = issues
     result["claims"] = claims
     result["suppressions"] = suppressions
+    result["dead_references"] = dead_refs
     result["skipped"] = {
         "test_files": len(skipped_tests),
         "include_tests": include_tests,
@@ -1566,9 +1881,15 @@ def analyze(target: str, *, max_files: int = 0, include_tests: bool = False) -> 
 
 
 def main() -> None:
-    argv = sys.argv[1:]
-    target, max_files = parse_common_args(argv, __doc__)
-    emit(analyze(target, max_files=max_files, include_tests="--include-tests" in argv))
+    args = parse_scan_args(sys.argv[1:], __doc__, flags={"--include-tests"})
+    emit(
+        analyze(
+            args.target,
+            max_files=args.max_files,
+            include_tests="--include-tests" in args.flags,
+            exclude=args.exclude,
+        )
+    )
 
 
 if __name__ == "__main__":

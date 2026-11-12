@@ -29,6 +29,7 @@ Key fields:
 - `summary`: aggregate statistics (total functions, hotspot counts, average scores)
 - Per-function `metrics`: `line_count`, `nesting_depth`, `parameter_count`, `branch_count`, `loop_count`, `return_count`, `local_variable_count`, `cognitive_complexity`
 - Per-function `score`: pre-computed 1-10 complexity rating
+- Per-function `metrics.flat`, `top_level_blocks`, `largest_block_share`, `largest_block_cognitive`: a **flat** function is a sequence of at least six independent top-level blocks (a validator checking one field after another, an accumulator appending to one list), none carrying more than 35% of the cognitive load, nested at most four deep. Its `score` uses the largest block's cognitive complexity instead of the sum and drops the branch-count term, since a reader holds one block at a time; `score_undiscounted` keeps the old value. A flat hotspot is usually inherent complexity (heterogeneous case handling): read it for a missing or inconsistent check across its blocks, not for a restructuring
 - Nested functions (closures, route handlers defined inside a router factory) are entries of their own, named `outer.inner` (`is_nested: true`, `parent`). Their lines and branches are **not** counted in the enclosing function, whose `nested_def_count` says how many it defines; `total_lines` is still the enclosing function's full span
 - `history_crossing` and, per hotspot, `fix_commits_2y`, `fix_density`, `risk_rank` and `verdict`: fix commits in the last two years whose hunks fell inside that function *in that commit's own version of the file*, matched by full path and qualified name. `active-risk` (≥ 2 fixes) outranks the complexity score; `recent-churn` (at least half of the function's current lines added in the last 90 days: `recent_commits`, `lines_added_recent`, `lines_changed_recent`, `recent_share`) means the code is young, so a low fix count says nothing yet: never deprioritize it; `settled` (complex, rarely fixed, not recently rewritten) says deprioritize; `quiet` on recently written code means "untested by time", not "safe"; `unknown` (with `verdict_reason`) means some fixes to the file could not be attributed and could change the verdict. A function renamed or moved within the window loses its earlier fixes. `history_crossing.fix_commits_seen` counts fixes to the **hotspots' files only** (`fix_commits_seen_scope`). Never report it as the project's fix count
 - `history_crossing.top_fixed_functions`: the source functions with the most fix commits across the whole scan root, whatever their score (`is_hotspot` says whether they also made the hotspot list). On a structurally simple codebase the fix-dense functions score below 5. Report the top ones in their own short table even when they are not hotspots, because that is where the defects have been. Pass `--key-type B=fix` (same meaning as in `analyze_history.py`) when the project marks bug-fix commits only with a tracker key
@@ -124,6 +125,14 @@ Per-function metrics can't see the complexity that produced most defects. When o
 - hotspots with no finding and a `settled` verdict (deprioritize, as the crossing says).
 
 Cite finding ids as the other agents wrote them, so consolidation can merge them. When no other reports are available, say so and skip this step.
+
+### Step 2c: Read Each Top Hotspot's Direct Callers and Callees
+
+The score ranks functions one at a time, but a hotspot's defects often sit in the small helpers it calls, or in the callers that prepare its input: each scores below 5 and never reaches the hotspot list. For every hotspot that gets a full write-up:
+
+1. List its direct callees and callers **in the same module** (`grep -n "<name>(" <file>`, and the calls inside its body).
+2. Read each one. Check what the hotspot assumes of it: the value it returns on the empty, missing or error case, the exception it raises, whether it mutates its argument, whether a caller validates the input the hotspot relies on.
+3. Report a defect found there under the hotspot's entry (`via callee <name>`), with the helper's own location, whatever the helper's score.
 
 ### Step 3: Analyze Simplification Strategies
 
@@ -237,6 +246,11 @@ For each group worth reporting: the copies (file:lines, function), `exact`/`rena
 ### Hotspots × Findings
 [The Step 2b table, or "no other agents' reports available"]
 
+### Defects Surfaced While Reading Hotspots
+[Correctness bugs you found while reading hotspot code: not complexity, but real. Each with the
+fields from `<plugin_root>/docs/finding-fields.md`. Reading the most complex code closely is how
+these surface, and they are lost if the report has only a simplification slot.]
+
 ## Cross-Cutting Observations
 
 [Patterns of complexity that appear across multiple hotspots. These often point to architectural improvements rather than function-level refactoring:]
@@ -280,10 +294,18 @@ For each group worth reporting: the copies (file:lines, function), `exact`/`rena
 - **Property complexity**: `@property` methods should be trivial. Complex property getters should be explicit methods.
 - **Magic method complexity**: `__init__` should be simple assignment. Complex initialization should use classmethods as alternative constructors.
 
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.
+
 ## Running the script
 
 These rules apply to every script call this agent makes.
 
+- **Scope.** `--exclude PAT[,PAT]` (repeatable) leaves generated, vendored or out-of-scope trees out of every count; the envelope's `files_excluded` says how many. measure_complexity.py skips migration files unless `--include-migrations`; on an export without `.git`, pass `--git-dir <checkout>` or the churn weighting is missing (it warns on stderr).
 - **Timeout.** Give the Bash call `timeout: 300000` (5 min). The 120 s default kills the script on
   large projects. If it may run longer still, use `run_in_background` and wait for the completion
   notification rather than polling.

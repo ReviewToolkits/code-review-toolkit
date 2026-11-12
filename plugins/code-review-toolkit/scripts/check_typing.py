@@ -50,6 +50,15 @@ packages are unchecked. ``mypy_python`` records the interpreter whose
 site-packages mypy resolved against, since every import result depends on it.
 The passes are independent and run concurrently.
 
+Each phantom hit is traced to the module its annotation imports from and
+tagged ``phantom_origin``; ``phantom_imports_real`` counts the hits whose
+module does not exist. ``stale_stub_packages`` lists installed ``types-*`` /
+``*-stubs`` distributions that shadow a library's own inline types. Through
+``analyze()``: ``extra_passes`` adds labelled passes for any mypy flags,
+``cache_dir`` keeps the cache for later runs, and ``boundary_map`` runs the
+opt-in typed-boundary overlay -- bare boundary parameters (``request``)
+annotated in an exported copy, so mypy checks what flows through them.
+
 Usage:
     python check_typing.py [path] [--mypy-bin PATH] [--max-files N]
         [--no-strict-pass] [--no-unreachable-pass] [--no-unused-ignores-pass]
@@ -61,6 +70,7 @@ from __future__ import annotations
 import argparse
 import ast
 import configparser
+import functools
 import json
 import os
 import re
@@ -74,6 +84,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scan_common import (  # noqa: E402
+    EXCLUDE_DIRS,
     build_envelope,
     discover_python_files,
     emit,
@@ -123,6 +134,42 @@ _DEFECT_CODES = frozenset(
         "method-assign",
     }
 )
+
+# `misc` is a grab bag, so it is split by message. "Invalid base class" and
+# "Class cannot subclass ... (has type "Any")" make the class an Any subclass:
+# every attribute access on its instances stops being checked, which is the
+# finding. `"None" not callable` is mostly a narrowing mypy lost (a callable
+# probed through a bool alias), so it is triaged before it is believed.
+_MISC_FAMILIES = (
+    (
+        "any-subclass",
+        re.compile(r'^(Invalid base class|Class cannot subclass .*"Any")'),
+    ),
+    ("none-not-callable", re.compile(r'^"None" not callable')),
+)
+
+# Errors whose RESULT silently becomes Any, so the code after them is unchecked
+# even when the error itself is ignored or baselined: an Any base class, and a
+# call no overload accepts (mypy types the result as Any or a guess).
+_SILENT_ANY_OVERLOAD = "failed-overload"
+
+
+def misc_family(message: str) -> str:
+    """The family of a `misc` message: any-subclass, none-not-callable or other."""
+    for family, pattern in _MISC_FAMILIES:
+        if pattern.search(message):
+            return family
+    return "other"
+
+
+def silent_any(code: str, message: str) -> str | None:
+    """Why this error's result is silently Any, or None if it is not."""
+    if code == "misc" and misc_family(message) == "any-subclass":
+        return "any-subclass"
+    if code == "call-overload":
+        return _SILENT_ANY_OVERLOAD
+    return None
+
 
 # Codes that describe MISSING typing rather than wrong typing.
 _ANNOTATION_CODES = frozenset(
@@ -313,6 +360,11 @@ def parse_output(
             ),
             "notes": pending_context,
         }
+        if code == "misc":
+            current["misc_family"] = misc_family(m["message"])
+        why_any = silent_any(code, m["message"])
+        if why_any:
+            current["silent_any"] = why_any
         findings.append(current)
         pending_context = []
     if standalone_notes is not None:
@@ -326,6 +378,7 @@ def _run_mypy(
     config: str | None,
     extra: list[str],
     cache_dir: str,
+    mypy_path: str | None = None,
 ) -> tuple[str, str, int | None]:
     # --no-color-output is load-bearing, not cosmetic. mypy honours FORCE_COLOR
     # even when stdout is a pipe, and the ANSI codes it injects sit between the
@@ -352,6 +405,11 @@ def _run_mypy(
     cmd.extend(extra)
     cmd.extend(targets)
     env = {**os.environ, "FORCE_COLOR": "0", "MYPY_FORCE_COLOR": "0", "NO_COLOR": "1"}
+    if mypy_path:
+        # Searched before the config's own mypy_path (the overlay's stubs).
+        env["MYPYPATH"] = os.pathsep.join(
+            p for p in (mypy_path, os.environ.get("MYPYPATH", "")) if p
+        )
     try:
         out = subprocess.run(
             cmd,
@@ -795,6 +853,414 @@ def _own_packages(project_root: Path, scan_root: Path) -> set[str]:
     return own
 
 
+# ---------------------------------------------------------------------------
+# Phantom imports: which hits are real?
+# ---------------------------------------------------------------------------
+#
+# `--disallow-any-unimported` fires wherever an annotation names a type from a
+# module mypy did not follow. On a project that silences untyped libraries
+# with ignore_missing_imports that is hundreds of hits, none of them a phantom:
+# the module exists, the config just turned it into Any on purpose. A REAL
+# phantom names a module that does not exist at all (a misspelled or moved
+# `TYPE_CHECKING` import). Each hit is traced from its annotation to the
+# import that bound the name, and that module is looked up -- without being
+# imported -- on the search path of the interpreter mypy resolves against.
+
+_ARG_HIT = re.compile(r'^Argument (\d+) to "[^"]*" becomes')
+_BASE_HIT = re.compile(r"^Base type (\S+) becomes")
+
+_FIND_PROBE = (
+    "import importlib.machinery as im, json, os, sys\n"
+    "req = json.loads(sys.stdin.read())\n"
+    "paths = req['paths'] + [p for p in sys.path if p]\n"
+    "suffixes = im.all_suffixes() + ['.pyi']\n"
+    "builtin = set(sys.builtin_module_names)\n"
+    "def find(mod):\n"
+    "    parts = mod.split('.')\n"
+    "    if len(parts) == 1 and parts[0] in builtin:\n"
+    "        return True\n"
+    "    search = paths\n"
+    "    for i, part in enumerate(parts):\n"
+    "        last = i == len(parts) - 1\n"
+    "        names = [part, part + '-stubs'] if i == 0 else [part]\n"
+    "        dirs = [os.path.join(b, n) for b in search for n in names\n"
+    "                if os.path.isdir(os.path.join(b, n))]\n"
+    "        is_file = any(os.path.isfile(os.path.join(b, part + s))\n"
+    "                      for b in search for s in suffixes)\n"
+    "        if last:\n"
+    "            return bool(dirs) or is_file\n"
+    "        if not dirs:\n"
+    "            return False\n"
+    "        search = dirs\n"
+    "    return True\n"
+    "print(json.dumps({m: find(m) for m in req['modules']}))\n"
+)
+
+
+def find_modules(
+    python: str | None, modules: list[str], paths: list[str]
+) -> dict[str, bool] | None:
+    """Whether each module exists on *python*'s search path (plus *paths*).
+
+    Nothing is imported: the probe walks the path entries like the import
+    system would (packages, namespace directories, module files, stubs
+    packages). None when the interpreter cannot be asked.
+    """
+    if not python:
+        return None
+    if not modules:
+        return {}
+    try:
+        out = subprocess.run(
+            [python, "-I", "-B", "-c", _FIND_PROBE],
+            input=json.dumps({"modules": modules, "paths": paths}),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        found = json.loads(out.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return found if isinstance(found, dict) else None
+
+
+def _file_module(path: Path) -> str:
+    """The dotted module name of *path*, from the packages above it."""
+    parts = [] if path.stem == "__init__" else [path.stem]
+    parent = path.parent
+    while (parent / "__init__.py").is_file():
+        parts.insert(0, parent.name)
+        parent = parent.parent
+    return ".".join(parts)
+
+
+def _imports_of(tree: ast.Module, module: str, is_pkg: bool) -> dict[str, str]:
+    """Local name -> the module that must exist for the binding to be real.
+
+    `from a.b import C` binds C to module `a.b` (C may itself be a submodule,
+    which `a.b` existing does not need); `import a.b` binds `a` and needs
+    `a.b`; `import a.b as m` binds `m`. Relative imports are made absolute.
+    """
+    package = module.split(".") if is_pkg else module.split(".")[:-1]
+    bound: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.level:
+                keep = len(package) - (node.level - 1)
+                if keep < 0:
+                    continue
+                source = ".".join(
+                    package[:keep] + ([node.module] if node.module else [])
+                )
+            else:
+                source = node.module or ""
+            for alias in node.names:
+                if alias.name != "*" and source:
+                    bound[alias.asname or alias.name] = source
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname:
+                    bound[alias.asname] = alias.name
+                else:
+                    top = alias.name.split(".")[0]
+                    # The longest `import a.b.c` is what must exist.
+                    if len(alias.name) > len(bound.get(top, "")):
+                        bound[top] = alias.name
+    return bound
+
+
+def _annotation_names(node: ast.AST | None) -> list[str]:
+    """Root names an annotation uses (`a` for `a.b.C`), quoted ones included."""
+    if node is None:
+        return []
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        try:
+            node = ast.parse(node.value, mode="eval").body
+        except (SyntaxError, ValueError, RecursionError):
+            return []
+    names: list[str] = []
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name):
+            names.append(sub.id)
+        elif isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+            names.extend(_annotation_names(sub))
+    return names
+
+
+def _hit_annotations(tree: ast.Module, line: int, message: str) -> list[ast.AST]:
+    """The annotation (or base class) a phantom hit at *line* is about."""
+    out: list[ast.AST] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.lineno != line:
+                continue
+            a = node.args
+            ordered = [*a.posonlyargs, *a.args]
+            ordered += [a.vararg] if a.vararg else []
+            ordered += a.kwonlyargs + ([a.kwarg] if a.kwarg else [])
+            m = _ARG_HIT.match(message)
+            if m and 0 < int(m.group(1)) <= len(ordered):
+                out.append(ordered[int(m.group(1)) - 1].annotation)
+            elif message.startswith("Return type"):
+                out.append(node.returns)
+            else:
+                out += [x.annotation for x in ordered] + [node.returns]
+        elif isinstance(node, ast.ClassDef) and node.lineno == line:
+            m = _BASE_HIT.match(message)
+            bases = node.bases
+            if m:
+                named = [b for b in bases if ast.unparse(b).endswith(m.group(1))]
+                bases = named or bases
+            out += bases
+        elif isinstance(node, ast.AnnAssign) and node.lineno == line:
+            out.append(node.annotation)
+    return [x for x in out if x is not None]
+
+
+def _local_definitions(tree: ast.Module) -> dict[str, list[ast.AST]]:
+    """Module-level classes (their bases) and aliases (their value), by name."""
+    defs: dict[str, list[ast.AST]] = {}
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            defs[node.name] = list(node.bases)
+        elif (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            defs[node.targets[0].id] = [node.value]
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.value is not None
+        ):
+            defs[node.target.id] = [node.value]
+    return defs
+
+
+def phantom_hit_modules(path: Path, line: int, message: str, cache: dict) -> list[str]:
+    """Modules the annotation behind one phantom hit takes its names from.
+
+    A name defined in the same file (a local base class or alias) is followed
+    to where its own names come from, a few levels deep.
+    """
+    if path not in cache:
+        tree = parse_source(path)
+        if tree is None:
+            cache[path] = None
+        else:
+            module = _file_module(path)
+            cache[path] = (
+                tree,
+                _imports_of(tree, module, path.stem == "__init__"),
+                _local_definitions(tree),
+            )
+    entry = cache[path]
+    if entry is None:
+        return []
+    tree, bound, local = entry
+    modules: list[str] = []
+    seen: set[str] = set()
+    frontier = [
+        (n, 0)
+        for a in _hit_annotations(tree, line, message)
+        for n in _annotation_names(a)
+    ]
+    while frontier:
+        name, depth = frontier.pop(0)
+        if name in seen:
+            continue
+        seen.add(name)
+        if name in bound:
+            if bound[name] not in modules:
+                modules.append(bound[name])
+        elif name in local and depth < 3:
+            frontier += [
+                (n, depth + 1) for x in local[name] for n in _annotation_names(x)
+            ]
+    return modules
+
+
+def _covers(module: str, silenced: set[str]) -> bool:
+    return any(
+        module == s or module.startswith(s + ".") or s.startswith(module + ".")
+        for s in silenced
+    )
+
+
+def classify_phantoms(
+    findings: list[dict],
+    silenced: set[str] | None,
+    own: set[str],
+    python: str | None,
+    search_paths: list[str],
+    roots: list[Path],
+) -> dict:
+    """Tag each phantom hit with where its Any comes from; return the summary.
+
+    `phantom_origin` is one of:
+
+    - ``module-missing``: the module the name is imported from does not exist
+      on mypy's search path. ``real_phantom`` is true unless the config also
+      silences it for an outside package (a dependency simply not installed
+      in this environment, which `module_found: false` still shows);
+    - ``silenced-by-config``: the modules exist, and one of them is one
+      ignore_missing_imports turned into Any on purpose (an annotation mixing
+      `typing` or project types with it gets its Any from that one);
+    - ``importable-unfollowed``: the module exists and is not silenced by the
+      config (a `# type: ignore` on its import, follow_imports, no stubs);
+    - ``unresolved-name``: the annotation could not be traced to an import.
+    """
+    cache: dict = {}
+    per_hit: list[tuple[dict, list[str]]] = []
+    wanted: set[str] = set()
+    for f in findings:
+        path = Path(f["file"])
+        if not path.is_absolute():
+            path = next(
+                (r / path for r in roots if (r / path).is_file()), roots[0] / path
+            )
+        modules = phantom_hit_modules(path, f["line"], f["message"], cache)
+        per_hit.append((f, modules))
+        wanted.update(modules)
+    found = find_modules(python, sorted(wanted), search_paths)
+    by_origin: dict[str, int] = {}
+    missing: set[str] = set()
+    for f, modules in per_hit:
+        f["phantom_modules"] = modules
+        if not modules:
+            origin, real = "unresolved-name", False
+        elif found is None:
+            origin, real = "not-measured", False
+        else:
+            absent = [m for m in modules if not found.get(m, False)]
+            if absent:
+                origin = "module-missing"
+                real = any(
+                    m.split(".")[0] in own or not (silenced and _covers(m, silenced))
+                    for m in absent
+                )
+                if real:
+                    missing.update(absent)
+            elif silenced is not None and any(_covers(m, silenced) for m in modules):
+                origin, real = "silenced-by-config", False
+            else:
+                origin, real = "importable-unfollowed", False
+            f["module_found"] = not absent
+        f["phantom_origin"] = origin
+        f["real_phantom"] = real
+        by_origin[origin] = by_origin.get(origin, 0) + 1
+    return {
+        "real": sum(1 for f, _ in per_hit if f["real_phantom"]),
+        "by_origin": dict(sorted(by_origin.items())),
+        "missing_modules": sorted(missing),
+        "basis": (
+            "not-measured: mypy's interpreter could not be asked"
+            if found is None and wanted
+            else "silenced-imports-pass"
+            if silenced is not None
+            else "no-silenced-imports-pass"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Stale stub packages
+# ---------------------------------------------------------------------------
+#
+# A `types-foo` / `foo-stubs` distribution installs `foo-stubs/`, which mypy
+# prefers over the package's own inline types (PEP 561 resolution order). Once
+# `foo` ships `py.typed` itself, the stub package is at best redundant and at
+# worst describes an older API: calls the real library rejects pass, and
+# calls it accepts fail. Nothing in mypy's output says the stub won.
+
+_STUB_PROBE = (
+    "import importlib.metadata as m, json, os, sys\n"
+    "paths = sys.argv[1:] or [p for p in sys.path if p]\n"
+    "out, seen = [], set()\n"
+    "for d in m.distributions(path=paths):\n"
+    "    name = d.metadata['Name'] or ''\n"
+    # Stub-only distributions are named `types-*` (typeshed) or `*-stubs`
+    # (PEP 561); reading every distribution's file list would be slow.
+    "    if not (name.lower().startswith('types-') or name.lower().endswith('-stubs')):\n"
+    "        continue\n"
+    "    tops = sorted({f.parts[0] for f in d.files or []\n"
+    "                   if f.parts and f.parts[0].endswith('-stubs')})\n"
+    "    for top in tops:\n"
+    "        mod = top[:-len('-stubs')]\n"
+    "        if (name, mod) in seen:\n"
+    "            continue\n"
+    "        seen.add((name, mod))\n"
+    "        typed = os.path.join(str(d.locate_file(top)), 'py.typed')\n"
+    "        try:\n"
+    "            with open(typed) as fh:\n"
+    "                partial = 'partial' in fh.read()\n"
+    "        except OSError:\n"
+    "            partial = False\n"
+    "        runtime = next((os.path.join(b, mod) for b in paths\n"
+    "                        if os.path.isdir(os.path.join(b, mod))), None)\n"
+    "        if runtime is None:\n"
+    "            continue\n"
+    "        if not os.path.isfile(os.path.join(runtime, 'py.typed')):\n"
+    "            continue\n"
+    "        out.append({'stub_distribution': name, 'stub_version': d.version,\n"
+    "                    'module': mod, 'stub_partial': partial,\n"
+    "                    'runtime_distribution': None, 'runtime_version': None})\n"
+    "if out:\n"
+    "    owners = {}\n"
+    "    for d in m.distributions(path=paths):\n"
+    "        for f in d.files or []:\n"
+    "            if f.parts and not f.parts[0].endswith(('-stubs', '.dist-info')):\n"
+    "                owners.setdefault(f.parts[0].split('.')[0], set()).add(\n"
+    "                    (d.metadata['Name'] or '', d.version))\n"
+    "    for e in out:\n"
+    "        dist = sorted(o for o in owners.get(e['module'], ())\n"
+    "                      if o[0] != e['stub_distribution'])\n"
+    "        if dist:\n"
+    "            e['runtime_distribution'], e['runtime_version'] = dist[0]\n"
+    "print(json.dumps(sorted(out, key=lambda e: (e['module'], e['stub_distribution']))))\n"
+)
+
+
+def stale_stub_packages(
+    python: str | None, paths: list[str] | None = None
+) -> tuple[list[dict] | None, str | None]:
+    """Installed stub distributions whose runtime package ships `py.typed`.
+
+    Asked of the interpreter mypy resolves against (``-I -B``: nothing is
+    imported from the caller's directory or written anywhere). *paths*
+    replaces its ``sys.path`` (tests). Returns ``(entries, None)`` or
+    ``(None, reason)``. A partial stub package (``partial`` in its own
+    ``py.typed``) is meant to be merged with the inline types, so it is
+    listed with ``stub_partial: true`` rather than left out.
+    """
+    if not python:
+        return None, "not measured: could not tell which interpreter mypy runs under"
+    entries, reason = _stub_probe(python, tuple(paths or ()))
+    return (None if entries is None else [dict(e) for e in entries]), reason
+
+
+@functools.lru_cache(maxsize=8)
+def _stub_probe(python: str, paths: tuple[str, ...]) -> tuple[list | None, str | None]:
+    # Cached per interpreter: an environment does not change within one run,
+    # and the probe reads every installed distribution's metadata.
+    try:
+        out = subprocess.run(
+            [python, "-I", "-B", "-c", _STUB_PROBE, *paths],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        entries = json.loads(out.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None, "not measured: mypy's interpreter could not be queried"
+    if not isinstance(entries, list):
+        return None, "not measured: unexpected probe output"
+    return entries, None
+
+
 def _count_untyped_defs(files: list[Path]) -> int:
     """Functions with no parameter or return annotation (mypy's "untyped")."""
     count = 0
@@ -911,6 +1377,228 @@ def _labelled_pass(
     return {"ran": True, "error": None, "findings": added}
 
 
+# ---------------------------------------------------------------------------
+# User-chosen passes and the typed-boundary overlay
+# ---------------------------------------------------------------------------
+
+# Flags an extra pass may not carry: they change where the output goes or how
+# it reads, and a pass whose output does not parse would report nothing.
+_EXTRA_PASS_DENY = (
+    "--config-file",
+    "--cache-dir",
+    "--output",
+    "-O",
+    "--pretty",
+    "--no-error-summary",
+    "--color-output",
+    "--force-color",
+    "--version",
+    "--help",
+)
+
+
+def validate_extra_passes(flags: list[str]) -> tuple[list[tuple[str, str]], list[dict]]:
+    """`(passes, rejected)`: each accepted flag as `(label, flag)`.
+
+    A flag must be one long option (``--strict-optional``,
+    ``--always-true=DEBUG``); one this script already runs as a labelled pass
+    is accepted once.
+    """
+    passes: list[tuple[str, str]] = []
+    rejected: list[dict] = []
+    for flag in flags:
+        flag = flag.strip()
+        why = None
+        if not flag.startswith("--") or " " in flag:
+            why = "not a single --long-option"
+        elif flag.split("=", 1)[0] in _EXTRA_PASS_DENY:
+            why = "changes where the output goes or how it parses"
+        if why:
+            rejected.append({"flag": flag, "reason": why})
+            continue
+        label = flag[2:]
+        if label not in {lbl for lbl, _ in passes}:
+            passes.append((label, flag))
+    return passes, rejected
+
+
+def _pass_dir(name: str) -> str:
+    return re.sub(r"[^\w.-]", "_", name)
+
+
+_OVERLAY_PASS = "boundary-overlay"
+_OVERLAY_ALIAS = "_crt_boundary_{}"
+_CONFIG_NAMES = ("mypy.ini", ".mypy.ini", "setup.cfg", "pyproject.toml")
+
+
+def _export_tree(project_root: Path, export: Path) -> None:
+    """Copy the project's Python sources and config files to *export*."""
+    for dirpath, dirnames, filenames in os.walk(project_root):
+        dirnames[:] = [
+            d for d in dirnames if d not in EXCLUDE_DIRS and not d.startswith(".")
+        ]
+        rel = Path(dirpath).relative_to(project_root)
+        for name in filenames:
+            if not (
+                name.endswith((".py", ".pyi"))
+                or name == "py.typed"
+                or (rel == Path(".") and name in _CONFIG_NAMES)
+            ):
+                continue
+            dest = export / rel / name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(Path(dirpath) / name, dest)
+
+
+def _boundary_edits(
+    tree: ast.Module, rel: str, by_name: dict[str, str], sites: list[dict]
+) -> list[tuple[int, int, str, str]]:
+    """`(line, byte_col, param, qualified_type)` for each bare parameter to annotate."""
+    wanted = {
+        (s["line"], s["param"]): s["annotation"] for s in sites if s.get("file") == rel
+    }
+    edits = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        a = node.args
+        for arg in a.posonlyargs + a.args + a.kwonlyargs:
+            if arg.annotation is not None:
+                continue
+            qualified = wanted.get((node.lineno, arg.arg)) or by_name.get(arg.arg)
+            if qualified and "." in qualified and arg.end_col_offset is not None:
+                edits.append((arg.lineno, arg.end_col_offset, arg.arg, qualified))
+    return edits
+
+
+def apply_boundary_overlay(
+    export: Path,
+    project_root: Path,
+    files: list[Path],
+    boundary_map: dict[str, str] | list[dict],
+) -> dict:
+    """Annotate bare boundary parameters in the exported copy of *files*.
+
+    *boundary_map* is either ``{param_name: "pkg.mod.Type"}`` (every bare
+    parameter of that name) or a list of sites ``{file, line, param,
+    annotation}`` -- `file` project-relative, `line` the def's line, as in
+    count_types' `untyped_boundaries` once a qualified type is filled in. Each
+    annotation is a quoted ``"_crt_boundary_N.Type"`` with ``import pkg.mod
+    as _crt_boundary_N`` appended at the end of the file, so no line moves and
+    every finding maps back to the original line.
+    """
+    by_name = boundary_map if isinstance(boundary_map, dict) else {}
+    sites = boundary_map if isinstance(boundary_map, list) else []
+    annotated: list[dict] = []
+    used: set[str] = set()
+    for path in files:
+        rel = str(path.relative_to(project_root))
+        tree = parse_source(path)
+        if tree is None:
+            continue
+        edits = _boundary_edits(tree, rel, by_name, sites)
+        if not edits:
+            continue
+        target = export / rel
+        lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
+        aliases: dict[str, str] = {}
+        for line, col, param, qualified in sorted(edits, reverse=True):
+            module, _, name = qualified.rpartition(".")
+            alias = aliases.setdefault(module, _OVERLAY_ALIAS.format(len(aliases)))
+            raw = lines[line - 1].encode("utf-8")
+            text = f': "{alias}.{name}"'.encode()
+            lines[line - 1] = (raw[:col] + text + raw[col:]).decode("utf-8")
+            annotated.append(
+                {"file": rel, "line": line, "param": param, "type": qualified}
+            )
+            used.add(param)
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines += [
+            f"import {m} as {a}  # crt boundary overlay\n" for m, a in aliases.items()
+        ]
+        target.write_text("".join(lines), encoding="utf-8")
+    wanted_names = set(by_name) | {s.get("param") for s in sites}
+    return {
+        "sites_annotated": sorted(annotated, key=lambda e: (e["file"], e["line"])),
+        "unmatched": sorted(n for n in wanted_names - used if n),
+    }
+
+
+def _overlay_pass(
+    mypy_bin: str,
+    project_root: Path,
+    files: list[Path],
+    targets: list[str],
+    config: str | None,
+    flags: list[str],
+    cache_dir: str,
+    baseline: set[tuple],
+    boundary_map: dict[str, str] | list[dict],
+    stubs: str | None = None,
+) -> dict:
+    """Annotate the boundaries in an export and report what mypy then adds.
+
+    *stubs* is a directory searched first for stubs (``MYPYPATH``): a minimal
+    ``.pyi`` for a library the config silences is what gives the annotated
+    parameter attributes worth checking.
+    """
+    export = Path(cache_dir) / "export"
+    shutil.rmtree(export, ignore_errors=True)
+    export.mkdir(parents=True)
+    _export_tree(project_root, export)
+    applied = apply_boundary_overlay(export, project_root, files, boundary_map)
+    result = {"ran": False, "error": None, "findings": [], **applied}
+    if not applied["sites_annotated"]:
+        result["error"] = "no bare parameter matched the boundary map"
+        return result
+
+    def moved(path: str) -> str:
+        p = Path(path)
+        try:
+            return str(export / p.resolve().relative_to(project_root))
+        except ValueError:
+            return path
+
+    out, err, rc = _run_mypy(
+        mypy_bin,
+        [moved(t) for t in targets],
+        moved(config) if config else None,
+        flags,
+        os.path.join(cache_dir, "mypy"),
+        mypy_path=stubs,
+    )
+    found, stats = parse_output(out)
+    if rc is None or not stats["files_checked"]:
+        result["error"] = _diagnose_failure(err, out, rc)
+        return result
+    edited = {(e["file"], e["line"]) for e in applied["sites_annotated"]}
+    for f in found:
+        # mypy prints a path under the caller's cwd relative to it, so a
+        # cache directory below the cwd yields `cache/.../export/pkg/m.py`.
+        path = Path(f["file"])
+        if not path.is_absolute() and (Path.cwd() / path).is_file():
+            path = Path.cwd() / path
+        try:
+            f["file"] = str(project_root / path.resolve().relative_to(export.resolve()))
+        except ValueError:
+            pass
+        if _finding_key(f) in baseline:
+            continue
+        rel = f["file"]
+        if Path(rel).is_absolute():
+            try:
+                rel = str(Path(rel).relative_to(project_root))
+            except ValueError:
+                pass
+        # `request: Request = None` is the overlay's own doing, not a defect.
+        f["overlay_artifact"] = (rel, f["line"]) in edited and f["code"] == "assignment"
+        f["pass"] = _OVERLAY_PASS
+        result["findings"].append(f)
+    result["ran"] = True
+    return result
+
+
 def analyze(
     target: str,
     *,
@@ -921,8 +1609,22 @@ def analyze(
     unused_ignores_pass: bool = True,
     untyped_defs_pass: bool = True,
     silenced_imports_pass: bool = True,
+    extra_passes: list[str] | None = None,
+    cache_dir: str | None = None,
+    boundary_map: dict[str, str] | list[dict] | None = None,
+    boundary_stubs: str | None = None,
+    boundary_flags: list[str] | None = None,
 ) -> dict:
     """Run mypy over *target*, plus labelled extra passes.
+
+    *extra_passes* adds one labelled pass per mypy flag, reported like the
+    built-in ones. *cache_dir* replaces the private temporary cache (kept
+    afterwards, so later runs reuse it; never inside the reviewed project).
+    *boundary_map* runs the opt-in typed-boundary overlay: see
+    `apply_boundary_overlay`; *boundary_stubs* is a stub directory for it,
+    and *boundary_flags* extra mypy flags for it (``--check-untyped-defs``:
+    what a labelled pass with the same flags finds is subtracted, so the
+    overlay reports only what the annotations expose).
 
     The passes are ``--disallow-any-unimported`` (phantom imports),
     ``--warn-unreachable`` (code a wrong annotation has silently removed from
@@ -959,9 +1661,29 @@ def analyze(
         }
 
     config = find_mypy_config(project_root)
+    extra, rejected = validate_extra_passes(extra_passes or [])
+    overlay_flags, rejected_overlay = validate_extra_passes(boundary_flags or [])
+    rejected += [{**r, "for": _OVERLAY_PASS} for r in rejected_overlay]
     # mypy's cache goes to a private temporary directory, never the reviewed
-    # project or the caller's cwd, and is removed however the run ends.
-    cache_root = tempfile.mkdtemp(prefix="crt-mypy-cache-")
+    # project or the caller's cwd, and is removed however the run ends -- or
+    # to the caller's own --cache-dir, which is kept.
+    keep_cache = cache_dir is not None
+    if keep_cache:
+        cache_path = Path(cache_dir).expanduser().resolve()
+        if cache_path == project_root or project_root in cache_path.parents:
+            return {
+                **envelope,
+                "status": "FAILED",
+                "error": (
+                    f"cache dir {cache_path} is inside the reviewed project; "
+                    "a review must not write there"
+                ),
+                "findings": [],
+            }
+        cache_path.mkdir(parents=True, exist_ok=True)
+        cache_root = str(cache_path)
+    else:
+        cache_root = tempfile.mkdtemp(prefix="crt-mypy-cache-")
     try:
         return _analyze_with_cache(
             mypy_bin=mypy_bin,
@@ -980,9 +1702,23 @@ def analyze(
             mypy_python=mypy_python_info(mypy_bin, config),
             untyped_defs=_count_untyped_defs(files[:max_files] if capped else files),
             cache_root=cache_root,
+            extra_passes=extra,
+            rejected_passes=rejected,
+            overlay=(
+                None
+                if boundary_map is None
+                else (
+                    boundary_map,
+                    files[:max_files] if capped else files,
+                    boundary_stubs,
+                    [flag for _, flag in overlay_flags],
+                )
+            ),
+            cache_kept=keep_cache,
         )
     finally:
-        shutil.rmtree(cache_root, ignore_errors=True)
+        if not keep_cache:
+            shutil.rmtree(cache_root, ignore_errors=True)
 
 
 def _analyze_with_cache(
@@ -997,6 +1733,10 @@ def _analyze_with_cache(
     cache_root: str,
     untyped_defs: int | None = None,
     mypy_python: dict | None = None,
+    extra_passes: list[tuple[str, str]] | None = None,
+    rejected_passes: list[dict] | None = None,
+    overlay: tuple | None = None,
+    cache_kept: bool = False,
 ) -> dict:
     stdout, stderr, returncode = _run_mypy(
         mypy_bin, targets, config, cap_flags, os.path.join(cache_root, "baseline")
@@ -1060,6 +1800,13 @@ def _analyze_with_cache(
     untyped_checked = config_enables(config, "check_untyped_defs")
     if untyped_checked:
         wanted.pop("check-untyped-defs", None)
+    extra_names: dict[str, str] = {}
+    if status == "OK":
+        for label, flag in extra_passes or []:
+            if label in wanted or label in passes:
+                continue  # a built-in pass already covers this flag
+            extra_names["extra:" + label] = label
+            wanted["extra:" + label] = ([flag], config)
     baseline = {_finding_key(f) for f in findings}
     labelled: dict[str, dict] = {}
     if wanted:
@@ -1072,12 +1819,57 @@ def _analyze_with_cache(
                     pass_config,
                     [*cap_flags, *flags],
                     name,
-                    os.path.join(cache_root, name),
+                    os.path.join(cache_root, _pass_dir(name)),
                     baseline,
                 )
                 for name, (flags, pass_config) in wanted.items()
             }
             labelled = {name: fut.result() for name, fut in futures.items()}
+
+    overlay_result = None
+    if overlay is not None:
+        if status != "OK":
+            overlay_result = {
+                "ran": False,
+                "error": "not run: the baseline run failed",
+                "findings": [],
+                "sites_annotated": [],
+                "unmatched": [],
+            }
+        else:
+            overlay_map, overlay_files, overlay_stubs, overlay_extra = overlay
+            # What a labelled pass with a subset of the overlay's flags found
+            # is the flags' doing, not the annotations'.
+            known = set(baseline)
+            for name, (flags, pass_config) in wanted.items():
+                result = labelled.get(name)
+                if (
+                    result
+                    and result["ran"]
+                    and pass_config == config
+                    and flags
+                    and set(flags) <= set(overlay_extra)
+                ):
+                    known |= {_finding_key(f) for f in result["findings"]}
+            overlay_result = _overlay_pass(
+                mypy_bin,
+                Path(envelope["project_root"]),
+                overlay_files,
+                targets,
+                config,
+                [*cap_flags, *overlay_extra],
+                os.path.join(cache_root, _OVERLAY_PASS),
+                known,
+                overlay_map,
+                overlay_stubs,
+            )
+        labelled[_OVERLAY_PASS] = overlay_result
+    extra_findings = [
+        f
+        for name in extra_names
+        if labelled.get(name, {}).get("ran")
+        for f in labelled[name]["findings"]
+    ]
 
     def pass_findings(name: str, code: str | None = None) -> list[dict] | None:
         result = labelled.get(name)
@@ -1151,6 +1943,26 @@ def _analyze_with_cache(
         status = "FAILED"
         failure_reason = parse_mismatch
 
+    project_root = Path(envelope["project_root"])
+    scan_root = Path(envelope["scan_root"])
+    own = _own_packages(project_root, scan_root)
+    phantom_summary = None
+    if phantom_imports:
+        phantom_summary = classify_phantoms(
+            phantom_imports,
+            None
+            if silenced is None
+            else {f["module"] for f in silenced if f.get("module")},
+            own,
+            (mypy_python or {}).get("executable"),
+            [str(project_root), str(project_root / "src"), str(scan_root.parent)],
+            [Path.cwd(), project_root, scan_root.parent],
+        )
+
+    stale_stubs, stale_stubs_reason = stale_stub_packages(
+        (mypy_python or {}).get("executable")
+    )
+
     drift = tag_dependency_drift(
         findings,
         Path(envelope["project_root"]),
@@ -1159,8 +1971,12 @@ def _analyze_with_cache(
     )
 
     by_code: dict[str, int] = {}
+    misc_by_family: dict[str, int] = {}
     for f in findings:
         by_code[f["code"] or "(none)"] = by_code.get(f["code"] or "(none)", 0) + 1
+        if "misc_family" in f:
+            family = f["misc_family"]
+            misc_by_family[family] = misc_by_family.get(family, 0) + 1
 
     return {
         **envelope,
@@ -1208,6 +2024,13 @@ def _analyze_with_cache(
                 {(f["file"], f["line"]) for f in findings if f["kind"] == "defect"}
             ),
             "by_code": dict(sorted(by_code.items(), key=lambda kv: -kv[1])),
+            # `misc` split by message (see _MISC_FAMILIES): any-subclass is a
+            # real loss of checking, none-not-callable mostly lost narrowing.
+            "misc_by_family": dict(sorted(misc_by_family.items())),
+            # Findings whose result is silently Any (`silent_any` on each):
+            # an Any base class, or a call no overload accepts. Code after
+            # them is unchecked even if the error is ignored.
+            "silent_any": sum(1 for f in findings if f.get("silent_any")),
             # Only mypy's own unused-ignore counts. A grep for `# type: ignore`
             # measures how many ignores EXIST, not how many are stale. null when
             # nothing measured it -- see stale_ignores_reason.
@@ -1252,6 +2075,68 @@ def _analyze_with_cache(
             "silenced_imports_source": silenced_source,
             "silenced_imports_reason": silenced_reason,
             "parse_mismatch": parse_mismatch,
+            # Of phantom_imports: hits whose module does not exist at all (a
+            # misspelled or moved import), the ones worth reading first. The
+            # rest come from modules that exist but were silenced or not
+            # followed -- see phantom_origin on each finding. null when the
+            # pass did not run or the modules could not be looked up.
+            "phantom_imports_real": (
+                None
+                if phantom_imports is None
+                else 0
+                if phantom_summary is None
+                else None
+                if phantom_summary["basis"].startswith("not-measured")
+                else phantom_summary["real"]
+            ),
+            "phantom_imports_by_origin": (
+                None if phantom_summary is None else phantom_summary["by_origin"]
+            ),
+            "phantom_missing_modules": (
+                None if phantom_summary is None else phantom_summary["missing_modules"]
+            ),
+            "phantom_origin_basis": (
+                None if phantom_summary is None else phantom_summary["basis"]
+            ),
+            # Installed `types-*` / `*-stubs` packages that shadow a library
+            # which now ships its own inline types (py.typed): mypy checks the
+            # project against the stub, not the library. null when the
+            # interpreter could not be asked -- see stale_stub_packages_reason.
+            "stale_stub_packages": (None if stale_stubs is None else len(stale_stubs)),
+            "stale_stub_packages_reason": stale_stubs_reason,
+            # Passes the caller added (extra_passes): label -> findings added,
+            # null when the pass failed; rejected flags with the reason.
+            "extra_passes": {
+                label: len(labelled[name]["findings"])
+                if labelled.get(name, {}).get("ran")
+                else None
+                for name, label in extra_names.items()
+            },
+            "extra_passes_rejected": rejected_passes or [],
+            # The opt-in typed-boundary overlay: what was annotated, and the
+            # errors mypy reports once it is (overlay_artifact marks errors the
+            # annotation itself causes, such as a None default). null if it
+            # did not run.
+            "boundary_overlay": (
+                None
+                if overlay_result is None
+                else {
+                    "ran": overlay_result["ran"],
+                    "error": overlay_result["error"],
+                    "sites_annotated": len(overlay_result["sites_annotated"]),
+                    "unmatched": overlay_result["unmatched"],
+                    "added": (
+                        sum(
+                            1
+                            for f in overlay_result["findings"]
+                            if not f["overlay_artifact"]
+                        )
+                        if overlay_result["ran"]
+                        else None
+                    ),
+                }
+            ),
+            "cache_dir_kept": cache_kept,
             "strict_pass_ran": phantom_imports is not None,
             "labelled_passes": {
                 name: {
@@ -1270,6 +2155,11 @@ def _analyze_with_cache(
         "stale_ignore_findings": stale_ignores or [],
         "untyped_body_findings": untyped_body or [],
         "silenced_import_findings": silenced or [],
+        "stale_stub_packages": stale_stubs or [],
+        # One list for every pass added with extra_passes (`pass` names it).
+        "extra_pass_findings": extra_findings,
+        "boundary_overlay_findings": (overlay_result or {}).get("findings", []),
+        "boundary_overlay_sites": (overlay_result or {}).get("sites_annotated", []),
         # Notes that belong to no error: `annotation-unchecked` (an annotated
         # variable inside an untyped function body mypy skips), reveal_type.
         "standalone_notes": standalone_notes,
@@ -1312,7 +2202,42 @@ def main() -> None:
         default=0,
         help="check only the first N discovered files (files_capped says so)",
     )
+    parser.add_argument(
+        "--extra-pass",
+        action="append",
+        default=[],
+        metavar="FLAG",
+        help="add a labelled pass for a mypy flag; attach it with = (--extra-pass=--strict-equality); repeatable",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        default=None,
+        help="keep mypy's cache here for later runs (default: a private temp dir)",
+    )
+    parser.add_argument(
+        "--boundary-map",
+        default=None,
+        metavar="FILE",
+        help="JSON for the typed-boundary overlay ({param: type} or a list of sites)",
+    )
+    parser.add_argument(
+        "--boundary-stubs", default=None, metavar="DIR", help="stubs for the overlay"
+    )
+    parser.add_argument(
+        "--boundary-flag",
+        action="append",
+        default=[],
+        metavar="FLAG",
+        help="extra mypy flag for the overlay pass, attached with = (--boundary-flag=--check-untyped-defs); repeatable",
+    )
     args = parser.parse_args()
+    boundary_map = None
+    if args.boundary_map:
+        try:
+            boundary_map = json.loads(Path(args.boundary_map).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            emit({"error": f"--boundary-map: {exc}", "status": "FAILED"})
+            sys.exit(2)
     try:
         result = analyze(
             args.target,
@@ -1323,6 +2248,11 @@ def main() -> None:
             unused_ignores_pass=not args.no_unused_ignores_pass,
             untyped_defs_pass=not args.no_untyped_defs_pass,
             silenced_imports_pass=not args.no_silenced_imports_pass,
+            extra_passes=args.extra_pass or None,
+            cache_dir=args.cache_dir,
+            boundary_map=boundary_map,
+            boundary_stubs=args.boundary_stubs,
+            boundary_flags=args.boundary_flag or None,
         )
         emit(result)
         sys.exit(1 if result["status"] == "FAILED" else 0)

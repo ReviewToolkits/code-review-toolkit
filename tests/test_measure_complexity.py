@@ -337,10 +337,6 @@ class TestMaxFiles(unittest.TestCase):
             self.assertGreater(output["files_total"], 3)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestNestingCalibration(unittest.TestCase):
     """Reader-facing depth, not AST depth (improvement-plan item 4.6)."""
 
@@ -890,6 +886,107 @@ class TestCloneDetection(unittest.TestCase):
             sorted(loc["file"] for loc in groups[0]["locations"]),
             ["pkg/a.py", "pkg/b.py"],
         )
+
+
+def _flat_validator(fields: int) -> str:
+    """A validator of `fields` independent checks, each a little nested."""
+    lines = ["def validate(record, strict=False):", "    errors = []"]
+    for i in range(fields):
+        lines += [
+            f"    value_{i} = record.get('field_{i}')",
+            f"    if value_{i} is None:",
+            f"        errors.append('field_{i} missing')",
+            f"    elif strict and not isinstance(value_{i}, str):",
+            f"        for part in value_{i}:",
+            "            if not part:",
+            f"                errors.append('field_{i} has an empty part')",
+        ]
+    lines += ["    if errors:", "        raise ValueError(errors)", "    return record"]
+    return "\n".join(lines) + "\n"
+
+
+_TANGLED = (
+    "def route(items, mode):\n"
+    "    for item in items:\n"
+    "        if item.ready:\n"
+    "            for sub in item.parts:\n"
+    "                if sub.kind == mode:\n"
+    "                    while sub.pending:\n"
+    "                        if sub.retry and not sub.done:\n"
+    "                            sub.step()\n"
+    "                        elif sub.failed:\n"
+    "                            break\n"
+    "                else:\n"
+    "                    if mode == 'all' or sub.optional:\n"
+    "                        sub.skip()\n"
+    "    return items\n"
+)
+
+
+class TestFlatness(unittest.TestCase):
+    """Flat accumulators are told apart from nested logic."""
+
+    def _function(self, source):
+        with TempProject({"mod.py": source}) as root:
+            return mod.analyze_file(root / "mod.py", root)["functions"][0]
+
+    def test_flat_validator_is_flat_and_discounted(self):
+        fn = self._function(_flat_validator(12))
+        metrics = fn["metrics"]
+        self.assertTrue(metrics["flat"])
+        self.assertGreaterEqual(metrics["top_level_blocks"], 12)
+        self.assertLessEqual(metrics["largest_block_share"], 0.35)
+        self.assertLess(fn["score"], fn["score_undiscounted"])
+        self.assertLess(fn["score"], 5)
+        self.assertGreaterEqual(fn["score_undiscounted"], 5)
+
+    def test_nested_logic_is_not_flat(self):
+        fn = self._function(_TANGLED)
+        self.assertFalse(fn["metrics"]["flat"])
+        self.assertEqual(fn["metrics"]["largest_block_share"], 1.0)
+        self.assertEqual(fn["score"], fn["score_undiscounted"])
+
+    def test_few_blocks_are_not_flat(self):
+        # Three independent checks are an ordinary function, not an accumulator.
+        fn = self._function(_flat_validator(3))
+        self.assertFalse(fn["metrics"]["flat"])
+        self.assertEqual(fn["score"], fn["score_undiscounted"])
+
+    def test_one_dominant_block_is_not_flat(self):
+        source = _flat_validator(6).replace(
+            "    if errors:\n",
+            "    for row in record.rows:\n"
+            "        for cell in row:\n"
+            "            if cell:\n"
+            "                for c in cell:\n"
+            "                    if c and c.bad:\n"
+            "                        while c.more:\n"
+            "                            if c.next():\n"
+            "                                errors.append(c)\n"
+            "    if errors:\n",
+        )
+        fn = self._function(source)
+        self.assertFalse(fn["metrics"]["flat"])
+
+    def test_evenly_spread_deep_nesting_is_not_flat(self):
+        lines = ["def deep(a, b, c, d, e, f):"]
+        for v in "abcdef":
+            lines += [
+                f"    if {v}:",
+                f"        for x in {v}:",
+                "            if x:",
+                "                for y in x:",
+                "                    if y:",
+                "                        print(y)",
+            ]
+        fn = self._function("\n".join(lines) + "\n")
+        self.assertLessEqual(fn["metrics"]["largest_block_share"], 0.35)
+        self.assertFalse(fn["metrics"]["flat"])
+
+    def test_empty_function_has_no_share(self):
+        metrics = self._function("def f():\n    return 1\n")["metrics"]
+        self.assertIsNone(metrics["largest_block_share"])
+        self.assertFalse(metrics["flat"])
 
 
 if __name__ == "__main__":

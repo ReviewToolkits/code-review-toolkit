@@ -47,7 +47,11 @@ Key fields:
   `tests_with_runtime_skip` and `files_with_module_level_skip` are skips decided at run time (`pytest.skip()`,
   `importorskip`) that no static count includes
 - `test_details`: per-test-file class/method inventory including `skipped_methods`, `skipped_standalone_tests`,
-  `markers`, `matched_sources` (by name), `imported_sources` (by import) and `route_matched_sources` (by URL)
+  `markers`, `matched_sources` (by name), `imported_sources` (by import) and `route_matched_sources` (by URL).
+  `name_match` says how the name match was made: `unique`, `mirrored` (one of several same-named sources, picked by
+  the test's directories: `tests/unit/accounts/test_views.py` → `pkg/accounts/views.py`) or `ambiguous` (several,
+  none picked, so none counts by name; `name_match_candidates` lists them). `summary.ambiguous_name_matches` counts
+  the ambiguous ones: read their imports before calling a candidate tested or untested
 
 ## External Tool Integration
 
@@ -295,10 +299,18 @@ Note: Simple functions with obvious correctness are ACCEPTABLE even without test
 - **POLICY**: Testing strategy decisions that affect the whole project (e.g., adopt integration tests, set coverage targets)
 - **ACCEPTABLE**: Simple functions with obvious correctness, trivial delegation, or one-line accessors that don't need tests
 
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.
+
 ## Running the script
 
 These rules apply to every script call this agent makes.
 
+- **Scope.** `--exclude PAT[,PAT]` (repeatable) leaves generated, vendored or out-of-scope trees out of every count; the envelope's `files_excluded` says how many. correlate_tests.py skips migration files (`migration_files_skipped`) and honours the project's coverage `omit` (`coverage_omit`), so neither shows up as untested source; quote both counts next to the coverage ratio.
 - **Timeout.** Give the Bash call `timeout: 300000` (5 min). The 120 s default kills the script on
   large projects. If it may run longer still, use `run_in_background` and wait for the completion
   notification rather than polling.

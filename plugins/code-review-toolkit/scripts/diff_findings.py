@@ -15,7 +15,10 @@ Every list compared is registered explicitly in ``_FINDING_LISTS`` below rather
 than sniffed, because a heuristic that silently stops recognising a list would
 make a regression look like an improvement. Anything unregistered, unreadable, or
 present in only one of the two runs is reported in ``notes`` -- the denominator is
-part of the answer.
+part of the answer. Lists that are inventory rather than findings are declared in
+``_INVENTORY_LISTS``, and test_release_discipline runs every script and fails on a
+top-level list that is in neither, so a new findings list cannot go undiffed.
+Nested lists are registered by dotted path (``clones.groups``).
 
 Usage:
     python diff_findings.py OLD_REPORT_DIR NEW_REPORT_DIR [--severity FIX]
@@ -25,6 +28,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -32,10 +36,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scan_common import emit, exit_on_help  # noqa: E402
 
+
 # Which top-level lists in each script's report are FINDINGS, and the fields that
 # identify one. `line` is deliberately never part of a key -- see the module
 # docstring. A list absent from here is inventory, not findings.
-_FINDING_LISTS: dict[str, dict[str, tuple[str, ...]]] = {
+def _clone_key(item: dict) -> tuple:
+    """A clone group is the set of places that share the code, in any order."""
+    places = sorted(
+        f"{loc.get('file', '')}::{loc.get('function', '')}"
+        for loc in item.get("locations") or []
+        if isinstance(loc, dict)
+    )
+    return (str(item.get("kind", "")), *places)
+
+
+# What identifies one finding: field names (`line` never among them), or a
+# function of the item when no flat field set does.
+_Key = tuple[str, ...] | Callable[[dict], tuple]
+
+_FINDING_LISTS: dict[str, dict[str, _Key]] = {
     # `message` is deliberately NOT part of the key. It carries the finding's
     # explanatory detail, so improving the wording of a check re-splits every
     # finding it produces into one `gone` plus one `added` -- the same spurious
@@ -49,17 +68,41 @@ _FINDING_LISTS: dict[str, dict[str, tuple[str, ...]]] = {
         # not gone -- see _RECLASSIFIED.
         "suppressed": ("file", "shape", "reason"),
     },
+    "scan_concurrency": {
+        # Project-level checks: the enclosing function tells two hits of one
+        # shape in a file apart without a line number.
+        "findings": ("file", "shape", "function"),
+    },
     "run_lint_rules": {
         "findings": ("file", "code"),
+        # Hits the suppression-comment signal dismissed.
+        "dismissed": ("file", "code"),
+        # Hits a `# noqa` hid, surfaced by the noqa-ignoring pass.
+        "noqa_suppressed": ("file", "code"),
+    },
+    "run_external_tools": {
+        # One nested section per tool that ran.
+        "ruff.findings": ("file", "rule"),
+        "mypy.findings": ("file", "code"),
+        "vulture.findings": ("file", "type", "name"),
     },
     "check_typing": {
         "findings": ("file", "code"),
         "phantom_import_findings": ("file", "code"),
         "unreachable_findings": ("file", "code"),
         "stale_ignore_findings": ("file", "code"),
+        "untyped_body_findings": ("file", "code"),
+        "dependency_drift_findings": ("file", "code"),
+        "silenced_import_findings": ("file", "module"),
+        "stale_stub_packages": ("stub_distribution", "module"),
+        "extra_pass_findings": ("pass", "file", "code"),
+        "boundary_overlay_findings": ("file", "code"),
     },
     "check_known_findings": {
         "findings": ("id", "shape"),
+        # Every catalog entry with its verdict: a verdict that changes (still
+        # present -> possibly fixed) shows as one gone plus one added.
+        "results": ("id", "verdict"),
     },
     "find_dead_symbols": {
         "unused_imports": ("file", "name", "module"),
@@ -67,28 +110,153 @@ _FINDING_LISTS: dict[str, dict[str, tuple[str, ...]]] = {
         "referenced_only_from_tests": ("file", "name", "type"),
         "orphan_files": ("file",),
         "commented_code_blocks": ("file", "preview"),
+        "write_only_attributes": ("file", "class", "attribute"),
     },
     "measure_complexity": {
         # qualified_name is `path/to/file.py::Class.method` -- file and symbol in one.
         "hotspots": ("qualified_name",),
+        "clones.groups": _clone_key,
     },
     "collect_debt": {
         "items": ("file", "category", "full_line"),
     },
     "count_types": {
         "any_usages": ("location", "function"),
+        "any_via_alias_usages": ("file", "kind", "function", "attribute"),
         # Keyed by (file, name): one `build` per plugin module is not one
         # function. Falls back to `name` for reports from before `file`
         # existed -- see _FALLBACK_KEYS.
         "unannotated_public_functions": ("file", "name"),
+        "untyped_containers": ("file", "where", "annotation"),
+        # Project-wide, one entry per parameter name.
+        "inconsistent_parameters": ("param",),
+        "untyped_boundaries": ("file", "callee", "param"),
+        "protocols_with_default_bodies": ("file", "name"),
+        # Functions holding mypy errors (only when count_types read mypy output).
+        "annotation_accuracy.functions": ("file", "name"),
     },
     "extract_test_invariants": {
         "invariants": ("file", "function"),
+        "untested_similar_functions": ("file", "function", "similar_to"),
+        "entry_point_siblings": ("file", "function", "sibling_of"),
+    },
+    "survey_docstrings": {
+        "contract_issues": ("file", "function", "kind", "documented"),
+        "dead_references": ("file", "function", "reference"),
+    },
+    "diff_siblings": {
+        # One outlier entry per (group, feature): who lacks what most share.
+        "sibling_outliers": ("group", "feature"),
+        "helper_bypasses": ("file", "class", "helper"),
+    },
+    "analyze_imports": {
+        "import_time_side_effects": ("file", "category", "operation"),
     },
 }
 
-# Lists whose items are not dicts and need their own key function.
-_SEQUENCE_LISTS = {"analyze_imports": ("cycles",)}
+# Lists whose items are not dicts (or have no stable fields): the item IS the key.
+_SEQUENCE_LISTS: dict[str, tuple[str, ...]] = {
+    "analyze_imports": ("cycles", "import_time_cycles", "dynamic_cycles"),
+    "correlate_tests": ("untested_sources",),
+    "map_exceptions": (
+        "leads.caught_never_raised",
+        "leads.raised_never_caught",
+        "leads.codes_produced_not_consumed",
+        "leads.codes_consumed_not_produced",
+    ),
+}
+
+# Top-level lists that are INVENTORY, not findings: deliberately not diffed.
+# Every list a script prints must be registered above or here (or be one of
+# _COMMON_INVENTORY); test_release_discipline runs the scripts and fails on
+# one that is neither, so a new findings list cannot go undiffed silently.
+_COMMON_INVENTORY = frozenset(
+    {
+        "warnings",
+        "notes",
+        "errors",
+        "files",
+        "files_unparsed",
+        "unparsed_files",
+        # Scope bookkeeping from scan_common's file selection.
+        "exclude_patterns",
+        "migration_dirs",
+    }
+)
+_INVENTORY_LISTS: dict[str, frozenset[str]] = {
+    "scan_concurrency": frozenset({"guards", "module_state"}),
+    "run_lint_rules": frozenset({"unlinted", "validated_versions"}),
+    "run_external_tools": frozenset(
+        {"tools_run", "tools_skipped", "configured_but_not_installed"}
+    ),
+    "check_typing": frozenset(
+        {"line_groups", "standalone_notes", "boundary_overlay_sites"}
+    ),
+    "count_types": frozenset({"alias_inventory"}),
+    "extract_test_invariants": frozenset({"bug_fix_tests"}),
+    "correlate_tests": frozenset({"source_coverage"}),
+    "analyze_imports": frozenset(
+        {"project_packages", "dynamic_import_sites", "string_imports", "re_exports"}
+    ),
+    "analyze_history": frozenset(
+        {
+            "file_churn",
+            "function_churn",
+            "recent_fixes",
+            "recent_features",
+            "recent_refactors",
+            "co_change_clusters",
+            "behavioural_non_code_commits",
+        }
+    ),
+    "survey_docstrings": frozenset({"claims", "suppressions"}),
+    "survey_error_handling": frozenset(
+        {"handlers", "suppress", "exit_methods", "finally", "implicit"}
+    ),
+    "survey_conventions": frozenset(),
+    "map_exceptions": frozenset({"code_keys", "raise_sites", "mappings"}),
+    # Facts about the findings it was given, not findings of its own.
+    "annotate_findings": frozenset({"annotations", "skipped", "unmerged_branches"}),
+    "map_findings_coverage": frozenset({"refs", "mutations"}),
+    "collect_debt": frozenset({"read_from_project_root"}),
+    "check_doc_refs": frozenset({"doc_files"}),
+    # Leads live in nested sections (`settings`, `routes`, `tasks`, ...), each
+    # with a `status`; not diffed yet.
+    "map_wiring": frozenset(),
+    "map_orm_schema": frozenset({"models"}),
+    "find_threat_model": frozenset(
+        {
+            "policy",
+            "external_policy_urls",
+            "audits",
+            "advisories",
+            "incidents",
+            "engagement_rules",
+            "precedents",
+            "accepted_risks",
+        }
+    ),
+}
+
+# Scripts whose output is never a `<script>.json` in a report directory.
+_NOT_DIFFED: dict[str, str] = {
+    "scan_common": "a library, not a script",
+    "build_informed_briefing": "prints the Markdown briefing, not JSON",
+    "diff_findings": "the differ itself",
+    # Phase 3 pipeline and run tooling: they read findings or run artifacts,
+    # not the reviewed project, so their output is never a scan to diff.
+    "merge_fragments": "folds slice fragments into findings.json",
+    "apply_verdicts": "applies reproduction verdicts to findings.json",
+    "build_public_tree": "writes a public findings tree",
+    "check_locations": "validates a findings.json's locations",
+    "leak_scan": "scans a publication tree for leaks",
+    "dump_tracker": "dumps and searches an issue tracker",
+    "sweep_fix_pattern": "sweeps for one fix commit's removed forms (needs --commit)",
+    "security_gate": (
+        "writes gate artifacts (claims-blind.json, signoff.json), judgements "
+        "about findings rather than findings"
+    ),
+}
 
 # Fields carried into the diff output for a human to act on, when present.
 _CARRY = (
@@ -99,6 +267,13 @@ _CARRY = (
     "qualified_name",
     "shape",
     "type",
+    "function",
+    "kind",
+    "module",
+    "param",
+    "callee",
+    "rule",
+    "copies",
     "severity",
     "confidence",
     "name",
@@ -116,7 +291,14 @@ _FALLBACK_KEYS: dict[tuple[str, str], tuple[str, ...]] = {
 
 # Lists capped by the producing script: `<list>_capped` true in either run
 # means items past the cap churn in and out without changing.
-_CAPPED = {("count_types", "unannotated_public_functions")}
+_CAPPED = {
+    ("count_types", "unannotated_public_functions"),
+    ("count_types", "untyped_containers"),
+    ("count_types", "inconsistent_parameters"),
+    ("count_types", "untyped_boundaries"),
+    ("extract_test_invariants", "untested_similar_functions"),
+    ("extract_test_invariants", "entry_point_siblings"),
+}
 
 # (script, reported list, suppressed list, shared key): a finding that leaves
 # the reported list and appears in the suppressed one was reclassified by a
@@ -142,12 +324,45 @@ def _load_report(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     return data, None
 
 
-def _key_of(item: dict, fields: tuple[str, ...]) -> tuple:
+def _key_of(item: dict, fields: _Key) -> tuple:
     """Identity of a finding: the registered fields, line number excluded."""
+    if callable(fields):
+        return fields(item)
     return tuple(str(item.get(f, "")) for f in fields)
 
 
-def _index(items: list, fields: tuple[str, ...] | None) -> dict[tuple, dict]:
+def _lookup(data: dict, path: str) -> Any:
+    """`data[a][b]` for the dotted *path* `a.b`; None where a step is missing."""
+    node: Any = data
+    for part in path.split("."):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(part)
+    return node
+
+
+def _is_capped(data: dict, list_name: str) -> bool:
+    flag = f"{list_name}_capped"
+    summary = data.get("summary")
+    return bool(data.get(flag) or (isinstance(summary, dict) and summary.get(flag)))
+
+
+def unregistered_lists(script: str, data: dict) -> list[str]:
+    """Top-level lists in *data* that are neither findings nor inventory.
+
+    Used for the diff's notes and by test_release_discipline, which runs every
+    script and fails on a list nobody decided about.
+    """
+    known = (
+        {p.split(".")[0] for p in _FINDING_LISTS.get(script, {})}
+        | {p.split(".")[0] for p in _SEQUENCE_LISTS.get(script, ())}
+        | _INVENTORY_LISTS.get(script, frozenset())
+        | _COMMON_INVENTORY
+    )
+    return sorted(k for k, v in data.items() if isinstance(v, list) and k not in known)
+
+
+def _index(items: list, fields: _Key | None) -> dict[tuple, dict]:
     """Index a finding list by key, disambiguating genuine duplicates."""
     out: dict[tuple, dict] = {}
     seen: dict[tuple, int] = {}
@@ -170,7 +385,7 @@ def _index(items: list, fields: tuple[str, ...] | None) -> dict[tuple, dict]:
     return out
 
 
-def _diff_list(old: list, new: list, fields: tuple[str, ...] | None) -> dict:
+def _diff_list(old: list, new: list, fields: _Key | None) -> dict:
     """Compare one finding list between two runs."""
     old_ix, new_ix = _index(old, fields), _index(new, fields)
     old_keys, new_keys = set(old_ix), set(new_ix)
@@ -192,7 +407,9 @@ def _diff_list(old: list, new: list, fields: tuple[str, ...] | None) -> dict:
     }
 
 
-def _lacks_fields(items: list, fields: tuple[str, ...]) -> bool:
+def _lacks_fields(items: list, fields: _Key) -> bool:
+    if callable(fields):
+        return False
     return any(isinstance(i, dict) and any(f not in i for f in fields) for i in items)
 
 
@@ -279,11 +496,17 @@ def analyze(argv: list[str]) -> dict:
         | {p.stem for p in new_dir.glob("*.json")}
     )
     for script in scripts:
-        registered = dict(_FINDING_LISTS.get(script, {}))
+        registered: dict[str, _Key | None] = dict(_FINDING_LISTS.get(script, {}))
         for name in _SEQUENCE_LISTS.get(script, ()):
-            registered[name] = None  # type: ignore[assignment]
+            registered[name] = None
         if not registered:
-            notes.append(f"{script}: no finding lists registered — not compared")
+            if script in _NOT_DIFFED:
+                why = _NOT_DIFFED[script]
+            elif script in _INVENTORY_LISTS:
+                why = "inventory only"
+            else:
+                why = "no finding lists registered"
+            notes.append(f"{script}: {why} — not compared")
             continue
 
         old_data, old_err = _load_report(old_dir / f"{script}.json")
@@ -309,26 +532,34 @@ def analyze(argv: list[str]) -> dict:
                 f"({old_root} vs {new_root}). A diff across scopes is meaningless."
             )
             continue
+        for data in (old_data, new_data):
+            for name in unregistered_lists(script, data):
+                note = (
+                    f"{script}.{name}: list not registered as findings or "
+                    "inventory — not compared"
+                )
+                if note not in notes:
+                    notes.append(note)
         for list_name, fields in registered.items():
-            old_items = old_data.get(list_name) or []
-            new_items = new_data.get(list_name) or []
+            old_items = _lookup(old_data, list_name) or []
+            new_items = _lookup(new_data, list_name) or []
             if not isinstance(old_items, list) or not isinstance(new_items, list):
                 notes.append(f"{script}.{list_name}: not a list in one run — skipped")
                 continue
             if not old_items and not new_items:
                 continue
             fallback = _FALLBACK_KEYS.get((script, list_name))
+            original = fields
             if fallback and fields and _lacks_fields(old_items + new_items, fields):
                 fields = fallback
                 notes.append(
                     f"{script}.{list_name}: an item has no "
-                    f"{'/'.join(f for f in registered[list_name] if f not in fallback)}"
+                    f"{'/'.join(f for f in original if f not in fallback)}"
                     f" field (an older report), so it is keyed by "
                     f"{'/'.join(fallback)} and identically named symbols collide"
                 )
             if (script, list_name) in _CAPPED and (
-                old_data.get(f"{list_name}_capped")
-                or new_data.get(f"{list_name}_capped")
+                _is_capped(old_data, list_name) or _is_capped(new_data, list_name)
             ):
                 notes.append(
                     f"{script}.{list_name}: capped in at least one run, so items "

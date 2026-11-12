@@ -792,6 +792,224 @@ class TestSharedMethodNames(unittest.TestCase):
         self.assertNotIn("Other._close", unreferenced)
 
 
+class TestDottedPathReferences(unittest.TestCase):
+    """Symbols named only by a dotted-path string (`"pkg.mod.func"`,
+    `"pkg.mod:Class"`) in a registration call or a root config file were
+    reported unreferenced."""
+
+    def test_dotted_string_in_a_registration_call_is_a_reference(self):
+        files = {
+            "pkg/__init__.py": "",
+            "pkg/hooks.py": (
+                "def audit_hook(event):\n    return event\n"
+                "class AuditFilter:\n    pass\n"
+                "def orphan_hook(event):\n    return event\n"
+            ),
+            "pkg/app.py": (
+                "def setup(registry):\n"
+                "    registry.add('pkg.hooks.audit_hook')\n"
+                "    registry.add_filter('pkg.hooks:AuditFilter')\n"
+            ),
+        }
+        with TempProject(files) as root:
+            out = _run_main(root, root / "pkg")
+        unreferenced = {u["name"] for u in out["unreferenced_symbols"]}
+        self.assertNotIn("audit_hook", unreferenced)
+        self.assertNotIn("AuditFilter", unreferenced)
+        self.assertIn("orphan_hook", unreferenced)  # true negative
+
+    def test_dotted_path_in_a_root_config_file_is_a_reference(self):
+        files = {
+            "pkg/__init__.py": "",
+            "pkg/server.py": (
+                "def app_factory(config):\n    return config\n"
+                "def unused_factory(config):\n    return config\n"
+            ),
+            "serve.ini": "[app:main]\nuse = call:pkg.server:app_factory\n"
+            "[other]\nhandler = logging.handlers.unused_factory\n",
+        }
+        with TempProject(files) as root:
+            out = _run_main(root, root / "pkg")
+        unreferenced = {u["name"] for u in out["unreferenced_symbols"]}
+        self.assertNotIn("app_factory", unreferenced)
+        # A dotted path outside the project's packages names nothing here.
+        self.assertIn("unused_factory", unreferenced)
+        self.assertEqual(out["summary"]["config_files_scanned"], ["serve.ini"])
+
+    def test_dotted_path_targets(self):
+        self.assertEqual(mod.dotted_path_targets("pkg.mod.func"), {"func"})
+        self.assertEqual(
+            mod.dotted_path_targets("pkg.mod:Klass.method"), {"Klass", "method"}
+        )
+        self.assertEqual(
+            mod.dotted_path_targets("pkg.mod.Klass.method"), {"Klass", "method"}
+        )
+
+
+class TestKeptImports(unittest.TestCase):
+    """`# noqa: F401` imports (re-exports, side-effect imports) were reported
+    unused at high confidence."""
+
+    def _unused(self, source: str) -> tuple[list[str], dict]:
+        kept: dict = {}
+        with TempProject({"mod.py": source}) as root:
+            analysis = mod.analyze_file(root / "mod.py", root)
+            names = [u["name"] for u in mod.find_unused_imports(analysis, kept)]
+        return names, kept
+
+    def test_noqa_f401_import_is_kept_and_counted(self):
+        names, kept = self._unused(
+            "import plugin_loader  # noqa: F401 -- importing registers it\n"
+            "from os import sep  # noqa:E402,F401\n"
+            "from json import dumps  # noqa\n"
+        )
+        self.assertEqual(names, [])
+        self.assertEqual(kept, {"noqa_f401": 3})
+
+    def test_noqa_for_another_code_still_reports(self):
+        names, kept = self._unused("import json  # noqa: E402\n")
+        self.assertEqual(names, ["json"])
+        self.assertEqual(kept, {})
+
+    def test_explicit_reexport_spelling_is_kept(self):
+        names, kept = self._unused(
+            "from os import path as path\nfrom os import sep as separator\n"
+        )
+        self.assertEqual(names, ["separator"])
+        self.assertEqual(kept, {"explicit_reexport": 1})
+
+    def test_noqa_on_a_multiline_import_name_line(self):
+        names, _kept = self._unused(
+            "from os import (\n    sep,  # noqa: F401\n    pathsep,\n)\n"
+        )
+        self.assertEqual(names, ["pathsep"])
+
+    def test_summary_counts_kept_imports(self):
+        files = {"pkg/__init__.py": "", "pkg/a.py": "import json  # noqa: F401\n"}
+        with TempProject(files) as root:
+            out = _run_main(root, root / "pkg")
+        self.assertEqual(out["unused_imports"], [])
+        self.assertEqual(
+            out["summary"]["unused_imports_kept_by_reason"], {"noqa_f401": 1}
+        )
+
+
+class TestCommentedCodePrecision(unittest.TestCase):
+    """Prose comments merged with one code-like line were reported as
+    commented-out code."""
+
+    def _blocks(self, body: str) -> list[dict]:
+        with TempProject({"mod.py": "x = 1\n" + body + "y = 2\n"}) as root:
+            return mod.find_commented_code(root / "mod.py", root)
+
+    def test_field_description_prose_is_not_code(self):
+        self.assertEqual(
+            self._blocks(
+                "# started_at = time the request was first seen\n"
+                "# owner = name of the account that sent it\n"
+                "# source = where the request was received from,\n"
+                "#   one of the configured gateways\n"
+            ),
+            [],
+        )
+
+    def test_one_code_line_followed_by_prose_is_not_code(self):
+        self.assertEqual(
+            self._blocks(
+                "# value = compute(item)\n"
+                "# would be simpler, but the helper raises on empty input\n"
+                "# and the caller relies on getting None back instead.\n"
+            ),
+            [],
+        )
+
+    def test_multiline_call_and_indented_block_are_code(self):
+        blocks = self._blocks(
+            "# form = RenameForm(\n"
+            "#    request.POST,\n"
+            "#    service=service,\n"
+            "# )\n"
+            "# if form.validate():\n"
+            "#    service.rename(form.name.data)\n"
+        )
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["code_lines"], 6)
+
+    def test_code_with_a_trailing_note_is_still_code(self):
+        blocks = self._blocks(
+            "# for item in items:\n"
+            "#     total += item.price\n"
+            "#     count += 1\n"
+            "# kept for the old report\n"
+        )
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["code_lines"], 3)
+
+
+class TestWriteOnlyAttributes(unittest.TestCase):
+    """`self.x` assigned and never read anywhere had no category."""
+
+    FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/store.py": (
+            "import threading\n"
+            "class Store:\n"
+            "    kind = 'plain'\n"
+            "    def __init__(self, data):\n"
+            "        self._cfg = data\n"
+            "        self._alias = data\n"
+            "        self.public_note = 'x'\n"
+            "        self.kind = 'custom'\n"
+            "        self._count = 0\n"
+            "    def bump(self):\n"
+            "        self._count += 1\n"
+            "    def get(self, key):\n"
+            "        return self._cfg[key]\n"
+            "class Worker(threading.Thread):\n"
+            "    def __init__(self):\n"
+            "        super().__init__()\n"
+            "        self.stop_flag = False\n"
+            "class Snapshot:\n"
+            "    def __init__(self):\n"
+            "        self._hidden = 1\n"
+            "    def dump(self):\n"
+            "        return dict(vars(self))\n"
+            "class Probe:\n"
+            "    def __init__(self):\n"
+            "        self._seen_by_tests = 1\n"
+        ),
+        "tests/test_store.py": (
+            "from pkg.store import Probe\n"
+            "def test_probe():\n"
+            "    assert Probe()._seen_by_tests == 1\n"
+        ),
+    }
+
+    def _run(self) -> dict:
+        with TempProject(self.FILES) as root:
+            return _run_main(root, root / "pkg")
+
+    def test_write_only_attribute_is_reported(self):
+        out = self._run()
+        found = {(w["class"], w["attribute"]): w for w in out["write_only_attributes"]}
+        self.assertEqual(set(found), {("Store", "_alias"), ("Store", "public_note")})
+        self.assertEqual(found[("Store", "_alias")]["confidence"], "medium")
+        self.assertEqual(found[("Store", "public_note")]["confidence"], "low")
+        self.assertEqual(out["summary"]["write_only_attributes"], 2)
+
+    def test_read_declared_framework_dynamic_and_test_read_are_not(self):
+        out = self._run()
+        attrs = {w["attribute"] for w in out["write_only_attributes"]}
+        # read, read by `+=`, declared in the class body, framework base,
+        # vars(self), read only by a test file.
+        for name in ("_cfg", "_count", "kind", "stop_flag", "_hidden"):
+            self.assertNotIn(name, attrs)
+        self.assertNotIn("_seen_by_tests", attrs)
+        self.assertEqual(
+            out["summary"]["write_only_attributes_excluded_by_reason"],
+            {"declared_in_class": 1, "dynamic_access": 1, "framework_base": 1},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
-

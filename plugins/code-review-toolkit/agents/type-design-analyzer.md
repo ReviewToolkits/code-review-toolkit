@@ -38,8 +38,12 @@ Key fields:
   `kind: "instance_attribute"` entries are the same for `self.x: T = ...` in `__init__`
 - `any_via_alias_usages`: annotations whose Any is reached **only through a type alias** (`body: Payload` where `Payload = dict[str, Any]`). Each names the `aliases` involved. On alias-heavy code this can exceed the direct count, so report both
 - `alias_inventory`: every module-level type alias with its `definition`, `contains_any` and `annotation_uses`. An alias of `dict[str, Any]` used 40 times is a container-choice question (TypedDict? dataclass?), not 40 separate Any findings
-- `container_inventory`: categorized data containers (dataclass, TypedDict, NamedTuple, Protocol, Enum, ABC), plus `pseudo-enum` (a class of UPPER_CASE constants acting as an enum) and `dict-subclass` / `list-subclass` / `set-subclass`
+- `container_inventory`: categorized data containers (dataclass, TypedDict, NamedTuple, Protocol, Enum, ABC), plus `pseudo-enum` (a class of UPPER_CASE constants acting as an enum), `dict-subclass` / `list-subclass` / `set-subclass`, `orm_model` (a declarative ORM model, its base, or a mixin that declares mapped columns) and `interface` (a zope-style interface declaration). On an ORM application the `orm_model` entries hold most of the type design: review them with §6
 - `unannotated_public_functions`: priority annotation targets (up to 50), each `{file, name, line}`; `unannotated_public_functions_total` is the uncapped count
+
+- `container_inventory`: categorized data containers (dataclass, TypedDict, NamedTuple, Protocol, Enum, ABC), plus `pseudo-enum` (a class of UPPER_CASE constants acting as an enum) and `dict-subclass` / `list-subclass` / `set-subclass`. An enum that subclasses a project enum mixin is included (`enum_via` on its class entry names the base)
+- `protocols_with_default_bodies`: Protocols whose methods have real bodies (`default_methods`), with the in-scope classes that subclass them explicitly (`explicit_subclasses`). A default body runs only for such a subclass, never for a class that conforms structurally; `bodies_inherited: false` means the bodies are dead code that reads like behaviour (often left over from an ABC turned into a Protocol)
+- `unannotated_public_functions`: priority annotation targets (up to 50), each `{file, name, line}`; `unannotated_public_functions_total` is the uncapped count. Methods of a private (`_Name`) class are private and not listed
 - `untyped_containers`: bare `list` / `dict` / `tuple` / `set` (and `List`, `Dict`, ...) in parameter, return and variable annotations, each `{file, line, content, annotation, where}`; `untyped_containers_total` is the uncapped count. Also per file as `files[].untyped_containers`
 - `inconsistent_parameters`: a parameter name annotated at some definitions and bare at others, with `annotated`, `unannotated`, `dominant_annotation`, `annotations` and sample `unannotated_sites`. `session: Session` in a few functions and bare `session` in dozens is dozens of unchecked boundaries whose type is already known
 - `untyped_boundaries`: bare parameters of in-scope functions that **typed** code passes arguments to, with `call_sites`, `arg_annotations` (when the caller's name says the type) and `sample_call_sites`. These are the candidates for the annotate-and-re-run step below
@@ -63,7 +67,11 @@ These are actual type errors — places where the type checker determined that t
 
 1. **Type errors validate your design assessment**: If your qualitative analysis rated a type's Invariant Enforcement at 8/10 but mypy found 3 type errors in its constructor, the enforcement is weaker than it appeared. Adjust your rating.
 
-2. **Type errors reveal annotation accuracy**: Your coverage analysis from count_types.py counts how many functions are annotated. mypy reveals how many of those annotations are *correct*. A function with 100% annotation coverage that has type errors is worse than an unannotated function. **The annotation-accuracy line in the template needs mypy data** (here, or from typing-integrity-auditor's `check_typing.py` run). Without it, write "not measured" — never derive it from coverage alone.
+2. **Type errors reveal annotation accuracy**: Your coverage analysis from count_types.py counts how many functions are annotated. mypy reveals how many of those annotations are *correct*. A function with 100% annotation coverage that has type errors is worse than an unannotated function. **The annotation-accuracy line in the template needs mypy data** (here, or from typing-integrity-auditor's `check_typing.py` run). `count_types.py --mypy-json FILE` does the join (FILE is either script's JSON, or mypy's `--output json`): `annotation_accuracy` has `fully_annotated_functions`, `annotated_functions_with_type_errors` and the functions ranked by errors. Write it into your private directory:
+   `python3 <plugin_root>/scripts/count_types.py [scope] --mypy-json [mypy.json] > "$d/accuracy.json"`.
+   Without mypy data, write "not measured" — never derive it from coverage alone.
+
+   **A clean mypy run is not a checked codebase.** Without `check_untyped_defs`, mypy skips the body of every function with no annotation at all, so attribute access on models and request objects inside them is never checked. check_typing.py's `summary.unchecked_untyped_bodies` says how many bodies a clean run never looked at; quote it beside any "mypy passes" statement.
 
 3. **Severity mapping**:
    - mypy `error` → classify as FIX (actual type error)
@@ -200,6 +208,38 @@ Check whether typing patterns are consistent across the codebase:
 - Consistent import style for typing constructs
 - Consistent approach to type narrowing (isinstance checks, TypeGuard)
 
+### 6. ORM Models and the Migrated Schema (if applicable)
+
+When `container_inventory` has `orm_model` entries, the model is a second type declaration that the
+database enforces and the type checker does not. Run the ORM pass:
+
+```bash
+python3 <plugin_root>/scripts/map_orm_schema.py [scope]
+```
+
+- `nullability.column_mismatches`: `nullable_but_annotation_not_optional` (the database accepts
+  NULL, `Mapped[X]` promises a value: a reader that dereferences it can get `None`) is the
+  FIX-grade kind; `not_null_but_annotation_optional` is CONSIDER. `server_default: true` narrows
+  how a NULL arrives but does not stop an explicit one.
+- `nullability.relationship_mismatches`: a scalar `Mapped[Target]` that can be `None` (nullable
+  foreign key, `secondary` table, the one-to-many side), with the `reason`.
+- `nullability.implicitly_nullable_columns`: `Column()` or an unannotated `mapped_column()` with no
+  `nullable=`, so NULL by default; check whether readers assume a value.
+- `migrations`: `declared_never_created` and `declared_but_dropped` (a named constraint the
+  migration history never created, or dropped later), `unnamed_checks_not_in_migrations` (a
+  model CHECK whose condition appears in no migration), `check_constraints_only_in_migrations`
+  (enforced by the database, unknown to the models, so a test database built from the models
+  lacks it). `created_by_dynamic_name` matched an f-string name: verify it by reading.
+- Each section says `"status": "not_detected"` when there are no models or no migrations.
+
+**Autogenerate drift checks are not schema diffs.** `alembic check` and `--autogenerate`
+(`compare_metadata`) do not report primary-key differences, CHECK constraints or duplicate indexes
+by default, and Django's `makemigrations --check` has similar blind spots. Never cite a clean drift
+check as proof that the schema matches the models. To confirm a lead, or when the static pass is
+not enough, follow `<plugin_root>/docs/orm-schema-diff.md`: build the migrated schema and the model
+schema in an export and compare primary keys, constraints and indexes from the database catalog,
+by definition as well as by name.
+
 ## Output Format
 
 ```
@@ -255,10 +295,18 @@ Check whether typing patterns are consistent across the codebase:
 - **POLICY**: Typing strategy decisions (e.g., enable mypy strict mode, adopt `X | None` over `Optional[X]`, set annotation coverage targets)
 - **ACCEPTABLE**: Untyped private functions with obvious types, legitimate `Any` usage for genuinely dynamic data, simple internal code where annotations add noise
 
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.
+
 ## Running the script
 
 These rules apply to every script call this agent makes.
 
+- **Scope.** `--exclude PAT[,PAT]` (repeatable) leaves generated, vendored or out-of-scope trees out of every count; the envelope's `files_excluded` says how many. count_types.py skips migration files unless `--include-migrations`, so revision modules don't dominate the counts.
 - **Timeout.** Give the Bash call `timeout: 300000` (5 min). The 120 s default kills the script on
   large projects. If it may run longer still, use `run_in_background` and wait for the completion
   notification rather than polling.

@@ -129,6 +129,43 @@ Codes are matched under the keys in `code_keys` (`code`, `error_code`, `error_ty
 If the project names its codes differently, add `--code-key NAME`. If the scope produces no codes,
 `codes` is empty: say so rather than reporting "no divergence".
 
+### Phase 2c: Sibling lookups and task call sites (ORM and task-queue apps)
+
+Two mechanical comparisons find defects that reading one implementation at a time misses. Run them
+when the project has ORM models or background tasks:
+
+```bash
+python3 <plugin_root>/scripts/map_orm_schema.py [scope]
+python3 <plugin_root>/scripts/map_wiring.py [scope]
+```
+
+**Sibling lookups against unique keys** (`map_orm_schema.py`, `lookups`). Per-provider or
+per-model implementations of one lookup (`exists`, `find_by_*`, `get_or_create`, `claim`) must
+find a row by the key the database keeps unique. `sibling_groups` puts same-named methods side by
+side: each member's `filters`, its `terminal` call, `covers_unique_key`, and
+`closest_unique_key` with the key columns the filter omits (`missing`) and the filtered columns
+outside the key (`extra`). Leads:
+- a member whose filter omits a key column (`missing`): it can match several rows, so `.one()`
+  raises and `.first()` picks one arbitrarily;
+- a column every lookup filters on that the unique key lacks (`extra` on every member): duplicates
+  the lookups cannot tell apart can be inserted;
+- members that disagree on case folding (`lower(col)` in one, `col` in another) or on which
+  columns they use (`filter_sets_differ`);
+- `single_row_lookups_not_unique`: a `.one()`/`.one_or_none()`/`scalar_one()`/`get()` whose
+  equality filters cover no unique key.
+
+**Task call sites against task bodies** (`map_wiring.py`, `tasks`). Each entry in
+`tasks.declared` lists every enqueue site's argument expressions bound to the task's parameters
+(`call_sites[].bound`) next to how the body uses each parameter (`param_uses`, followed one level
+into a same-module helper as `followed_into`). Compare what is passed with how it is used: a
+caller passing `obj.canonical_name` to a body that compares the parameter to a display-name
+column is the shape. `normalisation_differs` lists the parameters where callers disagree, or a
+caller normalises a value the body then uses raw; `binding_errors` lists calls that cannot bind to
+the signature at all; `injected_params` names a leading parameter the framework supplies.
+
+Both sections say `"status": "not_detected"` when the project has no models or no tasks: report
+that, not "no divergence".
+
 ### Phase 3: Missing Abstraction Detection
 
 The most valuable finding is often a **missing abstraction**. When the same concern is handled N different ways, it often means the codebase needs a shared utility, base class, protocol, or convention that doesn't exist yet. Look for:
@@ -203,6 +240,13 @@ For each:
 - **CONSIDER**: Divergence worth unifying for maintainability but no correctness risk
 - **POLICY**: Requires a project-level decision on which pattern to standardize on
 - **ACCEPTABLE**: Intentional variation between modules with genuinely different requirements, or where unification would increase complexity
+
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.
 
 ## Running the script
 

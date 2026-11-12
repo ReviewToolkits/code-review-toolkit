@@ -1,6 +1,7 @@
 """Tests for extract_test_invariants.py — test invariant extraction and propagation."""
 
 import unittest
+from typing import ClassVar
 
 from helpers import TempProject, import_script
 
@@ -8,12 +9,12 @@ mod = import_script("extract_test_invariants")
 
 
 SIMPLE_SOURCE = """\
-def validate_input(data):
+def sanitize_input(data):
     if not data:
         raise ValueError("empty input")
     return data.strip()
 
-def validate_config(config):
+def sanitize_config(config):
     if not config:
         return None
     return config.strip()
@@ -25,17 +26,17 @@ def process_data(items):
 SIMPLE_TESTS = """\
 import unittest
 
-class TestValidateInput(unittest.TestCase):
-    def test_validate_input_empty(self):
+class TestSanitizeInput(unittest.TestCase):
+    def test_sanitize_input_empty(self):
         with self.assertRaises(ValueError):
-            validate_input("")
+            sanitize_input("")
 
-    def test_validate_input_normal(self):
-        result = validate_input("  hello  ")
+    def test_sanitize_input_normal(self):
+        result = sanitize_input("  hello  ")
         self.assertEqual(result, "hello")
 
-    def test_validate_input_not_none(self):
-        result = validate_input("x")
+    def test_sanitize_input_not_none(self):
+        result = sanitize_input("x")
         self.assertIsNotNone(result)
 """
 
@@ -196,25 +197,25 @@ class TestSimilarFunctions(unittest.TestCase):
     def test_finds_same_prefix(self):
         """Functions with same verb prefix are ranked higher."""
         all_funcs = {
-            "validate_input": [{"file": "a.py", "line": 1, "param_count": 1,
-                                "is_method": False, "is_async": False, "name": "validate_input"}],
-            "validate_config": [{"file": "b.py", "line": 1, "param_count": 1,
-                                 "is_method": False, "is_async": False, "name": "validate_config"}],
+            "sanitize_input": [{"file": "a.py", "line": 1, "param_count": 1,
+                                "is_method": False, "is_async": False, "name": "sanitize_input"}],
+            "sanitize_config": [{"file": "b.py", "line": 1, "param_count": 1,
+                                 "is_method": False, "is_async": False, "name": "sanitize_config"}],
             "process_data": [{"file": "c.py", "line": 10, "param_count": 1,
                               "is_method": False, "is_async": False, "name": "process_data"}],
         }
         similar = mod.find_similar_functions(
-            "validate_input",
-            all_funcs["validate_input"][0],
+            "sanitize_input",
+            all_funcs["sanitize_input"][0],
             all_funcs,
         )
         names = [s["function"] for s in similar]
-        self.assertIn("validate_config", names)
-        # validate_config should rank higher than process_data (prefix match)
+        self.assertIn("sanitize_config", names)
+        # sanitize_config should rank higher than process_data (prefix match)
         if "process_data" in names:
-            vc_idx = names.index("validate_config")
+            vc_idx = names.index("sanitize_config")
             pd_idx = names.index("process_data")
-            self.assertLess(vc_idx, pd_idx, "validate_config should rank above process_data")
+            self.assertLess(vc_idx, pd_idx, "sanitize_config should rank above process_data")
 
     def test_respects_max_similar(self):
         """At most max_similar results returned."""
@@ -271,6 +272,21 @@ class TestSimilarFunctionPrecision(unittest.TestCase):
             "get_config_path": _fn("get_config_path", "pkg/c.py"),
         }
         self.assertEqual(self._similar("get_config", funcs), ["get_config_path"])
+
+    def test_a_shared_generic_verb_is_not_enough(self):
+        """`verify_token` and `verify_signature` share a word, not an operation."""
+        funcs = {
+            "verify_token": _fn("verify_token", "pkg/a.py"),
+            "verify_signature": _fn("verify_signature", "pkg/b.py"),
+            "validate_input": _fn("validate_input", "pkg/c.py"),
+            "validate_config": _fn("validate_config", "pkg/d.py"),
+            "handle_upload": _fn("handle_upload", "pkg/e.py"),
+            "handle_delete": _fn("handle_delete", "pkg/f.py"),
+            "verify_token_expiry": _fn("verify_token_expiry", "pkg/g.py"),
+        }
+        self.assertEqual(self._similar("verify_token", funcs), ["verify_token_expiry"])
+        self.assertEqual(self._similar("validate_input", funcs), [])
+        self.assertEqual(self._similar("handle_upload", funcs), [])
 
     def test_other_top_level_dirs_and_private_helpers_skipped(self):
         funcs = {
@@ -448,8 +464,8 @@ class TestAnalyze(unittest.TestCase):
             self.assertGreater(result["summary"]["test_files"], 0)
             self.assertGreater(result["summary"]["total_test_functions"], 0)
 
-    def test_finds_similar_validate_functions(self):
-        """validate_input test invariants are propagated to validate_config."""
+    def test_finds_similar_sanitize_functions(self):
+        """sanitize_input test invariants are propagated to sanitize_config."""
         with TempProject({
             "pkg/__init__.py": "",
             "pkg/validator.py": SIMPLE_SOURCE,
@@ -462,10 +478,10 @@ class TestAnalyze(unittest.TestCase):
             for inv in result["invariants"]:
                 all_similar.extend(inv.get("similar_functions", []))
             similar_names = [s["function"] for s in all_similar]
-            # validate_config should be found as similar to validate_input
+            # sanitize_config should be found as similar to sanitize_input
             self.assertTrue(
-                any("validate_config" in n for n in similar_names),
-                f"Expected validate_config in similar functions, got: {similar_names}"
+                any("sanitize_config" in n for n in similar_names),
+                f"Expected sanitize_config in similar functions, got: {similar_names}"
             )
 
     def test_handles_syntax_error(self):
@@ -789,12 +805,10 @@ class TestSelectionSpread(unittest.TestCase):
             "[fix] handle empty input",
             "Avoid a deadlock when closing the pool",
             "Close the race between flush and read",
-            "Roll back on cancel: rollback partial writes",
-            "Bound the request timeout",
         ):
-            self.assertTrue(mod._FIX_COMMIT_RE.search(subject), subject)
+            self.assertTrue(mod.is_fix_commit(subject), subject)
         for subject in ("Add a prefix option", "Refactor the dispatch table"):
-            self.assertIsNone(mod._FIX_COMMIT_RE.search(subject), subject)
+            self.assertFalse(mod.is_fix_commit(subject), subject)
 
 
 def _git(root, *args, env=None):
@@ -837,6 +851,23 @@ class TestBugFixAttribution(unittest.TestCase):
         self.assertEqual(total, 1)
         self.assertEqual(entries[0]["test_functions"], ["test_flush_race_regression"])
         self.assertEqual(entries[0]["attribution"], "function")
+
+    def test_keyed_fix_commit_is_found_with_key_types(self):
+        old = "def test_existing():\n    assert True\n"
+        new = old + "\n\ndef test_empty_batch():\n    assert True\n"
+        with TempProject({"pkg/core.py": "X = 1\n", "tests/test_core.py": old}) as root:
+            _git(root, "init", "-q", "-b", "main")
+            _git(root, "add", "-A")
+            _git(root, "commit", "-q", "-m", "Add core")
+            (root / "tests/test_core.py").write_text(new, encoding="utf-8")
+            (root / "pkg/core.py").write_text("X = 2\n", encoding="utf-8")
+            _git(root, "commit", "-q", "-am", "[core] Batch the empty case (B7)")
+            plain = mod.analyze(str(root), with_git=True)
+            keyed = mod.analyze(str(root), with_git=True, key_types={"B": "fix"})
+        self.assertEqual(plain["bug_fix_tests"], [])
+        self.assertEqual(
+            [e["test_functions"] for e in keyed["bug_fix_tests"]], [["test_empty_batch"]]
+        )
 
 
 # Two ways to install a record: create validates the spec first; restore
@@ -936,6 +967,114 @@ class TestEntryPointSiblings(unittest.TestCase):
         self.assertNotIn("Registry.create_record", names)
 
 
+_RANKING_SRC = (
+    "def require_owner(user):\n    return user\n"
+    "def validate_name(name):\n    return name\n"
+    "def _check_archive(blob):\n    return blob\n"
+    "def _write_lock():\n    return None\n"
+    "def _install_row(row):\n    return row\n"
+    "def _record_path(row):\n    return row\n"
+    "def create_record(user, name):\n"
+    "    require_owner(user)\n"
+    "    validate_name(name)\n"
+    "    with _write_lock():\n"
+    "        _install_row(name)\n"
+    "        return _record_path(name)\n"
+    # Validates its input, but with none of the tested guards.
+    "def import_record(blob):\n"
+    "    _check_archive(blob)\n"
+    "    with _write_lock():\n"
+    "        _install_row(blob)\n"
+    # Applies one of the two.
+    "def rename_record(name):\n"
+    "    validate_name(name)\n"
+    "    with _write_lock():\n"
+    "        _install_row(name)\n"
+    # No guard of its own, but the most shared helpers.
+    "def purge_record(name):\n"
+    "    with _write_lock():\n"
+    "        _install_row(name)\n"
+    "        _record_path(name)\n"
+    # Keeps every tested guard.
+    "def bulk_create(user, names):\n"
+    "    require_owner(user)\n"
+    "    validate_name(names)\n"
+    "    with _write_lock():\n"
+    "        _install_row(names)\n"
+    "        _record_path(names)\n"
+)
+
+
+class TestEntryPointSiblingRanking(unittest.TestCase):
+    """The true sibling ranked 12th: helper overlap put no-guard internals
+    and siblings that already keep the guard ahead of an entry point that
+    validates its input, just not with the tested guard."""
+
+    def _siblings(self, max_results: int = 5) -> list[dict]:
+        with TempProject({"pkg/__init__.py": "", "pkg/ops.py": _RANKING_SRC}) as root:
+            sources = [root / "pkg/__init__.py", root / "pkg/ops.py"]
+            functions = mod.extract_source_functions(sources, root)
+            index = mod.CallIndex(sources, root, functions)
+            return index.siblings(("pkg/ops.py", "create_record"), max_results)
+
+    def test_a_differing_guard_set_ranks_first(self):
+        siblings = self._siblings()
+        self.assertEqual(
+            [(s["function"], s["guard_relation"]) for s in siblings],
+            [
+                ("import_record", "disjoint"),
+                ("rename_record", "partial"),
+                ("purge_record", "unguarded"),
+                ("bulk_create", "keeps"),
+            ],
+        )
+        self.assertEqual(siblings[0]["missing_guards"], ["require_owner", "validate_name"])
+
+    def test_the_cap_drops_the_least_telling_first(self):
+        names = [s["function"] for s in self._siblings(max_results=3)]
+        self.assertEqual(names, ["import_record", "rename_record", "purge_record"])
+
+
+class TestReachedIndirectly(unittest.TestCase):
+    """A function a tested function calls directly (the service under a
+    tested route handler) was listed as an untested similar function."""
+
+    _FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/clean.py": (
+            "def sanitize_input(data):\n"
+            "    if not data:\n"
+            "        raise ValueError('empty')\n"
+            "    return sanitize_payload(data)\n"
+            "def sanitize_payload(data):\n"
+            "    return data.strip()\n"
+            "def sanitize_header(data):\n"
+            "    return data.lower()\n"
+        ),
+        "tests/test_clean.py": (
+            "import pytest\n"
+            "from pkg.clean import sanitize_input\n"
+            "def test_sanitize_input_rejects_empty():\n"
+            "    with pytest.raises(ValueError):\n"
+            "        sanitize_input('')\n"
+        ),
+    }
+
+    def test_direct_callees_are_marked_and_listed_last(self):
+        with TempProject(self._FILES) as root:
+            result = mod.analyze(str(root))
+        untested = result["untested_similar_functions"]
+        self.assertEqual(
+            [u["function"] for u in untested], ["sanitize_header", "sanitize_payload"]
+        )
+        self.assertNotIn("reached_indirectly", untested[0])
+        self.assertEqual(
+            untested[1]["reached_indirectly"],
+            {"via": "sanitize_input", "file": "pkg/clean.py"},
+        )
+        self.assertEqual(result["summary"]["untested_similar_reached_indirectly"], 1)
+
+
 class TestFixCommitClassification(unittest.TestCase):
     """A commit type or tag outranks fix vocabulary in the subject."""
 
@@ -974,6 +1113,50 @@ class TestFixCommitClassification(unittest.TestCase):
     def test_untyped_subject_without_vocabulary(self):
         self.assertFalse(mod.is_fix_commit("feat(cli: add a quiet flag"))
         self.assertFalse(mod.is_fix_commit("Add a prefix option"))
+
+    def test_hardening_subjects_are_fixes(self):
+        for subject in (
+            "Require a confirmed calendar before sharing it",
+            "Reject meeting invites that end before they start",
+            "Pin each device to its first sync folder",
+            "Validate time zones in imported events",
+            "restore the reminder queue after a worker restart",
+        ):
+            with self.subTest(subject=subject):
+                self.assertTrue(mod.is_fix_commit(subject))
+
+    def test_broad_words_and_lint_sweeps_are_not_fixes(self):
+        for subject in (
+            "Bump the lock file",
+            "Add a timeout option to the client",
+            "Make the thread pool size configurable",
+            "Fixed all pylint warnings",
+            "fix isort and formatting",
+            "fix(docs): correct the install command",
+        ):
+            with self.subTest(subject=subject):
+                self.assertFalse(mod.is_fix_commit(subject))
+
+    def test_tracker_keys_map_to_fixes(self):
+        subject = "[db] Batch the row writes (B12)"
+        self.assertFalse(mod.is_fix_commit(subject))
+        self.assertTrue(mod.is_fix_commit(subject, {"B": "fix"}))
+        self.assertFalse(mod.is_fix_commit(subject, {"B": "feature"}))
+
+    def test_agrees_with_the_history_classifier(self):
+        history = import_script("analyze_history")
+        for subject in (
+            "Guard against a missing organizer field",
+            "Close the race between flush and read",
+            "Bump the lock file",
+            "chore: fix a typo (#12)",
+            "Add docstrings to the parser",
+        ):
+            with self.subTest(subject=subject):
+                self.assertEqual(
+                    mod.is_fix_commit(subject),
+                    history.classify_commit(subject) == "fix",
+                )
 
 
 class TestTestOnlyFixesRankLast(unittest.TestCase):

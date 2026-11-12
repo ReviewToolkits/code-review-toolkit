@@ -1,6 +1,6 @@
 ---
 name: project-docs-auditor
-description: Use this agent to audit out-of-code documentation (README, CLAUDE.md, CONTRIBUTING.md, configuration files) for accuracy against the actual codebase. Unlike the documentation-auditor (which covers in-code docstrings and comments), this agent focuses on external-facing documentation. It has three concrete, verifiable capabilities — reference validation (do things mentioned in docs exist in code?), cross-file consistency (do documentation files agree with each other and with project metadata?), and structural completeness (does the project document what it actually exposes?). Every finding is mechanically verifiable, not subjectively opinionated.\n\n<example>\nContext: The user is preparing a release and wants to verify documentation accuracy.\nuser: "Before the release, can you check that our README is actually accurate?"\nassistant: "I'll use the project-docs-auditor to validate all references in the README against the current code and check for stale or broken documentation."\n<commentary>\nPre-release documentation accuracy check — the core use case. The agent will find renamed functions, changed CLI flags, and outdated examples.\n</commentary>\n</example>\n\n<example>\nContext: The user has refactored code and wants to check if docs are stale.\nuser: "I just renamed a bunch of functions and reorganized the modules — are the docs still correct?"\nassistant: "I'll use the project-docs-auditor to find any documentation references that point to the old names or structure."\n<commentary>\nPost-refactoring documentation drift detection. The agent excels at finding references to entities that no longer exist.\n</commentary>\n</example>\n\n<example>\nContext: The explore command dispatching this agent as part of a full review.\nuser: "/code-review-toolkit:explore . all"\nassistant: "[As part of the full exploration, the project-docs-auditor checks external documentation accuracy alongside the documentation-auditor's in-code analysis.]"\n<commentary>\nWhen run as part of a full exploration, this agent complements the documentation-auditor by covering external-facing docs.\n</commentary>\n</example>
+description: Use this agent to audit out-of-code documentation (README, CLAUDE.md, CONTRIBUTING.md, configuration files) for accuracy against the actual codebase. Unlike the documentation-auditor (which covers in-code docstrings and comments), this agent focuses on external-facing documentation. It has four concrete, verifiable capabilities — reference validation (do things mentioned in docs exist in code?, backed by `check_doc_refs.py`), cross-file consistency (do documentation files agree with each other and with project metadata?), structural completeness (does the project document what it actually exposes?), and behavioural claims (does the code do what the user docs promise?). Every finding is mechanically verifiable, not subjectively opinionated.\n\n<example>\nContext: The user is preparing a release and wants to verify documentation accuracy.\nuser: "Before the release, can you check that our README is actually accurate?"\nassistant: "I'll use the project-docs-auditor to validate all references in the README against the current code and check for stale or broken documentation."\n<commentary>\nPre-release documentation accuracy check — the core use case. The agent will find renamed functions, changed CLI flags, and outdated examples.\n</commentary>\n</example>\n\n<example>\nContext: The user has refactored code and wants to check if docs are stale.\nuser: "I just renamed a bunch of functions and reorganized the modules — are the docs still correct?"\nassistant: "I'll use the project-docs-auditor to find any documentation references that point to the old names or structure."\n<commentary>\nPost-refactoring documentation drift detection. The agent excels at finding references to entities that no longer exist.\n</commentary>\n</example>\n\n<example>\nContext: The explore command dispatching this agent as part of a full review.\nuser: "/code-review-toolkit:explore . all"\nassistant: "[As part of the full exploration, the project-docs-auditor checks external documentation accuracy alongside the documentation-auditor's in-code analysis.]"\n<commentary>\nWhen run as part of a full exploration, this agent complements the documentation-auditor by covering external-facing docs.\n</commentary>\n</example>
 model: opus
 color: emerald
 ---
@@ -34,6 +34,15 @@ Before starting analysis, discover and list all documentation that exists in the
 
 **Deployment and operations files (they document how to run the project, and drift silently):**
 - `Dockerfile`, `docker-compose.yml` / `compose.yaml`: exposed ports, env vars, entry commands, health checks, volumes — compare each with what the code actually reads and serves
+- **Exposed port vs bind host.** For every `EXPOSE` / `ports:` / `-p HOST:CONTAINER`, find the host
+  the server actually binds in that container: the entry command's `--host`/`--bind`, the env var
+  or config default the code resolves (`HOST`, `BIND`, `server.host`), and the framework default
+  when none is given (several servers default to `127.0.0.1`). A server bound to loopback behind
+  an exposed port is unreachable from outside the container while everything looks right. An
+  in-container `HEALTHCHECK` (`curl localhost:8000`) runs inside the same network namespace, so it
+  passes against a loopback bind and cannot catch this; only a request from outside (another
+  container, the host through the published port) can. Report the chain: the documented port, the
+  bind the code resolves, and where each comes from
 - `*.example` / `*.sample` / `dotenv.example` / `config.yml.example`: every key must exist in the code with the documented meaning and default
 - `Makefile` / `justfile` / `noxfile.py` / `tox.ini`: targets that reference scripts, paths or flags that no longer exist
 - CI configuration (`.github/workflows/`, `.gitlab-ci.yml` or a variant name, `.circleci/`): commands, Python versions, whether what CI tests matches what the docs promise, and whether each step actually runs (see "CI Steps That Pass Without Running")
@@ -46,6 +55,34 @@ deployment fails.
 - Environment variables read by the code (grep for os.environ, os.getenv, etc.)
 
 List what you found before starting analysis, so the user sees the documentation surface being audited.
+
+## Run the reference checker first
+
+Run `check_doc_refs.py` before reading the docs by hand (see "Running the script"). It is offline
+and does the mechanical sweeps that runs used to improvise; every section is a candidate list to
+confirm, not a verdict:
+
+| Key | What it holds |
+|---|---|
+| `links` | relative links in the Markdown/reST sources whose file or `#anchor` is missing (`missing_file` / `missing_anchor`). Anchors follow both MkDocs (Python-Markdown) and GitHub slug rules; footnotes and code blocks are not links. External URLs are only counted (`external_skipped`) |
+| `site` | the same for a built HTML site, when you pass `--site DIR` (see "The Built Documentation Site"); `null` with `site_reason` otherwise |
+| `app_doc_links` | documentation URLs the application emits from templates and code, resolved to a docs page and anchor: absolute URLs under a docs base (an `mkdocs*.yml` `site_url`, or `--docs-url BASE=DIR`) and calls to a docs-link helper (`--doc-helper NAME=DIR`). `docs_bases` / `doc_helpers` say what was mapped; a helper named `*docs_url` with no mapping is listed as `unchecked` |
+| `identifiers` | backticked calls (`name()`) and dotted paths into the project's own packages that resolve to nothing the project defines, imports or mentions. Changelogs and roadmaps/plans are skipped |
+| `paths` | backticked relative paths that start at a real directory but do not exist |
+| `make` | `missing_targets` (with `path_exists`: a documented `make tests` beside a `tests/` directory prints "Nothing to be done" and exits 0), `not_phony_path_collisions`, `env_overrides_ignored` (`VAR=x make t` while the Makefile assigns `VAR` with `=`/`:=`, so the override does nothing; only `?=` honours it) and `variables_not_in_makefile` (set by a documented command, read by no Makefile line, script, config or compose file). `null` with `make_reason` when there is no Makefile |
+
+Before running it, find how the application builds links into its own docs (`grep -rn "docs_url\|help_url\|docs\." <package>`).
+A helper such as `request.help_url('/guide/', anchor='x')` is checked only once you map it:
+
+```bash
+python3 <plugin_root>/scripts/check_doc_refs.py [scope] --doc-helper help_url=docs/guide \
+  --docs-url https://docs.example.org/=docs/guide
+```
+
+Static site builders often do not validate anchors (MkDocs can be told to ignore them), so a link
+the application emits to `page/#section` breaks silently when the heading is renamed. Every
+`missing_anchor` there is a candidate FIX: confirm it against the built site (`--site`) when you
+can, because a generated id (a tab, a custom anchor) exists only there.
 
 ## Capability 1: Reference Validation
 
@@ -106,26 +143,20 @@ hand-written usage lines, prose around the generated tables, and the pages that 
 
 ### Documented `make` Targets
 
-For every `make X` (or `just X`, `nox -s X`, `tox -e X`) in the docs, check that `X` is a target.
-Watch for one silent failure in particular: `X` is not a target, but a file or directory named
-`X` exists. A documented `make tests`, with a `tests/` directory and only a `test` target,
+The script's `make` section covers `make X` in the docs' code blocks and inline code. Watch for
+one silent failure in particular: `X` is not a target, but a file or directory named `X` exists
+(`path_exists`). A documented `make tests`, with a `tests/` directory and only a `test` target,
 prints "Nothing to be done for 'tests'" and exits 0, so the reader believes the tests passed. A
 real target that shares its name with a directory and is missing from `.PHONY` fails the same
-way.
+way (`not_phony_path_collisions`). Check `just X`, `nox -s X` and `tox -e X` by hand the same way.
 
-```bash
-# Command-shaped mentions only: a line that starts with `make`/`$ make`, or `make` in backticks.
-for t in $(grep -rhoE '(^\s*(\$ )?|`)make [a-z][a-z0-9_.-]*' README* CONTRIBUTING* docs/ 2>/dev/null | awk '{print $NF}' | sort -u); do
-  grep -qE "^$t:" Makefile || echo "not a target: make $t$( [ -e "$t" ] && echo '  (a path of that name exists: silent no-op)')"
-  grep -qE "^$t:" Makefile && [ -e "$t" ] && ! grep -qE "^\.PHONY:.*\b$t\b" Makefile && echo "not .PHONY, collides with a path: make $t"
-done
-```
-
-Confirm a hit with `make -n X` in an export ("Nothing to be done" / "is up to date", exit 0).
+Confirm a hit with `make -n X` in an export ("Nothing to be done" / "is up to date", exit 0). For
+`env_overrides_ignored`, `make -n X VAR=...` and `VAR=... make -n X` show the difference.
 
 ### Link Validation
 
-- Internal links (relative paths in markdown) → do the targets exist?
+- Internal links and anchors: the script's `links` (sources) and `site` (built pages)
+- Links the application emits into its own docs: `app_doc_links`
 - Don't validate external URLs (that's a different tool)
 
 ### The Built Documentation Site
@@ -141,9 +172,13 @@ cd "$export" && mkdocs build -d "$d/site" 2> "$d/site.err"              # or:
 cd "$export" && sphinx-build -b html docs "$d/site" 2> "$d/site.err"
 ```
 
+Then point the checker at it: `check_doc_refs.py [scope] --site "$d/site"` fills `site` with
+every relative link and `#anchor` that has no target in the generated pages, and confirms
+`app_doc_links` anchors against the generated ids. Scan the pages for template leftovers too:
+
 ```bash
 python3 - "$d/site" <<'EOF'
-import html, pathlib, re, sys
+import pathlib, re, sys
 root = pathlib.Path(sys.argv[1])
 for page in sorted(root.rglob("*.html")):
     text = page.read_text(errors="replace")
@@ -160,10 +195,6 @@ for page in sorted(root.rglob("*.html")):
     for m in re.finditer(r'(?:href|src)="(/[^"#?]*)', text):
         if rel.name != "404.html":  # generators make the 404 page root-absolute on purpose
             print(rel, "ROOT-ABSOLUTE", m.group(1))  # breaks under a URL prefix
-    for m in re.finditer(r'(?:href|src)="(?![a-z]+:|#|/)([^"#?]+)', text):
-        target = (page.parent / html.unescape(m.group(1))).resolve()
-        if not target.exists() and not (target / "index.html").exists():
-            print(rel, "MISSING-TARGET", m.group(1))
 EOF
 ```
 
@@ -268,6 +299,33 @@ Check whether the project documents what it actually exposes. This is NOT "does 
 - **CONSIDER**: A configuration option exists but isn't documented (users might need it)
 - **ACCEPTABLE**: An internal module isn't mentioned in external docs (it's internal — users don't need to know about it)
 
+## Capability 4: Behavioural Claims
+
+User docs promise behaviour, not just names: "returns 404 when the project does not exist",
+"the response includes `expires_at`", "only owners can delete", "at most 100 items per page",
+"you will receive an email when ...". These claims are where readers get hurt, and the top
+findings of past runs came from them. Capabilities 1-3 never test them.
+
+1. **Extract the claims.** Read the user-facing docs (guides, API reference, FAQ, error-message
+   help pages) and list each sentence that states a checkable behaviour, by kind: `status` (HTTP
+   codes, exit codes, error messages), `field` (a response, payload or config field and its
+   type/default), `permission` (who may do what), `limit` (sizes, counts, rates, timeouts,
+   retention), `notification` (emails, webhooks, events and when they fire), `ordering` and
+   `idempotency`. Keep the doc location and the exact wording.
+2. **Find the code that decides it.** For each claim, find the handler, the permission check, the
+   constant or the setting, and any test that pins the behaviour (`grep` the status code, field
+   name or limit value; the route for the documented URL).
+3. **Verify, cheapest first.** A test that asserts the documented behaviour settles it; a constant
+   that differs from the documented limit contradicts it. When neither settles it, write a small
+   reproducer in an export (see the "Run the examples" guidance above) and run it.
+4. **Report** each contradiction under "Behaviour Defects Found Through the Docs" when the code
+   is wrong, or under "Broken References" when the doc is: name the doc line, the code line, and
+   how you verified it (test, constant, reproducer). Report unverified claims as such, never as
+   correct.
+
+Cap this capability at the 30 claims a user is most likely to rely on (status codes, permissions
+and limits first) and say how many you extracted.
+
 ## Output Format
 
 ```
@@ -364,3 +422,40 @@ For each:
 - **click**: CLI defined via `@click.command()`, `@click.group()`, `@click.option("--flag")`.
 - **Environment variables**: `os.environ["VAR"]`, `os.environ.get("VAR")`, `os.getenv("VAR")`.
 - **Configuration files**: Look for YAML/TOML/JSON loading patterns to determine what config keys the code expects.
+
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.
+
+## Running the script
+
+These rules apply to every script call this agent makes.
+
+- **Timeout.** Give the Bash call `timeout: 300000` (5 min). The 120 s default kills the script on
+  large projects. If it may run longer still, use `run_in_background` and wait for the completion
+  notification rather than polling.
+- **A private output location.** Other agents run the toolkit's scripts concurrently in `parallel`
+  mode, so never write to a fixed path. Create a directory of your own and keep stdout and stderr
+  apart, in one Bash call:
+
+  ```bash
+  d=$(mktemp -d "${TMPDIR:-/tmp}/crt-project-docs-auditor.XXXXXX") && echo "$d" &&
+  python3 <plugin_root>/scripts/check_doc_refs.py [scope] [options] > "$d/out.json" 2> "$d/out.err"; echo "exit=$?"
+  ```
+
+  Each Bash call is a fresh shell: a `$$` suffix or a shell variable does not survive into the next
+  call. Reuse the literal path `echo` printed. Build the docs site, and run examples, in the same
+  directory.
+- **Running the project's own code** (examples, a docs build, a reproducer): do it in an exported
+  copy, never in the checkout, and set `TMPDIR` to your private directory.
+- **Forward `--max-files N`** when the caller gave one; it caps the Python files scanned for
+  emitted doc links, and `files_capped` says so.
+- **Check before you read.** A non-zero `exit` or an empty `out.json` means the run did not
+  succeed. Read `out.err`, and any `error` field in `out.json`. A section that is `null` was not
+  measured (`site_reason`, `make_reason`): say so, never "no defects".
+- **Do not retry a script that timed out or failed.** Answer the same question with Grep and Read,
+  and state in the report that the script did not complete. A run that failed is never "no
+  findings".

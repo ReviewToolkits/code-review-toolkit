@@ -14,6 +14,11 @@ Confidence levels:
 
 Usage:
     python scan_python_pitfalls.py [path] [--max-files N] [--check ID[,ID...]] [--exclude PAT[,PAT...]]
+
+``--exclude`` is repeatable and takes a comma list: a plain pattern matches as
+a substring of the project-relative path, a glob (``migrations/*``) at any
+depth. Excluded files are not counted and do not use up ``--max-files``; the
+envelope reports ``files_excluded`` and ``exclude_matches`` per pattern.
 """
 
 from __future__ import annotations
@@ -28,11 +33,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scan_common import (  # noqa: E402
     build_envelope,
-    collect_python_files,
     emit,
-    parse_common_args,
+    parse_scan_args,
     parse_source,
     relative_to_root,
+    select_python_files,
+    split_patterns,
 )
 
 # --------------------------------------------------------------------------
@@ -580,6 +586,31 @@ def _returns(name: str, body: list[ast.stmt]) -> bool:
     return False
 
 
+# Per-check bookkeeping for the summary's `per_check`: how many candidates a
+# check looked at and why it passed over some, so "no findings" can be told
+# apart from "nothing considered". analyze() resets it; a check that records
+# nothing reports `considered: null` (not instrumented), never 0.
+_STATS: dict[str, dict] = {}
+# The checks that call _note(): for these, no entry means "considered 0".
+_COUNTED_CHECKS = frozenset(
+    {
+        "class-level-mutable-attribute",
+        "eq-without-hash",
+        "except-exception-too-broad",
+        "raise-without-from-in-except",
+    }
+)
+
+
+def _note(shape: str, event: str, reason: str = "") -> None:
+    """Record that *shape* considered a candidate, or skipped one for *reason*."""
+    entry = _STATS.setdefault(shape, {"considered": 0, "skipped": {}})
+    if event == "considered":
+        entry["considered"] += 1
+    else:
+        entry["skipped"][reason] = entry["skipped"].get(reason, 0) + 1
+
+
 def _finding(
     shape: str,
     severity: str,
@@ -772,19 +803,77 @@ def _check_return_in_finally(tree: ast.AST) -> list[dict]:
     return out
 
 
+# Calls that hash their argument: a set or dict key needs `__hash__`.
+_HASHING_CALLS = frozenset(
+    {"hash", "set", "frozenset", "add", "fromkeys", "setdefault"}
+)
+# Methods that mark a class as a value type, one whose instances are compared
+# (and so plausibly hashed) by content.
+_VALUE_TYPE_METHODS = frozenset({"__lt__", "__le__", "__gt__", "__ge__", "__iter__"})
+
+
+def _instances_hashed(tree: ast.AST, name: str) -> bool:
+    """True if `name(...)` instances visibly reach a set, a dict key or hash()."""
+
+    def builds(node: ast.AST | None) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and _dotted_name(node.func).split(".")[-1] == name
+        )
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Set, ast.SetComp)):
+            elts = node.elts if isinstance(node, ast.Set) else [node.elt]
+            if any(builds(e) for e in elts):
+                return True
+        elif isinstance(node, ast.Dict):
+            if any(builds(k) for k in node.keys):
+                return True
+        elif isinstance(node, ast.DictComp):
+            if builds(node.key):
+                return True
+        elif isinstance(node, ast.Subscript) and builds(node.slice):
+            return True  # mapping[Name(...)]
+        elif isinstance(node, ast.Call) and _call_tail(node) in _HASHING_CALLS:
+            if any(builds(arg) for arg in node.args):
+                return True
+    return False
+
+
+def _is_value_type(cls: ast.ClassDef) -> bool:
+    """Ordering/iteration methods, `__slots__`, or a tuple-like base."""
+    for stmt in cls.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if stmt.name in _VALUE_TYPE_METHODS:
+                return True
+        elif isinstance(stmt, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "__slots__" for t in stmt.targets
+        ):
+            return True
+    return any(
+        _dotted_name(b).split(".")[-1] in ("tuple", "NamedTuple", "Enum")
+        for b in cls.bases
+    )
+
+
 def _check_eq_without_hash(tree: ast.AST) -> list[dict]:
     out: list[dict] = []
+    shape = "eq-without-hash"
     for cls in ast.walk(tree):
         if not isinstance(cls, ast.ClassDef):
             continue
-        decorators = _decorator_names(cls)
-        if decorators & _DATACLASS_DECORATORS:
-            continue  # eq/hash are derived
         methods = {
             m.name
             for m in cls.body
             if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
+        if "__eq__" not in methods:
+            continue
+        _note(shape, "considered")
+        decorators = _decorator_names(cls)
+        if decorators & _DATACLASS_DECORATORS:
+            _note(shape, "skipped", "dataclass")
+            continue  # eq/hash are derived
         # An explicit `__hash__ = None` is a deliberate opt-out.
         explicit = {
             t.id
@@ -793,22 +882,38 @@ def _check_eq_without_hash(tree: ast.AST) -> list[dict]:
             for t in stmt.targets
             if isinstance(t, ast.Name)
         }
-        if (
-            "__eq__" in methods
-            and "__hash__" not in methods
-            and "__hash__" not in explicit
-        ):
-            out.append(
-                _finding(
-                    "eq-without-hash",
-                    "CONSIDER",
-                    "medium",
-                    cls,
-                    f"class {cls.name} defines __eq__ but not __hash__; instances become "
-                    f"unhashable (Python sets __hash__ = None)",
-                    "only a problem if instances are used in a set or as dict keys -- check",
-                )
+        if "__hash__" in methods or "__hash__" in explicit:
+            _note(shape, "skipped", "defines-hash")
+            continue
+        # Unhashable instances are a defect only where something hashes them.
+        # Five of five hits on one web app were service and factory classes
+        # nothing ever puts in a set: report those at low.
+        if _instances_hashed(tree, cls.name):
+            conf = "medium"
+            why = "instances reach a set, a dict key or hash() in this module"
+        elif _is_value_type(cls):
+            conf = "medium"
+            why = (
+                "a value type (ordering, __slots__ or a tuple-like base): its "
+                "instances are likely to end up in a set or as dict keys"
             )
+        else:
+            conf = "low"
+            why = (
+                "no instance is seen in a set, as a dict key or in hash() in this "
+                "module -- only a problem if some caller hashes one"
+            )
+        out.append(
+            _finding(
+                shape,
+                "CONSIDER",
+                conf,
+                cls,
+                f"class {cls.name} defines __eq__ but not __hash__; instances become "
+                f"unhashable (Python sets __hash__ = None)",
+                why,
+            )
+        )
     return out
 
 
@@ -961,18 +1066,64 @@ def _check_lru_cache_on_method(tree: ast.AST) -> list[dict]:
             first = fn.args.args[0].arg if fn.args.args else ""
             if first not in {"self", "cls"}:
                 continue
+            bound = _lru_cache_bound(fn)
+            if bound is None:
+                out.append(
+                    _finding(
+                        "lru-cache-on-method",
+                        "CONSIDER",
+                        "high",
+                        fn,
+                        f"{cls.name}.{fn.name}() is cached on the CLASS with '{first}' in "
+                        f"the key and no size bound, so every instance ever passed is "
+                        f"retained for the process lifetime",
+                        "use cached_property or a per-instance cache; harmless for "
+                        "singletons",
+                    )
+                )
+                continue
             out.append(
                 _finding(
                     "lru-cache-on-method",
                     "CONSIDER",
-                    "high",
+                    "medium",
                     fn,
-                    f"{cls.name}.{fn.name}() is cached on the CLASS with '{first}' in the key, "
-                    f"so every instance ever passed is retained for the process lifetime",
-                    "use cached_property or a per-instance cache; harmless for singletons",
+                    f"{cls.name}.{fn.name}() is cached on the CLASS with '{first}' in the "
+                    f"key: up to {bound} entries, and the instances in them, stay alive "
+                    f"and are shared across instances",
+                    "bounded, so this is retention, not a leak: it matters when the "
+                    "instances are short-lived (per request or session) or hold heavy "
+                    "state, where the hit rate is also near zero (check cache_info())",
                 )
             )
     return out
+
+
+def _lru_cache_bound(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+    """The `maxsize` of the method's `lru_cache`, as text; None when unbounded.
+
+    `@cache` and `@lru_cache(maxsize=None)` are unbounded; a bare `@lru_cache`
+    or `@lru_cache()` keeps functools' default of 128.
+    """
+    for dec in fn.decorator_list:
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        tail = _dotted_name(target).split(".")[-1]
+        if tail == "cache":
+            return None
+        if tail != "lru_cache":
+            continue
+        if not isinstance(dec, ast.Call):
+            return "128"
+        size = dec.args[0] if dec.args else None
+        for kw in dec.keywords:
+            if kw.arg == "maxsize":
+                size = kw.value
+        if size is None:
+            return "128"
+        if isinstance(size, ast.Constant) and size.value is None:
+            return None
+        return ast.unparse(size)
+    return None
 
 
 def _attribute_mutated_anywhere(tree: ast.AST, attr: str) -> bool:
@@ -1009,42 +1160,125 @@ def _attribute_mutated_anywhere(tree: ast.AST, attr: str) -> bool:
     return False
 
 
+# Constructors that build a fresh mutable container. `x = set()` at class level
+# is the same shared object as `x = set([])` or `x = {}`.
+_MUTABLE_CONSTRUCTORS = frozenset(
+    {"list", "dict", "set", "defaultdict", "OrderedDict", "deque", "Counter"}
+)
+# Bare names a constructor may take without making the value opaque:
+# `defaultdict(list)`, `deque(maxlen=10)`.
+_CONSTRUCTOR_ARG_NAMES = frozenset(
+    {"list", "dict", "set", "int", "float", "str", "bool", "tuple", "frozenset"}
+)
+# Base-class names of declarative (ORM/schema) classes: their class attributes
+# are configuration a metaclass reads once, not per-instance state.
+_DECLARATIVE_BASE_SUFFIXES = ("Base", "Model", "DeclarativeBase", "Schema")
+
+
+def _is_mutable_value(value: ast.expr) -> bool:
+    """A list/dict/set literal, or a container constructor with plain arguments."""
+    if isinstance(value, (ast.List, ast.Dict, ast.Set)):
+        return True
+    if not isinstance(value, ast.Call):
+        return False
+    if _call_tail(value) not in _MUTABLE_CONSTRUCTORS:
+        return False
+    args = [*value.args, *(kw.value for kw in value.keywords)]
+    return all(
+        isinstance(a, ast.Constant)
+        or (isinstance(a, ast.Name) and a.id in _CONSTRUCTOR_ARG_NAMES)
+        for a in args
+    )
+
+
+def _is_classvar(annotation: ast.expr | None) -> bool:
+    """`ClassVar[...]` / `typing.ClassVar[...]`: sharing is declared."""
+    if annotation is None:
+        return False
+    if isinstance(annotation, ast.Subscript):
+        annotation = annotation.value
+    return _dotted_name(annotation).split(".")[-1] == "ClassVar"
+
+
+def _is_declarative_class(cls: ast.ClassDef) -> bool:
+    """An ORM/schema-style class: a declarative base, or a mapped table."""
+    for base in cls.bases:
+        if _dotted_name(base).split(".")[-1].endswith(_DECLARATIVE_BASE_SUFFIXES):
+            return True
+    return any(
+        isinstance(stmt, ast.Assign)
+        and any(
+            isinstance(t, ast.Name) and t.id == "__tablename__" for t in stmt.targets
+        )
+        for stmt in cls.body
+    )
+
+
 def _check_class_level_mutable(tree: ast.AST) -> list[dict]:
     out: list[dict] = []
+    shape = "class-level-mutable-attribute"
     for cls in ast.walk(tree):
         if not isinstance(cls, ast.ClassDef):
             continue
         if _decorator_names(cls) & _DATACLASS_DECORATORS:
             continue
+        declarative = _is_declarative_class(cls)
         for stmt in cls.body:
             targets: list[ast.expr] = []
             value: ast.expr | None = None
+            annotation: ast.expr | None = None
             if isinstance(stmt, ast.Assign):
                 targets, value = stmt.targets, stmt.value
             elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
                 targets, value = [stmt.target], stmt.value
-            if value is None or not isinstance(value, (ast.List, ast.Dict, ast.Set)):
+                annotation = stmt.annotation
+            if value is None or not _is_mutable_value(value):
                 continue
             for tgt in targets:
                 if not isinstance(tgt, ast.Name):
                     continue
+                _note(shape, "considered")
                 # The defect requires an actual mutation. ALL_CAPS reads as a
                 # constant, and an attribute never mutated in this module is
                 # declarative class config (the menu_specs/Meta pattern seen
                 # throughout idlelib) -- downgrade rather than drop, since the
                 # mutation could live in another module.
                 mutated = _attribute_mutated_anywhere(tree, tgt.id)
-                if mutated:
+                dunder = tgt.id.startswith("__") and tgt.id.endswith("__")
+                suppressed = None
+                if _is_classvar(annotation):
+                    if mutated:
+                        conf = "medium"
+                        why = (
+                            "annotated ClassVar, so the sharing is declared; a "
+                            "defect only if per-instance state was meant"
+                        )
+                    else:
+                        conf, why = "low", "annotated ClassVar and never mutated"
+                        suppressed = "annotated-classvar"
+                elif mutated:
                     conf, why = (
                         "high",
                         "the shared object is mutated in this module -- state bleeds "
                         "between instances",
                     )
+                elif dunder:
+                    # `__table_args__`, `__acl__`, `__slots__`, `__all__`: a
+                    # protocol hook a framework or the interpreter reads, and
+                    # on web apps most of this shape's output.
+                    conf, why = "low", "dunder hook, never mutated in this module"
+                    suppressed = "dunder-hook-not-mutated"
                 elif tgt.id.isupper():
                     conf, why = (
                         "low",
                         "ALL_CAPS and no mutation seen: reads as a constant (prefer a "
                         "tuple/frozenset to make that explicit)",
+                    )
+                elif declarative:
+                    conf = "low"
+                    why = (
+                        "declarative (ORM/schema) class and no mutation seen: "
+                        "configuration its base reads once"
                     )
                 else:
                     conf, why = (
@@ -1053,17 +1287,18 @@ def _check_class_level_mutable(tree: ast.AST) -> list[dict]:
                         "config, possibly overridden by subclasses -- confirm nothing "
                         "elsewhere mutates it",
                     )
-                out.append(
-                    _finding(
-                        "class-level-mutable-attribute",
-                        "FIX",
-                        conf,
-                        stmt,
-                        f"{cls.name}.{tgt.id} is a mutable class attribute shared by every "
-                        f"instance",
-                        why,
-                    )
+                finding = _finding(
+                    shape,
+                    "FIX",
+                    conf,
+                    stmt,
+                    f"{cls.name}.{tgt.id} is a mutable class attribute shared by every "
+                    f"instance",
+                    why,
                 )
+                if suppressed:
+                    finding["suppressed"] = suppressed
+                out.append(finding)
     return out
 
 
@@ -1257,6 +1492,97 @@ def _handler_swallows(handler: ast.ExceptHandler) -> bool:
     return True
 
 
+# Calls that leave the handler by raising or exiting: `abort(500)`,
+# `pytest.fail(...)`, `sys.exit(1)`, `raise_for_status()`, `task.retry()`.
+_RAISING_CALL_TAILS = frozenset(
+    {
+        "abort",
+        "fail",
+        "exit",
+        "_exit",
+        "reraise",
+        "throw",
+        "raise_for_status",
+        # A task queue's `task.retry(exc=...)` raises its retry exception.
+        "retry",
+    }
+)
+# Calls that tell a user or an operator about the failure without stopping
+# the caller: an error tracker, a flash message, a notification.
+_REPORTING_HINTS = (
+    "capture_exception",
+    "captureexception",
+    "capture_message",
+    "report",
+    "notify",
+    "flash",
+    "alert",
+    "sentry",
+)
+
+
+def _handler_exits(handler: ast.ExceptHandler) -> bool:
+    """True if the handler always re-raises or exits.
+
+    Only unconditional statements count: a `raise` at the handler's top
+    level, or a final top-level call to something that raises or exits
+    (`sys.exit(...)`, `abort(...)`, `raise_for_status()`). A raise inside a
+    branch or a nested def, or a `fail(...)` followed by a `return`, leaves a
+    path on which the failure is swallowed.
+    """
+    body = handler.body
+    if any(isinstance(stmt, ast.Raise) for stmt in body):
+        return True
+    last = body[-1] if body else None
+    if isinstance(last, ast.Expr) and isinstance(last.value, ast.Call):
+        tail = _call_tail(last.value)
+        if tail in _RAISING_CALL_TAILS or tail.startswith("raise_"):
+            return True
+    return False
+
+
+def _handler_calls(handler: ast.ExceptHandler) -> tuple[list[str], list[str]]:
+    """(reporting calls, other effectful calls) the handler makes.
+
+    Logging calls and side-effect-free helpers are neither: logging is graded
+    on its own, and a pure helper changes nothing.
+    """
+    reporting: list[str] = []
+    other: list[str] = []
+    for node in ast.walk(handler):
+        if not isinstance(node, ast.Call) or _logger_level(node) is not None:
+            continue
+        tail = _call_tail(node)
+        # A bare `error(...)` / `info(...)`: log-named, but with no logger
+        # receiver it is neither proven logging nor a report. Not counted.
+        if not tail or tail in _PURE_CALLS:
+            continue
+        if tail in _QUIET_LOG_METHODS or tail in _LOUD_LOG_METHODS:
+            continue
+        name = _dotted_name(node.func).lower()
+        if any(hint in name for hint in _REPORTING_HINTS):
+            reporting.append(tail)
+        else:
+            other.append(tail)
+    return reporting, other
+
+
+def _broad_handler_type(handler: ast.ExceptHandler) -> str | None:
+    """`Exception`/`BaseException` if the handler catches one, else None.
+
+    Also matches a dotted spelling (`builtins.Exception`) and a tuple that
+    includes one: `except (ValueError, Exception)` is just as broad.
+    """
+    types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    for node in types:
+        if node is None:
+            continue
+        name = _dotted_name(node).split(".")[-1]
+        if name in ("Exception", "BaseException"):
+            return name
+    return None
+
+
 # --- except-exception-too-broad grading -----------------------------------
 #
 # The size of the try body says little about whether a broad catch hides a
@@ -1384,7 +1710,7 @@ _PURE_CALLS = frozenset(
 )
 
 # A returned call whose name says it builds an error result.
-_ERROR_RESULT_HINTS = ("error", "fail", "reject", "abort", "problem")
+_ERROR_RESULT_HINTS = ("error", "fail", "reject", "abort", "problem", "denied")
 
 _EMPTY_CONTAINER_CALLS = frozenset({"dict", "list", "set", "tuple", "frozenset", "str"})
 
@@ -1720,29 +2046,49 @@ def _grade_broad_handler(
             conf, why = "high", _BROAD_DETAIL["in-domain"]
         else:
             conf, why = "medium", _BROAD_DETAIL["named-default"]
+    reporting, other = _handler_calls(handler)
     if loud:
         conf = _DOWNGRADE[conf]
         why += "; the handler logs at warning or above, so the failure is visible"
+    elif reporting:
+        conf = _DOWNGRADE[conf]
+        why += (
+            f"; the handler reports it via `{reporting[0]}()`, so a user or operator "
+            "sees it, but the caller still proceeds as if the operation worked"
+        )
+    elif other:
+        conf = _DOWNGRADE[conf]
+        why += (
+            f"; the handler calls `{other[0]}()` -- read it: dismiss if it "
+            "re-raises or records the failure"
+        )
     return conf, why
 
 
 def _check_except_exception_too_broad(tree: ast.AST) -> list[dict]:
     out: list[dict] = []
+    shape = "except-exception-too-broad"
     for node, following, fn, cls in _tries_in_context(tree):
         for handler in node.handlers:
-            if not isinstance(handler.type, ast.Name):
+            caught = _broad_handler_type(handler)
+            if caught is None:
                 continue
-            if handler.type.id not in {"Exception", "BaseException"}:
-                continue
-            if not _handler_swallows(handler):
+            _note(shape, "considered")
+            # Only a handler that re-raises or exits lets the failure out; one
+            # that returns an error result is graded (and suppressed) below.
+            # Any other call -- `flash()`, `capture_exception()`, a helper --
+            # used to exempt the handler outright, so the shape reported zero
+            # on code whose broad catches all notify and carry on.
+            if _handler_exits(handler):
+                _note(shape, "skipped", "re-raises-or-exits")
                 continue
             conf, why = _grade_broad_handler(node, handler, following, fn, cls)
             finding = _finding(
-                "except-exception-too-broad",
+                shape,
                 "CONSIDER" if conf in ("low", "suppressed") else "FIX",
                 conf,
                 handler,
-                f"`except {handler.type.id}:` swallows every failure of the "
+                f"`except {caught}:` swallows every failure of the "
                 f"guarded operation, not just the expected one",
                 why,
             )
@@ -2059,6 +2405,7 @@ def _raises_in_handler(handler: ast.ExceptHandler):
 
 def _check_raise_without_from(tree: ast.AST) -> list[dict]:
     out: list[dict] = []
+    shape = "raise-without-from-in-except"
     for candidate in ast.walk(tree):
         if not isinstance(candidate, ast.ExceptHandler):
             continue
@@ -2071,14 +2418,42 @@ def _check_raise_without_from(tree: ast.AST) -> list[dict]:
             # Re-raising the caught name itself needs no cause.
             if isinstance(node.exc, ast.Name) and node.exc.id == handler.name:
                 continue
+            _note(shape, "considered")
+            # Style-grade by default: the implicit chain ("During handling of
+            # the above exception...") still prints the original, and these
+            # dominated the totals on a web app. Medium only where the
+            # original's details are visibly dropped: the handler binds the
+            # exception and then never uses it.
+            raised = _raised_name(node)
+            if raised.startswith("HTTP") or raised.endswith(("Redirect", "Response")):
+                conf = "low"
+                why = (
+                    "an HTTP response exception: control flow, not an error chain "
+                    "-- `from None` states that if wanted"
+                )
+            elif handler.name and not any(
+                handler.name in _names_used(stmt) for stmt in handler.body
+            ):
+                conf = "medium"
+                why = (
+                    f"the handler binds `{handler.name}` and never uses it: the new "
+                    "exception's message drops the original's details -- use "
+                    f"`from {handler.name}`, or put them in the message"
+                )
+            else:
+                conf = "low"
+                why = (
+                    "style: the implicit chain still shows the original; use "
+                    "`from err` to chain or `from None` to suppress deliberately"
+                )
             finding = _finding(
-                "raise-without-from-in-except",
+                shape,
                 "CONSIDER",
-                "medium",
+                conf,
                 node,
                 "raising a new exception inside `except` without `from` loses the "
                 "explicit cause",
-                "use `from err` to chain or `from None` to suppress deliberately",
+                why,
             )
             if _raised_name(node) == "SystemExit":
                 # An exit prints no traceback, so there is no chain to show.
@@ -4888,9 +5263,359 @@ def _check_unformatted_format_string(tree: ast.AST) -> list[dict]:
     return out
 
 
+# --------------------------------------------------------------------------
+# Web / ORM shapes
+# --------------------------------------------------------------------------
+
+_INTEGRITY_ERRORS = frozenset({"IntegrityError", "UniqueViolation"})
+# Calls that leave the session usable (or hand the abort to the framework).
+_SESSION_RECOVERY_CALLS = frozenset(
+    {"rollback", "begin_nested", "abort", "set_rollback", "savepoint"}
+)
+
+
+def _caught_tails(handler: ast.ExceptHandler) -> set[str]:
+    if handler.type is None:
+        return set()
+    parts = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    return {_dotted_name(p).split(".")[-1] for p in parts}
+
+
+def _call_tails(stmts: list[ast.stmt]) -> set[str]:
+    return {
+        _call_tail(node)
+        for stmt in stmts
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.Call)
+    }
+
+
+def _check_integrity_error_without_rollback(tree: ast.AST) -> list[dict]:
+    """`except IntegrityError:` handled without a rollback or a savepoint."""
+    out: list[dict] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try) or "begin_nested" in _call_tails(node.body):
+            continue
+        for handler in node.handlers:
+            caught = _caught_tails(handler) & _INTEGRITY_ERRORS
+            if not caught or _call_tails(handler.body) & _SESSION_RECOVERY_CALLS:
+                continue
+            raises = [
+                sub
+                for stmt in handler.body
+                for sub in ast.walk(stmt)
+                if isinstance(sub, ast.Raise)
+            ]
+            if any(
+                r.exc is None
+                or (isinstance(r.exc, ast.Name) and r.exc.id == handler.name)
+                for r in raises
+            ):
+                continue  # re-raised: the framework sees it and rolls back
+            # A conversion (`raise Conflict() from e`) is fine when the new
+            # exception reaches the framework, and the defect when a caller
+            # catches it and keeps using the session. Statically unknowable:
+            # report it at low confidence, with where to look.
+            converted = bool(raises)
+            out.append(
+                _finding(
+                    "integrity-error-caught-without-rollback",
+                    "FIX",
+                    "low" if converted else "medium",
+                    handler,
+                    f"{min(caught)} is handled without session.rollback() or a "
+                    f"savepoint: the transaction is aborted, so the next use of the "
+                    f"session raises PendingRollbackError"
+                    + (
+                        " (converted to another exception: a defect only if a "
+                        "caller catches it and keeps using the session)"
+                        if converted
+                        else ""
+                    ),
+                    "roll back first in the handler, or flush inside "
+                    "session.begin_nested(); for a conversion, follow the new "
+                    "exception to the code that catches it; dismiss if the caller "
+                    "always discards the session",
+                )
+            )
+    return out
+
+
+_TRANSLATION_CALLS = frozenset(
+    {
+        "_",
+        "gettext",
+        "ngettext",
+        "pgettext",
+        "npgettext",
+        "lazy_gettext",
+        "gettext_lazy",
+        "ugettext",
+        "translate",
+    }
+)
+
+
+def _interpolated(node: ast.AST) -> str | None:
+    """How *node* builds a string at run time, or None for a literal."""
+    if isinstance(node, ast.JoinedStr) and any(
+        isinstance(v, ast.FormattedValue) for v in node.values
+    ):
+        return "an f-string"
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+        sides = (node.left, node.right)
+        if any(
+            isinstance(s, ast.JoinedStr)
+            or (isinstance(s, ast.Constant) and isinstance(s.value, str))
+            for s in sides
+        ):
+            return "a concatenation" if isinstance(node.op, ast.Add) else "%-formatting"
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "format"
+        and isinstance(node.func.value, ast.Constant)
+        and isinstance(node.func.value.value, str)
+    ):
+        return ".format()"
+    return None
+
+
+def _check_translation_of_interpolated_string(tree: ast.AST) -> list[dict]:
+    """`_(f"...")` / `request._("..." + x)`: the msgid is built at run time."""
+    out: list[dict] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and node.args):
+            continue
+        name = _call_tail(node)
+        if name not in _TRANSLATION_CALLS:
+            continue
+        how = _interpolated(node.args[0])
+        if how is None:
+            continue
+        out.append(
+            _finding(
+                "translation-lookup-of-interpolated-string",
+                "FIX",
+                "high" if name != "translate" else "medium",
+                node,
+                f"{_dotted_name(node.func) or name}() is given {how}: the lookup key is "
+                f"the interpolated text, which no catalog entry matches",
+                "pass a literal msgid and the values through the translation's "
+                "mapping/format arguments",
+            )
+        )
+    return out
+
+
+_RANGE_OPS = (ast.Lt, ast.LtE, ast.Gt, ast.GtE)
+_FINITE_CHECKS = frozenset({"isfinite", "isnan", "isinf"})
+
+
+def _floats_bound(scope: ast.AST) -> dict[str, ast.Call]:
+    """Names bound to `float(<non-literal>)` in *scope* (not nested scopes)."""
+    out: dict[str, ast.Call] = {}
+    for node in _walk_same_scope(scope):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Call)
+            and _call_name(node.value) == "float"
+            and node.value.args
+            and not isinstance(node.value.args[0], ast.Constant)
+        ):
+            out[node.targets[0].id] = node.value
+    return out
+
+
+def _rejects_when_true(stmt: ast.If, name: str) -> bool:
+    """Is the `if` body a rejection of *name*, not the accepted branch?
+
+    A raise, `continue`/`break`, or a return or assignment that does not use
+    *name* (`return 0`, `x = DEFAULT`) rejects; `return compute(x)` accepts.
+    """
+    last = stmt.body[-1] if stmt.body else None
+    if isinstance(last, (ast.Raise, ast.Continue, ast.Break)):
+        return True
+    if isinstance(last, (ast.Return, ast.Assign)):
+        return last.value is None or name not in _names_used(last.value)
+    return False
+
+
+def _check_non_finite_float_passes_range_guard(tree: ast.AST) -> list[dict]:
+    """`x = float(raw)`; `if x <= 0: raise` -- 'nan' and 'inf' pass."""
+    out: list[dict] = []
+    for scope in _iter_scopes(tree):
+        floats = _floats_bound(scope)
+        if not floats:
+            continue
+        nodes = list(_walk_same_scope(scope))
+        if any(
+            isinstance(n, ast.Call) and _call_tail(n) in _FINITE_CHECKS for n in nodes
+        ):
+            continue
+        reported: set[str] = set()
+        for stmt in nodes:
+            if not isinstance(stmt, ast.If):
+                continue
+            test = stmt.test
+            if not (
+                isinstance(test, ast.Compare)
+                and len(test.ops) == 1
+                and isinstance(test.ops[0], _RANGE_OPS)
+            ):
+                continue  # `not x > 0` and chained `lo < x <= hi` reject NaN
+            for side in (test.left, test.comparators[0]):
+                if not (isinstance(side, ast.Name) and side.id in floats):
+                    continue
+                if side.id in reported or not _rejects_when_true(stmt, side.id):
+                    continue
+                reported.add(side.id)
+                out.append(
+                    _finding(
+                        "non-finite-float-passes-range-guard",
+                        "CONSIDER",
+                        "medium",
+                        stmt,
+                        f"`{ast.unparse(test)}` rejects out-of-range values of "
+                        f"{side.id} = float(...), but float() accepts 'nan' and 'inf': "
+                        f"NaN fails every comparison, so it passes this guard",
+                        "add `not math.isfinite(...)` to the rejection, or write the "
+                        "test so NaN fails it (`if not 0 < x <= hi`)",
+                    )
+                )
+    return out
+
+
+_COLUMN_FACTORIES = frozenset({"Column", "mapped_column"})
+_JSON_COLUMN_TYPES = frozenset({"JSON", "JSONB", "ARRAY", "HSTORE"})
+_MUTATION_TRACKERS = frozenset(
+    {"MutableDict", "MutableList", "MutableSet", "as_mutable"}
+)
+
+
+def _json_columns(
+    corpus: list[tuple[str, ast.AST]],
+) -> tuple[dict[str, set[str]], set[str]]:
+    """Mapped JSON-like columns: attr -> declaring classes (untracked), and
+    the attribute names some model declares with mutation tracking."""
+    untracked: dict[str, set[str]] = {}
+    tracked: set[str] = set()
+    for _rel, tree in corpus:
+        for cls in ast.walk(tree):
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            for stmt in cls.body:
+                if isinstance(stmt, ast.AnnAssign) and isinstance(
+                    stmt.target, ast.Name
+                ):
+                    name, value = stmt.target.id, stmt.value
+                elif (
+                    isinstance(stmt, ast.Assign)
+                    and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name)
+                ):
+                    name, value = stmt.targets[0].id, stmt.value
+                else:
+                    continue
+                if not (
+                    isinstance(value, ast.Call)
+                    and _call_tail(value) in _COLUMN_FACTORIES
+                ):
+                    continue
+                used = {
+                    n.id if isinstance(n, ast.Name) else n.attr
+                    for n in ast.walk(value)
+                    if isinstance(n, (ast.Name, ast.Attribute))
+                }
+                if used & _MUTATION_TRACKERS:
+                    tracked.add(name)
+                elif used & _JSON_COLUMN_TYPES:
+                    untracked.setdefault(name, set()).add(cls.name)
+    return untracked, tracked
+
+
+def _mutated_attribute(node: ast.AST) -> ast.Attribute | None:
+    """`x.attr[k] = v`, `del x.attr[k]`, `x.attr[k] += 1`, `x.attr.update(...)`."""
+    targets: list[ast.AST] = []
+    if isinstance(node, (ast.Assign, ast.Delete)):
+        targets = list(node.targets)
+    elif isinstance(node, ast.AugAssign):
+        targets = [node.target]
+    for target in targets:
+        if isinstance(target, ast.Subscript) and isinstance(
+            target.value, ast.Attribute
+        ):
+            return target.value
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in _MUTATING_METHODS
+        and isinstance(node.func.value, ast.Attribute)
+    ):
+        return node.func.value
+    return None
+
+
+def _check_untracked_json_column_mutation(
+    corpus: list[tuple[str, ast.AST]],
+) -> list[dict]:
+    """In-place change to a JSON/JSONB/ARRAY column with no mutation tracking."""
+    untracked, tracked = _json_columns(corpus)
+    columns = {k: v for k, v in untracked.items() if k not in tracked}
+    if not columns:
+        return []
+    out: list[dict] = []
+    for rel, tree in corpus:
+        owners: dict[int, str] = {}  # id(function) -> enclosing class name
+        for cls in ast.walk(tree):
+            if isinstance(cls, ast.ClassDef):
+                for item in cls.body:
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        owners[id(item)] = cls.name
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            nodes = list(_walk_same_scope(fn))
+            if any(
+                isinstance(n, ast.Call) and _call_tail(n) == "flag_modified"
+                for n in nodes
+            ):
+                continue
+            for node in nodes:
+                attr = _mutated_attribute(node)
+                if attr is None or attr.attr not in columns:
+                    continue
+                receiver = _dotted_name(attr.value)
+                if (
+                    receiver in ("self", "cls")
+                    and owners.get(id(fn)) not in columns[attr.attr]
+                ):
+                    continue  # another class's attribute of the same name
+                models = "/".join(sorted(columns[attr.attr]))
+                finding = _finding(
+                    "in-place-mutation-of-untracked-json-column",
+                    "FIX",
+                    "medium",
+                    node,
+                    f"{ast.unparse(attr)} is changed in place, but {models}."
+                    f"{attr.attr} is a JSON-like column without MutableDict/"
+                    f"MutableList and nothing calls flag_modified(): the change is "
+                    f"never flushed",
+                    "reassign the attribute, call flag_modified(obj, name), or wrap "
+                    "the column type in MutableDict.as_mutable(); fine for an object "
+                    "that is not flushed yet",
+                )
+                finding["file"] = rel
+                out.append(finding)
+    return out
+
+
 _PROJECT_CHECKS = {
     "divergent-sentinel-across-parallel-modules": _check_divergent_sentinel,
     "unguarded-inverse-of-guarded-operation": _check_unguarded_inverse,
+    "in-place-mutation-of-untracked-json-column": _check_untracked_json_column_mutation,
 }
 
 
@@ -4938,6 +5663,11 @@ _CHECKS = {
     "cleanup-inside-try-triggers-rollback": _check_cleanup_inside_try_triggers_rollback,
     "side-channel-raise-in-finally": _check_side_channel_raise_in_finally,
     "wide-suppress-exception-block": _check_wide_suppress_exception,
+    "integrity-error-caught-without-rollback": _check_integrity_error_without_rollback,
+    "translation-lookup-of-interpolated-string": (
+        _check_translation_of_interpolated_string
+    ),
+    "non-finite-float-passes-range-guard": _check_non_finite_float_passes_range_guard,
 }
 
 
@@ -4988,8 +5718,9 @@ def analyze(
 ) -> dict:
     """Scan *target* for catalogued Python pitfalls.
 
-    ``exclude`` drops files whose project-relative path contains any of the given
-    substrings. Real-world runs show generated content (report artifacts, golden
+    ``exclude`` drops files whose project-relative path matches any of the given
+    patterns (a substring, or a glob -- see ``scan_common.path_matches``), before
+    counting and before the ``max_files`` cap. Real-world runs show generated content (report artifacts, golden
     fixtures, vendored trees) is the dominant false-positive source, and it is
     project-specific enough that it cannot be hardcoded -- hence the option, plus
     the ``by_directory`` breakdown below so such clustering is visible at a glance.
@@ -5003,14 +5734,15 @@ def analyze(
     # into "scan everything" -- a trap worth not reproducing. discover_python_files
     # handles a file path directly, so no special-casing is needed.)
     scan_root = resolved
-    files, files_total = collect_python_files(scan_root, max_files)
+    selection = select_python_files(
+        scan_root, project_root=project_root, max_files=max_files, exclude=exclude
+    )
+    files, files_total = selection.files, selection.files_total
 
     findings: list[dict] = []
     corpus: list[tuple[str, ast.AST]] = []
+    _STATS.clear()
     for path in files:
-        rel = relative_to_root(path, project_root)
-        if exclude and any(pattern in rel for pattern in exclude):
-            continue
         findings.extend(analyze_file(path, project_root, checks, corpus))
 
     for name in checks or list(_PROJECT_CHECKS):
@@ -5051,7 +5783,23 @@ def analyze(
         top = directory.lstrip("/").split("/")[0] or "."
         by_top_directory[top] = by_top_directory.get(top, 0) + 1
 
-    result = build_envelope(project_root, scan_root, files_total, len(files))
+    # One line per check that ran: what it reported and suppressed, and --
+    # for the checks that count their candidates -- what it considered and
+    # why it passed some over. `considered: null` means "not counted", so a
+    # zero is never mistaken for "checked and clean" or the reverse.
+    per_check: dict[str, dict] = {}
+    for name in sorted(checks or (set(_CHECKS) | set(_PROJECT_CHECKS))):
+        stats = _STATS.get(name)
+        if stats is None and name in _COUNTED_CHECKS:
+            stats = {"considered": 0, "skipped": {}}
+        per_check[name] = {
+            "reported": by_shape.get(name, 0),
+            "suppressed": suppressed_counts.get(name, {}),
+            "considered": stats["considered"] if stats else None,
+            "skipped": dict(sorted(stats["skipped"].items())) if stats else None,
+        }
+
+    result = build_envelope(project_root, scan_root, files_total, len(files), selection)
     result["summary"] = {
         "total_findings": len(findings),
         "by_shape": dict(sorted(by_shape.items())),
@@ -5071,37 +5819,18 @@ def analyze(
         ),
         "suppressed_by_differential": dict(sorted(suppressed_counts.items())),
         "checks_run": sorted(checks or (set(_CHECKS) | set(_PROJECT_CHECKS))),
-        "excluded_patterns": sorted(exclude or []),
+        "excluded_patterns": sorted(selection.exclude_patterns),
+        "per_check": per_check,
     }
     result["findings"] = findings
     result["suppressed"] = suppressed
     return result
 
 
-def _extract_options(
-    argv: list[str],
-) -> tuple[list[str], list[str] | None, list[str] | None]:
-    """Pull ``--check`` and ``--exclude`` out of argv, returning the remainder."""
-    rest: list[str] = []
-    checks: list[str] | None = None
-    exclude: list[str] | None = None
-    i = 0
-    while i < len(argv):
-        if argv[i] == "--check" and i + 1 < len(argv):
-            checks = [c.strip() for c in argv[i + 1].split(",") if c.strip()]
-            i += 2
-        elif argv[i] == "--exclude" and i + 1 < len(argv):
-            exclude = [p.strip() for p in argv[i + 1].split(",") if p.strip()]
-            i += 2
-        else:
-            rest.append(argv[i])
-            i += 1
-    return rest, checks, exclude
-
-
 def main() -> None:
-    argv, checks, exclude = _extract_options(sys.argv[1:])
-    target, max_files = parse_common_args(argv)
+    args = parse_scan_args(sys.argv[1:], __doc__, value_flags={"--check"})
+    target, max_files = args.target, args.max_files
+    checks = split_patterns(args.values.get("--check")) or None
     if checks:
         known = set(_CHECKS) | set(_PROJECT_CHECKS)
         unknown = [c for c in checks if c not in known]
@@ -5113,7 +5842,7 @@ def main() -> None:
                 }
             )
             sys.exit(2)
-    emit(analyze(target, max_files=max_files, checks=checks, exclude=exclude))
+    emit(analyze(target, max_files=max_files, checks=checks, exclude=args.exclude))
 
 
 if __name__ == "__main__":

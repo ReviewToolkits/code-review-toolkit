@@ -5,7 +5,27 @@ Maps each source file to its corresponding test file(s), counts test classes
 and methods, and identifies source files with no test coverage.
 
 Usage:
-    python correlate_tests.py [path]
+    python correlate_tests.py [path] [--max-files N] [--exclude PAT[,PAT]]
+                              [--include-migrations] [--no-coverage-omit]
+
+Options:
+    --max-files N         Analyze at most N files
+    --exclude PAT[,PAT]   Leave out files whose project-relative path matches
+                          (repeatable; a plain pattern is a substring, a glob
+                          such as ``vendor/*`` matches at any depth). Excluded
+                          files are not counted; the envelope reports
+                          ``files_excluded`` and ``exclude_matches``.
+    --include-migrations  Keep schema-migration files (Alembic revisions and
+                          ``env.py``, Django migrations). Skipped by default and
+                          reported as ``migration_files_skipped``: they are run
+                          by the migration framework, not unit-tested, and
+                          counting them as untested sources sank the coverage
+                          ratio of a fully gated project.
+    --no-coverage-omit    Count source files the project's coverage config
+                          omits (``[run] omit`` in .coveragerc / setup.cfg /
+                          tox.ini, ``[tool.coverage.run] omit`` in
+                          pyproject.toml). By default they are left out of the
+                          source files and listed under ``coverage_omit``.
 """
 
 import ast
@@ -15,9 +35,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scan_common import (  # noqa: E402
+    coverage_omit_patterns,
+    coverage_omitted,
     discover_python_files,
     find_project_root,
     parse_source,
+    select_python_files,
 )
 
 _TEST_DIR_NAMES = frozenset({"test", "tests"})
@@ -313,23 +336,55 @@ _LAYER_DIR_NAMES = frozenset({
 })
 
 
-def _match_test_to_source(
-    test_file: Path, source_files: list[Path], project_root: Path
-) -> list[str]:
-    """Find source files that a test file likely corresponds to.
+def _dir_parts(path: Path, project_root: Path) -> list[str]:
+    return list(path.parent.relative_to(project_root).parts)
+
+
+def _mirror_score(test_dirs: list[str], source: Path, project_root: Path) -> tuple:
+    """How well a test file's directories mirror a source file's.
+
+    `(exact, shared_tail, shared)`: whether the directories are the same once
+    the test layer (`tests/unit/`) and the source's package root (`src/`, the
+    top package) are dropped, how many trailing directories they share, and
+    how many of the test's directories appear in the source's path at all.
+    `tests/unit/accounts/test_views.py` mirrors `pkg/accounts/views.py`
+    exactly; `tests/test_views.py` mirrors `pkg/views.py`;
+    `tests/admin/test_audit.py` prefers `pkg/admin/views/audit.py` to
+    `pkg/cli/audit.py`.
+    """
+    full = _dir_parts(source, project_root)
+    inner = full[1:] if full[:1] == ["src"] else full
+    inner = inner[1:]
+    tail = 0
+    for a, b in zip(reversed(test_dirs), reversed(full)):
+        if a != b:
+            break
+        tail += 1
+    shared = sum(1 for d in test_dirs if d in full)
+    return (test_dirs in (inner, full), tail, shared)
+
+
+def _name_match(test_file: Path, source_files: list[Path], project_root: Path) -> dict:
+    """The source files a test file corresponds to by name, and how.
 
     Heuristics:
-    - test_runner.py → runner.py (any directory; several same-stem sources
-      all match)
+    - test_runner.py → runner.py
     - tests/<stem>/test_*.py → <stem>.py: a directory per source module,
       holding one test file per method or behaviour
+
+    One candidate matches outright (`how: "unique"`). Several same-named
+    sources (`views.py` in every app) are told apart by which one the test's
+    directories mirror (`"mirrored"`); when none does, or several mirror it
+    equally, nothing matches by name and the candidates are reported
+    (`"ambiguous"`) -- an import or route match may still find the module.
 
     Only test-named files (`test_*.py`, `*_test.py`) name-match: a test
     package's `__init__.py` or a `helpers.py` corresponds to no module, and
     a package `__init__.py` is never matched by name.
     """
+    none = {"matches": [], "how": None, "candidates": []}
     if not _test_named(test_file):
-        return []
+        return none
     test_name = test_file.stem  # e.g. "test_runner"
     source_stem = test_name[5:] if test_name.startswith("test_") else test_name[:-5]
     parent = test_file.parent.name
@@ -338,14 +393,42 @@ def _match_test_to_source(
         and parent not in _LAYER_DIR_NAMES
         and parent != "__init__"
     )
+    test_dirs = [
+        d for d in _dir_parts(test_file, project_root) if d not in _LAYER_DIR_NAMES
+    ]
 
-    matches: list[str] = []
+    candidates: list[tuple[Path, list[str]]] = []
     for sf in source_files:
         if sf.stem == "__init__":
             continue
-        if sf.stem == source_stem or (by_directory and sf.stem == parent):
-            matches.append(str(sf.relative_to(project_root)))
-    return list(dict.fromkeys(matches))
+        if sf.stem == source_stem:
+            candidates.append((sf, test_dirs))
+        elif by_directory and sf.stem == parent:
+            # The directory names the module; what is above it is the mirror.
+            candidates.append((sf, test_dirs[:-1]))
+    rels = list(
+        dict.fromkeys(str(sf.relative_to(project_root)) for sf, _ in candidates)
+    )
+    if len(rels) <= 1:
+        return {"matches": rels, "how": "unique" if rels else None, "candidates": []}
+    scored: dict[str, tuple] = {}
+    for sf, dirs in candidates:
+        rel = str(sf.relative_to(project_root))
+        scored[rel] = max(
+            scored.get(rel, (False, 0, 0)), _mirror_score(dirs, sf, project_root)
+        )
+    best = max(scored.values())
+    winners = [rel for rel in rels if scored[rel] == best]
+    if best > (False, 0, 0) and len(winners) == 1:
+        return {"matches": winners, "how": "mirrored", "candidates": rels}
+    return {"matches": [], "how": "ambiguous", "candidates": rels}
+
+
+def _match_test_to_source(
+    test_file: Path, source_files: list[Path], project_root: Path
+) -> list[str]:
+    """Source files a test file corresponds to by name (see `_name_match`)."""
+    return _name_match(test_file, source_files, project_root)["matches"]
 
 
 # ---------------------------------------------------------------------------
@@ -799,21 +882,44 @@ def resolve_imported_sources(
     return found
 
 
-def analyze(target: str, *, max_files: int = 0) -> dict:
+def analyze(
+    target: str,
+    *,
+    max_files: int = 0,
+    exclude: list[str] | None = None,
+    include_migrations: bool = False,
+    coverage_omit: bool = True,
+) -> dict:
     """Correlate the source and test files under *target*; return the report."""
     target_path = Path(target).resolve()
     project_root = find_project_root(target_path)
     scan_root = target_path if target_path.is_dir() else project_root
-    all_files = sorted(discover_python_files(scan_root))
-    files_total = len(all_files)
-    if max_files > 0 and files_total > max_files:
-        all_files = all_files[:max_files]
+    selection = select_python_files(
+        scan_root,
+        project_root=project_root,
+        max_files=max_files,
+        exclude=exclude,
+        migrations="detect" if include_migrations else "skip",
+    )
+    all_files, files_total = selection.files, selection.files_total
     files = all_files
 
     test_named_sources: list[Path] = []
     source_files, test_files = classify_files(
         files, project_root, test_named_sources
     )
+    # Sources the project's own coverage config omits are not meant to have
+    # tests; only the source side is filtered (`omit` often lists tests/ too).
+    omit_patterns, omit_source = (
+        coverage_omit_patterns(project_root) if coverage_omit else ([], None)
+    )
+    omitted = {
+        f
+        for f in source_files
+        if omit_patterns and coverage_omitted(f, omit_patterns, project_root)
+    }
+    source_files = [f for f in source_files if f not in omitted]
+    omitted_sources = sorted(str(f.relative_to(project_root)) for f in omitted)
     warnings: list[str] = []
     if test_named_sources:
         warnings.append(
@@ -889,7 +995,14 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
                 kind = "helper"
             support_info[rel] = {"kind": kind, "imported_sources": imported_sources}
             continue
-        tinfo["matched_sources"] = _match_test_to_source(tf, source_files, project_root)
+        name_match = _name_match(tf, source_files, project_root)
+        tinfo["matched_sources"] = name_match["matches"]
+        # "unique", "mirrored" (one of several same-named sources, picked by
+        # directory), "ambiguous" (several, none picked: see
+        # name_match_candidates) or null.
+        tinfo["name_match"] = name_match["how"]
+        if name_match["how"] in ("mirrored", "ambiguous"):
+            tinfo["name_match_candidates"] = name_match["candidates"]
         tinfo["imported_modules"] = _read_test_imports(tf, project_root)
         # Import-based correspondence. Feature-named suites (`test_*_race.py`
         # for `storage/engine.py`) never match by file name, but they import
@@ -1011,6 +1124,15 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
         "files_total": files_total,
         "files_analyzed": len(all_files),
         "files_capped": max_files > 0 and files_total > max_files,
+        **selection.envelope_fields(),
+        "coverage_omit": {
+            # null source: no coverage config sets `omit` (or --no-coverage-omit).
+            "source": omit_source,
+            "patterns": omit_patterns,
+            "applied": coverage_omit,
+            "source_files_omitted": len(omitted_sources),
+            "files": omitted_sources,
+        },
         # "no_tests_found": no test file anywhere, so every coverage number
         # below is unmeasured, not zero.
         "status": "ok" if test_files else "no_tests_found",
@@ -1024,6 +1146,15 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
             "source_files_with_tests": tested,
             "source_files_without_tests": len(untested),
             "source_files_with_tests_by_name": sum(1 for v in by_name.values() if v),
+            # Test files named after several same-named sources (`test_views.py`
+            # with a `views.py` in every app) whose directories mirror none of
+            # them: not name-matched at all rather than matched to every one.
+            "ambiguous_name_matches": sum(
+                1 for t in test_info.values() if t.get("name_match") == "ambiguous"
+            ),
+            "mirrored_name_matches": sum(
+                1 for t in test_info.values() if t.get("name_match") == "mirrored"
+            ),
             "source_files_with_tests_by_import_only": sum(
                 1 for s in source_info if by_import[s] and not by_name[s]
             ),
@@ -1067,10 +1198,20 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
 
 
 def main() -> None:
-    from scan_common import emit, parse_common_args
+    from scan_common import emit, parse_scan_args
 
-    target, max_files = parse_common_args(sys.argv[1:], __doc__)
-    emit(analyze(target, max_files=max_files))
+    args = parse_scan_args(
+        sys.argv[1:], __doc__, flags={"--include-migrations", "--no-coverage-omit"}
+    )
+    emit(
+        analyze(
+            args.target,
+            max_files=args.max_files,
+            exclude=args.exclude,
+            include_migrations="--include-migrations" in args.flags,
+            coverage_omit="--no-coverage-omit" not in args.flags,
+        )
+    )
 
 
 if __name__ == "__main__":

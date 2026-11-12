@@ -40,6 +40,11 @@ Usage:
 
 Options:
     --max-files N   Analyze at most N files (``files_capped`` says so).
+    --exclude PAT[,PAT]
+                    Leave out files whose project-relative path matches
+                    (repeatable; a plain pattern is a substring, a glob such
+                    as ``vendor/*`` matches at any depth). Excluded files are
+                    not counted; see ``files_excluded`` / ``exclude_matches``.
     --no-implicit   Skip the implicit-site inventory.
 """
 
@@ -56,12 +61,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scan_common import (
     build_envelope,
-    collect_python_files,
     emit,
-    parse_common_args,
+    parse_scan_args,
     parse_source,
     relative_to_root,
     resolve_target,
+    select_python_files,
 )
 
 BROAD_NAMES = frozenset({"Exception", "BaseException"})
@@ -789,10 +794,19 @@ def _summary(
     }
 
 
-def analyze(target: str, *, max_files: int = 0, implicit: bool = True) -> dict:
+def analyze(
+    target: str,
+    *,
+    max_files: int = 0,
+    implicit: bool = True,
+    exclude: list[str] | None = None,
+) -> dict:
     """Inventory the error-handling sites under *target*."""
     resolved, project_root, scan_root = resolve_target(target)
-    files, files_total = collect_python_files(resolved, max_files)
+    selection = select_python_files(
+        resolved, project_root=project_root, max_files=max_files, exclude=exclude
+    )
+    files, files_total = selection.files, selection.files_total
     handlers: list[dict] = []
     suppress: list[dict] = []
     finally_blocks: list[dict] = []
@@ -811,7 +825,7 @@ def analyze(target: str, *, max_files: int = 0, implicit: bool = True) -> dict:
         finally_blocks.extend(result["finally"])
         exits.extend(result["exits"])
         implicit_sites.extend(result["implicit"])
-    output = build_envelope(project_root, scan_root, files_total, len(files))
+    output = build_envelope(project_root, scan_root, files_total, len(files), selection)
     output["files_unparsed"] = unparsed
     output["summary"] = _summary(
         try_count,
@@ -832,10 +846,15 @@ def analyze(target: str, *, max_files: int = 0, implicit: bool = True) -> dict:
 
 
 def main() -> None:
-    argv = sys.argv[1:]
-    implicit = "--no-implicit" not in argv
-    target, max_files = parse_common_args(argv)
-    emit(analyze(target, max_files=max_files, implicit=implicit))
+    args = parse_scan_args(sys.argv[1:], __doc__, flags={"--no-implicit"})
+    emit(
+        analyze(
+            args.target,
+            max_files=args.max_files,
+            implicit="--no-implicit" not in args.flags,
+            exclude=args.exclude,
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -12,12 +12,27 @@ that typed code calls (the boundary where annotating one signature lets the
 checker see a whole call chain).
 
 Usage:
-    python count_types.py [path] [--max-files N]
+    python count_types.py [path] [--max-files N] [--exclude PAT[,PAT]]
+                          [--include-migrations] [--mypy-json FILE]
+
+Options:
+    --max-files N         Analyze at most N files
+    --exclude PAT[,PAT]   Leave out files whose project-relative path matches
+                          (repeatable; a plain pattern is a substring, a glob
+                          such as ``vendor/*`` matches at any depth). Excluded
+                          files are not counted; the envelope reports
+                          ``files_excluded`` and ``exclude_matches``.
+    --include-migrations  Keep schema-migration files (Alembic revisions and
+                          ``env.py``, Django migrations). They are skipped by
+                          default and reported as ``migration_files_skipped``:
+                          a framework loads them by path, and hundreds of
+                          near-identical revision modules swamp the counts.
 """
 
 from __future__ import annotations
 
 import ast
+import json
 import re
 import sys
 from pathlib import Path
@@ -26,10 +41,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scan_common import (  # noqa: E402
     build_envelope,
-    discover_python_files,
     emit,
     find_project_root,
-    parse_common_args,
+    parse_scan_args,
+    select_python_files,
 )
 
 # Bare (unparameterized) container names reported as `untyped_containers`.
@@ -243,8 +258,108 @@ def _is_pseudo_enum(class_node: ast.ClassDef) -> bool:
     return constants >= 2
 
 
+# Declarative bases that make a subclass an ORM model by inheritance alone.
+_ORM_BASE_NAMES = frozenset({"DeclarativeBase", "DeclarativeBaseNoMeta"})
+# `models.Model` (Django) and `db.Model` (Flask-SQLAlchemy style): the
+# attribute form only, so a project's own unrelated `Model` class is not caught.
+_ORM_MODEL_ATTR_BASES = frozenset({("models", "Model"), ("db", "Model")})
+# Class-body calls that declare a mapped column or relationship.
+_ORM_COLUMN_CALLS = frozenset(
+    {"Column", "mapped_column", "relationship", "column_property", "composite"}
+)
+_ORM_DUNDERS = frozenset({"__tablename__", "__table__"})
+_INTERFACE_NAME = re.compile(r"^I[A-Z]\w*$")
+
+
+def _call_name(node: ast.AST | None) -> str | None:
+    return _terminal_name(node.func) if isinstance(node, ast.Call) else None
+
+
+def _is_mapped_annotation(annotation: ast.AST) -> bool:
+    """`Mapped[...]`, also as a string annotation."""
+    annotation = _parse_string_annotation(annotation) or annotation
+    return (
+        isinstance(annotation, ast.Subscript)
+        and _terminal_name(annotation.value) == "Mapped"
+    )
+
+
+def _is_django_field_call(node: ast.AST | None) -> bool:
+    """`models.CharField(...)`, `models.ForeignKey(...)` and the like."""
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+        return False
+    owner, attr = node.func.value, node.func.attr
+    return (
+        isinstance(owner, ast.Name)
+        and owner.id == "models"
+        and (attr.endswith("Field") or attr in ("ForeignKey", "ManyToManyField"))
+    )
+
+
+def _is_orm_model(class_node: ast.ClassDef) -> bool:
+    """A declarative ORM model (SQLAlchemy or Django), its base, or a mapped mixin.
+
+    Detected from what the class body declares (`__tablename__`, `Mapped[...]`
+    annotations, `Column()` / `mapped_column()` / `models.XField()` values)
+    or from a declarative base (`DeclarativeBase`, `models.Model`). A subclass
+    of a `declarative_base()` result is recognised by its body, because the
+    base is a variable this per-class check cannot resolve.
+    """
+    for base in class_node.bases:
+        if _terminal_name(base) in _ORM_BASE_NAMES:
+            return True
+        if (
+            isinstance(base, ast.Attribute)
+            and isinstance(base.value, ast.Name)
+            and (base.value.id, base.attr) in _ORM_MODEL_ATTR_BASES
+        ):
+            return True
+    for stmt in class_node.body:
+        if isinstance(stmt, ast.AnnAssign):
+            if _is_mapped_annotation(stmt.annotation):
+                return True
+        elif isinstance(stmt, ast.Assign):
+            if any(
+                isinstance(t, ast.Name) and t.id in _ORM_DUNDERS for t in stmt.targets
+            ):
+                return True
+        else:
+            continue
+        if _call_name(stmt.value) in _ORM_COLUMN_CALLS or _is_django_field_call(
+            stmt.value
+        ):
+            return True
+    return False
+
+
+def _is_interface(class_node: ast.ClassDef) -> bool:
+    """A zope-style interface declaration.
+
+    Either it subclasses `Interface`, or it is an `IName` class whose bases
+    are all `IName` classes and whose methods take no `self` (interface
+    methods are specifications, not implementations).
+    """
+    if not class_node.bases:
+        return False
+    if any(_terminal_name(b) == "Interface" for b in class_node.bases):
+        return True
+    if not _INTERFACE_NAME.match(class_node.name):
+        return False
+    if not all(
+        _INTERFACE_NAME.match(_terminal_name(b) or "") for b in class_node.bases
+    ):
+        return False
+    for stmt in class_node.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            params = stmt.args.posonlyargs + stmt.args.args
+            if params and params[0].arg in ("self", "cls"):
+                return False
+    return True
+
+
 def _detect_container_type(class_node: ast.ClassDef) -> str | None:
     """Detect if a class is a dataclass, TypedDict, NamedTuple, Protocol, Enum, ABC,
+    an ORM model (`orm_model`), an interface declaration (`interface`),
     a pseudo-enum constants class, or a subclass of dict/list/set."""
     # Check decorators for @dataclass.
     for dec in class_node.decorator_list:
@@ -288,6 +403,10 @@ def _detect_container_type(class_node: ast.ClassDef) -> str | None:
         elif base_name in _CONTAINER_BASES and container_subclass is None:
             container_subclass = _CONTAINER_BASES[base_name]
 
+    if _is_orm_model(class_node):
+        return "orm_model"
+    if _is_interface(class_node):
+        return "interface"
     if container_subclass:
         return container_subclass
     if _is_pseudo_enum(class_node):
@@ -524,6 +643,144 @@ class _SymbolIndex:
         ]
 
 
+def _is_stub_body(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """A body that only declares: docstring, `...`, `pass`, `raise NotImplementedError`."""
+    body = list(node.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    if not body:
+        return True
+    if len(body) != 1:
+        return False
+    stmt = body[0]
+    if isinstance(stmt, ast.Pass):
+        return True
+    if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
+        return stmt.value.value is Ellipsis
+    if isinstance(stmt, ast.Raise) and stmt.exc is not None:
+        exc = stmt.exc.func if isinstance(stmt.exc, ast.Call) else stmt.exc
+        return _terminal_name(exc) == "NotImplementedError"
+    return False
+
+
+def _class_resolver(index: _SymbolIndex, file_analyses: list[dict]):
+    """`(classes, resolve)`: every scanned class by `(module, name)`, and a
+    function mapping a base as written in a module to the class it names."""
+    classes: dict[tuple[str, str], tuple[str, dict]] = {}
+    for fa in file_analyses:
+        module = _module_dotted(fa["file"])
+        for cls in fa["classes"]:
+            classes.setdefault((module, cls["name"]), (fa["file"], cls))
+
+    def find(module: str, name: str, depth: int = 0) -> tuple[str, str] | None:
+        if (module, name) in classes:
+            return module, name
+        info = index.modules.get(module)
+        if info is None or depth > 10:
+            return None
+        imported = info["from_imports"].get(name)
+        if imported is None:
+            return None
+        target = index.find_module(imported[0])
+        return find(target, imported[1], depth + 1) if target else None
+
+    def resolve(module: str, base: str) -> tuple[str, str] | None:
+        base = base.split("[", 1)[0].strip()
+        if "." not in base:
+            return find(module, base)
+        head, _, attr = base.rpartition(".")
+        target = (
+            index.module_ref(module, head)
+            if "." not in head
+            else index.find_module(head)
+        )
+        return find(target, attr) if target else None
+
+    return classes, resolve
+
+
+def _inherit_enums(index: _SymbolIndex, file_analyses: list[dict]) -> None:
+    """Mark subclasses of in-project enums as enums, to a fixpoint.
+
+    `class Color(MyStrEnum)` where `MyStrEnum(str, Enum)` is a project mixin
+    has no Enum base in its own source; only following the project's classes
+    shows it is one. Its assignments then are members, not attributes.
+    """
+    classes, resolve = _class_resolver(index, file_analyses)
+    changed = True
+    while changed:
+        changed = False
+        for (module, _name), (_file, cls) in classes.items():
+            if cls["container_type"] is not None:
+                continue
+            for base in cls["bases"]:
+                hit = resolve(module, base)
+                if hit and classes[hit][1]["container_type"] == "Enum":
+                    cls["container_type"] = "Enum"
+                    cls["enum_via"] = base
+                    cls["enum_members"] = cls["unannotated_attributes"]
+                    cls["unannotated_attributes"] = []
+                    changed = True
+                    break
+
+
+def _protocols_with_default_bodies(
+    index: _SymbolIndex, file_analyses: list[dict]
+) -> list[dict]:
+    """Protocols whose methods have real bodies, and who can inherit them.
+
+    A Protocol's default body runs only for a class that names the protocol
+    as a base; a class that merely conforms structurally never gets it. With
+    no explicit subclass the bodies are dead code that reads like behaviour.
+    """
+    classes, resolve = _class_resolver(index, file_analyses)
+    parents: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for key, (_file, cls) in classes.items():
+        parents[key] = [h for b in cls["bases"] if (h := resolve(key[0], b))]
+
+    def ancestors(key: tuple[str, str]) -> set[tuple[str, str]]:
+        seen: set[tuple[str, str]] = set()
+        stack = list(parents.get(key, []))
+        while stack:
+            cur = stack.pop()
+            if cur not in seen:
+                seen.add(cur)
+                stack.extend(parents.get(cur, []))
+        return seen
+
+    out = []
+    for key, (file, cls) in sorted(
+        classes.items(), key=lambda kv: (kv[1][0], kv[1][1]["line"])
+    ):
+        if cls["container_type"] != "Protocol" or not cls.get("default_methods"):
+            continue
+        subclasses = [
+            {"file": sub_file, "name": sub["name"], "line": sub["line"]}
+            for sub_key, (sub_file, sub) in classes.items()
+            if sub["container_type"] != "Protocol" and key in ancestors(sub_key)
+        ]
+        out.append(
+            {
+                "file": file,
+                "name": cls["name"],
+                "line": cls["line"],
+                "default_methods": cls["default_methods"],
+                "explicit_subclasses": sorted(
+                    subclasses, key=lambda s: (s["file"], s["line"])
+                ),
+                # False: nothing in scope inherits the bodies, so they never run
+                # (a subclass outside the scanned tree may still exist).
+                "bodies_inherited": bool(subclasses),
+            }
+        )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Per-file analysis
 # ---------------------------------------------------------------------------
@@ -655,9 +912,14 @@ def analyze_file(
         class_name: str | None = None,
         qualname: str | None = None,
         nested: bool = False,
+        private_scope: bool = False,
     ) -> dict:
         name = qualname or (f"{class_name}.{node.name}" if class_name else node.name)
-        is_public = not node.name.startswith("_") or node.name in _PUBLIC_DUNDERS
+        # A method of a private class is private whatever its own name: no
+        # caller outside the module is meant to reach `_Helper.run`.
+        is_public = not private_scope and (
+            not node.name.startswith("_") or node.name in _PUBLIC_DUNDERS
+        )
 
         # Check parameter annotations.
         all_args = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
@@ -848,13 +1110,18 @@ def analyze_file(
         method_nodes = []
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                methods.append(_analyze_func(child, node.name))
+                methods.append(
+                    _analyze_func(child, node.name, private_scope=not is_public)
+                )
                 method_nodes.append(child)
 
         info: dict = {
             "name": node.name,
             "line": node.lineno,
             "is_public": is_public,
+            # As written, for resolving project bases (`StrEnum` subclasses,
+            # explicit Protocol implementations) once every module is read.
+            "bases": [ast.unparse(b) for b in node.bases],
             "container_type": container_type,
             "annotated_attributes": annotated_attrs,
             "unannotated_attributes": unannotated_attrs,
@@ -868,6 +1135,12 @@ def analyze_file(
 
         if container_type == "dataclass":
             info["frozen"] = _check_frozen_dataclass(node)
+        if container_type == "Protocol":
+            # Bodies beyond a stub: they run only for a class that subclasses
+            # the protocol explicitly; structural implementations never see them.
+            info["default_methods"] = [
+                m.name for m in method_nodes if not _is_stub_body(m)
+            ]
 
         for child in method_nodes:
             _add_nested(child, f"{node.name}.{child.name}")
@@ -1308,14 +1581,219 @@ def _count_alias_uses(index: _SymbolIndex) -> dict:
     return uses
 
 
-def analyze(target: str, *, max_files: int = 0) -> dict:
+# ---------------------------------------------------------------------------
+# Annotation accuracy: mypy errors joined to the functions they are in
+# ---------------------------------------------------------------------------
+
+# Codes that say an annotation is MISSING, not wrong (as in check_typing).
+_MISSING_ANNOTATION_CODES = frozenset(
+    {"no-untyped-def", "no-untyped-call", "no-any-return", "var-annotated", "type-arg"}
+)
+
+
+def load_mypy_errors(path: str) -> tuple[list[dict] | None, str | None]:
+    """mypy errors from *path*: `(errors, None)` or `(None, reason)`.
+
+    Accepts check_typing's output (its baseline `findings`), the mypy section
+    of run_external_tools (`mypy.findings`; a capped list is read as given),
+    mypy's own `--output json` (one object per line), or a JSON list. Each
+    error is `{file, line, code}`; notes and missing-annotation codes are
+    dropped: they say nothing about whether an annotation is right.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, f"could not read {path}: {exc.strerror or exc}"
+    items: list | None = None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+        items = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                items.append(json.loads(line))
+            except ValueError:
+                return None, f"{path} is neither JSON nor mypy's JSON lines"
+    if data is not None:
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict) and isinstance(data.get("findings"), list):
+            items = data["findings"]
+        elif isinstance(data, dict) and isinstance(
+            (data.get("mypy") or {}).get("findings"), list
+        ):
+            items = data["mypy"]["findings"]
+        elif isinstance(data, dict) and "file" in data:
+            items = [data]
+        else:
+            return None, f"no mypy findings in {path}"
+    errors = []
+    for item in items or []:
+        if not isinstance(item, dict) or "file" not in item or "line" not in item:
+            continue
+        if str(item.get("severity", "error")) != "error":
+            continue
+        code = item.get("code") or ""
+        if code in _MISSING_ANNOTATION_CODES:
+            continue
+        try:
+            line = int(item["line"])
+        except (TypeError, ValueError):
+            continue
+        errors.append({"file": str(item["file"]), "line": line, "code": code})
+    return errors, None
+
+
+def _collect_spans(
+    node: ast.AST, prefix: str, in_class: bool, found: list[dict]
+) -> None:
+    """Append every def under *node* to *found* (see `_function_spans`)."""
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            a = child.args
+            params = [
+                x
+                for x in a.posonlyargs + a.args + a.kwonlyargs
+                if x.arg not in ("self", "cls")
+            ]
+            found.append(
+                {
+                    "name": prefix + child.name,
+                    "line": child.lineno,
+                    "start": min(
+                        [child.lineno] + [d.lineno for d in child.decorator_list]
+                    ),
+                    "end": child.end_lineno or child.lineno,
+                    "fully_annotated": child.returns is not None
+                    and all(x.annotation is not None for x in params),
+                    "method": in_class,
+                }
+            )
+            _collect_spans(child, prefix + child.name + ".", False, found)
+        elif isinstance(child, ast.ClassDef):
+            _collect_spans(child, prefix + child.name + ".", True, found)
+        else:
+            _collect_spans(child, prefix, in_class, found)
+
+
+def _function_spans(index: _SymbolIndex) -> dict[str, list[dict]]:
+    """Per scanned file: every def's span, qualified name and annotation state."""
+    spans: dict[str, list[dict]] = {}
+    for info in index.modules.values():
+        tree = info.get("tree")
+        if tree is None:
+            continue
+        found: list[dict] = []
+        _collect_spans(tree, "", False, found)
+        spans[info["file"]] = found
+    return spans
+
+
+def annotation_accuracy(
+    index: _SymbolIndex, errors: list[dict], project_root: Path, scan_root: Path
+) -> dict:
+    """How many fully annotated functions contain at least one mypy error.
+
+    Each error goes to the innermost function whose span holds its line.
+    `errors_outside_scan` are errors in files this run did not scan;
+    `errors_outside_functions` are module- or class-level ones.
+    """
+    spans = _function_spans(index)
+    scanned = set(spans)
+
+    def rel_of(file: str) -> str | None:
+        path = Path(file)
+        candidates = (
+            [path]
+            if path.is_absolute()
+            else [project_root / path, scan_root / path, Path.cwd() / path]
+        )
+        for cand in candidates:
+            try:
+                rel = str(cand.resolve().relative_to(project_root))
+            except (OSError, ValueError):
+                continue
+            if rel in scanned:
+                return rel
+        hits = [r for r in scanned if r.endswith("/" + file.lstrip("./"))]
+        return hits[0] if len(hits) == 1 else None
+
+    per_function: dict[tuple[str, str], dict] = {}
+    outside_scan = outside_functions = 0
+    for err in errors:
+        rel = rel_of(err["file"])
+        if rel is None:
+            outside_scan += 1
+            continue
+        holders = [s for s in spans[rel] if s["start"] <= err["line"] <= s["end"]]
+        if not holders:
+            outside_functions += 1
+            continue
+        fn = min(holders, key=lambda s: s["end"] - s["start"])
+        entry = per_function.setdefault(
+            (rel, fn["name"]),
+            {
+                "file": rel,
+                "name": fn["name"],
+                "line": fn["line"],
+                "fully_annotated": fn["fully_annotated"],
+                "errors": 0,
+                "codes": {},
+            },
+        )
+        entry["errors"] += 1
+        code = err["code"] or "(none)"
+        entry["codes"][code] = entry["codes"].get(code, 0) + 1
+    functions = sorted(
+        per_function.values(), key=lambda e: (-e["errors"], e["file"], e["line"])
+    )
+    annotated = sum(1 for fs in spans.values() for s in fs if s["fully_annotated"])
+    return {
+        "errors_read": len(errors),
+        "errors_in_functions": sum(e["errors"] for e in functions),
+        "errors_outside_functions": outside_functions,
+        "errors_outside_scan": outside_scan,
+        # Nested defs and methods included, so the denominator can be larger
+        # than summary.fully_annotated_functions.
+        "fully_annotated_functions": annotated,
+        "annotated_functions_with_type_errors": sum(
+            1 for e in functions if e["fully_annotated"]
+        ),
+        "functions_with_type_errors": len(functions),
+        "functions_capped": len(functions) > _LIST_CAP,
+        "functions": functions[:_LIST_CAP],
+    }
+
+
+def analyze(
+    target: str,
+    *,
+    max_files: int = 0,
+    exclude: list[str] | None = None,
+    include_migrations: bool = False,
+    mypy_json: str | None = None,
+) -> dict:
+    """Annotation coverage and type design inventory for *target*.
+
+    *mypy_json* (check_typing's output, run_external_tools', or mypy's own
+    `--output json`) adds `annotation_accuracy`: mypy errors joined to the
+    functions that contain them.
+    """
     target_path = Path(target).resolve()
     project_root = find_project_root(target_path)
     scan_root = target_path if target_path.is_dir() else project_root
-    all_files = sorted(discover_python_files(scan_root))
-    files_total = len(all_files)
-    if max_files > 0 and files_total > max_files:
-        all_files = all_files[:max_files]
+    selection = select_python_files(
+        scan_root,
+        project_root=project_root,
+        max_files=max_files,
+        exclude=exclude,
+        migrations="detect" if include_migrations else "skip",
+    )
+    all_files, files_total = selection.files, selection.files_total
 
     # Pass 1: every module's aliases and imports, so an alias defined in one
     # module resolves where another module imports it.
@@ -1335,6 +1813,8 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
         analyze_file(f, project_root, index=index, collector=collector)
         for f in all_files
     ]
+    _inherit_enums(index, file_analyses)
+    protocols = _protocols_with_default_bodies(index, file_analyses)
 
     # Aggregate statistics.
     all_functions: list[dict] = []
@@ -1416,8 +1896,23 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
     alias_uses = _count_alias_uses(index)
     aliases = _alias_inventory(index, alias_uses)
 
+    accuracy = None
+    accuracy_reason = "not measured: no mypy output was given (mypy_json)"
+    if mypy_json:
+        errors, why = load_mypy_errors(mypy_json)
+        if errors is None:
+            accuracy_reason = f"not measured: {why}"
+        else:
+            accuracy = {
+                "source": str(mypy_json),
+                **annotation_accuracy(index, errors, project_root, scan_root),
+            }
+            accuracy_reason = None
+
     output = {
-        **build_envelope(project_root, scan_root, files_total, len(all_files)),
+        **build_envelope(
+            project_root, scan_root, files_total, len(all_files), selection
+        ),
         "summary": {
             "total_functions": len(all_functions),
             "public_functions": len(public_funcs),
@@ -1458,6 +1953,21 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
             "inconsistent_parameters": len(inconsistent),
             "untyped_boundaries": len(boundaries),
             "container_types": {k: len(v) for k, v in container_types.items()},
+            # Protocols with non-stub method bodies, and how many of them no
+            # class in scope subclasses explicitly (their bodies never run).
+            # Fully annotated functions with at least one mypy error in their
+            # body (mypy_json given); null when not measured -- see
+            # annotation_accuracy_reason.
+            "annotated_functions_with_type_errors": (
+                None
+                if accuracy is None
+                else accuracy["annotated_functions_with_type_errors"]
+            ),
+            "annotation_accuracy_reason": accuracy_reason,
+            "protocols_with_default_bodies": len(protocols),
+            "protocols_with_uninherited_bodies": sum(
+                1 for p in protocols if not p["bodies_inherited"]
+            ),
         },
         "container_inventory": {k: sorted(v) for k, v in container_types.items()},
         "any_usages": all_any,
@@ -1478,14 +1988,26 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
         "untyped_boundaries_total": len(boundaries),
         "untyped_boundaries_capped": len(boundaries) > _LIST_CAP,
         "untyped_boundaries": boundaries[:_LIST_CAP],
+        "protocols_with_default_bodies": protocols,
+        "annotation_accuracy": accuracy,
         "files": file_analyses,
     }
     return output
 
 
 def main() -> None:
-    target, max_files = parse_common_args(sys.argv[1:], __doc__)
-    emit(analyze(target, max_files=max_files))
+    args = parse_scan_args(
+        sys.argv[1:], __doc__, flags={"--include-migrations"}, value_flags={"--mypy-json"}
+    )
+    emit(
+        analyze(
+            args.target,
+            max_files=args.max_files,
+            exclude=args.exclude,
+            include_migrations="--include-migrations" in args.flags,
+            mypy_json=args.value("--mypy-json"),
+        )
+    )
 
 
 if __name__ == "__main__":

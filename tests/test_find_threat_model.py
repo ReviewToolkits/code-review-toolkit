@@ -149,7 +149,8 @@ class TestAudits(unittest.TestCase):
         self.assertEqual(set(by_id), {"EX-1", "EX-2", "EX-3", "EX-4"})
         # Markdown links are stripped from cells, and the fix PR is kept.
         self.assertEqual(
-            by_id["EX-1"]["title"], "Missing authorization on the account export endpoint"
+            by_id["EX-1"]["title"],
+            "Missing authorization on the account export endpoint",
         )
         self.assertEqual(by_id["EX-1"]["severity"], "high")
         self.assertEqual(by_id["EX-1"]["status"], "remediated")
@@ -192,6 +193,156 @@ class TestAudits(unittest.TestCase):
             result = run(root)
         self.assertEqual(result["policy"], [])
         self.assertEqual(result["status"], "missing")
+
+
+RST_GRID_AUDIT = """\
+Second security audit
+=====================
+
+The assessment was performed by an independent firm.
+
++------+---------------------------+----------+------------+
+| ID   | Title                     | Severity | Status     |
++======+===========================+==========+============+
+| GR-1 | Weak signature check on   | High     | Remediated |
+|      | inbound webhooks          |          |            |
++------+---------------------------+----------+------------+
+| GR-2 | Verbose error pages       | Low      | Accepted   |
++------+---------------------------+----------+------------+
+"""
+
+RST_SIMPLE_AUDIT = """\
+Security audit results
+======================
+
+=====  ==========================  ========  ========
+ID     Title                       Severity  Status
+=====  ==========================  ========  ========
+SI-1   Missing lockout on login    Medium    Fixed
+SI-2   Debug endpoint exposed      High      Accepted
+       in production builds
+=====  ==========================  ========  ========
+
+Closing remarks.
+"""
+
+RST_LIST_AUDIT = """\
+Security audit
+==============
+
+.. list-table:: Summary of findings
+   :header-rows: 1
+
+   * - ID
+     - Title
+     - Severity
+   * - LT-1
+     - Session id not rotated at login
+     - Low
+"""
+
+HTML_AUDIT = """<html><body><h1>Our first security audit</h1>
+<p>Audited by Cure53.</p>
+<table><thead><tr><th>ID</th><th>Title</th><th>Severity</th><th>Status</th></tr></thead>
+<tbody><tr><td>HT-1</td><td>Token &amp; key written to logs</td><td>Medium</td>
+<td><a href="https://example.invalid/pull/9">Fixed</a></td></tr>
+<tr><td>HT-2</td><td>Clickjacking on settings</td><td>Informational</td><td>Accepted</td></tr>
+</tbody></table></body></html>
+"""
+
+
+class TestTableFormats(unittest.TestCase):
+    """Audit finding tables in RST and HTML, not only pipe tables."""
+
+    def _rows(self, text):
+        return [
+            (r.get("id"), r.get("title"), r["severity"], r.get("status"))
+            for r in mod.parse_finding_tables(text)
+        ]
+
+    def test_rst_grid_table_with_multiline_cells(self):
+        self.assertEqual(
+            self._rows(RST_GRID_AUDIT),
+            [
+                (
+                    "GR-1",
+                    "Weak signature check on inbound webhooks",
+                    "high",
+                    "Remediated",
+                ),
+                ("GR-2", "Verbose error pages", "low", "Accepted"),
+            ],
+        )
+
+    def test_rst_simple_table_with_continuation_line(self):
+        self.assertEqual(
+            self._rows(RST_SIMPLE_AUDIT),
+            [
+                ("SI-1", "Missing lockout on login", "medium", "Fixed"),
+                (
+                    "SI-2",
+                    "Debug endpoint exposed in production builds",
+                    "high",
+                    "Accepted",
+                ),
+            ],
+        )
+
+    def test_rst_list_table(self):
+        self.assertEqual(
+            self._rows(RST_LIST_AUDIT),
+            [("LT-1", "Session id not rotated at login", "low", None)],
+        )
+
+    def test_html_table_keeps_status_links(self):
+        rows = mod.parse_finding_tables(HTML_AUDIT)
+        self.assertEqual([r["id"] for r in rows], ["HT-1", "HT-2"])
+        self.assertEqual(rows[0]["title"], "Token & key written to logs")
+        self.assertEqual(rows[0]["fix_refs"], ["https://example.invalid/pull/9"])
+
+    def test_rst_and_html_audits_become_precedents(self):
+        files = {
+            "docs/audit-2.rst": RST_GRID_AUDIT,
+            "docs/audit-results.rst": RST_SIMPLE_AUDIT,
+            "docs/site/audit.html": HTML_AUDIT,
+        }
+        with TempProject(files) as root:
+            result = run(root)
+        ids = {p["id"]: p for p in result["precedents"]}
+        self.assertEqual(set(ids), {"GR-1", "GR-2", "SI-1", "SI-2", "HT-1", "HT-2"})
+        self.assertEqual(ids["HT-1"]["status"], "remediated")
+        self.assertEqual(ids["GR-2"]["status"], "accepted")
+        self.assertEqual(result["status"], "found")
+
+    def test_audit_document_outside_the_tree(self):
+        with (
+            TempProject({"SECURITY.md": SECURITY_MD}) as root,
+            tempfile.TemporaryDirectory() as tmp,
+        ):
+            page = Path(tmp) / "firm-report.html"
+            page.write_text(HTML_AUDIT, encoding="utf-8")
+            empty = Path(tmp) / "notes.md"
+            empty.write_text("# Notes\n\nNo table here.\n", encoding="utf-8")
+            result = run(
+                root,
+                audit_docs=[str(page), str(empty), str(Path(tmp) / "missing.md")],
+            )
+        ids = {p["id"]: p for p in result["precedents"]}
+        self.assertEqual(set(ids), {"HT-1", "HT-2"})
+        self.assertEqual(ids["HT-1"]["source"], str(page))
+        self.assertEqual(len(result["audits"]), 2)
+        errors = "\n".join(result["errors"])
+        self.assertIn("notes.md: no finding table", errors)
+        self.assertIn("not readable", errors)
+
+    def test_rst_table_without_severity_is_ignored(self):
+        text = RST_GRID_AUDIT.replace("Severity", "Owner   ")
+        self.assertEqual(mod.parse_finding_tables(text), [])
+
+    def test_rst_headings_are_not_tables(self):
+        # Section underlines must survive the table rewrite untouched.
+        text = "Title\n=====\n\nBody.\n\nSub\n---\n\nMore.\n"
+        self.assertEqual(mod._rst_tables_to_pipe(text), text.rstrip("\n"))
 
 
 class TestNetworkSources(unittest.TestCase):

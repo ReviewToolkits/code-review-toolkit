@@ -15,6 +15,8 @@ Design constraints, every one of them measured (see docs/decision-log.md D-10):
   0.16.0, and it is not a superset -- 18 rules were dropped. A ruff bump is a
   calibration event, so the version is recorded in every envelope and a mismatch
   against ``PINNED_RUFF_VERSION`` is reported rather than ignored.
+  ``VALIDATED_RUFF_VERSIONS`` lists the versions the tiers were re-validated
+  on; by default the ruff that matches the project's own pin is preferred.
 * **Always an explicit ``--select``, never ``--extend-select``**, which composes
   with a default that just changed sevenfold.
 * **JSON output only.** Concise output changed shape between versions *and*
@@ -35,6 +37,10 @@ Two fields carry the design:
     Non-null when the rule overlaps a catalogued bug shape. A finding with a
     shape_id should be MERGED with the scanner's finding at raised confidence,
     never double-reported.
+``candidate_shapes``
+    Every shape the rule's hits may be, ``shape_id`` first. A rule that maps to
+    more than one (the DTZ clock rules) lists them all; the shapes'
+    ``differential`` decides which one a site is.
 ``has_suppression_comment``
     Measured to be the strongest dismissal signal. Tier-1 precision is 50-70%,
     not 100%, and an existing suppression naming the rule class is usually why.
@@ -50,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import fnmatch
 import json
 import re
 import subprocess
@@ -66,9 +73,30 @@ from scan_common import (  # noqa: E402
 )
 
 # A ruff bump is a calibration event. Bump this WITH a fixture-corpus re-run.
-PINNED_RUFF_VERSION = "0.16.0"
+PINNED_RUFF_VERSION = "0.17.3"
+
+# Versions the tier lists were re-validated on, against the pin: every
+# selected code stable (`rule_validation` clean), the preview-only codes still
+# preview-gated, and identical per-code counts at --tier 2 on the validation
+# corpora. A run on any of these is comparable with the calibration. Add a
+# version here only after that re-run, never because it is installed.
+VALIDATED_RUFF_VERSIONS = ("0.16.0", "0.17.3")
 
 _RUFF_TIMEOUT = 300
+
+
+def _ruff_env() -> dict[str, str]:
+    """The environment for every ruff subprocess: caching off.
+
+    Every `ruff check` here also passes ``--no-cache``. A project's own config
+    (``cache-dir = ".cache/ruff"``) otherwise makes ruff write a cache INTO
+    the reviewed checkout, whatever the working directory. ``RUFF_NO_CACHE``
+    covers the invocations that take no ``--no-cache`` flag too.
+    """
+    import os
+
+    return {**os.environ, "RUFF_NO_CACHE": "true"}
+
 
 # ruff reports a file it could not read on stderr only -- "warning: Failed to
 # lint <path>: <reason>" -- and still exits 0 with an empty result. A
@@ -194,7 +222,47 @@ RULE_TO_SHAPE = {
     "B905": "zip-truncates-on-length-mismatch",
     "DTZ005": "naive-datetime-in-a-persisted-artifact",
     "DTZ006": "naive-datetime-in-a-persisted-artifact",
+    # A naive local clock read compared with naive-UTC database values is the
+    # commoner DTZ defect on web apps; DTZ001/005/006 can be either shape.
+    "DTZ001": "local-clock-compared-with-utc-store",
+    "DTZ011": "local-clock-compared-with-utc-store",
+    # Preview-only: mapped so the preview pass's hits carry the shape too.
+    "RUF027": "interpolation-placeholder-without-f-prefix",
 }
+
+# Rules whose hits can be either of several catalogued shapes. A finding's
+# `candidate_shapes` lists them (its `shape_id` first); each shape's
+# `differential` decides which one, if any, the site is.
+RULE_ALTERNATE_SHAPES = {
+    "DTZ001": ("naive-datetime-in-a-persisted-artifact",),
+    "DTZ005": ("local-clock-compared-with-utc-store",),
+    "DTZ006": ("local-clock-compared-with-utc-store",),
+}
+
+
+def candidate_shapes(code: str) -> list[str]:
+    """Every catalogued shape a hit of *code* may be: `shape_id` first."""
+    primary = RULE_TO_SHAPE.get(code)
+    return ([primary] if primary else []) + list(RULE_ALTERNATE_SHAPES.get(code, ()))
+
+
+# Selected rules that can never become a bug shape: size and complexity
+# metrics, magic numbers, and project policy (deferred imports, asserts,
+# unused imports). They stay selected and reported, but are kept out of
+# `novel_shape_candidates`, which they otherwise dominated on every corpus.
+SHAPE_INELIGIBLE = frozenset(
+    {
+        "C901",
+        "PLR0911",
+        "PLR0912",
+        "PLR0913",
+        "PLR0915",
+        "PLR2004",
+        "PLC0415",
+        "S101",
+        "F401",
+    }
+)
 
 _SUPPRESSION = re.compile(
     r"#\s*(noqa|type:\s*ignore|pylint:\s*disable|ruff:\s*noqa|nosec|pragma)",
@@ -209,6 +277,9 @@ _SUPPRESSION_TAIL = re.compile(
     re.IGNORECASE,
 )
 _SUPPRESSION_CODES = re.compile(r"\b([A-Z]{1,4}\d{2,4})\b")
+# The suppression kinds that can address a ruff rule. A comment with none of
+# these (only `type: ignore` or `pragma`) is not a dismissal signal for one.
+_RUFF_SUPPRESSION = re.compile(r"noqa|nosec|pylint:\s*disable")
 _SECURITY_RULE = re.compile(r"^S\d{3}$")
 
 
@@ -235,8 +306,14 @@ def suppression_details(code: str, text: str) -> dict:
     aliases = {code}
     if _SECURITY_RULE.match(code):
         aliases.add("B" + code[1:])
-    if "type:" in head or "pragma" in head or "pylint" in head:
-        names_rule = None  # cannot name a ruff code
+    if code.startswith("PL") and len(code) > 3:
+        aliases.add(code[2:])  # pylint's own `W0603` is ruff's PLW0603
+    if not _RUFF_SUPPRESSION.search(head):
+        # Only a `# type: ignore` or a `# pragma` (e.g. `no cover`): it
+        # addresses mypy or coverage, so it says nothing about a ruff rule.
+        names_rule = False
+    elif "pylint" in head and not named:
+        names_rule = None  # pylint's symbolic names cannot name a ruff code
     elif not named:
         names_rule = None  # a blanket suppression
     else:
@@ -245,7 +322,8 @@ def suppression_details(code: str, text: str) -> dict:
     return {
         "suppression_comment": comment,
         # True: it names this rule; False: it names only other rules (stale or
-        # misdirected); None: blanket, or a kind that cannot name a ruff code.
+        # misdirected), or is only a type-ignore / coverage pragma, which
+        # addresses another tool; None: blanket, or pylint's symbolic names.
         "suppression_names_rule": names_rule,
         "suppression_is_dismissal_signal": not exempt and names_rule is not False,
     }
@@ -327,7 +405,8 @@ DISMISSAL_REASONS = {
         "nothing; this is a CLI's normal exit path."
     ),
     "yaml-loader-subclasses-safeloader": (
-        "S506 on a Loader class defined in the same file whose bases are all "
+        "S506 on a Loader class defined in the same file (at module level or in "
+        "a function enclosing the call) whose bases are all "
         "yaml's SafeLoader/CSafeLoader/BaseLoader/CBaseLoader: ruff matches the "
         "loader by name and cannot see the subclass is safe. Constructors the "
         "subclass registers (`add_constructor`) are not checked: review them "
@@ -691,16 +770,41 @@ def _yaml_bindings(tree: ast.Module) -> tuple[set[str], set[str]]:
     return modules, loaders
 
 
-def _safe_yaml_loader_class(
-    tree: ast.Module, name: str, modules: set, loaders: set, seen: set
-) -> bool:
-    if name in seen:
+def _local_class(scope: ast.AST, name: str):
+    """The one ClassDef binding *name* in function *scope*.
+
+    None when *scope* does not bind *name* at all (look outward); False when
+    it binds it some other way, or more than once (unknowable).
+    """
+    if name in _param_names(scope):
         return False
-    seen.add(name)
+    classes: list[ast.ClassDef] = []
+    others = 0
+    for node in _scope_nodes(scope):
+        if isinstance(node, ast.ClassDef) and node.name == name:
+            classes.append(node)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            others += node.name == name
+        elif isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            others += node.id == name
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            others += any(
+                (alias.asname or alias.name.split(".")[0]) == name
+                for alias in node.names
+            )
+        elif isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names:
+            return False
+    if not classes and not others:
+        return None
+    return classes[0] if len(classes) == 1 and not others else False
+
+
+def _module_class(tree: ast.Module, name: str, loaders: set):
+    """The one top-level ClassDef binding *name*, or None."""
     classes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name]
     # Exactly one top-level class, and nothing else binding that name.
     if len(classes) != 1 or name in loaders:
-        return False
+        return None
     others = sum(
         1
         for n in ast.walk(tree)
@@ -712,9 +816,39 @@ def _safe_yaml_loader_class(
             and n.name == name
         )
     )
-    if others != 1 or not classes[0].bases:
+    return classes[0] if others == 1 else None
+
+
+def _safe_yaml_loader_class(
+    tree: ast.Module,
+    name: str,
+    modules: set,
+    loaders: set,
+    seen: set,
+    scopes: tuple = (),
+) -> bool:
+    """Whether *name*, looked up from *scopes* outward, is a safe Loader class.
+
+    *scopes* are the enclosing function scopes, innermost first; the module
+    is always searched last. A Loader defined inside the function that calls
+    ``yaml.load`` resolves there, as Python resolves it.
+    """
+    if (name, len(scopes)) in seen:
         return False
-    for base in classes[0].bases:
+    seen.add((name, len(scopes)))
+    cls, outer = None, ()
+    for i, scope in enumerate(scopes):
+        found = _local_class(scope, name)
+        if found is False:
+            return False
+        if found is not None:
+            cls, outer = found, scopes[i:]
+            break
+    if cls is None:
+        cls = _module_class(tree, name, loaders)
+    if cls is None or not cls.bases:
+        return False
+    for base in cls.bases:
         if isinstance(base, ast.Attribute) and base.attr in _SAFE_YAML_LOADERS:
             root = base.value
             while isinstance(root, ast.Attribute):
@@ -723,12 +857,24 @@ def _safe_yaml_loader_class(
                 continue
             return False
         if isinstance(base, ast.Name):
-            if base.id in loaders:
+            if base.id in loaders and not any(
+                _local_class(scope, base.id) is not None for scope in outer
+            ):
                 continue
-            if _safe_yaml_loader_class(tree, base.id, modules, loaders, seen):
+            if _safe_yaml_loader_class(tree, base.id, modules, loaders, seen, outer):
                 continue
         return False
     return True
+
+
+def _enclosing_functions(ctx: _FileContext, node: ast.AST) -> tuple:
+    """The function scopes enclosing *node*, innermost first."""
+    scopes = []
+    cur = ctx.scope_of(node)
+    while isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        scopes.append(cur)
+        cur = ctx.scope_of(cur)
+    return tuple(scopes)
 
 
 def _yaml_safe_subclass(ctx: _FileContext, line: int, col: int) -> bool:
@@ -738,7 +884,14 @@ def _yaml_safe_subclass(ctx: _FileContext, line: int, col: int) -> bool:
     modules, loaders = _yaml_bindings(ctx.tree)
     if not modules and not loaders:
         return False
-    return _safe_yaml_loader_class(ctx.tree, names[0].id, modules, loaders, set())
+    return _safe_yaml_loader_class(
+        ctx.tree,
+        names[0].id,
+        modules,
+        loaders,
+        set(),
+        _enclosing_functions(ctx, names[0]),
+    )
 
 
 def _enclosing_lambda_call(ctx: _FileContext, line: int, col: int):
@@ -1114,12 +1267,71 @@ def ruff_version(ruff_bin: str) -> str | None:
     """The version string of *ruff_bin*, or None if it cannot be run."""
     try:
         out = subprocess.run(
-            [ruff_bin, "--version"], capture_output=True, text=True, timeout=30
+            [ruff_bin, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_ruff_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return None
     parts = out.stdout.split()
     return parts[1] if len(parts) > 1 else None
+
+
+def _ruff_candidates(project_root: Path) -> list[str]:
+    """Ruff binaries that may be the project's own, most specific first."""
+    import os
+
+    found = []
+    venv = os.environ.get("VIRTUAL_ENV")
+    dirs = [Path(venv)] if venv else []
+    dirs += [project_root / ".venv", project_root / "venv"]
+    for directory in dirs:
+        for name in ("bin/ruff", "Scripts/ruff.exe"):
+            path = directory / name
+            if path.is_file() and str(path) not in found:
+                found.append(str(path))
+    return found
+
+
+def resolve_ruff_bin(
+    ruff_bin: str, project_root: Path, project_pin: dict | None
+) -> tuple[str, dict]:
+    """The ruff to run, and how it was chosen.
+
+    An explicit ``--ruff-bin`` path is always used. For the default
+    (``ruff``, whatever is first on PATH), a ruff whose version equals the
+    project's pin is preferred: the active virtualenv's, then an in-tree
+    ``.venv`` / ``venv``. Hits from a ruff the project does not run are not
+    the project's lint.
+    """
+    if ruff_bin != "ruff":
+        return ruff_bin, {"used": ruff_bin, "reason": "explicit --ruff-bin"}
+    pinned = (project_pin or {}).get("version")
+    if not pinned:
+        return ruff_bin, {
+            "used": ruff_bin,
+            "reason": "the project pins no exact ruff version: ruff on PATH",
+        }
+    checked = []
+    for candidate in [*_ruff_candidates(project_root), ruff_bin]:
+        version = ruff_version(candidate)
+        checked.append({"path": candidate, "version": version})
+        if version == pinned:
+            return candidate, {
+                "used": candidate,
+                "reason": f"matches the project's pinned ruff {pinned}",
+                "candidates": checked,
+            }
+    return ruff_bin, {
+        "used": ruff_bin,
+        "reason": (
+            f"no ruff matching the project's pin {pinned} was found (pass the "
+            "review venv's ruff with --ruff-bin): ruff on PATH"
+        ),
+        "candidates": checked,
+    }
 
 
 def validate_rules(ruff_bin: str, codes: list[str]) -> dict:
@@ -1140,6 +1352,7 @@ def validate_rules(ruff_bin: str, codes: list[str]) -> dict:
             capture_output=True,
             text=True,
             timeout=60,
+            env=_ruff_env(),
         )
         known = {r["code"]: r for r in json.loads(out.stdout)}
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError, KeyError):
@@ -1200,6 +1413,10 @@ def normalize(
         "preview": preview,
         # Non-null => merge with the scanner's finding, do not double-report.
         "shape_id": RULE_TO_SHAPE.get(code),
+        # More than one entry => let each shape's differential pick.
+        "candidate_shapes": candidate_shapes(code),
+        # False for metric and policy rules that can never become a shape.
+        "shape_eligible": code not in SHAPE_INELIGIBLE,
         # The strongest measured dismissal signal.
         "has_suppression_comment": bool(_SUPPRESSION.search(text)),
         **suppression_details(code, text),
@@ -1290,14 +1507,228 @@ def detect_target_version(project_root: Path) -> str:
     return f"py3{sys.version_info.minor}"
 
 
+# ---------------------------------------------------------------------------
+# The project's own ruff configuration: what it selects, what it ignores, and
+# the reason written next to each ignore. Read as text, not with tomllib, so
+# the comments survive (and so Python 3.10 works).
+# ---------------------------------------------------------------------------
+
+_TOML_SECTION = re.compile(r"^\s*\[+\s*([^\]]+?)\s*\]+\s*(?:#.*)?$")
+_TOML_KEY = re.compile(r"^\s*([A-Za-z0-9_\"'.*/-]+?)\s*=\s*(.*)$")
+_TOML_STRING = re.compile(r'"([^"\n]*)"|\'([^\'\n]*)\'')
+_RULE_SELECTOR = re.compile(r"^(?:ALL|[A-Z]+[0-9]*)$")
+
+
+def _split_comment(line: str) -> tuple[str, str | None]:
+    """(code part, trailing comment text or None), ignoring `#` in strings."""
+    quote = None
+    for i, ch in enumerate(line):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#":
+            return line[:i], line[i + 1 :].strip() or None
+    return line, None
+
+
+def _strings(text: str) -> list[str]:
+    return [a or b for a, b in _TOML_STRING.findall(text)]
+
+
+def _ruff_config_file(project_root: Path) -> tuple[Path, str] | None:
+    """(config file, the section prefix ruff's settings live under), or None."""
+    for name in ("ruff.toml", ".ruff.toml"):
+        if (project_root / name).is_file():
+            return project_root / name, ""
+    pyproject = project_root / "pyproject.toml"
+    if re.search(r"(?m)^\s*\[tool\.ruff", _read(pyproject)):
+        return pyproject, "tool.ruff"
+    return None
+
+
+def parse_project_ruff_config(project_root: Path) -> dict | None:
+    """The project's ruff `select` / `ignore` / `per-file-ignores`, with reasons.
+
+    Each ignore entry carries the comment written next to it: the trailing
+    comment on its own line, or else the comment lines just above it. A
+    maintainer's "this lint triggers where it's impossible for us to fix it"
+    is a dismissal signal; "we should probably fix them" asks for
+    verification. None when the project has no ruff config.
+    """
+    found = _ruff_config_file(project_root)
+    if found is None:
+        return None
+    path, prefix = found
+    lint = f"{prefix}.lint" if prefix else "lint"
+    main_sections = {prefix, lint}
+    pfi_sections = {f"{prefix}.per-file-ignores" if prefix else "per-file-ignores"}
+    pfi_sections.add(f"{lint}.per-file-ignores")
+    pfi_sections.update(
+        s.replace("per-file-ignores", "extend-per-file-ignores")
+        for s in list(pfi_sections)
+    )
+    lists: dict[str, list[dict]] = {
+        "select": [],
+        "extend-select": [],
+        "ignore": [],
+        "extend-ignore": [],
+    }
+    per_file: list[dict] = []
+    section = None
+    # The comment-only lines just above (a reason for what follows them),
+    # and whether the previous line was one.
+    comments: list[str] = []
+    after_comment = False
+    key = None  # the array being read: (kind, key name, reason on its key line)
+    # A comment block above several consecutive keys explains all of them.
+    group: str | None = None
+    for raw in _read(path).splitlines():
+        code, comment = _split_comment(raw)
+        stripped = code.strip()
+        if not stripped:
+            if comment:
+                comments = (comments if after_comment else []) + [comment]
+                after_comment = True
+            else:
+                comments, after_comment, group = [], False, None
+            continue
+        after_comment = False
+        if key is None:
+            header = _TOML_SECTION.match(stripped)
+            if header:
+                section, comments, group = header.group(1).strip(), [], None
+                continue
+            m = _TOML_KEY.match(code)
+            if not m:
+                comments, group = [], None
+                continue
+            name, code = m.group(1).strip("\"'"), m.group(2)
+            if section in main_sections and name in lists:
+                kind = "main"
+            elif section in pfi_sections:
+                kind = "pfi"
+            else:
+                comments, group = [], None
+                continue
+            rules_here = bool(_strings(code))
+            block = " ".join(comments) or None
+            if kind == "pfi":
+                group = block = block or group
+            key = (kind, name, (None if rules_here else comment) or block)
+            comments = []
+        kind, name, key_reason = key
+        block = " ".join(comments) or None
+        for rule in _strings(code):
+            if not _RULE_SELECTOR.match(rule):
+                continue
+            reason = comment or block or key_reason
+            if kind == "main":
+                lists[name].append({"rule": rule, "reason": reason})
+            else:
+                per_file.append({"pattern": name, "rule": rule, "reason": reason})
+        if "]" in code:
+            key, comments = None, []
+    select = [e["rule"] for e in lists["select"]]
+    extend = [e["rule"] for e in lists["extend-select"]]
+    return {
+        "source": path.name,
+        # None: no `select`, so ruff's default selection is in place (plus
+        # `extend_select`).
+        "select": select or None,
+        "extend_select": extend,
+        "selects_all": "ALL" in select + extend,
+        "ignore": lists["ignore"] + lists["extend-ignore"],
+        "per_file_ignores": per_file,
+    }
+
+
+def _prefix_match(code: str, entries: list[dict]) -> dict | None:
+    """The most specific selector in *entries* matching *code*, or None."""
+    best = None
+    for entry in entries:
+        rule = entry["rule"]
+        if rule == "ALL" or code.startswith(rule):
+            length = 0 if rule == "ALL" else len(rule)
+            if best is None or length > best[0]:
+                best = (length, entry)
+    return best[1] if best else None
+
+
+def _pattern_matches(relpath: str, pattern: str) -> bool:
+    """ruff's per-file-ignores glob against a project-relative path."""
+    candidates = {pattern, pattern.replace("**/", "")}
+    if "/" not in pattern:
+        candidates.add("**/" + pattern)
+        candidates.add(pattern)
+        if fnmatch.fnmatch(relpath.rsplit("/", 1)[-1], pattern):
+            return True
+    return any(fnmatch.fnmatch(relpath, c) for c in candidates)
+
+
+def project_rule_status(code: str, relpath: str, config: dict | None) -> dict | None:
+    """What the project's own ruff config says about *code* in *relpath*.
+
+    ``status`` is ``ignored-for-file`` (a per-file-ignores entry),
+    ``ignored-by-project`` (the ignore list), ``selected-by-project``,
+    ``not-selected-by-project``, or ``project-default-selection`` (no
+    explicit select). ``entry`` and ``reason`` come from the matching line.
+    """
+    if config is None:
+        return None
+    for entry in config["per_file_ignores"]:
+        if (entry["rule"] == "ALL" or code.startswith(entry["rule"])) and (
+            _pattern_matches(relpath, entry["pattern"])
+        ):
+            return {
+                "status": "ignored-for-file",
+                "entry": entry["rule"],
+                "pattern": entry["pattern"],
+                "reason": entry["reason"],
+            }
+    ignored = _prefix_match(code, config["ignore"])
+    selectors = (config["select"] or []) + config["extend_select"]
+    selected = _prefix_match(code, [{"rule": r} for r in selectors])
+    if config["select"] is None and selected is None:
+        if ignored:
+            return {
+                "status": "ignored-by-project",
+                "entry": ignored["rule"],
+                "reason": ignored["reason"],
+            }
+        return {"status": "project-default-selection"}
+    select_len = (
+        -1
+        if selected is None
+        else 0
+        if selected["rule"] == "ALL"
+        else len(selected["rule"])
+    )
+    if ignored and len(ignored["rule"]) >= select_len:
+        return {
+            "status": "ignored-by-project",
+            "entry": ignored["rule"],
+            "reason": ignored["reason"],
+        }
+    if selected is None:
+        return {"status": "not-selected-by-project"}
+    return {"status": "selected-by-project", "entry": selected["rule"]}
+
+
 def _run_ruff(
     ruff_bin: str,
     codes: list[str],
     target: Path,
     preview: bool,
     target_version: str | None = None,
+    ignore_noqa: bool = False,
 ) -> tuple[list[dict], str, str | None]:
-    """Run ruff over *target*; return (findings, stderr, error)."""
+    """Run ruff over *target*; return (findings, stderr, error).
+
+    *ignore_noqa* reports hits on `# noqa` lines too, which ruff otherwise
+    drops before anything can see them.
+    """
     cmd = [
         ruff_bin,
         "check",
@@ -1316,9 +1747,17 @@ def _run_ruff(
         cmd.extend(["--target-version", target_version])
     if preview:
         cmd.append("--preview")
+    if ignore_noqa:
+        cmd.append("--ignore-noqa")
     cmd.append(str(target))
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=_RUFF_TIMEOUT)
+        out = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=_RUFF_TIMEOUT,
+            env=_ruff_env(),
+        )
     except subprocess.TimeoutExpired:
         return [], "", f"ruff timed out after {_RUFF_TIMEOUT}s"
     except OSError as exc:
@@ -1348,6 +1787,7 @@ def _run_project_ruff(
             text=True,
             timeout=_RUFF_TIMEOUT,
             cwd=str(project_root),
+            env=_ruff_env(),
             check=False,  # exit 1 means "findings"; the code is read below
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -1415,6 +1855,23 @@ def project_autofix_check(
     }
 
 
+def _hit_key(raw: dict) -> tuple:
+    location = raw.get("location") or {}
+    return (
+        raw.get("filename"),
+        location.get("row"),
+        location.get("column"),
+        raw.get("code"),
+    )
+
+
+def _count_codes(findings: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for f in findings:
+        counts[f["code"]] = counts.get(f["code"], 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
+
+
 def analyze(
     target: str,
     *,
@@ -1427,6 +1884,10 @@ def analyze(
     """Run the tiered ruff selection over *target*."""
     scan_root = Path(target).resolve()
     project_root = find_project_root(scan_root)
+    project_pin = detect_project_ruff_pin(project_root)
+    ruff_bin, ruff_bin_resolution = resolve_ruff_bin(
+        ruff_bin, project_root, project_pin
+    )
     version = ruff_version(ruff_bin)
 
     if version is None:
@@ -1438,7 +1899,6 @@ def analyze(
             "findings": [],
         }
 
-    project_pin = detect_project_ruff_pin(project_root)
     codes = _tier_codes(tier)
     validation = validate_rules(ruff_bin, codes)
     # Never send ruff a code it will reject; an unknown code aborts the whole run.
@@ -1475,6 +1935,37 @@ def analyze(
             finding.update(closure_argument_hint(finding, path, trees, cache))
             findings.append(finding)
 
+    # ruff drops a hit on a `# noqa` line before anything can see it, so the
+    # suppressions themselves were invisible -- on a project that selects ALL,
+    # most of its considered exceptions. A second pass with --ignore-noqa
+    # finds them; a hit that appears only there is a suppressed claim to
+    # verify, kept apart from `findings` so the calibrated counts hold.
+    noqa_suppressed: list[dict] = []
+    noqa_pass: dict = {"ran": False}
+    if not error:
+        nraw, _, nerror = _run_ruff(
+            ruff_bin,
+            runnable,
+            scan_root,
+            preview=False,
+            target_version=target_version,
+            ignore_noqa=True,
+        )
+        if nerror:
+            noqa_pass = {"ran": False, "error": nerror}
+        else:
+            seen = {_hit_key(r) for r in raw}
+            for raw_finding in nraw:
+                if _hit_key(raw_finding) in seen:
+                    continue
+                noqa_suppressed.append(
+                    {
+                        **normalize(raw_finding, project_root, cache),
+                        "noqa_suppressed": True,
+                    }
+                )
+            noqa_pass = {"ran": True}
+
     preview_findings: list[dict] = []
     preview_stderr = ""
     if preview_pass:
@@ -1501,13 +1992,33 @@ def analyze(
 
     autofix = project_autofix_check(ruff_bin, findings, project_root)
 
+    # What the project's own ruff config says about each hit's rule, with the
+    # reason its maintainers wrote next to an ignore.
+    project_config = parse_project_ruff_config(project_root)
+    by_project_status: dict[str, int] = {}
+    ignored_entries: dict[tuple, dict] = {}
+    for f in noqa_suppressed:
+        f["project_config"] = project_rule_status(f["code"], f["file"], project_config)
+    for f in findings + dismissed + preview_findings:
+        status = project_rule_status(f["code"], f["file"], project_config)
+        f["project_config"] = status
+        if status is None:
+            continue
+        by_project_status[status["status"]] = (
+            by_project_status.get(status["status"], 0) + 1
+        )
+        if status["status"].startswith("ignored"):
+            key = (status["status"], status["entry"], status.get("pattern"))
+            entry = ignored_entries.setdefault(key, {**status, "hits": 0})
+            entry["hits"] += 1
+
     merged = [f for f in findings if f["shape_id"]]
     suppressed = [f for f in findings if f["has_suppression_comment"]]
 
     unlinted = unlinted_paths(stderr) + unlinted_paths(preview_stderr)
     error = error or unlinted_error(unlinted)
 
-    return {
+    result = {
         "project_root": str(project_root),
         "scan_root": str(scan_root),
         "ruff_version": version,
@@ -1515,6 +2026,13 @@ def analyze(
         # A mismatch does not fail the run, but it makes every count in this
         # envelope non-comparable with a calibrated one. Say so.
         "version_matches_pin": version == PINNED_RUFF_VERSION,
+        # A version the tiers were re-validated on: its counts compare with
+        # the calibration even when it is not the exact pin.
+        "version_validated": version in VALIDATED_RUFF_VERSIONS,
+        "validated_versions": list(VALIDATED_RUFF_VERSIONS),
+        # Which ruff ran, and why (an explicit --ruff-bin, or the one that
+        # matches the project's pin).
+        "ruff_bin": ruff_bin_resolution,
         # The ruff the PROJECT pins (lock file, pre-commit, requirements).
         # When it differs from both this run and PINNED_RUFF_VERSION, run once
         # per version and report the difference.
@@ -1532,6 +2050,9 @@ def analyze(
         # Paths ruff reported it could not read ("Failed to lint"). Non-empty
         # means `error` is set: their absence of findings is not a clean result.
         "unlinted": unlinted,
+        # The project's ruff `select` / `ignore` / `per-file-ignores`, each
+        # ignore with the comment written next to it; null with no config.
+        "project_ruff_config": project_config,
         "summary": {
             # Every hit ruff returned, dismissed ones included (the calibrated
             # number); `reported` is what is left in `findings` to triage.
@@ -1547,19 +2068,59 @@ def analyze(
             # ~30 selected rules have no shape at all. A confirmed true positive
             # from one of those is a NEW CATALOG ENTRY -- the highest-value
             # output of this script, more than the findings themselves.
-            # A known tool false positive is not evidence of a new shape.
+            # A known tool false positive is not evidence of a new shape, and
+            # a metric or policy rule (`shape_eligible: false`) never is one.
             "novel_shape_candidates": sorted(
                 {
                     f["code"]
                     for f in findings
-                    if not f["shape_id"] and not f.get("suspect_tool_bug")
+                    if not f["shape_id"]
+                    and f["shape_eligible"]
+                    and not f.get("suspect_tool_bug")
                 }
             ),
+            # The metric and policy rules that fired, left out of the harvest.
+            "shape_ineligible_codes": sorted(
+                {f["code"] for f in findings if not f["shape_eligible"]}
+            ),
+            # Any suppression-like comment on the hit's line, including a
+            # `type: ignore` or a coverage pragma, which say nothing about a
+            # ruff rule. Triage on the next count, not this one.
             "has_suppression_comment": len(suppressed),
+            # Hits whose comment is a dismissal signal for THIS rule (see each
+            # hit's `suppression_is_dismissal_signal`).
+            "suppression_dismissal_signals": sum(
+                1 for f in suppressed if f["suppression_is_dismissal_signal"]
+            ),
             # Suppressed hits whose comment must be VERIFIED, not trusted: a
             # security rule, a `nosec`, or a comment naming a different rule.
             "suppression_needs_verification": sum(
                 1 for f in suppressed if not f["suppression_is_dismissal_signal"]
+            ),
+            # Hits on `# noqa` lines, found by the --ignore-noqa pass (see
+            # `noqa_suppressed`); null when that pass did not run.
+            "noqa_suppressed": len(noqa_suppressed) if noqa_pass["ran"] else None,
+            "noqa_suppressed_by_code": (
+                _count_codes(noqa_suppressed) if noqa_pass["ran"] else None
+            ),
+            # Of those, the ones whose noqa is a claim to check (a security
+            # rule, or a noqa naming other rules), not a dismissal signal.
+            "noqa_suppressed_needs_verification": (
+                sum(
+                    1
+                    for f in noqa_suppressed
+                    if not f["suppression_is_dismissal_signal"]
+                )
+                if noqa_pass["ran"]
+                else None
+            ),
+            # Each hit's `project_config.status`, counted (null: no config).
+            "by_project_status": by_project_status if project_config else None,
+            # The project ignore entries this run's hits fall under, with the
+            # maintainers' reason and the hit count: one line per entry to
+            # verify or dismiss, instead of one per hit.
+            "project_ignored_rules": sorted(
+                ignored_entries.values(), key=lambda e: -e["hits"]
             ),
             # Hits matching a known ruff false-positive mode (see each hit's
             # `known_tool_issue` and `tool_bug_note`). Flagged, not dismissed.
@@ -1575,7 +2136,21 @@ def analyze(
         # (explained in `dismissal_reasons`). Not triaged, but not hidden.
         "dismissed": dismissed,
         "dismissal_reasons": {k: DISMISSAL_REASONS[k] for k in dismissed_by_reason},
+        # Hits ruff reports only with --ignore-noqa: each sits on a `# noqa`
+        # line, with its `suppression_*` fields. Claims to verify, not findings.
+        "noqa_pass": noqa_pass,
+        "noqa_suppressed": noqa_suppressed[:max_findings],
     }
+    if project_config and project_config["selects_all"]:
+        result["project_selects_all_note"] = (
+            "The project's ruff config selects ALL, so its own lint already "
+            "reports every rule here except the ones it ignores (see each "
+            "hit's `project_config` and `summary.project_ignored_rules`), the "
+            "hits on `# noqa` lines (`noqa_suppressed`), and files it excludes. "
+            "Each hit is a rule the maintainers chose to ignore: read their "
+            "stated reason before re-litigating it."
+        )
+    return result
 
 
 def main() -> None:
