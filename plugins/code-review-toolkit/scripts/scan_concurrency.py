@@ -3388,6 +3388,133 @@ def _module_state(p: Project) -> list[dict]:
 # Driver
 # --------------------------------------------------------------------------
 
+# Cross-process locks (a cache, a file, a coordination service). The lock-
+# guard model does not apply to them -- the state they guard lives outside the
+# process -- but a project whose concurrency lives there must not read as
+# "no locks": they are listed in `summary.distributed_locks`.
+_DISTRIBUTED_LOCK_CLASSES = frozenset(
+    {
+        "redis.lock.Lock",
+        "redis.Lock",
+        "redis.asyncio.lock.Lock",
+        "redis.asyncio.Lock",
+        "pottery.Redlock",
+        "pottery.redlock.Redlock",
+        "filelock.FileLock",
+        "filelock.SoftFileLock",
+        "filelock.BaseFileLock",
+        "filelock.AsyncFileLock",
+        "portalocker.Lock",
+        "portalocker.RedisLock",
+        "fasteners.InterProcessLock",
+        "fasteners.InterProcessReaderWriterLock",
+        "sherlock.Lock",
+        "sherlock.RedisLock",
+    }
+)
+# A client method that returns a distributed lock: `client.lock("name", ...)`.
+_CLIENT_LOCK_KEYWORDS = frozenset({"timeout", "blocking_timeout", "sleep", "blocking"})
+# Calls that start in-process concurrency: threads, processes, executors.
+_CONCURRENCY_STARTS = re.compile(
+    r"(^|\.)(Thread|Timer|Process|ThreadPoolExecutor|ProcessPoolExecutor|Pool"
+    r"|start_new_thread|run_in_executor|to_thread|create_task|gather|TaskGroup)$"
+)
+
+
+def _distributed_locks(p: Project) -> dict:
+    """Distributed-lock classes (and project subclasses) and where they are used."""
+    classes: dict[str, dict] = {}
+    pending = True
+    while pending:  # project subclasses of project subclasses
+        pending = False
+        for key, info in p.classes.items():
+            if key in classes:
+                continue
+            mod = p.modules[info.module]
+            for base in info.bases:
+                if not base:
+                    continue
+                node = ast.parse(base, mode="eval").body
+                dotted = p.qualify(mod, node)
+                base_key = p.resolve_class(mod, node)
+                if dotted in _DISTRIBUTED_LOCK_CLASSES or base_key in classes:
+                    classes[key] = {
+                        "class": f"{info.module}.{info.name}",
+                        "file": mod.rel,
+                        "base": classes[base_key]["class"]
+                        if base_key in classes
+                        else dotted,
+                    }
+                    pending = True
+                    break
+    sites: list[dict] = []
+    for func in p.funcs.values():
+        mod = p.modules[func.module]
+        for node in _walk_scope(func.node):
+            if not isinstance(node, (ast.With, ast.AsyncWith)):
+                continue
+            for item in node.items:
+                expr = item.context_expr
+                if not isinstance(expr, ast.Call):
+                    continue
+                dotted = p.qualify(mod, expr.func)
+                cls_key = p.resolve_class(mod, expr.func)
+                if dotted in _DISTRIBUTED_LOCK_CLASSES or cls_key in classes:
+                    how = "class"
+                elif (
+                    isinstance(expr.func, ast.Attribute)
+                    and expr.func.attr == "lock"
+                    and (
+                        (expr.args and isinstance(expr.args[0], ast.Constant))
+                        or any(k.arg in _CLIENT_LOCK_KEYWORDS for k in expr.keywords)
+                    )
+                ):
+                    how = "client-lock-method"
+                else:
+                    continue
+                sites.append(
+                    {
+                        "file": func.rel,
+                        "line": node.lineno,
+                        "function": func.qualname,
+                        "lock": _text(expr.func),
+                        "via": how,
+                    }
+                )
+    sites.sort(key=lambda s: (s["file"], s["line"]))
+    return {
+        "classes": sorted(classes.values(), key=lambda c: c["class"]),
+        "sites": sites,
+    }
+
+
+def _concurrency_evidence(p: Project, lock_kinds: dict, distributed: dict) -> dict:
+    """What in-process concurrency the model found, for `model_applicable`."""
+    starts = 0
+    for func in p.funcs.values():
+        mod = p.modules[func.module]
+        for node in _walk_scope(func.node):
+            if isinstance(node, ast.Call) and _CONCURRENCY_STARTS.search(
+                p.qualify(mod, node.func)
+            ):
+                starts += 1
+    for mod in p.modules.values():
+        for node in mod.tree.body:
+            if isinstance(node, (ast.Expr, ast.Assign)) and isinstance(
+                node.value, ast.Call
+            ):
+                starts += bool(
+                    _CONCURRENCY_STARTS.search(p.qualify(mod, node.value.func))
+                )
+    return {
+        "locks_declared": sum(lock_kinds.values()),
+        "lock_context_managers": sum(1 for v in p.lock_cms.values() if v),
+        "async_functions": sum(1 for f in p.funcs.values() if f.is_async),
+        "concurrency_starts": starts,
+        "distributed_lock_sites": len(distributed["sites"]),
+    }
+
+
 _CHECKS = (
     "unguarded-access-to-lock-guarded-state",
     "check-then-act-without-lock",
@@ -3506,6 +3633,8 @@ def analyze(
             lock_kinds[kind] = lock_kinds.get(kind, 0) + 1
 
     module_state = _module_state(project)
+    distributed = _distributed_locks(project)
+    evidence = _concurrency_evidence(project, lock_kinds, distributed)
     result = build_envelope(project_root, scan_root, files_total, len(files))
     result["summary"] = {
         "total_findings": len(findings),
@@ -3537,6 +3666,23 @@ def analyze(
             for k, v in project.lock_cms.items()
             if v is None and (items := _yield_with_items(project.funcs[k].node))
         ),
+        # False when the model found nothing to model: no thread or async
+        # lock, no lock CM, no `async def`, no thread/process/executor/task
+        # start. Zero findings then means "not applicable", not "clean".
+        "model_applicable": any(
+            evidence[k]
+            for k in (
+                "locks_declared",
+                "lock_context_managers",
+                "async_functions",
+                "concurrency_starts",
+            )
+        ),
+        "concurrency_evidence": evidence,
+        # Cross-process locks (cache, file, coordination service) and project
+        # subclasses of them, with every `with` site. Outside the lock-guard
+        # model: the races they guard are in the external store.
+        "distributed_locks": distributed,
         "guards_inferred": len(guards),
         "module_state_entries": len(module_state),
         "slow_locks": sorted(k.split(":", 1)[-1] for k in summaries.slow_locks),
@@ -3548,6 +3694,22 @@ def analyze(
             "by_lock": [] if all_blocking else _summarize_low_signal(low_signal),
         },
     }
+    if not result["summary"]["model_applicable"]:
+        result["summary"]["model_note"] = (
+            "No in-process concurrency was found (no thread or async locks, no "
+            "async functions, no thread, process, executor or task starts), so "
+            "zero findings here is not a clean result: this scanner's model does "
+            "not apply. If the project's concurrency lives in its database, cache "
+            "or task queue, review those races by hand (check-then-insert, lost "
+            "updates, lock ordering in SQL"
+            + (
+                f", and the {len(distributed['sites'])} distributed-lock site(s) in "
+                "`distributed_locks`"
+                if distributed["sites"]
+                else ""
+            )
+            + ")."
+        )
     result["guards"] = guards
     result["module_state"] = module_state
     result["findings"] = findings

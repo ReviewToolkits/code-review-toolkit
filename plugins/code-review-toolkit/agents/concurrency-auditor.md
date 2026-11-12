@@ -125,8 +125,13 @@ locks it found:
   check done mechanically for one shape.
 - **Docstrings that promise concurrency properties** ("lock-free", "called with the lock held",
   "other collections keep serving"). Each is a testable claim.
-- **A project with no concurrency** (`locks_declared` empty, no `async def`): the hazards are
-  still there, one level up. Start from `module_state`:
+- **A project with no concurrency** (`summary.model_applicable: false`; `concurrency_evidence`
+  says what was looked for): zero findings is **not** a clean result, and the report must say the
+  model did not apply. Read `summary.distributed_locks` first: cross-process lock classes (a
+  cache, file or coordination-service lock, and project subclasses of one) with every `with`
+  site. The races they guard live in the external store, so check each site's timeout, what
+  happens when the lock expires mid-work, and what runs when acquiring fails. The hazards are
+  also still there one level up. Start from `module_state`:
   - **Re-entrancy of process-global state.** For each singleton, mutated container or rebound
     global, ask what a second in-process call sees: a test runner calling `main()` twice, an
     application embedding the library, a planned server mode. State left over from the first

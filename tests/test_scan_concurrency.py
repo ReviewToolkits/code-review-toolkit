@@ -1467,3 +1467,88 @@ class TestEnvelopeAndOptions(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestModelApplicability(unittest.TestCase):
+    """No in-process concurrency must not read as a clean result."""
+
+    def test_nothing_to_model_says_so(self):
+        out = scan_project({"pkg/mod.py": "def f(x):\n    return x + 1\n"})
+        summary = out["summary"]
+        self.assertFalse(summary["model_applicable"])
+        self.assertIn("not a clean result", summary["model_note"])
+        self.assertEqual(summary["concurrency_evidence"]["locks_declared"], 0)
+
+    def test_a_threaded_project_is_applicable(self):
+        out = scan_project({"pkg/mod.py": _GUARDED_CLASS.format(body="pass")})
+        self.assertTrue(out["summary"]["model_applicable"])
+        self.assertNotIn("model_note", out["summary"])
+
+    def test_thread_starts_and_async_count_as_concurrency(self):
+        for src in (
+            "import threading\ndef go(f):\n    threading.Thread(target=f).start()\n",
+            "async def handler():\n    return 1\n",
+            (
+                "from concurrent.futures import ThreadPoolExecutor\n"
+                "def go(f):\n    with ThreadPoolExecutor() as ex:\n        ex.submit(f)\n"
+            ),
+        ):
+            with self.subTest(src=src):
+                out = scan_project({"pkg/mod.py": src})
+                self.assertTrue(out["summary"]["model_applicable"])
+
+    def test_distributed_lock_subclasses_and_sites_are_listed(self):
+        src = """
+        from redis.lock import Lock
+        import filelock
+
+        class JobLock(Lock):
+            def __init__(self, client):
+                super().__init__(client, "job-lock")
+
+        class NightlyLock(JobLock):
+            pass
+
+        def run(client):
+            with JobLock(client):
+                pass
+
+        def nightly(client):
+            with NightlyLock(client):
+                pass
+
+        def export(path):
+            with filelock.FileLock(path + ".lock"):
+                pass
+
+        def refresh(client):
+            with client.lock("refresh", timeout=30):
+                pass
+
+        def unrelated(store):
+            with store.transaction():
+                pass
+        """
+        out = scan_project({"pkg/tasks.py": src})
+        summary = out["summary"]
+        locks = summary["distributed_locks"]
+        self.assertEqual(
+            [(c["class"], c["base"]) for c in locks["classes"]],
+            [
+                ("pkg.tasks.JobLock", "redis.lock.Lock"),
+                ("pkg.tasks.NightlyLock", "pkg.tasks.JobLock"),
+            ],
+        )
+        self.assertEqual(
+            [(site["function"], site["via"]) for site in locks["sites"]],
+            [
+                ("run", "class"),
+                ("nightly", "class"),
+                ("export", "class"),
+                ("refresh", "client-lock-method"),
+            ],
+        )
+        # Not in-process concurrency: the model still does not apply, and the
+        # note points at the sites.
+        self.assertFalse(summary["model_applicable"])
+        self.assertIn("4 distributed-lock site(s)", summary["model_note"])
