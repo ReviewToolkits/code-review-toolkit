@@ -46,6 +46,7 @@ when it is a GitHub URL.
 from __future__ import annotations
 
 import html
+import itertools
 import json
 import re
 import subprocess
@@ -244,8 +245,10 @@ def _is_html(path: Path) -> bool:
 
 
 def _html_to_text(text: str) -> str:
-    """Crude HTML -> Markdown-ish text: headings become `#` lines, tags dropped."""
+    """Crude HTML -> Markdown-ish text: headings become `#` lines, tables pipe
+    tables, other tags dropped."""
     text = re.sub(r"(?is)<(script|style)\b.*?</\1>", "", text)
+    text = _html_tables_to_pipe(text)
     text = re.sub(r"(?is)\{#.*?#\}", "", text)
     text = re.sub(
         r"(?is)<h([1-6])\b[^>]*>(.*?)</h\1>",
@@ -337,16 +340,171 @@ def _bullets(body: list[str], limit: int = 25) -> list[str]:
 
 # --------------------------------------------------------------------------- tables
 
+# Audit reports publish their finding tables in whatever markup the site uses.
+# Each converter below rewrites one kind as a pipe table, which the one parser
+# (`parse_finding_tables`) then reads.
+
+_HTML_TABLE_RE = re.compile(r"(?is)<table\b[^>]*>(.*?)</table>")
+_HTML_ROW_RE = re.compile(r"(?is)<tr\b[^>]*>(.*?)</tr>")
+_HTML_CELL_RE = re.compile(r"(?is)<t([hd])\b[^>]*>(.*?)</t\1>")
+_HTML_LINK_RE = re.compile(r"(?is)<a\b[^>]*\bhref=[\"']([^\"']*)[\"'][^>]*>(.*?)</a>")
+_GRID_BORDER_RE = re.compile(r"^\s*\+(?:[-=]+\+)+\s*$")
+_SIMPLE_BORDER_RE = re.compile(r"^\s*=+(?:\s+=+)+\s*$")
+
+
+def _pipe_row(cells: list[str]) -> str:
+    return "| " + " | ".join(c.replace("|", "/") for c in cells) + " |"
+
+
+def _pipe_table(header: list[str], rows: list[list[str]]) -> list[str]:
+    return [
+        _pipe_row(header),
+        "|" + "---|" * len(header),
+        *(_pipe_row(r) for r in rows),
+        "",
+    ]
+
+
+def _html_tables_to_pipe(text: str) -> str:
+    """Rewrite every HTML ``<table>`` as a pipe table; links become Markdown links."""
+
+    def cell_text(raw: str) -> str:
+        raw = _HTML_LINK_RE.sub(lambda m: f"[{m.group(2)}]({m.group(1)})", raw)
+        return " ".join(html.unescape(_TAG_RE.sub(" ", raw)).split())
+
+    def convert(match: re.Match) -> str:
+        rows = [
+            [cell_text(c.group(2)) for c in _HTML_CELL_RE.finditer(row.group(1))]
+            for row in _HTML_ROW_RE.finditer(match.group(1))
+        ]
+        rows = [r for r in rows if r]
+        if len(rows) < 2:
+            return match.group(0)
+        return "\n" + "\n".join(_pipe_table(rows[0], rows[1:])) + "\n"
+
+    return _HTML_TABLE_RE.sub(convert, text)
+
+
+def _grid_table(lines: list[str]) -> list[str]:
+    """An RST grid table (``+---+`` borders) as pipe-table lines."""
+    border = lines[0]
+    cuts = [i for i, ch in enumerate(border) if ch == "+"]
+    header: list[str] | None = None
+    rows: list[list[str]] = []
+    current: list[list[str]] = []
+    for line in lines[1:]:
+        if _GRID_BORDER_RE.match(line):
+            if current:
+                rows.append([" ".join(" ".join(parts).split()) for parts in current])
+            current = []
+            if "=" in line and header is None and rows:
+                header = rows.pop()
+            continue
+        cells = [line[a + 1 : b] for a, b in itertools.pairwise(cuts)]
+        if not current:
+            current = [[] for _ in cells]
+        for parts, cell in zip(current, cells):
+            parts.append(cell.strip().strip("|").strip())
+    if header is None and rows:
+        header = rows.pop(0)
+    return _pipe_table(header, rows) if header and rows else []
+
+
+def _simple_table(lines: list[str]) -> list[str]:
+    """An RST simple table (``=====  =====`` borders) as pipe-table lines."""
+    spans = [m.span() for m in re.finditer(r"=+", lines[0])]
+    starts = [a for a, _ in spans]
+
+    def split(line: str) -> list[str]:
+        bounds = [*starts[1:], None]
+        return [line[a:b].strip() for a, b in zip(starts, bounds)]
+
+    borders = [i for i, line in enumerate(lines) if _SIMPLE_BORDER_RE.match(line)]
+    body_from = borders[1] + 1 if len(borders) >= 3 else 1
+    header_lines = lines[1 : borders[1]] if len(borders) >= 3 else []
+    rows: list[list[str]] = []
+    for line in lines[body_from:]:
+        if _SIMPLE_BORDER_RE.match(line) or not line.strip():
+            continue
+        cells = split(line)
+        if rows and not cells[0]:  # continuation of the previous row
+            rows[-1] = [" ".join(x for x in pair if x) for pair in zip(rows[-1], cells)]
+        else:
+            rows.append(cells)
+    header = split(header_lines[0]) if header_lines else (rows.pop(0) if rows else [])
+    return _pipe_table(header, rows) if header and rows else []
+
+
+def _list_table(lines: list[str]) -> list[str]:
+    """An RST ``.. list-table::`` directive as pipe-table lines."""
+    rows: list[list[str]] = []
+    for line in lines[1:]:
+        m = re.match(r"^\s*\*\s+-\s*(.*)$", line)
+        if m:
+            rows.append([m.group(1).strip()])
+            continue
+        m = re.match(r"^\s*-\s*(.*)$", line)
+        if m and rows:
+            rows[-1].append(m.group(1).strip())
+        elif line.strip() and rows and not line.lstrip().startswith(":"):
+            rows[-1][-1] = (rows[-1][-1] + " " + line.strip()).strip()
+    return _pipe_table(rows[0], rows[1:]) if len(rows) >= 2 else []
+
+
+def _rst_tables_to_pipe(text: str) -> str:
+    """Rewrite RST grid, simple and list tables as pipe tables."""
+    lines = text.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if _GRID_BORDER_RE.match(line):
+            j = i + 1
+            while j < len(lines) and lines[j].lstrip().startswith(("+", "|")):
+                j += 1
+            converted = _grid_table(lines[i:j])
+            out += converted or lines[i:j]
+            i = j
+            continue
+        if _SIMPLE_BORDER_RE.match(line):
+            # Header border, header, border, rows, closing border; or no header.
+            borders, j = 1, i + 1
+            while j < len(lines):
+                if _SIMPLE_BORDER_RE.match(lines[j]):
+                    borders += 1
+                    nxt = lines[j + 1] if j + 1 < len(lines) else ""
+                    if borders >= 2 and (not nxt.strip() or borders == 3):
+                        j += 1
+                        break
+                j += 1
+            converted = _simple_table(lines[i:j])
+            out += converted or lines[i:j]
+            i = j
+            continue
+        if re.match(r"^\s*\.\.\s+list-table::", line):
+            j = i + 1
+            while j < len(lines) and (not lines[j].strip() or lines[j][:1].isspace()):
+                j += 1
+            converted = _list_table(lines[i:j])
+            out += converted or lines[i:j]
+            i = j
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
 
 def parse_finding_tables(text: str) -> list[dict]:
-    """Rows of every pipe table whose header has a severity-like column.
+    """Rows of every finding table whose header has a severity-like column.
 
-    Each row becomes ``{id, title, severity, difficulty, status, fix_refs}``
-    with Markdown links stripped; ``fix_refs`` keeps their targets (the PR that
-    remediated a finding is often only a link in the status cell).
+    Pipe tables are read directly; HTML tables and RST grid, simple and list
+    tables are rewritten as pipe tables first. Each row becomes ``{id, title,
+    severity, difficulty, status, fix_refs}`` with Markdown links stripped;
+    ``fix_refs`` keeps their targets (the PR that remediated a finding is often
+    only a link in the status cell).
     """
     rows: list[dict] = []
-    lines = text.splitlines()
+    lines = _rst_tables_to_pipe(_html_tables_to_pipe(text)).splitlines()
     i = 0
     while i < len(lines) - 1:
         header, sep = lines[i], lines[i + 1]
