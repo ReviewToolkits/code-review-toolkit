@@ -63,10 +63,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scan_common import (
-    EXCLUDE_DIRS,
     build_envelope,
     collect_python_files,
+    discover_python_files,
     emit,
+    migration_kind,
     parse_common_args,
     parse_source,
     relative_to_root,
@@ -947,24 +948,23 @@ def _relationship_may_be_none(
 
 
 def _migration_files(project_root: Path) -> tuple[list[Path], list[Path], list[str]]:
+    """Alembic revisions, Django migrations and their directories.
+
+    Uses scan_common's discovery and `migration_kind`, so this script and the
+    migration-aware scanners agree on which files are migrations.
+    """
     alembic, django, dirs = [], [], set()
-    for path in sorted(project_root.rglob("*.py")):
-        parts = path.relative_to(project_root).parts
-        if set(parts) & EXCLUDE_DIRS or "node_modules" in parts:
-            continue
-        parent = path.parent.name
-        if parent not in ("versions", "migrations"):
+    for path in sorted(discover_python_files(project_root)):
+        if migration_kind(path) != "revision":
             continue
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        if parent == "versions" and "revision" in text and "def upgrade" in text:
-            alembic.append(path)
-            dirs.add(relative_to_root(path.parent, project_root))
-        elif parent == "migrations" and "migrations.Migration" in text:
-            django.append(path)
-            dirs.add(relative_to_root(path.parent, project_root))
+        (django if "Migration" in text and "class Migration" in text else alembic).append(
+            path
+        )
+        dirs.add(relative_to_root(path.parent, project_root))
     return alembic, django, sorted(dirs)
 
 

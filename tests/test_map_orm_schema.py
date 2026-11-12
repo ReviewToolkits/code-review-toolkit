@@ -239,6 +239,28 @@ LOOKUPS.update(
 )
 
 
+class TestMigrationDetectionIsShared(unittest.TestCase):
+    """Migrations are what scan_common.migration_kind says, as in every scanner."""
+
+    def test_a_helper_in_versions_is_not_a_revision(self):
+        files = {
+            # Mentions "revision" and defines upgrade(), but has no
+            # module-level revision/down_revision: not an Alembic revision.
+            "app/migrations/versions/helpers.py": (
+                "# shared by every revision\ndef upgrade():\n    pass\n"
+            ),
+            "app/migrations/versions/abc123_add.py": (
+                "revision = 'abc123'\ndown_revision = None\n"
+                "def upgrade():\n    pass\n"
+            ),
+        }
+        with TempProject(files) as root:
+            alembic, django, dirs = mod._migration_files(root)
+        self.assertEqual([p.name for p in alembic], ["abc123_add.py"])
+        self.assertEqual(django, [])
+        self.assertEqual(dirs, ["app/migrations/versions"])
+
+
 class TestLookups(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
