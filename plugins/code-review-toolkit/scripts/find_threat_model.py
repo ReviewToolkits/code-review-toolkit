@@ -35,11 +35,14 @@ as an empty result. "No advisories" and "could not ask" are different facts.
 
 Usage:
     python find_threat_model.py [scope] [--repo OWNER/REPO] [--no-network]
-        [--advisories-json PATH] [--issues-json PATH] [--format json|md]
-        [--max-files N]
+        [--advisories-json PATH] [--issues-json PATH] [--audit-doc PATH ...]
+        [--format json|md] [--max-files N]
 
 `--advisories-json` / `--issues-json` read a saved `gh api` response instead of
-querying (offline runs and tests). `--repo` defaults to the `origin` remote
+querying (offline runs and tests). `--audit-doc` (repeatable) adds an audit
+report saved outside the tree -- an HTML page from the firm or a funder, or a
+Markdown/RST file holding the finding table copied out of a PDF; its rows become
+precedents with the file path as their `source`. `--repo` defaults to the `origin` remote
 when it is a GitHub URL.
 """
 
@@ -617,6 +620,36 @@ def find_policy(root: Path, docs: list[Path]) -> list[dict]:
     return out
 
 
+def _audit_record(path: Path, source: str, raw: str, text: str, title: str) -> dict:
+    """One audit document: its finding table rows become precedents."""
+    firms = sorted({f for f in AUDIT_FIRMS if f.lower() in text.lower()})
+    links = sorted({u.rstrip(".,;") for u in AUDIT_LINK_RE.findall(raw)})
+    precedents = [
+        {
+            "id": r.get("id") or "",
+            "title": r.get("title") or "",
+            "severity": r["severity"],
+            "difficulty": r.get("difficulty"),
+            "status": _norm_status(r.get("status", "")),
+            "status_raw": r.get("status"),
+            "fix_refs": [u for u in r["fix_refs"] if u.startswith("http")],
+            "source": source,
+        }
+        for r in parse_finding_tables(text)
+    ]
+    return {
+        "path": source,
+        "title": title,
+        "firms": firms,
+        "report_links": links[:10],
+        "findings": precedents,
+        "severity_counts": _count(p["severity"] for p in precedents),
+        "accepted": [
+            p["id"] or p["title"] for p in precedents if p["status"] == "accepted"
+        ],
+    }
+
+
 def find_audits(root: Path, docs: list[Path]) -> tuple[list[dict], list[dict]]:
     """Audit reports (with their finding tables) and incident reports."""
     audits, incidents = [], []
@@ -627,42 +660,35 @@ def find_audits(root: Path, docs: list[Path]) -> tuple[list[dict], list[dict]]:
         text = _html_to_text(raw) if _is_html(path) else raw
         title = _title_of(text, path)
         head = title + " " + path.stem.replace("-", " ").replace("_", " ")
-        firms = sorted({f for f in AUDIT_FIRMS if f.lower() in text.lower()})
-        links = sorted({u.rstrip(".,;") for u in AUDIT_LINK_RE.findall(raw)})
-        rows = parse_finding_tables(text)
+        record = _audit_record(path, relative_to_root(path, root), raw, text, title)
         mentions_audit = bool(AUDIT_RE.search(text)) or "audit" in head.lower()
-        if mentions_audit and (rows or firms or links):
-            precedents = [
-                {
-                    "id": r.get("id") or "",
-                    "title": r.get("title") or "",
-                    "severity": r["severity"],
-                    "difficulty": r.get("difficulty"),
-                    "status": _norm_status(r.get("status", "")),
-                    "status_raw": r.get("status"),
-                    "fix_refs": [u for u in r["fix_refs"] if u.startswith("http")],
-                    "source": relative_to_root(path, root),
-                }
-                for r in rows
-            ]
-            audits.append(
-                {
-                    "path": relative_to_root(path, root),
-                    "title": title,
-                    "firms": firms,
-                    "report_links": links[:10],
-                    "findings": precedents,
-                    "severity_counts": _count(p["severity"] for p in precedents),
-                    "accepted": [
-                        p["id"] or p["title"]
-                        for p in precedents
-                        if p["status"] == "accepted"
-                    ],
-                }
-            )
+        if mentions_audit and (
+            record["findings"] or record["firms"] or record["report_links"]
+        ):
+            audits.append(record)
         elif INCIDENT_RE.search(head):
             incidents.append({"path": relative_to_root(path, root), "title": title})
     return audits, incidents
+
+
+def read_external_audits(paths: list[str]) -> tuple[list[dict], list[str]]:
+    """Audit reports saved outside the tree (a firm's or funder's page, a table
+    copied out of a PDF): every given file is taken as an audit."""
+    audits, errors = [], []
+    for name in paths:
+        path = Path(name).expanduser()
+        raw = _read(path)
+        if not raw:
+            errors.append(f"audit document not readable: {name}")
+            continue
+        text = _html_to_text(raw) if _is_html(path) else raw
+        record = _audit_record(path, str(path), raw, text, _title_of(text, path))
+        if not record["findings"]:
+            errors.append(
+                f"audit document {name}: no finding table with a severity column"
+            )
+        audits.append(record)
+    return audits, errors
 
 
 def find_engagement_rules(root: Path, docs: list[Path], limit: int = 20) -> list[dict]:
@@ -834,6 +860,7 @@ def analyze(
     network: bool = True,
     advisories_path: str | None = None,
     issues_path: str | None = None,
+    audit_docs: list[str] | None = None,
 ) -> dict:
     _, project_root, scan_root = resolve_target(target)
     all_docs = list(_iter_docs(scan_root))
@@ -842,6 +869,9 @@ def analyze(
 
     policy = find_policy(project_root, docs)
     audits, incidents = find_audits(project_root, docs)
+    external, external_errors = read_external_audits(audit_docs or [])
+    audits += external
+    errors += external_errors
     references = find_references(project_root, docs)
     engagement = find_engagement_rules(project_root, docs)
     commits = find_security_commits(project_root)
@@ -1066,6 +1096,7 @@ def main(argv: list[str] | None = None) -> None:
         "network": True,
         "advisories_path": None,
         "issues_path": None,
+        "audit_docs": [],
     }
     fmt, max_files, positional = "json", 0, []
     valued = {
@@ -1076,7 +1107,10 @@ def main(argv: list[str] | None = None) -> None:
     i = 0
     while i < len(argv):
         arg = argv[i]
-        if arg in valued and i + 1 < len(argv):
+        if arg == "--audit-doc" and i + 1 < len(argv):
+            opts["audit_docs"].append(argv[i + 1])
+            i += 2
+        elif arg in valued and i + 1 < len(argv):
             opts[valued[arg]] = argv[i + 1]
             i += 2
         elif arg == "--format" and i + 1 < len(argv):

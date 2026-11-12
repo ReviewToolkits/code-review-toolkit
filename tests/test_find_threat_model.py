@@ -314,6 +314,27 @@ class TestTableFormats(unittest.TestCase):
         self.assertEqual(ids["GR-2"]["status"], "accepted")
         self.assertEqual(result["status"], "found")
 
+    def test_audit_document_outside_the_tree(self):
+        with (
+            TempProject({"SECURITY.md": SECURITY_MD}) as root,
+            tempfile.TemporaryDirectory() as tmp,
+        ):
+            page = Path(tmp) / "firm-report.html"
+            page.write_text(HTML_AUDIT, encoding="utf-8")
+            empty = Path(tmp) / "notes.md"
+            empty.write_text("# Notes\n\nNo table here.\n", encoding="utf-8")
+            result = run(
+                root,
+                audit_docs=[str(page), str(empty), str(Path(tmp) / "missing.md")],
+            )
+        ids = {p["id"]: p for p in result["precedents"]}
+        self.assertEqual(set(ids), {"HT-1", "HT-2"})
+        self.assertEqual(ids["HT-1"]["source"], str(page))
+        self.assertEqual(len(result["audits"]), 2)
+        errors = "\n".join(result["errors"])
+        self.assertIn("notes.md: no finding table", errors)
+        self.assertIn("not readable", errors)
+
     def test_rst_table_without_severity_is_ignored(self):
         text = RST_GRID_AUDIT.replace("Severity", "Owner   ")
         self.assertEqual(mod.parse_finding_tables(text), [])
