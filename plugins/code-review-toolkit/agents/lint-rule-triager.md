@@ -140,7 +140,10 @@ saying so briefly is better than omitting them.
 ## Phase 4 — Harvest new shapes (the highest-value step)
 
 Read `summary.novel_shape_candidates`: defect-grade rules that fired and have **no catalogued shape**.
-Roughly 30 selected rules are in this position.
+Roughly 30 selected rules are in this position. Metric and policy rules (`C901`, `PLR09xx`,
+`PLR2004`, `PLC0415`, `S101`, `F401`) can never become a shape: their hits carry
+`shape_eligible: false`, are still reported, and are listed in `summary.shape_ineligible_codes`
+instead of the harvest.
 
 For each one where you confirm a true positive, write a candidate catalog entry in the
 `data/python_bug_shapes.json` field structure — `pattern`, `guarded_twin`, `hunt`, `expected`,

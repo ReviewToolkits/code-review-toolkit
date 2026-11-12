@@ -196,6 +196,24 @@ RULE_TO_SHAPE = {
     "DTZ006": "naive-datetime-in-a-persisted-artifact",
 }
 
+# Selected rules that can never become a bug shape: size and complexity
+# metrics, magic numbers, and project policy (deferred imports, asserts,
+# unused imports). They stay selected and reported, but are kept out of
+# `novel_shape_candidates`, which they otherwise dominated on every corpus.
+SHAPE_INELIGIBLE = frozenset(
+    {
+        "C901",
+        "PLR0911",
+        "PLR0912",
+        "PLR0913",
+        "PLR0915",
+        "PLR2004",
+        "PLC0415",
+        "S101",
+        "F401",
+    }
+)
+
 _SUPPRESSION = re.compile(
     r"#\s*(noqa|type:\s*ignore|pylint:\s*disable|ruff:\s*noqa|nosec|pragma)",
     re.IGNORECASE,
@@ -1210,6 +1228,8 @@ def normalize(
         "preview": preview,
         # Non-null => merge with the scanner's finding, do not double-report.
         "shape_id": RULE_TO_SHAPE.get(code),
+        # False for metric and policy rules that can never become a shape.
+        "shape_eligible": code not in SHAPE_INELIGIBLE,
         # The strongest measured dismissal signal.
         "has_suppression_comment": bool(_SUPPRESSION.search(text)),
         **suppression_details(code, text),
@@ -1557,13 +1577,20 @@ def analyze(
             # ~30 selected rules have no shape at all. A confirmed true positive
             # from one of those is a NEW CATALOG ENTRY -- the highest-value
             # output of this script, more than the findings themselves.
-            # A known tool false positive is not evidence of a new shape.
+            # A known tool false positive is not evidence of a new shape, and
+            # a metric or policy rule (`shape_eligible: false`) never is one.
             "novel_shape_candidates": sorted(
                 {
                     f["code"]
                     for f in findings
-                    if not f["shape_id"] and not f.get("suspect_tool_bug")
+                    if not f["shape_id"]
+                    and f["shape_eligible"]
+                    and not f.get("suspect_tool_bug")
                 }
+            ),
+            # The metric and policy rules that fired, left out of the harvest.
+            "shape_ineligible_codes": sorted(
+                {f["code"] for f in findings if not f["shape_eligible"]}
             ),
             # Any suppression-like comment on the hit's line, including a
             # `type: ignore` or a coverage pragma, which say nothing about a

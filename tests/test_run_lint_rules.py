@@ -177,6 +177,40 @@ class TestSuppressionDetails(unittest.TestCase):
         self.assertEqual(result["summary"]["suppression_dismissal_signals"], 0)
 
 
+class TestShapeEligibility(unittest.TestCase):
+    """Metric and policy rules are not harvested as novel shapes."""
+
+    def test_metric_and_policy_rules_are_left_out_of_the_harvest(self):
+        from helpers import TempProject
+
+        source = "import os\nassert x\nf(s, x)\n"
+        with TempProject({"m.py": source}) as root:
+            hits = [
+                _fake_hit(root, "m.py", 1, "os", code="F401"),
+                _fake_hit(root, "m.py", 2, "assert", code="S101"),
+                _fake_hit(root, "m.py", 3, "f", code="C901"),
+                _fake_hit(root, "m.py", 3, "s", code="PLR2004"),
+                # A defect-grade rule with no shape is still harvested.
+                _fake_hit(root, "m.py", 3, "x", code="F821"),
+            ]
+            result = _analyze_with_fake_ruff(root, hits, tier=2)
+        summary = result["summary"]
+        self.assertEqual(summary["novel_shape_candidates"], ["F821"])
+        self.assertEqual(
+            summary["shape_ineligible_codes"], ["C901", "F401", "PLR2004", "S101"]
+        )
+        # Still reported: only the harvest changes.
+        self.assertEqual(summary["reported"], 5)
+        eligible = {f["code"]: f["shape_eligible"] for f in result["findings"]}
+        self.assertFalse(eligible["S101"])
+        self.assertTrue(eligible["F821"])
+
+    def test_every_ineligible_rule_is_a_selected_rule(self):
+        for code in mod.SHAPE_INELIGIBLE:
+            with self.subTest(code=code):
+                self.assertIn(code, mod.TIER_1 + mod.TIER_2)
+
+
 class TestNormalize(unittest.TestCase):
     def test_null_filename_and_location_are_tolerated(self):
         # ruff 0.16.0's JSON notes that filename and location "may now be null".
