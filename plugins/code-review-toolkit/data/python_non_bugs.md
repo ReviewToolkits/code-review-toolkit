@@ -563,3 +563,28 @@ so. Docs that describe only the new value are a low-severity doc note.
 
 **Real bug:** the split is not explained anywhere (commit, comment, migration), or the old value was
 meant to be migrated and the migration never ran.
+
+### 55. `RUF027` on a translation placeholder
+
+**Looks like:** `interpolation-placeholder-without-f-prefix` -- `_("Deleted ${name}")` or
+`gettext("Hello {user}")` has braces and a name in scope, so ruff suggests an `f` prefix.
+
+**Why it is not a bug:** the placeholder is resolved after the catalog lookup, through the
+translation's `mapping=` or a `.format()` on the translated text (`string.Template`-style `${name}`
+in some frameworks). Adding the `f` would break the lookup: that is
+`translation-lookup-of-interpolated-string`.
+
+**Discriminator:** the string is the first argument of a translation call (or its result is
+formatted later), or the braces are preceded by `$`. **Real bug:** the string reaches output with
+no formatting step at all.
+
+### 56. `DTZ005` on `datetime.now().timestamp()`
+
+**Looks like:** a time-zone-dependent clock read (`local-clock-compared-with-utc-store`,
+`naive-datetime-in-a-persisted-artifact`).
+
+**Why it is not a bug:** a naive local `now()` converts back to the same epoch value, so
+`datetime.now().timestamp()` equals `time.time()` whatever the TZ.
+
+**Discriminator:** the value's only use is `.timestamp()`. **Real bug:** the naive value itself is
+compared, subtracted, formatted or stored.

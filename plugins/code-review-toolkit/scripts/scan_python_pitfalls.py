@@ -4999,6 +4999,73 @@ def _check_integrity_error_without_rollback(tree: ast.AST) -> list[dict]:
     return out
 
 
+_TRANSLATION_CALLS = frozenset(
+    {
+        "_",
+        "gettext",
+        "ngettext",
+        "pgettext",
+        "npgettext",
+        "lazy_gettext",
+        "gettext_lazy",
+        "ugettext",
+        "translate",
+    }
+)
+
+
+def _interpolated(node: ast.AST) -> str | None:
+    """How *node* builds a string at run time, or None for a literal."""
+    if isinstance(node, ast.JoinedStr) and any(
+        isinstance(v, ast.FormattedValue) for v in node.values
+    ):
+        return "an f-string"
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+        sides = (node.left, node.right)
+        if any(
+            isinstance(s, ast.JoinedStr)
+            or (isinstance(s, ast.Constant) and isinstance(s.value, str))
+            for s in sides
+        ):
+            return "a concatenation" if isinstance(node.op, ast.Add) else "%-formatting"
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "format"
+        and isinstance(node.func.value, ast.Constant)
+        and isinstance(node.func.value.value, str)
+    ):
+        return ".format()"
+    return None
+
+
+def _check_translation_of_interpolated_string(tree: ast.AST) -> list[dict]:
+    """`_(f"...")` / `request._("..." + x)`: the msgid is built at run time."""
+    out: list[dict] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and node.args):
+            continue
+        name = _call_tail(node)
+        if name not in _TRANSLATION_CALLS:
+            continue
+        how = _interpolated(node.args[0])
+        if how is None:
+            continue
+        out.append(
+            _finding(
+                "translation-lookup-of-interpolated-string",
+                "FIX",
+                "high" if name != "translate" else "medium",
+                node,
+                f"{_dotted_name(node.func) or name}() is given {how}: the lookup key is "
+                f"the interpolated text, which no catalog entry matches",
+                "pass a literal msgid and the values through the translation's "
+                "mapping/format arguments",
+            )
+        )
+    return out
+
+
 _COLUMN_FACTORIES = frozenset({"Column", "mapped_column"})
 _JSON_COLUMN_TYPES = frozenset({"JSON", "JSONB", "ARRAY", "HSTORE"})
 _MUTATION_TRACKERS = frozenset(
@@ -5175,6 +5242,9 @@ _CHECKS = {
     "side-channel-raise-in-finally": _check_side_channel_raise_in_finally,
     "wide-suppress-exception-block": _check_wide_suppress_exception,
     "integrity-error-caught-without-rollback": _check_integrity_error_without_rollback,
+    "translation-lookup-of-interpolated-string": (
+        _check_translation_of_interpolated_string
+    ),
 }
 
 

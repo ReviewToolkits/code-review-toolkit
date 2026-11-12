@@ -37,7 +37,8 @@ class TestRuleToShape(unittest.TestCase):
     """The overlap map is what stops the same defect being reported twice."""
 
     def test_every_mapped_rule_is_actually_selected(self):
-        selected = set(mod._tier_codes(2))
+        # A preview-only code runs in the labelled preview pass.
+        selected = set(mod._tier_codes(2)) | set(mod.PREVIEW_ONLY)
         for code in mod.RULE_TO_SHAPE:
             with self.subTest(code=code):
                 self.assertIn(code, selected, "mapped but never run")
@@ -54,6 +55,46 @@ class TestRuleToShape(unittest.TestCase):
         for code, shape in mod.RULE_TO_SHAPE.items():
             with self.subTest(code=code):
                 self.assertIn(shape, known)
+
+    def test_every_alternate_shape_exists_and_has_a_primary(self):
+        import json
+        from pathlib import Path
+
+        data = Path(mod.__file__).resolve().parent.parent / "data"
+        known = {
+            s["id"]
+            for s in json.loads(
+                (data / "python_bug_shapes.json").read_text(encoding="utf-8")
+            )["shapes"]
+        }
+        for code, shapes in mod.RULE_ALTERNATE_SHAPES.items():
+            with self.subTest(code=code):
+                self.assertIn(code, mod.RULE_TO_SHAPE)
+                self.assertLessEqual(set(shapes), known)
+
+    def test_clock_rules_offer_both_datetime_shapes(self):
+        # A naive local clock read is either written into an artifact other
+        # programs read, or compared with naive-UTC database values: the
+        # differential decides, so both shapes are offered.
+        both = {
+            "naive-datetime-in-a-persisted-artifact",
+            "local-clock-compared-with-utc-store",
+        }
+        for code in ("DTZ001", "DTZ005", "DTZ006"):
+            with self.subTest(code=code):
+                candidates = mod.candidate_shapes(code)
+                self.assertEqual(set(candidates), both)
+                self.assertEqual(candidates[0], mod.RULE_TO_SHAPE[code])
+        self.assertEqual(
+            mod.candidate_shapes("DTZ011"), ["local-clock-compared-with-utc-store"]
+        )
+        self.assertEqual(mod.candidate_shapes("E501"), [])
+
+    def test_preview_rule_for_missing_f_prefix_is_mapped(self):
+        self.assertEqual(
+            mod.RULE_TO_SHAPE.get("RUF027"),
+            "interpolation-placeholder-without-f-prefix",
+        )
 
     def test_catalogued_zip_and_datetime_shapes_are_mapped(self):
         # Unmapped, these were harvested as novel shapes although the catalog
@@ -161,6 +202,24 @@ class TestNormalize(unittest.TestCase):
             cache={},
         )
         self.assertIsNone(out["shape_id"])
+        self.assertEqual(out["candidate_shapes"], [])
+
+    def test_clock_rule_carries_every_candidate_shape(self):
+        from pathlib import Path
+
+        out = mod.normalize(
+            {"code": "DTZ005", "filename": None, "location": None, "message": "m"},
+            Path("/p"),
+            cache={},
+        )
+        self.assertEqual(out["shape_id"], "naive-datetime-in-a-persisted-artifact")
+        self.assertEqual(
+            out["candidate_shapes"],
+            [
+                "naive-datetime-in-a-persisted-artifact",
+                "local-clock-compared-with-utc-store",
+            ],
+        )
 
 
 class TestPerFindingTier(unittest.TestCase):

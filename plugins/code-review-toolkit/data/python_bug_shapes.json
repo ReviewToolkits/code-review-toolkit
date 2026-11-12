@@ -3076,6 +3076,69 @@
       "differential": "A doc describing a deliberately deferred behaviour with a date or an issue link, or an enum split for grandfathering whose introducing commit says so, is a doc note, not a code defect (see the false-positive taxonomy).",
       "detected_by": null,
       "detectability": "agent-only"
+    },
+    {
+      "id": "local-clock-compared-with-utc-store",
+      "title": "A local naive `datetime.now()` is compared with, or stored against, naive-UTC values from a database",
+      "agent": "lint-rule-triager",
+      "severity": "CONSIDER",
+      "pattern": "`datetime.now()`, `date.today()`, `datetime.fromtimestamp(ts)` or a naive `datetime(...)` (no tz) compared with, subtracted from, or written to a column that the project fills with UTC (`server_default=now()` in a UTC database, `utcnow()` elsewhere). The code is correct only while the server's TZ is UTC; elsewhere every window (an expiry window, a repeat-email interval) shifts by the offset.",
+      "guarded_twin": "`datetime.now(UTC)` (aware) on both sides, or the project's own `utcnow()`-equivalent helper, which sibling code usually already uses.",
+      "hunt": "For each DTZ001/DTZ005/DTZ006/DTZ011 hit, follow the value: keep the ones compared with, subtracted from, or stored into a database timestamp. Check how that column is filled. Then grep the project's own now() helper: the sites that bypass it are the candidates.",
+      "expected": "time comparisons are correct whatever the server's TZ.",
+      "caught_as": "SILENT -- correct in production while TZ=UTC; wrong windows on a developer machine, in CI, or after a deployment change.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): naive local datetime.now()/fromtimestamp() calls were compared with or written to naive-UTC columns (an expiry window, an email repeat window), correct only while TZ=UTC."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "ruff DTZ001 / DTZ005 / DTZ006 / DTZ011 flag the call; the destination decides the shape",
+        "Python docs, datetime: naive objects have no notion of time zone"
+      ],
+      "differential": "`datetime.now().timestamp()` is TZ-independent (it round-trips to the epoch) -- see the false-positive taxonomy. A pure in-process duration is `duration-measured-with-wall-clock`; a naive value written into a file or schema that other programs read is `naive-datetime-in-a-persisted-artifact`.",
+      "detected_by": null,
+      "detectability": "implementable"
+    },
+    {
+      "id": "interpolation-placeholder-without-f-prefix",
+      "title": "A string with `{name}` placeholders that was meant to be an f-string has no `f` prefix",
+      "agent": "lint-rule-triager",
+      "severity": "CONSIDER",
+      "pattern": "`raise ValueError(\"unknown mode {mode}\")` or `log(\"retrying {attempt}\")` where `mode`/`attempt` are names in scope and nothing formats the string later. The user sees the literal braces. Usually an f-prefix dropped in an edit or a copy from a sibling line.",
+      "guarded_twin": "The sibling line with the `f` prefix, or an explicit `.format(...)` / `%` call.",
+      "hunt": "Take each RUF027 hit (preview-only in ruff today). Keep it when every placeholder names a variable in scope and the string reaches output without `.format`, `%`, `string.Template` or a translation call with a mapping. Then grep for the same message elsewhere: its sibling often has the prefix.",
+      "expected": "messages show values, not braces.",
+      "caught_as": "SILENT -- error messages and logs with literal `{name}` text.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "ruff RUF027 (missing-f-string-syntax), preview"
+      ],
+      "differential": "Translation strings with `${name}` or `{name}` placeholders resolved through a `mapping=`/`.format` after the lookup are correct (see the false-positive taxonomy). Templates formatted later, docs and regex quantifiers like `{2,3}` are not instances. The translation variant that IS a defect is the opposite case: `translation-lookup-of-interpolated-string`.",
+      "detected_by": null,
+      "detectability": "implementable"
+    },
+    {
+      "id": "translation-lookup-of-interpolated-string",
+      "title": "A translation call receives an f-string or a concatenation, so the lookup key never matches the catalog",
+      "agent": "python-pitfall-scanner",
+      "severity": "FIX",
+      "pattern": "`request._(f\"Archived {name!r}\")`, `_(\"Could not archive \" + name)` or `gettext(\"...{}\".format(x))`. The runtime msgid is the interpolated text, which never matches a catalog entry, so every locale shows the source language; extraction tools record nothing, or a fragment. ruff's INT001-INT003 catch bare `_()`/`gettext()` names only, not method aliases such as `request._` or `localizer.translate`.",
+      "guarded_twin": "A literal msgid with the values passed through the translation's mapping (`request._(\"Archived ${name}\", mapping={\"name\": name})`), which the same files usually do dozens of times.",
+      "hunt": "Every call to `_`, `gettext`, `ngettext`, `pgettext`, `lazy_gettext` or a `translate` method (bare or as a method) whose first argument is an f-string, a `+` or `%` expression, or `.format(...)`. Also check that `${x}` placeholders in literal msgids match the mapping's keys.",
+      "expected": "msgids are literals; values arrive through the mapping.",
+      "caught_as": "SILENT in source-language test runs; only non-source-language users see untranslated text.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): flash messages passed an f-string or a concatenation to a request-bound translation method; the scanner check finds exactly those sites."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "ruff INT001 / INT002 / INT003 (flake8-gettext)",
+        "GNU gettext manual: the msgid must be a literal for extraction and lookup"
+      ],
+      "differential": "A wrapper whose parameter is passed straight through (`def t(msg): return localizer.translate(msg)`, called with literals) is fine: check its callers instead. A project with no message catalogs is not translating anything.",
+      "detected_by": "scan_python_pitfalls.py",
+      "detectability": "implemented"
     }
   ]
 }

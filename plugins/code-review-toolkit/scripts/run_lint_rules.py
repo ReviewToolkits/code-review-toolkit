@@ -35,6 +35,10 @@ Two fields carry the design:
     Non-null when the rule overlaps a catalogued bug shape. A finding with a
     shape_id should be MERGED with the scanner's finding at raised confidence,
     never double-reported.
+``candidate_shapes``
+    Every shape the rule's hits may be, ``shape_id`` first. A rule that maps to
+    more than one (the DTZ clock rules) lists them all; the shapes'
+    ``differential`` decides which one a site is.
 ``has_suppression_comment``
     Measured to be the strongest dismissal signal. Tier-1 precision is 50-70%,
     not 100%, and an existing suppression naming the rule class is usually why.
@@ -194,7 +198,29 @@ RULE_TO_SHAPE = {
     "B905": "zip-truncates-on-length-mismatch",
     "DTZ005": "naive-datetime-in-a-persisted-artifact",
     "DTZ006": "naive-datetime-in-a-persisted-artifact",
+    # A naive local clock read compared with naive-UTC database values is the
+    # commoner DTZ defect on web apps; DTZ001/005/006 can be either shape.
+    "DTZ001": "local-clock-compared-with-utc-store",
+    "DTZ011": "local-clock-compared-with-utc-store",
+    # Preview-only: mapped so the preview pass's hits carry the shape too.
+    "RUF027": "interpolation-placeholder-without-f-prefix",
 }
+
+# Rules whose hits can be either of several catalogued shapes. A finding's
+# `candidate_shapes` lists them (its `shape_id` first); each shape's
+# `differential` decides which one, if any, the site is.
+RULE_ALTERNATE_SHAPES = {
+    "DTZ001": ("naive-datetime-in-a-persisted-artifact",),
+    "DTZ005": ("local-clock-compared-with-utc-store",),
+    "DTZ006": ("local-clock-compared-with-utc-store",),
+}
+
+
+def candidate_shapes(code: str) -> list[str]:
+    """Every catalogued shape a hit of *code* may be: `shape_id` first."""
+    primary = RULE_TO_SHAPE.get(code)
+    return ([primary] if primary else []) + list(RULE_ALTERNATE_SHAPES.get(code, ()))
+
 
 _SUPPRESSION = re.compile(
     r"#\s*(noqa|type:\s*ignore|pylint:\s*disable|ruff:\s*noqa|nosec|pragma)",
@@ -1200,6 +1226,8 @@ def normalize(
         "preview": preview,
         # Non-null => merge with the scanner's finding, do not double-report.
         "shape_id": RULE_TO_SHAPE.get(code),
+        # More than one entry => let each shape's differential pick.
+        "candidate_shapes": candidate_shapes(code),
         # The strongest measured dismissal signal.
         "has_suppression_comment": bool(_SUPPRESSION.search(text)),
         **suppression_details(code, text),

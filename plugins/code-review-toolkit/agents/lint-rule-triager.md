@@ -151,12 +151,18 @@ Known-productive candidates from the benchmark runs that are still uncatalogued:
   dismissed mechanically (`sql-built-from-literals`), so the hits that remain interpolate a value
   from outside the file or from a parameter.
 
-Two former candidates are now catalogued, and their hits carry a `shape_id`, so merge them in
-Phase 2 instead of proposing them again: **`B905`** (`zip()` without `strict=`) →
-`zip-truncates-on-length-mismatch`, and **`DTZ005`/`DTZ006`** (naive `datetime.now()` /
-`fromtimestamp()`) → `naive-datetime-in-a-persisted-artifact`. The shapes are narrower than the
-rules: apply each shape's `differential`. A naive timestamp that never leaves the process is not
-that shape.
+Former candidates that are now catalogued carry a `shape_id`, so merge them in Phase 2 instead of
+proposing them again: **`B905`** (`zip()` without `strict=`) → `zip-truncates-on-length-mismatch`;
+the DTZ clock rules; and the preview-only **`RUF027`** (braces without an `f` prefix) →
+`interpolation-placeholder-without-f-prefix`. The shapes are narrower than the rules: apply each
+shape's `differential`.
+
+The DTZ rules can be either of two shapes, so their findings list both in `candidate_shapes`:
+**`DTZ001`/`DTZ005`/`DTZ006`/`DTZ011`** (a naive `now()`, `fromtimestamp()`, `datetime(...)` or
+`date.today()`) is `naive-datetime-in-a-persisted-artifact` when the value is written somewhere
+other programs read, `local-clock-compared-with-utc-store` when it is compared with or stored
+against naive-UTC database values, and neither when it never leaves the process (or its only use
+is `.timestamp()`). Follow the value to decide.
 
 ## Phase 5 — Report
 

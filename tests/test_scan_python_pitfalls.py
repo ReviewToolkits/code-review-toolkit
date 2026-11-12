@@ -2300,6 +2300,33 @@ class TestIntegrityErrorWithoutRollback(unittest.TestCase):
         self.assertNotIn(self.shape, shapes(reraise))
 
 
+class TestTranslationOfInterpolatedString(unittest.TestCase):
+    shape = "translation-lookup-of-interpolated-string"
+
+    def test_method_alias_with_fstring_and_concatenation(self):
+        src = (
+            "def view(self, name):\n"
+            "    self.request.session.flash(self.request._(f'Archived {name!r}'))\n"
+            "    flash(request._('Could not archive ' + f'{name!r}'))\n"
+            "    flash(_('Removed {}'.format(name)))\n"
+            "    flash(gettext('Removed %s' % name))\n"
+        )
+        found = [f for f in scan(src) if f["shape"] == self.shape]
+        self.assertEqual([f["line"] for f in found], [2, 3, 4, 5])
+
+    def test_literal_msgid_with_mapping_is_silent(self):
+        src = (
+            "def view(request, name):\n"
+            "    request._('Archived ${name}', mapping={'name': name})\n"
+            "    _('A literal message')\n"
+            "    request._(f'no placeholders')\n"
+        )
+        self.assertNotIn(self.shape, shapes(src))
+
+    def test_non_translation_call_is_silent(self):
+        self.assertNotIn(self.shape, shapes("print(f'{x}')\nlog.info('a' + b)\n"))
+
+
 _MODELS = (
     "from sqlalchemy.dialects.postgresql import JSONB\n"
     "from sqlalchemy.ext.mutable import MutableDict\n"
