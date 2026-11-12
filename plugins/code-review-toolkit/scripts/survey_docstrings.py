@@ -732,6 +732,11 @@ class ReferenceIndex:
     def packages(self) -> set[str]:
         return {m.split(".", 1)[0] for m in self.modules}
 
+    def is_package_prefix(self, dotted: str) -> bool:
+        """Whether some project module lives under *dotted*."""
+        prefix = dotted + "."
+        return any(m.startswith(prefix) for m in self.modules)
+
     def class_has(self, cls: str, member: str) -> bool | None:
         """Whether *cls* (or a project base of it) defines *member*; None when
         a base outside the project could supply it."""
@@ -770,6 +775,7 @@ class ReferenceIndex:
         ):
             return None  # a metric/logger/event name the code spells as a string
         if head in self.packages:
+            cut, mod = 0, ""
             for cut in range(len(parts), 0, -1):
                 mod = ".".join(parts[:cut])
                 if mod in self.modules:
@@ -777,6 +783,12 @@ class ReferenceIndex:
             rest = parts[cut:]
             if not rest:
                 return None
+            if self.is_package_prefix(f"{mod}.{rest[0]}"):
+                return None  # a sub-package (a namespace one has no module)
+            if mod not in self.modules:
+                return f"no module {mod}.{rest[0]}"
+            if "__getattr__" in self.modules[mod]:
+                return None  # PEP 562: the module computes its attributes
             if rest[0] not in self.modules[mod]:
                 return f"module {mod} has no {rest[0]}"
             if (
