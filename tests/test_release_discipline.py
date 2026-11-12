@@ -314,6 +314,7 @@ _DIFF_FIXTURE = {
 
 
 class TestDiffFindingsCoversEveryScript(unittest.TestCase):
+    maxDiff = None
     """Run each script on a small project; every top-level list it prints
     must be registered in diff_findings as findings or as inventory."""
 

@@ -77,6 +77,8 @@ _FINDING_LISTS: dict[str, dict[str, _Key]] = {
         "findings": ("file", "code"),
         # Hits the suppression-comment signal dismissed.
         "dismissed": ("file", "code"),
+        # Hits a `# noqa` hid, surfaced by the noqa-ignoring pass.
+        "noqa_suppressed": ("file", "code"),
     },
     "run_external_tools": {
         # One nested section per tool that ran.
@@ -108,6 +110,7 @@ _FINDING_LISTS: dict[str, dict[str, _Key]] = {
         "referenced_only_from_tests": ("file", "name", "type"),
         "orphan_files": ("file",),
         "commented_code_blocks": ("file", "preview"),
+        "write_only_attributes": ("file", "class", "attribute"),
     },
     "measure_complexity": {
         # qualified_name is `path/to/file.py::Class.method` -- file and symbol in one.
@@ -139,6 +142,12 @@ _FINDING_LISTS: dict[str, dict[str, _Key]] = {
     },
     "survey_docstrings": {
         "contract_issues": ("file", "function", "kind", "documented"),
+        "dead_references": ("file", "function", "reference"),
+    },
+    "diff_siblings": {
+        # One outlier entry per (group, feature): who lacks what most share.
+        "sibling_outliers": ("group", "feature"),
+        "helper_bypasses": ("file", "class", "helper"),
     },
     "analyze_imports": {
         "import_time_side_effects": ("file", "category", "operation"),
@@ -162,11 +171,21 @@ _SEQUENCE_LISTS: dict[str, tuple[str, ...]] = {
 # _COMMON_INVENTORY); test_release_discipline runs the scripts and fails on
 # one that is neither, so a new findings list cannot go undiffed silently.
 _COMMON_INVENTORY = frozenset(
-    {"warnings", "notes", "errors", "files", "files_unparsed"}
+    {
+        "warnings",
+        "notes",
+        "errors",
+        "files",
+        "files_unparsed",
+        "unparsed_files",
+        # Scope bookkeeping from scan_common's file selection.
+        "exclude_patterns",
+        "migration_dirs",
+    }
 )
 _INVENTORY_LISTS: dict[str, frozenset[str]] = {
     "scan_concurrency": frozenset({"guards", "module_state"}),
-    "run_lint_rules": frozenset({"unlinted"}),
+    "run_lint_rules": frozenset({"unlinted", "validated_versions"}),
     "run_external_tools": frozenset(
         {"tools_run", "tools_skipped", "configured_but_not_installed"}
     ),
@@ -199,6 +218,12 @@ _INVENTORY_LISTS: dict[str, frozenset[str]] = {
     # Facts about the findings it was given, not findings of its own.
     "annotate_findings": frozenset({"annotations", "skipped", "unmerged_branches"}),
     "map_findings_coverage": frozenset({"refs", "mutations"}),
+    "collect_debt": frozenset({"read_from_project_root"}),
+    "check_doc_refs": frozenset({"doc_files"}),
+    # Leads live in nested sections (`settings`, `routes`, `tasks`, ...), each
+    # with a `status`; not diffed yet.
+    "map_wiring": frozenset(),
+    "map_orm_schema": frozenset({"models"}),
     "find_threat_model": frozenset(
         {
             "policy",
@@ -218,6 +243,15 @@ _NOT_DIFFED: dict[str, str] = {
     "scan_common": "a library, not a script",
     "build_informed_briefing": "prints the Markdown briefing, not JSON",
     "diff_findings": "the differ itself",
+    # Phase 3 pipeline and run tooling: they read findings or run artifacts,
+    # not the reviewed project, so their output is never a scan to diff.
+    "merge_fragments": "folds slice fragments into findings.json",
+    "apply_verdicts": "applies reproduction verdicts to findings.json",
+    "build_public_tree": "writes a public findings tree",
+    "check_locations": "validates a findings.json's locations",
+    "leak_scan": "scans a publication tree for leaks",
+    "dump_tracker": "dumps and searches an issue tracker",
+    "sweep_fix_pattern": "sweeps for one fix commit's removed forms (needs --commit)",
     "security_gate": (
         "writes gate artifacts (claims-blind.json, signoff.json), judgements "
         "about findings rather than findings"
