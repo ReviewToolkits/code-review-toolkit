@@ -80,6 +80,20 @@ VALIDATED_RUFF_VERSIONS = ("0.16.0", "0.17.3")
 
 _RUFF_TIMEOUT = 300
 
+
+def _ruff_env() -> dict[str, str]:
+    """The environment for every ruff subprocess: caching off.
+
+    Every `ruff check` here also passes ``--no-cache``. A project's own config
+    (``cache-dir = ".cache/ruff"``) otherwise makes ruff write a cache INTO
+    the reviewed checkout, whatever the working directory. ``RUFF_NO_CACHE``
+    covers the invocations that take no ``--no-cache`` flag too.
+    """
+    import os
+
+    return {**os.environ, "RUFF_NO_CACHE": "true"}
+
+
 # ruff reports a file it could not read on stderr only -- "warning: Failed to
 # lint <path>: <reason>" -- and still exits 0 with an empty result. A
 # confined ruff (the snap package cannot see /tmp) therefore prints "All
@@ -1227,7 +1241,11 @@ def ruff_version(ruff_bin: str) -> str | None:
     """The version string of *ruff_bin*, or None if it cannot be run."""
     try:
         out = subprocess.run(
-            [ruff_bin, "--version"], capture_output=True, text=True, timeout=30
+            [ruff_bin, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_ruff_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -1308,6 +1326,7 @@ def validate_rules(ruff_bin: str, codes: list[str]) -> dict:
             capture_output=True,
             text=True,
             timeout=60,
+            env=_ruff_env(),
         )
         known = {r["code"]: r for r in json.loads(out.stdout)}
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError, KeyError):
@@ -1704,7 +1723,13 @@ def _run_ruff(
         cmd.append("--ignore-noqa")
     cmd.append(str(target))
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=_RUFF_TIMEOUT)
+        out = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=_RUFF_TIMEOUT,
+            env=_ruff_env(),
+        )
     except subprocess.TimeoutExpired:
         return [], "", f"ruff timed out after {_RUFF_TIMEOUT}s"
     except OSError as exc:
@@ -1734,6 +1759,7 @@ def _run_project_ruff(
             text=True,
             timeout=_RUFF_TIMEOUT,
             cwd=str(project_root),
+            env=_ruff_env(),
             check=False,  # exit 1 means "findings"; the code is read below
         )
     except (OSError, subprocess.SubprocessError) as exc:

@@ -875,6 +875,82 @@ class TestRuffBinResolution(unittest.TestCase):
         self.assertNotEqual(mod.PINNED_RUFF_VERSION, "0.16.0")
 
 
+RECORDING_RUFF = """\
+#!{python}
+import json, os, sys
+
+args = sys.argv[1:]
+with open({log!r}, "a", encoding="utf-8") as log:
+    log.write(json.dumps({{"args": args, "env": os.environ.get("RUFF_NO_CACHE")}}) + "\\n")
+if args[:1] == ["--version"]:
+    print("ruff 0.17.3")
+elif args[:1] == ["rule"]:
+    print("[]")
+else:
+    if "--no-cache" not in args and not os.environ.get("RUFF_NO_CACHE"):
+        # What a real ruff does under `cache-dir = ".cache/ruff"`.
+        os.makedirs(os.path.join({project!r}, ".cache", "ruff"), exist_ok=True)
+    sys.stdout.write("[]")
+"""
+
+
+class TestNoRuffCacheInTheProject(unittest.TestCase):
+    """A project's `cache-dir` must never make ruff write into the checkout."""
+
+    PYPROJECT = '[project]\nname = "x"\n\n[tool.ruff]\ncache-dir = ".cache/ruff"\n'
+
+    def test_every_ruff_invocation_disables_the_cache(self):
+        import json
+        import os
+        import sys
+        import tempfile
+        from pathlib import Path
+
+        from helpers import TempProject
+
+        with (
+            tempfile.TemporaryDirectory() as bindir,
+            TempProject({"pkg/m.py": "x = 1\n"}) as root,
+        ):
+            (root / "pyproject.toml").write_text(self.PYPROJECT, encoding="utf-8")
+            log = Path(bindir) / "calls.jsonl"
+            ruff = Path(bindir) / "ruff"
+            ruff.write_text(
+                RECORDING_RUFF.format(
+                    python=sys.executable, log=str(log), project=str(root)
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(ruff, 0o755)
+            mod.analyze(str(root / "pkg"), ruff_bin=str(ruff), tier=2)
+            mod._run_project_ruff(str(ruff), [root / "pkg" / "m.py"], root)
+            calls = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertFalse((root / ".cache").exists(), "ruff cache written")
+        checks = [c for c in calls if c["args"][:1] == ["check"]]
+        # The tiered pass, the --ignore-noqa pass, the project-config pass.
+        self.assertEqual(len(checks), 3)
+        for call in checks:
+            self.assertIn("--no-cache", call["args"])
+        for call in calls:
+            self.assertEqual(call["env"], "true")
+
+    def test_a_real_ruff_leaves_no_cache(self):
+        import shutil
+
+        from helpers import TempProject
+
+        ruff = shutil.which("ruff")
+        if ruff is None:
+            self.skipTest("no ruff on PATH")
+        with TempProject({"pkg/m.py": "import os\n"}) as root:
+            (root / "pyproject.toml").write_text(self.PYPROJECT, encoding="utf-8")
+            result = mod.analyze(str(root / "pkg"), ruff_bin=ruff, tier=2)
+            if result.get("error"):
+                self.skipTest(f"this ruff cannot lint a temp dir: {result['error']}")
+            self.assertFalse((root / ".cache").exists(), "ruff cache written")
+            self.assertFalse((root / ".ruff_cache").exists())
+
+
 class TestUnlintedPaths(unittest.TestCase):
     """ruff exits 0 with no findings for a path it could not read."""
 
