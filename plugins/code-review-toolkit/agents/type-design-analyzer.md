@@ -38,7 +38,7 @@ Key fields:
   `kind: "instance_attribute"` entries are the same for `self.x: T = ...` in `__init__`
 - `any_via_alias_usages`: annotations whose Any is reached **only through a type alias** (`body: Payload` where `Payload = dict[str, Any]`). Each names the `aliases` involved. On alias-heavy code this can exceed the direct count, so report both
 - `alias_inventory`: every module-level type alias with its `definition`, `contains_any` and `annotation_uses`. An alias of `dict[str, Any]` used 40 times is a container-choice question (TypedDict? dataclass?), not 40 separate Any findings
-- `container_inventory`: categorized data containers (dataclass, TypedDict, NamedTuple, Protocol, Enum, ABC), plus `pseudo-enum` (a class of UPPER_CASE constants acting as an enum) and `dict-subclass` / `list-subclass` / `set-subclass`
+- `container_inventory`: categorized data containers (dataclass, TypedDict, NamedTuple, Protocol, Enum, ABC), plus `pseudo-enum` (a class of UPPER_CASE constants acting as an enum), `dict-subclass` / `list-subclass` / `set-subclass`, `orm_model` (a declarative ORM model, its base, or a mixin that declares mapped columns) and `interface` (a zope-style interface declaration). On an ORM application the `orm_model` entries hold most of the type design: review them with §6
 - `unannotated_public_functions`: priority annotation targets (up to 50), each `{file, name, line}`; `unannotated_public_functions_total` is the uncapped count
 - `untyped_containers`: bare `list` / `dict` / `tuple` / `set` (and `List`, `Dict`, ...) in parameter, return and variable annotations, each `{file, line, content, annotation, where}`; `untyped_containers_total` is the uncapped count. Also per file as `files[].untyped_containers`
 - `inconsistent_parameters`: a parameter name annotated at some definitions and bare at others, with `annotated`, `unannotated`, `dominant_annotation`, `annotations` and sample `unannotated_sites`. `session: Session` in a few functions and bare `session` in dozens is dozens of unchecked boundaries whose type is already known
@@ -199,6 +199,38 @@ Check whether typing patterns are consistent across the codebase:
 - Consistent use of `Optional` vs. `X | None`
 - Consistent import style for typing constructs
 - Consistent approach to type narrowing (isinstance checks, TypeGuard)
+
+### 6. ORM Models and the Migrated Schema (if applicable)
+
+When `container_inventory` has `orm_model` entries, the model is a second type declaration that the
+database enforces and the type checker does not. Run the ORM pass:
+
+```bash
+python3 <plugin_root>/scripts/map_orm_schema.py [scope]
+```
+
+- `nullability.column_mismatches`: `nullable_but_annotation_not_optional` (the database accepts
+  NULL, `Mapped[X]` promises a value: a reader that dereferences it can get `None`) is the
+  FIX-grade kind; `not_null_but_annotation_optional` is CONSIDER. `server_default: true` narrows
+  how a NULL arrives but does not stop an explicit one.
+- `nullability.relationship_mismatches`: a scalar `Mapped[Target]` that can be `None` (nullable
+  foreign key, `secondary` table, the one-to-many side), with the `reason`.
+- `nullability.implicitly_nullable_columns`: `Column()` or an unannotated `mapped_column()` with no
+  `nullable=`, so NULL by default; check whether readers assume a value.
+- `migrations`: `declared_never_created` and `declared_but_dropped` (a named constraint the
+  migration history never created, or dropped later), `unnamed_checks_not_in_migrations` (a
+  model CHECK whose condition appears in no migration), `check_constraints_only_in_migrations`
+  (enforced by the database, unknown to the models, so a test database built from the models
+  lacks it). `created_by_dynamic_name` matched an f-string name: verify it by reading.
+- Each section says `"status": "not_detected"` when there are no models or no migrations.
+
+**Autogenerate drift checks are not schema diffs.** `alembic check` and `--autogenerate`
+(`compare_metadata`) do not report primary-key differences, CHECK constraints or duplicate indexes
+by default, and Django's `makemigrations --check` has similar blind spots. Never cite a clean drift
+check as proof that the schema matches the models. To confirm a lead, or when the static pass is
+not enough, follow `<plugin_root>/docs/orm-schema-diff.md`: build the migrated schema and the model
+schema in an export and compare primary keys, constraints and indexes from the database catalog,
+by definition as well as by name.
 
 ## Output Format
 
