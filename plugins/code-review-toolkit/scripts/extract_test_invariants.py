@@ -1190,6 +1190,26 @@ class CallIndex:
                 for name in calls:
                     self.callers[name].add(key)
 
+    def direct_callees(
+        self, keys: set[tuple[str, str]]
+    ) -> dict[tuple[str, str], tuple[str, str]]:
+        """Functions one call below *keys*, each mapped to one caller in *keys*.
+
+        Calls resolve by last name, so a name is followed only when it is
+        distinctive or defined once: `run` called from a tested function
+        does not make every `run` in the project reached.
+        """
+        reached: dict[tuple[str, str], tuple[str, str]] = {}
+        for key in sorted(keys):
+            for name in sorted(self.calls.get(key, ())):
+                targets = self.defs.get(name, set())
+                if not (_distinctive(name) or len(targets) == 1):
+                    continue
+                for target in sorted(targets):
+                    if target not in keys and target not in self.abstract:
+                        reached.setdefault(target, key)
+        return reached
+
     def chain(self, key: tuple[str, str]) -> list[tuple[str, str]]:
         """*key* and the same-named functions it reaches through calls.
 
@@ -1814,6 +1834,10 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
         for t in all_test_info
         if t.get("tested_function")
     }
+    # A function a tested function calls directly runs under that test (a
+    # service called by a tested route handler): not "untested", though its
+    # own behaviour may not be asserted. Marked, and listed after the rest.
+    reached = call_index.direct_callees(tested_funcs)
     untested_similar: list[dict] = []
     for test in selected:
         tested = test.get("tested_function")
@@ -1833,6 +1857,12 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
                     "invariant_types": test["invariant_types"],
                     "similarity_reason": sim["similarity_reason"],
                 })
+                via = reached.get((sim["file"], sim["function"]))
+                if via is not None:
+                    untested_similar[-1]["reached_indirectly"] = {
+                        "via": via[1],
+                        "file": via[0],
+                    }
 
     # Deduplicate untested_similar by function name
     seen: set[tuple[str, str]] = set()
@@ -1841,6 +1871,7 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
         if (item["file"], item["function"]) not in seen:
             seen.add((item["file"], item["function"]))
             deduped.append(item)
+    deduped.sort(key=lambda item: "reached_indirectly" in item)
     untested_similar_total = len(deduped)
     untested_similar = deduped[:20]
 
@@ -1892,6 +1923,10 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
             "untested_similar_functions": len(untested_similar),
             "untested_similar_functions_total": untested_similar_total,
             "untested_similar_functions_capped": untested_similar_total > 20,
+            # Of the total: called directly by a tested function.
+            "untested_similar_reached_indirectly": sum(
+                1 for item in deduped if "reached_indirectly" in item
+            ),
             "entry_point_siblings": min(entry_points_total, 20),
             "entry_point_siblings_total": entry_points_total,
             "entry_point_siblings_capped": entry_points_total > 20,

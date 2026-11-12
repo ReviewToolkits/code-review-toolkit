@@ -1,6 +1,7 @@
 """Tests for extract_test_invariants.py — test invariant extraction and propagation."""
 
 import unittest
+from typing import ClassVar
 
 from helpers import TempProject, import_script
 
@@ -1017,6 +1018,46 @@ class TestEntryPointSiblingRanking(unittest.TestCase):
     def test_the_cap_drops_the_least_telling_first(self):
         names = [s["function"] for s in self._siblings(max_results=3)]
         self.assertEqual(names, ["import_record", "rename_record", "purge_record"])
+
+
+class TestReachedIndirectly(unittest.TestCase):
+    """A function a tested function calls directly (the service under a
+    tested route handler) was listed as an untested similar function."""
+
+    _FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/clean.py": (
+            "def sanitize_input(data):\n"
+            "    if not data:\n"
+            "        raise ValueError('empty')\n"
+            "    return sanitize_payload(data)\n"
+            "def sanitize_payload(data):\n"
+            "    return data.strip()\n"
+            "def sanitize_header(data):\n"
+            "    return data.lower()\n"
+        ),
+        "tests/test_clean.py": (
+            "import pytest\n"
+            "from pkg.clean import sanitize_input\n"
+            "def test_sanitize_input_rejects_empty():\n"
+            "    with pytest.raises(ValueError):\n"
+            "        sanitize_input('')\n"
+        ),
+    }
+
+    def test_direct_callees_are_marked_and_listed_last(self):
+        with TempProject(self._FILES) as root:
+            result = mod.analyze(str(root))
+        untested = result["untested_similar_functions"]
+        self.assertEqual(
+            [u["function"] for u in untested], ["sanitize_header", "sanitize_payload"]
+        )
+        self.assertNotIn("reached_indirectly", untested[0])
+        self.assertEqual(
+            untested[1]["reached_indirectly"],
+            {"via": "sanitize_input", "file": "pkg/clean.py"},
+        )
+        self.assertEqual(result["summary"]["untested_similar_reached_indirectly"], 1)
 
 
 class TestFixCommitClassification(unittest.TestCase):
