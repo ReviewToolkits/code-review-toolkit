@@ -107,6 +107,23 @@ through it. If it cannot produce the value, the test is out of range: rerun the 
 does generate (in an exported copy). A defect that appears only then is a FIX the test was hiding. A defect that
 appears only with the impossible input is ACCEPTABLE.
 
+**Tests that call a view directly skip the rules its decorators and the framework enforce.** A unit test that calls
+`my_view(request)` bypasses everything wrapped around the view at registration: decorators (`@login_required`,
+a re-authentication check, `@csrf_protect`, a rate limiter), view derivers or middleware options set on the registration
+(`require_csrf=True`, `require_methods=`, a duplicate-key check on form posts), permission and predicate arguments
+(`permission=`, `request_method=`, `accept=`). Those rules are invariants too, and the direct-call test never sees
+them. For each tested view:
+
+1. List its registration: the decorators on the function, the `@view_config(...)`/`@app.route(...)` arguments, and
+   the derivers or middleware the project applies to every view (find them where the app is configured; on a web
+   app `map_wiring.py`'s `routes.declared` gives each route's `permissions` and `methods`).
+2. Write each rule as an invariant the direct-call tests do not exercise: "POST to this view without a CSRF token is
+   rejected", "a form with a repeated key is rejected", "the view requires re-authentication".
+3. Check whether any test drives the view through the app (a functional test client) and so exercises the rule. If
+   none does, check the sibling views: a rule enforced by a decorator on most siblings and missing from one is a
+   FIX candidate; a rule enforced only by a deriver the direct-call test skipped is an untested invariant
+   (CONSIDER), not a violation.
+
 ### Phase 3: Source Mapping and Similar Function Discovery
 
 For each extracted invariant:
