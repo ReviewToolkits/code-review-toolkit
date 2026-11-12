@@ -7,6 +7,7 @@ none. Several shapes need a call chain, so fixtures span functions and modules.
 
 import unittest
 from textwrap import dedent
+from typing import ClassVar
 
 from helpers import TempProject, import_script
 
@@ -1552,3 +1553,58 @@ class TestModelApplicability(unittest.TestCase):
         # note points at the sites.
         self.assertFalse(summary["model_applicable"])
         self.assertIn("4 distributed-lock site(s)", summary["model_note"])
+
+
+class TestSlowLockWitness(unittest.TestCase):
+    """The "meanwhile" holder a finding cites is the slowest, not the first."""
+
+    _FILES: ClassVar[dict] = {
+        "pkg/store.py": """
+            import subprocess, threading
+
+            class Store:
+                def __init__(self):
+                    self._state = threading.Lock()
+
+                def save_settings(self, path):
+                    with self._state:
+                        with open(path, "w") as fh:  # a quick, by-design hold
+                            fh.write("x")
+
+                def archive(self, src):
+                    with self._state:
+                        subprocess.run(["tar", "czf", "out.tgz", src])
+
+                def flush_metrics(self):
+                    with self._state:
+                        pass
+            """,
+        "pkg/app.py": """
+            import asyncio
+            from pkg.store import Store
+
+            async def flush_periodically(store: Store):
+                while True:
+                    await asyncio.sleep(10)
+                    store.flush_metrics()
+            """,
+    }
+
+    def test_the_slowest_holder_is_the_witness(self):
+        out = scan_project(self._FILES)
+        found = of(out["findings"], "transitive-blocking-call-in-async")
+        self.assertEqual(len(found), 1)
+        meanwhile = [step for step in found[0]["chain"] if "meanwhile" in step]
+        self.assertEqual(len(meanwhile), 1)
+        # The subprocess holder, not the file write found first in the file.
+        self.assertIn("archive", meanwhile[0])
+
+    def test_every_holder_is_listed_slowest_first(self):
+        holders = scan_project(self._FILES)["summary"]["slow_lock_holders"]
+        entry = holders["Store._state"]
+        self.assertEqual(entry["holders"], 2)
+        self.assertEqual(
+            [(h["category"], h["strong"]) for h in entry["top"]],
+            [("subprocess", True), ("file-io", True)],
+        )
+        self.assertIn("archive", entry["top"][0]["at"])

@@ -288,6 +288,8 @@ _MAX_CHAIN = 8
 # A method name defined by at most this many project classes resolves to all of
 # them, as weak edges (typically an interface, its implementation, a test double).
 _MAX_WEAK_CANDIDATES = 3
+# Distinct holders kept per slow lock (the slowest few are reported).
+_MAX_WITNESSES = 25
 
 
 # --------------------------------------------------------------------------
@@ -1800,6 +1802,10 @@ class Summaries:
         self.slow_strong: dict[
             str, bool
         ] = {}  # every hop of the witness resolved strongly
+        # Every distinct witness per slow lock: (where it starts) -> (category,
+        # strong, chain). `slow_locks` holds the slowest strong one.
+        self.slow_witnesses: dict[str, dict[tuple, tuple[str, bool, list[Step]]]] = {}
+        self.slow_category: dict[str, str] = {}
         self._direct()
         self._propagate()
         self._entry_locksets()
@@ -1938,26 +1944,46 @@ class Summaries:
         """Locks some code holds across blocking work: waiting for one is slow too.
 
         Holding L while waiting for a slow lock M makes L slow as well, so this
-        runs to a fixpoint. Each lock keeps one witness chain, preferring one whose
-        every hop resolved strongly.
+        runs to a fixpoint. Every distinct holder is kept as a witness; the one
+        a finding shows ("meanwhile, another thread holds ...") is the slowest
+        by blocking category (process/network before file I/O), preferring one
+        whose every hop resolved strongly. The first one found was often a
+        trivial hold, which left the finding unexplained.
         """
 
-        def mark(held: tuple[Held, ...], chain: list[Step], strong: bool) -> bool:
+        def rank(category: str) -> int:
+            order = _BLOCKING_ORDER
+            return order.index(category) if category in order else len(order)
+
+        def mark(
+            held: tuple[Held, ...], chain: list[Step], strong: bool, category: str
+        ) -> bool:
             changed = False
+            where = (chain[0].rel, chain[0].line, category)
             for h in held:
                 if h.anonymous or h.is_async:
                     continue
-                if h.key not in self.slow_locks or (
-                    strong and not self.slow_strong[h.key]
-                ):
-                    self.slow_locks[h.key] = chain
-                    self.slow_strong[h.key] = strong
+                witnesses = self.slow_witnesses.setdefault(h.key, {})
+                old = witnesses.get(where)
+                if old is not None and (old[1] or not strong):
+                    continue
+                if old is None and len(witnesses) >= _MAX_WITNESSES:
+                    continue
+                witnesses[where] = (category, strong, chain)
+                best = min(
+                    witnesses.values(),
+                    key=lambda w: (not w[1], rank(w[0]), len(w[2])),
+                )
+                if self.slow_locks.get(h.key) is not best[2]:
+                    self.slow_locks[h.key] = best[2]
+                    self.slow_strong[h.key] = best[1]
+                    self.slow_category[h.key] = best[0]
                     changed = True
             return changed
 
         for func in self.p.funcs.values():
-            for _category, name, node, held in func.direct_blocking:
-                mark(held, [self._step(func, node, f"{name}(...)")], True)
+            for category, name, node, held in func.direct_blocking:
+                mark(held, [self._step(func, node, f"{name}(...)")], True, category)
         for _ in range(20):
             changed = False
             for func in self.p.funcs.values():
@@ -1968,6 +1994,7 @@ class Summaries:
                             held,
                             [step, *self.slow_locks[lock.key]],
                             self.slow_strong[lock.key],
+                            self.slow_category[lock.key],
                         )
                 for call in func.calls:
                     if not call.held:
@@ -1981,7 +2008,10 @@ class Summaries:
                         ).items():
                             if category in _BLOCKING_CATEGORIES:
                                 changed |= mark(
-                                    call.held, [step, *chain], strong and cstrong
+                                    call.held,
+                                    [step, *chain],
+                                    strong and cstrong,
+                                    category,
                                 )
                         for key, (_lock, chain, cstrong, _same) in self.acquires.get(
                             callee, {}
@@ -1995,9 +2025,31 @@ class Summaries:
                                         *_meanwhile(_lock.text, self.slow_locks[key]),
                                     ],
                                     strong and cstrong and self.slow_strong[key],
+                                    self.slow_category[key],
                                 )
             if not changed:
                 break
+
+    def slow_holders(self, key: str, limit: int = 3) -> list[dict]:
+        """The slowest holders of slow lock *key*, slowest first."""
+        order = _BLOCKING_ORDER
+        ranked = sorted(
+            self.slow_witnesses.get(key, {}).values(),
+            key=lambda w: (
+                not w[1],
+                order.index(w[0]) if w[0] in order else len(order),
+                len(w[2]),
+            ),
+        )
+        return [
+            {
+                "category": category,
+                "strong": strong,
+                "at": chain[0].render(),
+                "chain": [step.render() for step in chain],
+            }
+            for category, strong, chain in ranked[:limit]
+        ]
 
 
 def _meanwhile(lock_text: str, witness: list[Step]) -> list[Step]:
@@ -3686,6 +3738,16 @@ def analyze(
         "guards_inferred": len(guards),
         "module_state_entries": len(module_state),
         "slow_locks": sorted(k.split(":", 1)[-1] for k in summaries.slow_locks),
+        # Per slow lock: how many distinct holders block under it, and the
+        # slowest few (process/network first, file I/O last; strongly resolved
+        # chains before name-only ones). The first is the one findings cite.
+        "slow_lock_holders": {
+            k.split(":", 1)[-1]: {
+                "holders": len(summaries.slow_witnesses.get(k, {})),
+                "top": summaries.slow_holders(k),
+            }
+            for k in sorted(summaries.slow_locks)
+        },
         # File I/O and pipe waits under a lock: mostly by design, so summarized
         # per lock instead of one finding each (--all-blocking lists them).
         "blocking_low_signal": {

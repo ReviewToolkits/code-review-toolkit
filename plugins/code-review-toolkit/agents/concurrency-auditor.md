@@ -51,6 +51,10 @@ Scan the package, not the tests: test fixtures take locks in odd ways on purpose
   and look for state you'd expect to be guarded that is missing from it.
 - **`slow_locks`** — locks some code holds across blocking work. Waiting for one of these is slow.
   Every `transitive-blocking-call-in-async` finding at `medium`/`high` goes through one.
+  `slow_lock_holders` gives, per slow lock, how many distinct holders block under it and the
+  slowest few (process/network/sleep first, file I/O last; strongly resolved chains first). The
+  "meanwhile, another thread holds ..." step of a finding's `chain` is the first of these; cite
+  it, and check the others when it does not convince you.
 - **`blocking_low_signal`** — file I/O and pipe waits under a lock, grouped by lock and by the leaf
   call the chains end in. Not findings: read it for a lock that is held across far more I/O than
   its purpose needs, and for pipes (a request/reply channel under a lock is where the desync hunt
