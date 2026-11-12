@@ -2,6 +2,7 @@
 
 import io
 import json
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -202,6 +203,82 @@ class TestLayoutDetection(unittest.TestCase):
     def test_missing_findings_file_is_an_error(self):
         result = mod.analyze(".", findings_path="/definitely/not/there.json")
         self.assertIn("error", result)
+
+
+class TestReformatsAndMerges(unittest.TestCase):
+    """Listed reformats and merge commits never become `introduced_by`."""
+
+    def _project(self, commits):
+        project = GitTempProject(commits)
+        root = project.__enter__()
+        self.addCleanup(project.__exit__, None, None, None)
+        return root
+
+    def _reformatted(self):
+        # The reformat swaps quote style: not layout only by _layout_key.
+        return self._project(
+            [
+                {"files": {"pkg/m.py": "x = 'a'\n"}, "message": "Add x"},
+                {"files": {"pkg/m.py": "x = 'b'\n"}, "message": "fix: use b"},
+                {"files": {"pkg/m.py": 'x = "b"\n'}, "message": "Reformat the tree"},
+            ]
+        )
+
+    def test_reformat_absorbs_introduced_by_without_an_ignore_file(self):
+        root = self._reformatted()
+        result = mod.analyze(
+            str(root), findings=[{"file": "pkg/m.py", "line": 1}], no_branches=True
+        )
+        ann = result["annotations"][0]
+        self.assertEqual(ann["introduced_by"]["message"], "Reformat the tree")
+        self.assertIsNone(result["blame_ignore_revs"])
+
+    def test_listed_reformat_is_skipped(self):
+        root = self._reformatted()
+        reformat = _git(root, "rev-parse", "HEAD")
+        (root / ".git-blame-ignore-revs").write_text(
+            f"# formatter run\n{reformat}\n", encoding="utf-8"
+        )
+        result = mod.analyze(
+            str(root), findings=[{"file": "pkg/m.py", "line": 1}], no_branches=True
+        )
+        ann = result["annotations"][0]
+        self.assertEqual(ann["introduced_by"]["message"], "fix: use b")
+        self.assertEqual(ann["skipped_ignore_revs"], [reformat[:7]])
+        self.assertEqual(ann["blame"]["message"], "fix: use b")
+        self.assertTrue(result["blame_ignore_revs"].endswith(".git-blame-ignore-revs"))
+
+    def test_read_ignore_revs_keeps_full_shas_only(self):
+        root = self._reformatted()
+        sha = _git(root, "rev-parse", "HEAD")
+        (root / ".git-blame-ignore-revs").write_text(
+            f"# comment\n{sha}  # trailing\nabc123\n\n", encoding="utf-8"
+        )
+        path, shas = mod.read_ignore_revs(root)
+        self.assertEqual(shas, frozenset({sha}))
+        self.assertEqual(path, root / ".git-blame-ignore-revs")
+
+    def test_conflict_resolving_merge_is_not_introduced_by(self):
+        root = self._project([{"files": {"pkg/m.py": "v = 1\n"}, "message": "Add v"}])
+        _git(root, "checkout", "-q", "-b", "feat")
+        (root / "pkg" / "m.py").write_text("v = 2\n", encoding="utf-8")
+        _git(root, "commit", "-qam", "Set v to two")
+        _git(root, "checkout", "-q", "main")
+        (root / "pkg" / "m.py").write_text("v = 3\n", encoding="utf-8")
+        _git(root, "commit", "-qam", "Set v to three")
+        _git(root, "checkout", "-q", "feat")
+        subprocess.run(
+            ["git", "merge", "-q", "main"], cwd=str(root), capture_output=True
+        )
+        (root / "pkg" / "m.py").write_text("v = 4\n", encoding="utf-8")
+        _git(root, "commit", "-qam", "Merge branch 'main' into feat")
+        result = mod.analyze(
+            str(root), findings=[{"file": "pkg/m.py", "line": 1}], no_branches=True
+        )
+        ann = result["annotations"][0]
+        subjects = [c["message"] for c in ann["line_history"]]
+        self.assertNotIn("Merge branch 'main' into feat", subjects)
+        self.assertFalse(ann["introduced_by"]["message"].startswith("Merge"))
 
 
 if __name__ == "__main__":

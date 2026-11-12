@@ -536,5 +536,90 @@ class TestTrackerKeyResolution(unittest.TestCase):
         self.assertEqual(keys["ABC-1"]["commits"], 1)
 
 
+def _commit(root, message, author, date):
+    import os
+    import subprocess
+
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": author,
+        "GIT_AUTHOR_EMAIL": "a@example.com",
+        "GIT_COMMITTER_NAME": author,
+        "GIT_COMMITTER_EMAIL": "a@example.com",
+        "GIT_AUTHOR_DATE": date,
+        "GIT_COMMITTER_DATE": date,
+    }
+    for args in (["add", "-A"], ["commit", "-q", "-m", message]):
+        subprocess.run(["git", *args], cwd=str(root), env=env, check=True)
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+class TestBlame(unittest.TestCase):
+    """Markers are dated by one blame per file, skipping listed reformats."""
+
+    def _project(self, root):
+        import subprocess
+
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(root), check=True)
+        (root / "mod.py").write_text(
+            "def f():\n    return 1  # TODO: handle zero\n"
+            "def g():\n    return 2  # FIXME: overflow\n",
+            encoding="utf-8",
+        )
+        _commit(root, "Add mod", "Early Author", "2015-03-01T12:00:00+00:00")
+        # A reformat: same code, new layout.
+        (root / "mod.py").write_text(
+            "def f():\n    return 1   # TODO: handle zero\n"
+            "def g():\n    return 2   # FIXME: overflow\n",
+            encoding="utf-8",
+        )
+        return _commit(root, "Reformat", "Format Bot", "2025-06-01T12:00:00+00:00")
+
+    def test_reformat_owns_the_lines_without_an_ignore_file(self):
+        with TempProject({}) as root:
+            self._project(root)
+            items = mod.scan_file(root / "mod.py", root, use_git=True)
+        self.assertEqual({i["author"] for i in items}, {"Format Bot"})
+
+    def test_ignore_revs_file_skips_the_reformat(self):
+        with TempProject({}) as root:
+            reformat = self._project(root)
+            (root / ".git-blame-ignore-revs").write_text(
+                f"# mass reformat\n{reformat}\n", encoding="utf-8"
+            )
+            blamer = mod.Blamer(root)
+            items = mod.scan_file(root / "mod.py", root, use_git=True, blamer=blamer)
+        self.assertEqual(blamer.ignore_revs_file, root / ".git-blame-ignore-revs")
+        self.assertEqual({i["author"] for i in items}, {"Early Author"})
+        self.assertEqual({i["date"][:4] for i in items}, {"2015"})
+        self.assertEqual({i["age"] for i in items}, {"ancient"})
+
+    def test_each_file_is_blamed_once(self):
+        with TempProject({}) as root:
+            self._project(root)
+            blamer = mod.Blamer(root)
+            items = mod.scan_file(root / "mod.py", root, use_git=True, blamer=blamer)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(blamer.files_blamed, 1)
+        self.assertIsNone(blamer.ignore_revs_file)
+
+    def test_parse_porcelain_reuses_metadata_by_sha(self):
+        sha = "a" * 40
+        text = (
+            f"{sha} 1 1 2\nauthor Ann\nauthor-time 0\nsummary s\n"
+            "filename m.py\n\tx = 1\n"
+            f"{sha} 2 2\n\ty = 2\n"
+        )
+        lines = mod.parse_blame_porcelain(text)
+        self.assertEqual(lines[2]["author"], "Ann")
+        self.assertEqual(lines[1]["date"], "1970-01-01T00:00:00+00:00")
+
+
 if __name__ == "__main__":
     unittest.main()

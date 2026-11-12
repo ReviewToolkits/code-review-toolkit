@@ -162,7 +162,7 @@ python3 <plugin_root>/scripts/annotate_findings.py [scope] --findings "$d/findin
 ```
 
 Per finding it reports:
-- `introduced_by`: the newest change to those lines that is not layout only, from `git log -L`, which follows renames. Re-indents, re-wraps and comment edits are skipped and listed in `skipped_layout_only`.
+- `introduced_by`: the newest change to those lines that is not layout only, from `git log -L`, which follows renames. Re-indents, re-wraps and comment edits are skipped and listed in `skipped_layout_only`; commits listed in the repository's `.git-blame-ignore-revs` (mass reformats) are skipped and listed in `skipped_ignore_revs` (`blame_ignore_revs` names the file, null when there is none); merge commits are never candidates.
 - `blame` (`git blame -w -C -C`) as a cross-check.
 - `pickaxe`, when you gave a `pattern`.
 - `first_release`: the first tag matching `--release-pattern`.

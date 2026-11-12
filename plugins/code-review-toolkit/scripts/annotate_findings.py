@@ -5,9 +5,11 @@ For each finding (a file and a line), report:
 - `introduced_by`: the newest commit that changed the finding's lines in a
   way that is not layout only (`git log -L`, which follows renames). Commits
   that only re-indented, re-wrapped or re-commented the lines are skipped
-  and listed in `skipped_layout_only`.
+  and listed in `skipped_layout_only`; commits listed in the repository's
+  `.git-blame-ignore-revs` are skipped and listed in `skipped_ignore_revs`;
+  merge commits are never candidates.
 - `blame`: the cross-check from `git blame -w -C -C` (whitespace-insensitive,
-  follows moves and copies).
+  follows moves and copies; honours `.git-blame-ignore-revs`).
 - `pickaxe` (when the finding gives `pattern`): the oldest commit that added
   that exact string (`git log -S`).
 - `first_release`: the first release tag containing `introduced_by`.
@@ -160,16 +162,49 @@ def parse_line_log(text: str) -> list[dict]:
     return commits
 
 
+def read_ignore_revs(git_root: Path) -> tuple[Path | None, frozenset[str]]:
+    """The repository's `.git-blame-ignore-revs` and the commits it lists.
+
+    Projects list their mass-reformat commits there. A reformat that also
+    changed quotes or wrapping is not layout only by `_layout_key`, so without
+    this list it absorbed `introduced_by` for every line it touched.
+    """
+    path = git_root / ".git-blame-ignore-revs"
+    if not path.is_file():
+        return None, frozenset()
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None, frozenset()
+    shas = set()
+    for line in text.splitlines():
+        token = line.split("#", 1)[0].strip()
+        if re.fullmatch(r"[0-9a-f]{40}", token):
+            shas.add(token)
+    return path, frozenset(shas)
+
+
 def line_history(
-    git_root: Path, rel: str, start: int, end: int, key_types: dict[str, str]
+    git_root: Path,
+    rel: str,
+    start: int,
+    end: int,
+    key_types: dict[str, str],
+    ignore_revs: frozenset[str] = frozenset(),
 ) -> list[dict] | None:
-    """Commits that changed lines start..end of `rel` (HEAD numbering)."""
+    """Commits that changed lines start..end of `rel` (HEAD numbering).
+
+    Merge commits are left out: a merge from the main branch that resolved a
+    conflict in these lines is not where they were written. A commit listed
+    in `.git-blame-ignore-revs` is marked `ignored_rev`.
+    """
     out = _git(
         [
             "-c",
             "core.quotepath=off",
             "log",
             f"-L{start},{end}:{rel}",
+            "--no-merges",
             "--no-color",
             "--no-ext-diff",
             "--format=%x00%H%x00%cI%x00%s",
@@ -185,6 +220,7 @@ def line_history(
             commit["removed"]
         ) == _layout_key(commit["added"])
         commit["type"] = classify_commit_detail(commit["subject"], key_types)["type"]
+        commit["ignored_rev"] = commit["sha"] in ignore_revs
     return history
 
 
@@ -195,14 +231,21 @@ def _commit_ref(sha: str, date: str, subject: str, ctype: str | None = None) -> 
     return ref
 
 
-def blame_line(git_root: Path, rel: str, line: int) -> dict | None:
-    """`git blame -w -C -C` of one line at HEAD, or None."""
+def blame_line(
+    git_root: Path, rel: str, line: int, ignore_revs_file: Path | None = None
+) -> dict | None:
+    """`git blame -w -C -C` of one line at HEAD, or None.
+
+    Honours `ignore_revs_file` (the repository's `.git-blame-ignore-revs`).
+    """
+    ignore = ["--ignore-revs-file", str(ignore_revs_file)] if ignore_revs_file else []
     out = _git(
         [
             "blame",
             "-w",
             "-C",
             "-C",
+            *ignore,
             "--porcelain",
             f"-L{line},{line}",
             "HEAD",
@@ -485,17 +528,23 @@ def annotate_one(
     out["function_span"] = [span[1], span[2]] if span else None
 
     # Introducing commit: newest change to the lines that is not layout only.
-    history = line_history(git_root, rel, line, end, options["key_types"])
+    history = line_history(
+        git_root, rel, line, end, options["key_types"], options["ignore_revs"]
+    )
     if history is None or not history:
         out["introduced_by"] = None
         out["introduced_reason"] = "git log -L found no history for these lines"
         out["line_history"] = []
     else:
         skipped = []
+        skipped_ignored = []
         introduced = None
         for commit in history:
             if commit["layout_only"]:
                 skipped.append(commit["sha"][:7])
+                continue
+            if commit["ignored_rev"]:
+                skipped_ignored.append(commit["sha"][:7])
                 continue
             introduced = commit
             break
@@ -508,9 +557,13 @@ def annotate_one(
         ]
         out["line_history_total"] = len(history)
         out["skipped_layout_only"] = skipped
+        # Listed in .git-blame-ignore-revs (mass reformats).
+        out["skipped_ignore_revs"] = skipped_ignored
         if introduced is None:
             out["introduced_by"] = None
-            out["introduced_reason"] = "every change to these lines was layout only"
+            out["introduced_reason"] = (
+                "every change to these lines was layout only or a listed reformat"
+            )
         else:
             out["introduced_by"] = _commit_ref(
                 introduced["sha"],
@@ -518,8 +571,10 @@ def annotate_one(
                 introduced["subject"],
                 introduced["type"],
             )
-            out["introduced_by"]["method"] = "git log -L, layout-only changes skipped"
-    out["blame"] = blame_line(git_root, rel, line)
+            out["introduced_by"]["method"] = (
+                "git log -L, merges, layout-only changes and listed reformats skipped"
+            )
+    out["blame"] = blame_line(git_root, rel, line, options["ignore_revs_file"])
 
     pattern = finding.get("pattern")
     if pattern:
@@ -551,6 +606,7 @@ def annotate_one(
             "log",
             f"-L{span[1]},{span[2]}:{rel}",
             "-s",
+            "--no-merges",
             "--format=%H%x00%cI%x00%s",
         ]
         if options["since"]:
@@ -656,7 +712,14 @@ def analyze(
                 ),
             }
 
-    options = {"key_types": key_types or {}, "release_re": release_re, "since": since}
+    ignore_revs_file, ignore_revs = read_ignore_revs(git_root)
+    options = {
+        "key_types": key_types or {},
+        "release_re": release_re,
+        "since": since,
+        "ignore_revs_file": ignore_revs_file,
+        "ignore_revs": ignore_revs,
+    }
     annotations: list[dict] = []
     skipped: list[dict] = []
     release_cache: dict = {}
@@ -696,6 +759,9 @@ def analyze(
             "findings_annotated": len(annotations),
             "skipped": skipped,
             "release_pattern": release_pattern,
+            # The .git-blame-ignore-revs honoured by blame and introduced_by,
+            # or null when the repository has none.
+            "blame_ignore_revs": str(ignore_revs_file) if ignore_revs_file else None,
             "unmerged_branches": branch_info,
             "annotations": annotations,
         }

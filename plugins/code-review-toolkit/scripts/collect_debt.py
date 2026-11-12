@@ -68,34 +68,99 @@ def _has_git(project_root: Path) -> bool:
     return (project_root / ".git").exists()
 
 
-def _git_blame_line(filepath: Path, lineno: int, project_root: Path) -> dict | None:
-    """Get git blame info for a specific line."""
+def find_ignore_revs_file(project_root: Path) -> Path | None:
+    """The repository's `.git-blame-ignore-revs`, when it has one.
+
+    Projects list their mass-reformat commits there. Blame that ignores the
+    file credits every reformatted line to the reformat, so years-old debt
+    reads as fresh and the reformat's author owns it.
+    """
     try:
         result = subprocess.run(
-            ["git", "blame", "-L", f"{lineno},{lineno}", "--porcelain", str(filepath)],
+            ["git", "rev-parse", "--show-toplevel"],
             capture_output=True,
             text=True,
             cwd=str(project_root),
             timeout=10,
+            check=False,
         )
-        if result.returncode != 0:
-            return None
-
-        author = None
-        timestamp = None
-        for line in result.stdout.splitlines():
-            if line.startswith("author "):
-                author = line[7:]
-            elif line.startswith("author-time "):
-                try:
-                    ts = int(line[12:])
-                    timestamp = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-                except (ValueError, OSError):
-                    pass
-
-        return {"author": author, "date": timestamp}
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    candidate = Path(result.stdout.strip()) / ".git-blame-ignore-revs"
+    return candidate if candidate.is_file() else None
+
+
+def parse_blame_porcelain(text: str) -> dict[int, dict]:
+    """{final line number: {"author", "date"}} from `git blame --porcelain`.
+
+    Porcelain prints a commit's metadata only the first time the commit
+    appears, so it is remembered by sha for the later lines.
+    """
+    by_sha: dict[str, dict] = {}
+    lines: dict[int, dict] = {}
+    current: dict | None = None
+    for row in text.splitlines():
+        if row.startswith("\t"):
+            continue
+        fields = row.split(" ")
+        if len(fields) >= 3 and len(fields[0]) == 40 and fields[2].isdigit():
+            current = by_sha.setdefault(fields[0], {"author": None, "date": None})
+            lines[int(fields[2])] = current
+        elif current is not None and row.startswith("author "):
+            current["author"] = row[7:]
+        elif current is not None and row.startswith("author-time "):
+            try:
+                ts = int(row[12:])
+                current["date"] = datetime.fromtimestamp(
+                    ts, tz=timezone.utc
+                ).isoformat()
+            except (ValueError, OSError):
+                pass
+    return lines
+
+
+class Blamer:
+    """Blames each file once, on first need, and answers per line.
+
+    One `git blame -L n,n` per marker took most of the run on a large tree;
+    a whole-file blame costs about the same as one line's. Honours the
+    repository's `.git-blame-ignore-revs`.
+    """
+
+    def __init__(self, project_root: Path):
+        self.project_root = project_root
+        self.ignore_revs_file = find_ignore_revs_file(project_root)
+        self.files_blamed = 0
+        self._cache: dict[Path, dict[int, dict] | None] = {}
+
+    def line(self, filepath: Path, lineno: int) -> dict | None:
+        if filepath not in self._cache:
+            self._cache[filepath] = self._blame(filepath)
+        lines = self._cache[filepath]
+        return None if lines is None else lines.get(lineno)
+
+    def _blame(self, filepath: Path) -> dict[int, dict] | None:
+        args = ["git", "blame", "--porcelain"]
+        if self.ignore_revs_file is not None:
+            args += ["--ignore-revs-file", str(self.ignore_revs_file)]
+        try:
+            result = subprocess.run(
+                [*args, "--", str(filepath)],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                cwd=str(self.project_root),
+                timeout=60,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return None
+        if result.returncode != 0:
+            return None
+        self.files_blamed += 1
+        return parse_blame_porcelain(result.stdout)
 
 
 def _classify_age(date_str: str | None) -> str:
@@ -118,8 +183,19 @@ def _classify_age(date_str: str | None) -> str:
         return "unknown"
 
 
-def scan_file(filepath: Path, project_root: Path, use_git: bool) -> list[dict]:
-    """Scan a file for debt markers."""
+def scan_file(
+    filepath: Path,
+    project_root: Path,
+    use_git: bool,
+    blamer: Blamer | None = None,
+) -> list[dict]:
+    """Scan a file for debt markers.
+
+    With `use_git`, each marker is dated by `blamer` (one is made when none
+    is passed; share one across files).
+    """
+    if use_git and blamer is None:
+        blamer = Blamer(project_root)
     try:
         lines = filepath.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
@@ -149,8 +225,8 @@ def scan_file(filepath: Path, project_root: Path, use_git: bool) -> list[dict]:
                     "context_after": context_after,
                 }
 
-                if use_git:
-                    blame = _git_blame_line(filepath, i, project_root)
+                if blamer is not None:
+                    blame = blamer.line(filepath, i)
                     if blame:
                         item["author"] = blame["author"]
                         item["date"] = blame["date"]
@@ -183,8 +259,8 @@ def scan_file(filepath: Path, project_root: Path, use_git: bool) -> list[dict]:
                 "context_after": lines[i].strip() if i < len(lines) else "",
                 "age": "unknown",
             }
-            if use_git:
-                blame = _git_blame_line(filepath, i, project_root)
+            if blamer is not None:
+                blame = blamer.line(filepath, i)
                 if blame:
                     item["author"] = blame["author"]
                     item["date"] = blame["date"]
@@ -984,9 +1060,10 @@ def main() -> None:
         all_files = all_files[:max_files]
     use_git = _has_git(project_root)
 
+    blamer = Blamer(project_root) if use_git else None
     all_items: list[dict] = []
     for f in all_files:
-        all_items.extend(scan_file(f, project_root, use_git))
+        all_items.extend(scan_file(f, project_root, use_git, blamer))
 
     # Aggregate stats.
     by_category: dict[str, int] = {}
@@ -1009,6 +1086,13 @@ def main() -> None:
         "files_analyzed": len(all_files),
         "files_capped": max_files > 0 and files_total > max_files,
         "git_available": use_git,
+        # The `.git-blame-ignore-revs` blame honoured (mass reformats), or null
+        # when the repository has none.
+        "blame_ignore_revs": (
+            str(blamer.ignore_revs_file)
+            if blamer is not None and blamer.ignore_revs_file is not None
+            else None
+        ),
         "summary": {
             "total_markers": len(all_items),
             "by_category": dict(sorted(by_category.items(), key=lambda x: -x[1])),
