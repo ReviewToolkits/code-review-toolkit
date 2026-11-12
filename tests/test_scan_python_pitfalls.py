@@ -809,6 +809,66 @@ class TestExceptExceptionTooBroadGrading(unittest.TestCase):
         self.assertEqual(broad(src)[0]["confidence"], "high")
 
 
+class TestExceptExceptionTooBroadHandlerCalls(unittest.TestCase):
+    """A handler that notifies and carries on still swallows the failure."""
+
+    def test_notifying_handlers_are_reported_and_graded(self):
+        # `flash()` / `capture_exception()` used to exempt the handler, so
+        # the shape reported zero on code whose broad catches all do this.
+        src = (
+            "def save(request, form):\n    try:\n        form.save()\n"
+            "    except Exception:\n        request.session.flash('failed')\n"
+            "def send(mailer, msg):\n    try:\n        mailer.send(msg)\n"
+            "    except Exception as exc:\n        sentry_sdk.capture_exception(exc)\n"
+        )
+        found = {f["line"]: f for f in broad(src)}
+        self.assertEqual(set(found), {4, 9})
+        # Durable call, narrow body: high, downgraded once for the report.
+        self.assertEqual(found[4]["confidence"], "medium")
+        self.assertIn("reports it via `flash()`", found[4]["detail"])
+        self.assertIn("capture_exception()", found[9]["detail"])
+
+    def test_an_unknown_helper_call_is_graded_with_a_pointer(self):
+        src = (
+            "def f(o, state):\n    try:\n        o.flush()\n"
+            "    except Exception:\n        state.mark_dirty()\n"
+        )
+        f = broad(src)
+        self.assertEqual(f[0]["confidence"], "medium")
+        self.assertIn("`mark_dirty()` -- read it", f[0]["detail"])
+
+    def test_raising_and_exiting_calls_are_not_swallowing(self):
+        for handler in (
+            "abort(500)",
+            "pytest.fail('boom')",
+            "sys.exit(1)",
+            "task.retry(exc=exc)",
+            "raise_conflict(exc)",
+        ):
+            src = (
+                "def f(o, task):\n    try:\n        o.flush()\n"
+                f"    except Exception as exc:\n        {handler}\n"
+            )
+            with self.subTest(handler=handler):
+                self.assertEqual(broad(src), [])
+
+    def test_a_tuple_including_exception_is_broad(self):
+        src = (
+            "def f(o):\n    try:\n        o.flush()\n"
+            "    except (ValueError, Exception):\n        pass\n"
+        )
+        f = broad(src)
+        self.assertEqual(f[0]["confidence"], "high")
+        self.assertIn("`except Exception:`", f[0]["message"])
+
+    def test_a_returned_denial_is_an_error_result(self):
+        src = (
+            "def check(v, ctx):\n    try:\n        v.verify(ctx)\n"
+            "    except Exception as exc:\n        return PermissionDenied(str(exc))\n"
+        )
+        self.assertEqual(broad(src), [])
+
+
 class TestCleanupOnlyOnSuccess(unittest.TestCase):
     def test_close_last_in_try_is_flagged(self):
         src = (

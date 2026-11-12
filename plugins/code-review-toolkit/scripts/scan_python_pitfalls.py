@@ -1357,6 +1357,89 @@ def _handler_swallows(handler: ast.ExceptHandler) -> bool:
     return True
 
 
+# Calls that leave the handler by raising or exiting: `abort(500)`,
+# `pytest.fail(...)`, `sys.exit(1)`, `raise_for_status()`, `task.retry()`.
+_RAISING_CALL_TAILS = frozenset(
+    {
+        "abort",
+        "fail",
+        "exit",
+        "_exit",
+        "reraise",
+        "throw",
+        "raise_for_status",
+        # A task queue's `task.retry(exc=...)` raises its retry exception.
+        "retry",
+    }
+)
+# Calls that tell a user or an operator about the failure without stopping
+# the caller: an error tracker, a flash message, a notification.
+_REPORTING_HINTS = (
+    "capture_exception",
+    "captureexception",
+    "capture_message",
+    "report",
+    "notify",
+    "flash",
+    "alert",
+    "sentry",
+)
+
+
+def _handler_exits(handler: ast.ExceptHandler) -> bool:
+    """True if the handler re-raises, or calls something that raises or exits."""
+    for node in ast.walk(handler):
+        if isinstance(node, ast.Raise):
+            return True
+        if isinstance(node, ast.Call):
+            tail = _call_tail(node)
+            if tail in _RAISING_CALL_TAILS or tail.startswith("raise_"):
+                return True
+    return False
+
+
+def _handler_calls(handler: ast.ExceptHandler) -> tuple[list[str], list[str]]:
+    """(reporting calls, other effectful calls) the handler makes.
+
+    Logging calls and side-effect-free helpers are neither: logging is graded
+    on its own, and a pure helper changes nothing.
+    """
+    reporting: list[str] = []
+    other: list[str] = []
+    for node in ast.walk(handler):
+        if not isinstance(node, ast.Call) or _logger_level(node) is not None:
+            continue
+        tail = _call_tail(node)
+        # A bare `error(...)` / `info(...)`: log-named, but with no logger
+        # receiver it is neither proven logging nor a report. Not counted.
+        if not tail or tail in _PURE_CALLS:
+            continue
+        if tail in _QUIET_LOG_METHODS or tail in _LOUD_LOG_METHODS:
+            continue
+        name = _dotted_name(node.func).lower()
+        if any(hint in name for hint in _REPORTING_HINTS):
+            reporting.append(tail)
+        else:
+            other.append(tail)
+    return reporting, other
+
+
+def _broad_handler_type(handler: ast.ExceptHandler) -> str | None:
+    """`Exception`/`BaseException` if the handler catches one, else None.
+
+    Also matches a dotted spelling (`builtins.Exception`) and a tuple that
+    includes one: `except (ValueError, Exception)` is just as broad.
+    """
+    types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    for node in types:
+        if node is None:
+            continue
+        name = _dotted_name(node).split(".")[-1]
+        if name in ("Exception", "BaseException"):
+            return name
+    return None
+
+
 # --- except-exception-too-broad grading -----------------------------------
 #
 # The size of the try body says little about whether a broad catch hides a
@@ -1484,7 +1567,7 @@ _PURE_CALLS = frozenset(
 )
 
 # A returned call whose name says it builds an error result.
-_ERROR_RESULT_HINTS = ("error", "fail", "reject", "abort", "problem")
+_ERROR_RESULT_HINTS = ("error", "fail", "reject", "abort", "problem", "denied")
 
 _EMPTY_CONTAINER_CALLS = frozenset({"dict", "list", "set", "tuple", "frozenset", "str"})
 
@@ -1820,29 +1903,49 @@ def _grade_broad_handler(
             conf, why = "high", _BROAD_DETAIL["in-domain"]
         else:
             conf, why = "medium", _BROAD_DETAIL["named-default"]
+    reporting, other = _handler_calls(handler)
     if loud:
         conf = _DOWNGRADE[conf]
         why += "; the handler logs at warning or above, so the failure is visible"
+    elif reporting:
+        conf = _DOWNGRADE[conf]
+        why += (
+            f"; the handler reports it via `{reporting[0]}()`, so a user or operator "
+            "sees it, but the caller still proceeds as if the operation worked"
+        )
+    elif other:
+        conf = _DOWNGRADE[conf]
+        why += (
+            f"; the handler calls `{other[0]}()` -- read it: dismiss if it "
+            "re-raises or records the failure"
+        )
     return conf, why
 
 
 def _check_except_exception_too_broad(tree: ast.AST) -> list[dict]:
     out: list[dict] = []
+    shape = "except-exception-too-broad"
     for node, following, fn, cls in _tries_in_context(tree):
         for handler in node.handlers:
-            if not isinstance(handler.type, ast.Name):
+            caught = _broad_handler_type(handler)
+            if caught is None:
                 continue
-            if handler.type.id not in {"Exception", "BaseException"}:
-                continue
-            if not _handler_swallows(handler):
+            _note(shape, "considered")
+            # Only a handler that re-raises or exits lets the failure out; one
+            # that returns an error result is graded (and suppressed) below.
+            # Any other call -- `flash()`, `capture_exception()`, a helper --
+            # used to exempt the handler outright, so the shape reported zero
+            # on code whose broad catches all notify and carry on.
+            if _handler_exits(handler):
+                _note(shape, "skipped", "re-raises-or-exits")
                 continue
             conf, why = _grade_broad_handler(node, handler, following, fn, cls)
             finding = _finding(
-                "except-exception-too-broad",
+                shape,
                 "CONSIDER" if conf in ("low", "suppressed") else "FIX",
                 conf,
                 handler,
-                f"`except {handler.type.id}:` swallows every failure of the "
+                f"`except {caught}:` swallows every failure of the "
                 f"guarded operation, not just the expected one",
                 why,
             )
