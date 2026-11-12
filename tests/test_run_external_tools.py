@@ -1508,6 +1508,84 @@ class TestVultureConfidence(unittest.TestCase):
         self.assertIn("--min-confidence=80", cmd)
 
 
+class TestVultureDeadSymbolsCrossCheck(unittest.TestCase):
+    """Vulture hits are tagged with what find_dead_symbols.py concluded."""
+
+    REPORT: ClassVar[dict] = {
+        "unreferenced_symbols": [
+            {"file": "pkg/a.py", "line": 20, "name": "helper", "type": "function"},
+        ],
+        "referenced_only_from_tests": [],
+    }
+
+    def _run(self, report):
+        with (
+            TempProject({"pkg/a.py": "x = 1\n"}) as root,
+            patch.object(mod.subprocess, "run") as run,
+        ):
+            run.return_value = MagicMock(stdout=VULTURE_OUTPUT, stderr="")
+            args = mod.parse_args([str(root)])
+            if report is not None:
+                path = root / "dead.json"
+                path.write_text(json.dumps(report), encoding="utf-8")
+                args.dead_symbols = str(path)
+            return mod.run_vulture(args, root, root)
+
+    def test_hits_are_tagged_with_the_scripts_verdict(self):
+        out = self._run(self.REPORT)
+        status = {f["name"]: f["script_status"] for f in out["findings"]}
+        # The script reports `helper` too: corroborated.
+        self.assertEqual(status["helper"], "unreferenced")
+        # A method the script checked and did not report: it found a
+        # reference or excluded it (framework base, registration...).
+        self.assertEqual(status["_open_writer"], "referenced_or_excluded")
+        # Imports and variables are outside what the script checks.
+        self.assertEqual(status["os"], "not_checked")
+        self.assertEqual(status["exc_tb"], "not_checked")
+        referenced = {f["name"]: f["script_referenced"] for f in out["findings"]}
+        self.assertTrue(referenced["_open_writer"])
+        self.assertFalse(referenced["helper"])
+        self.assertEqual(
+            out["script_cross_check"],
+            {"not_checked": 2, "referenced_or_excluded": 1, "unreferenced": 1},
+        )
+
+    def test_test_only_and_per_symbol_exclusions(self):
+        report = {
+            "unreferenced_symbols": [],
+            "referenced_only_from_tests": [
+                {"file": "pkg/a.py", "line": 20, "name": "helper"},
+            ],
+            "excluded_symbols": [
+                {
+                    "file": "pkg/a.py",
+                    "line": 10,
+                    "name": "Writer._open_writer",
+                    "reason": "framework_base",
+                },
+            ],
+        }
+        out = self._run(report)
+        by_name = {f["name"]: f for f in out["findings"]}
+        self.assertEqual(by_name["helper"]["script_status"], "test_only")
+        self.assertEqual(by_name["_open_writer"]["script_status"], "excluded")
+        self.assertEqual(
+            by_name["_open_writer"]["script_excluded_reason"], "framework_base"
+        )
+
+    def test_without_a_report_nothing_is_claimed(self):
+        out = self._run(None)
+        self.assertIsNone(out["script_cross_check"])
+        self.assertNotIn("script_status", out["findings"][0])
+
+    def test_an_unreadable_report_is_an_error_not_a_clean_check(self):
+        out = self._run({"not": "a report"})
+        self.assertIsNone(out["script_cross_check"])
+        self.assertIn(
+            "not a find_dead_symbols.py report", out["script_cross_check_error"]
+        )
+
+
 class TestMypyNotes(unittest.TestCase):
     """mypy notes are not findings; the parse is cross-checked."""
 

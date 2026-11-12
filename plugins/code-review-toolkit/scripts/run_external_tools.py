@@ -921,6 +921,84 @@ def parse_vulture_output(
     return findings
 
 
+# Vulture types whose symbol find_dead_symbols also checks (top-level functions,
+# classes and methods; a property is a decorated method there). Variables,
+# attributes and imports it does not check, so "absent from its output" says
+# nothing about those.
+_DEAD_SYMBOLS_CHECKED_TYPES = frozenset(
+    {"unused-function", "unused-method", "unused-class", "unused-property"}
+)
+
+
+def load_dead_symbols(path: str | None) -> tuple[dict | None, str | None]:
+    """Read a find_dead_symbols.py JSON report: ``(report, error)``."""
+    if not path:
+        return None, None
+    try:
+        report = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return None, f"could not read --dead-symbols {path}: {exc}"
+    if not isinstance(report, dict) or "unreferenced_symbols" not in report:
+        return None, f"--dead-symbols {path} is not a find_dead_symbols.py report"
+    return report, None
+
+
+def tag_vulture_with_dead_symbols(findings: list[dict], report: dict) -> dict:
+    """Mark each vulture hit with what find_dead_symbols.py concluded.
+
+    Vulture's 60% tier (functions, methods, classes) is mostly framework
+    dispatch it cannot see; find_dead_symbols already excludes registered,
+    framework-base and dispatch-prefixed symbols and follows references into
+    tests, docs and templates. Each hit gets ``script_status``:
+
+    - ``unreferenced``: the script reports it too (corroborated);
+    - ``test_only``: the script found references, but only from tests;
+    - ``excluded``: the script left it out on purpose (``script_excluded_reason``),
+      when the report lists per-symbol exclusions;
+    - ``referenced_or_excluded``: the script checked this kind of symbol and
+      reported nothing, so it found a reference or excluded it;
+    - ``not_checked``: a kind of symbol the script does not check.
+
+    ``script_referenced`` is True for ``test_only`` and
+    ``referenced_or_excluded``. Returns the per-status counts.
+    """
+
+    def index(entries: list[dict]) -> tuple[dict, dict]:
+        by_line, by_name = {}, {}
+        for entry in entries or []:
+            name = str(entry.get("name", "")).rsplit(".", 1)[-1]
+            by_line[(entry.get("file"), entry.get("line"))] = entry
+            by_name.setdefault((entry.get("file"), name), entry)
+        return by_line, by_name
+
+    tables = [
+        ("unreferenced", index(report.get("unreferenced_symbols", []))),
+        ("test_only", index(report.get("referenced_only_from_tests", []))),
+        ("excluded", index(report.get("excluded_symbols", []))),
+    ]
+    counts: dict[str, int] = {}
+    for finding in findings:
+        if finding.get("type") not in _DEAD_SYMBOLS_CHECKED_TYPES:
+            finding["script_status"] = "not_checked"
+            finding["script_referenced"] = False
+            counts["not_checked"] = counts.get("not_checked", 0) + 1
+            continue
+        key_line = (finding.get("file"), finding.get("line"))
+        key_name = (finding.get("file"), finding.get("name"))
+        status, matched = "referenced_or_excluded", None
+        for label, (by_line, by_name) in tables:
+            matched = by_line.get(key_line) or by_name.get(key_name)
+            if matched is not None:
+                status = label
+                break
+        finding["script_status"] = status
+        finding["script_referenced"] = status in ("test_only", "referenced_or_excluded")
+        if status == "excluded" and matched.get("reason"):
+            finding["script_excluded_reason"] = matched["reason"]
+        counts[status] = counts.get(status, 0) + 1
+    return dict(sorted(counts.items()))
+
+
 def run_vulture(
     args: argparse.Namespace, project_root: Path, scan_root: Path,
 ) -> dict:
@@ -941,6 +1019,14 @@ def run_vulture(
     # Parse everything, then cap: stopping the parse at max_findings made
     # `total_findings` equal the cap and `findings_capped` never true.
     findings = parse_vulture_output(result.stdout, project_root)
+    # Cross-check against find_dead_symbols.py when its report is given
+    # (`--dead-symbols`): tag every hit before capping, so counts are complete.
+    dead_symbols, dead_symbols_error = load_dead_symbols(
+        getattr(args, "dead_symbols", None)
+    )
+    script_cross_check = None
+    if dead_symbols is not None:
+        script_cross_check = tag_vulture_with_dead_symbols(findings, dead_symbols)
     normalized = findings[:args.max_findings]
 
     by_confidence: dict[str, int] = {}
@@ -950,7 +1036,7 @@ def run_vulture(
         by_confidence[key] = by_confidence.get(key, 0) + 1
         by_type[finding["type"]] = by_type.get(finding["type"], 0) + 1
 
-    return {
+    out = {
         "min_confidence": min_confidence,
         "total_findings": len(findings),
         "findings_capped": len(findings) > args.max_findings,
@@ -963,8 +1049,14 @@ def run_vulture(
             sorted(by_confidence.items(), key=lambda kv: -int(kv[0]))
         ),
         "by_type": dict(sorted(by_type.items())),
+        # Per `script_status` counts when a find_dead_symbols report was
+        # given; null when none was (not cross-checked, not "no overlap").
+        "script_cross_check": script_cross_check,
         "findings": normalized,
     }
+    if dead_symbols_error:
+        out["script_cross_check_error"] = dead_symbols_error
+    return out
 
 
 # ---------------------------------------------------------------------------
