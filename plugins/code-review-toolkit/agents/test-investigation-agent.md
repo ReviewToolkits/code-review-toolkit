@@ -25,6 +25,14 @@ python3 <plugin_root>/scripts/extract_test_invariants.py [scope] --with-git
 
 where `<plugin_root>` is the root of the code-review-toolkit plugin directory.
 
+- **An export has no `.git`.** If `[scope]` is an exported copy, add `--git-dir <checkout>` (the checkout directory
+  that matches the export's project root). Without history, `bug_fix_scan.status` is `no_git_history` and the
+  bug-fix counts are `null`: say "bug-fix tests not measured", never "no bug-fix tests".
+- **Raise the caps on a large suite.** By default 30 tests are selected (`summary.max_tests`, `tests_capped`), the last
+  100 commits and 30 fix commits are read (`bug_fix_scan`), and 15 bug-fix entries are printed. Use `--max-tests N`,
+  `--since DATE` / `--max-commits N` / `--max-fix-commits N` / `--all`, and `--max-bug-fix-groups N`. When tests live
+  outside the scan root under an unusual name, pass `--tests DIR` (and `--source DIR`).
+
 Parse the JSON output. Key fields:
 
 - `invariants[]`: Selected test functions with extracted assertions, invariant types, tested function mapping, and pre-computed similar functions.

@@ -10,9 +10,17 @@ Outputs a JSON structure with:
 - re_exports: __init__.py re-exports and __all__ declarations
 
 Usage:
-    python analyze_imports.py [path]
+    python analyze_imports.py [path] [--max-files N] [--exclude PAT[,PAT]]
 
     path: directory, file, or omitted for current directory
+
+Options:
+    --max-files N        Analyze at most N files
+    --exclude PAT[,PAT]  Leave out files whose project-relative path matches
+                         (repeatable; a plain pattern is a substring, a glob
+                         such as ``migrations/*`` matches at any depth).
+                         Excluded files are not counted; the envelope reports
+                         ``files_excluded`` and ``exclude_matches``.
 """
 
 import ast
@@ -25,9 +33,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scan_common import (  # noqa: E402
-    discover_python_files,
+    discover_python_files,  # noqa: F401 -- tests and callers use it from here
     find_project_root,
-    parse_common_args,
+    parse_scan_args,
+    select_python_files,
 )
 
 
@@ -1651,7 +1660,9 @@ def dynamic_cycles(
     return out
 
 
-def analyze(target: str, *, max_files: int = 0) -> dict:
+def analyze(
+    target: str, *, max_files: int = 0, exclude: list[str] | None = None
+) -> dict:
     """Import graph, metrics and cycles for *target* (see the module docstring)."""
     target_path = Path(target).resolve()
 
@@ -1659,10 +1670,13 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
     scan_root = target_path if target_path.is_dir() else project_root
     project_packages = identify_project_packages(project_root, scan_root)
 
-    all_files = sorted(discover_python_files(scan_root))
-    files_total = len(all_files)
-    if max_files > 0 and files_total > max_files:
-        all_files = all_files[:max_files]
+    selection = select_python_files(
+        scan_root,
+        project_root=project_root,
+        max_files=max_files,
+        exclude=exclude,
+    )
+    all_files, files_total = selection.files, selection.files_total
 
     file_analyses = [analyze_file(f, project_root, project_packages) for f in all_files]
 
@@ -1781,6 +1795,7 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
         "files_total": files_total,
         "files_analyzed": len(all_files),
         "files_capped": max_files > 0 and files_total > max_files,
+        **selection.envelope_fields(),
         "file_count": len(file_analyses),
         "files": file_analyses,
         "internal_graph": internal_graph,
@@ -1826,8 +1841,9 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
 
 
 def main() -> None:
-    target_arg, max_files = parse_common_args(sys.argv[1:], __doc__)
-    json.dump(analyze(target_arg, max_files=max_files), sys.stdout, indent=2)
+    args = parse_scan_args(sys.argv[1:], __doc__)
+    result = analyze(args.target, max_files=args.max_files, exclude=args.exclude)
+    json.dump(result, sys.stdout, indent=2)
     sys.stdout.write("\n")
 
 

@@ -864,6 +864,9 @@ def run_vulture(
     # Parse everything, then cap: stopping the parse at max_findings made
     # `total_findings` equal the cap and `findings_capped` never true.
     findings = parse_vulture_output(result.stdout, project_root)
+    # Most confident first, so the cap keeps the 90-100% hits (unused
+    # imports, unreachable code) rather than whatever vulture printed first.
+    findings.sort(key=lambda f: (-f["confidence"], f["file"], f["line"]))
     normalized = findings[:args.max_findings]
 
     by_confidence: dict[str, int] = {}

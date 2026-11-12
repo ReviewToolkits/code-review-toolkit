@@ -12,6 +12,12 @@ roadmap, commits that mention the key). Never touches the network.
 
 Usage:
     python collect_debt.py [path] [--max-files N] [--key-regex PATTERN]
+                           [--exclude PAT[,PAT]]
+
+``--exclude`` (repeatable, comma list) leaves out files whose project-relative
+path matches: a plain pattern as a substring, a glob (``migrations/*``) at any
+depth. Excluded files are not counted; the envelope reports ``files_excluded``
+and ``exclude_matches``.
 """
 
 import ast
@@ -27,9 +33,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scan_common import (  # noqa: E402
-    discover_python_files,
+    discover_python_files,  # noqa: F401 -- tests and callers use it from here
     find_project_root,
-    parse_common_args,
+    parse_scan_args,
+    select_python_files,
 )
 
 
@@ -965,8 +972,8 @@ def _extract_options(argv: list[str]) -> tuple[list[str], str | None]:
 
 def main() -> None:
     argv, key_regex = _extract_options(sys.argv[1:])
-    target_arg, max_files = parse_common_args(argv, __doc__)
-    target = Path(target_arg).resolve()
+    args = parse_scan_args(argv, __doc__)
+    target, max_files = Path(args.target).resolve(), args.max_files
     key_pattern: re.Pattern[str] | None = None
     if key_regex is not None:
         try:
@@ -978,10 +985,10 @@ def main() -> None:
 
     project_root = find_project_root(target)
     scan_root = target if target.is_dir() else project_root
-    all_files = sorted(discover_python_files(scan_root))
-    files_total = len(all_files)
-    if max_files > 0 and files_total > max_files:
-        all_files = all_files[:max_files]
+    selection = select_python_files(
+        scan_root, project_root=project_root, max_files=max_files, exclude=args.exclude
+    )
+    all_files, files_total = selection.files, selection.files_total
     use_git = _has_git(project_root)
 
     all_items: list[dict] = []
@@ -1008,6 +1015,7 @@ def main() -> None:
         "files_total": files_total,
         "files_analyzed": len(all_files),
         "files_capped": max_files > 0 and files_total > max_files,
+        **selection.envelope_fields(),
         "git_available": use_git,
         "summary": {
             "total_markers": len(all_items),

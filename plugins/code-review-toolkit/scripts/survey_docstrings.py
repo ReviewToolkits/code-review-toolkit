@@ -27,6 +27,12 @@ are listed under ``skipped``, never silently dropped.
 
 Usage:
     python survey_docstrings.py [path] [--max-files N] [--include-tests]
+        [--exclude PAT[,PAT]]
+
+``--exclude PAT[,PAT]`` (repeatable) leaves out files whose project-relative
+path matches: a plain pattern as a substring, a glob (``vendor/*``) at any
+depth. Excluded files are not counted; the envelope reports ``files_excluded``
+and ``exclude_matches``.
 """
 
 from __future__ import annotations
@@ -45,11 +51,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scan_common import (  # noqa: E402
     build_envelope,
-    collect_python_files,
     emit,
-    parse_common_args,
+    parse_scan_args,
     relative_to_root,
     resolve_target,
+    select_python_files,
 )
 
 _FUNC_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef)
@@ -1494,10 +1500,19 @@ def _summarize_coverage(surveys: list[FileSurvey]) -> dict:
     }
 
 
-def analyze(target: str, *, max_files: int = 0, include_tests: bool = False) -> dict:
+def analyze(
+    target: str,
+    *,
+    max_files: int = 0,
+    include_tests: bool = False,
+    exclude: list[str] | None = None,
+) -> dict:
     """Survey docstrings under *target* (a directory or a file)."""
     _resolved, project_root, scan_root = resolve_target(target)
-    files, files_total = collect_python_files(scan_root, max_files)
+    selection = select_python_files(
+        scan_root, project_root=project_root, max_files=max_files, exclude=exclude
+    )
+    files, files_total = selection.files, selection.files_total
     skipped_tests: list[str] = []
     unparseable: list[str] = []
     parsed: list[tuple[str, str, ast.Module]] = []
@@ -1538,7 +1553,7 @@ def analyze(target: str, *, max_files: int = 0, include_tests: bool = False) -> 
         return dict(sorted(out.items()))
 
     coverage = _summarize_coverage(surveys)
-    result = build_envelope(project_root, scan_root, files_total, len(files))
+    result = build_envelope(project_root, scan_root, files_total, len(files), selection)
     result["summary"] = {
         "files_surveyed": len(surveys),
         "coverage": {
@@ -1566,9 +1581,15 @@ def analyze(target: str, *, max_files: int = 0, include_tests: bool = False) -> 
 
 
 def main() -> None:
-    argv = sys.argv[1:]
-    target, max_files = parse_common_args(argv, __doc__)
-    emit(analyze(target, max_files=max_files, include_tests="--include-tests" in argv))
+    args = parse_scan_args(sys.argv[1:], __doc__, flags={"--include-tests"})
+    emit(
+        analyze(
+            args.target,
+            max_files=args.max_files,
+            include_tests="--include-tests" in args.flags,
+            exclude=args.exclude,
+        )
+    )
 
 
 if __name__ == "__main__":

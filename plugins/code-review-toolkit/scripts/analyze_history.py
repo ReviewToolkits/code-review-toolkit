@@ -23,9 +23,23 @@ Options:
     --key-type SPEC   Map tracker-key prefixes, or single keys, to commit
                       types, e.g. B=fix,F=feature or T4-12=fix (repeatable;
                       a key entry overrides its prefix's)
+    --exclude PAT[,PAT]
+                      Leave matching paths out of churn, co-change, function
+                      churn and the commit lists (repeatable; a plain pattern
+                      is a substring, a glob such as ``locale/*`` matches at
+                      any depth). A commit left with no path is dropped.
+    --exclude-author GLOB[,GLOB]
+                      Drop commits whose author name matches (case-insensitive
+                      glob, repeatable), e.g. a translation or dependency bot
+    --include-generated
+                      Keep generated files: by default locale catalogs
+                      (*.po, *.pot, *.mo) and lockfiles are left out, as if
+                      passed to --exclude. ``history_filters`` in the output
+                      says what every filter removed.
 """
 
 import ast
+import fnmatch
 import json
 import re
 import subprocess
@@ -40,6 +54,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scan_common import (  # noqa: E402
     find_project_root,
+    first_matching_pattern,
+    split_patterns,
 )
 
 # Keyword fallback for commit classification -- first CATEGORY wins. Each entry
@@ -1842,6 +1858,97 @@ def last_commit_date(git_root: Path, rel_scope: str) -> str | None:
     return result.stdout.strip() or None
 
 
+# Generated files that dominate churn and co-change without carrying review
+# signal: translation catalogs rewritten by a bot, lockfiles rewritten by a
+# resolver. Left out unless --include-generated.
+DEFAULT_GENERATED_GLOBS = (
+    "*.po",
+    "*.pot",
+    "*.mo",
+    "*.lock",
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "pnpm-lock.yaml",
+)
+
+
+def history_filter_spec(args: dict) -> dict:
+    """The path and author filters *args* asks for, ready for filter_log_lines."""
+    generated = [] if args["include_generated"] else list(DEFAULT_GENERATED_GLOBS)
+    return {
+        "exclude_patterns": list(args["exclude"]),
+        "generated_patterns": generated,
+        "exclude_authors": list(args["exclude_authors"]),
+    }
+
+
+def filter_log_lines(lines: Iterable[str], spec: dict, stats: dict) -> Iterable[str]:
+    """Drop excluded paths and authors from a `git log --numstat` stream.
+
+    Applied before parse_git_log, so file churn, co-change, function churn
+    and the fix/feature/refactor lists all see the same filtered history. A
+    commit by an excluded author is dropped whole; so is a commit none of
+    whose paths survive (a translation-bot sync), so it does not count as an
+    empty fix. *stats* receives the counts: commits and path entries
+    dropped, per path pattern and per author pattern.
+    """
+    patterns = [*spec["exclude_patterns"], *spec["generated_patterns"]]
+    authors = [a.lower() for a in spec["exclude_authors"]]
+    stats.setdefault("commits_dropped", 0)
+    stats.setdefault("commits_dropped_by_author", 0)
+    stats.setdefault("path_entries_dropped", 0)
+    by_pattern = stats.setdefault("path_matches", {p: 0 for p in patterns})
+    by_author = stats.setdefault("author_matches", {a: 0 for a in authors})
+    if not patterns and not authors:
+        yield from lines
+        return
+
+    header: str | None = None
+    kept: list[str] = []
+    had_paths = False
+    drop_author = False
+
+    def flush():
+        if header is None:
+            return []
+        if drop_author:
+            stats["commits_dropped"] += 1
+            stats["commits_dropped_by_author"] += 1
+            return []
+        if had_paths and not any(line.strip() for line in kept):
+            stats["commits_dropped"] += 1
+            return []
+        return [header, *kept]
+
+    for line in lines:
+        if line.startswith("COMMIT:"):
+            yield from flush()
+            header, kept, had_paths, drop_author = line, [], False, False
+            parsed = _parse_commit_header(line.rstrip("\n")[7:])
+            if parsed is not None and authors:
+                name = parsed[3].lower()
+                for pattern in authors:
+                    if fnmatch.fnmatchcase(name, pattern):
+                        by_author[pattern] += 1
+                        drop_author = True
+                        break
+            continue
+        if header is None:
+            yield line
+            continue
+        parts = line.rstrip("\n").split("\t", 2)
+        if len(parts) == 3 and patterns:
+            had_paths = True
+            _, new_path = split_rename(parts[2])
+            hit = first_matching_pattern(new_path, patterns)
+            if hit is not None:
+                by_pattern[hit] += 1
+                stats["path_entries_dropped"] += 1
+                continue
+        kept.append(line)
+    yield from flush()
+
+
 def parse_args(argv: list[str]) -> dict:
     """Parse command-line arguments."""
     args: dict = {
@@ -1856,6 +1963,9 @@ def parse_args(argv: list[str]) -> dict:
         "no_branches": False,
         "sweep_files": SWEEP_FILES,
         "key_types": {},
+        "exclude": [],
+        "exclude_authors": [],
+        "include_generated": False,
         "unknown_args": [],
     }
 
@@ -1924,6 +2034,13 @@ def parse_args(argv: list[str]) -> dict:
         elif arg == "--no-branches":
             args["no_branches"] = True
             i += 1
+        elif arg == "--include-generated":
+            args["include_generated"] = True
+            i += 1
+        elif arg in ("--exclude", "--exclude-author") and i + 1 < len(argv):
+            key = "exclude" if arg == "--exclude" else "exclude_authors"
+            args[key] = split_patterns([*args[key], argv[i + 1]])
+            i += 2
         elif arg == "--key-type" and i + 1 < len(argv):
             try:
                 args["key_types"].update(parse_key_types(argv[i + 1]))
@@ -1996,9 +2113,11 @@ def analyze(argv: list[str] | None = None) -> dict:
     # landed in reports/coveragepy_v1/analyze_history.json and made the report
     # unparseable -- the warning is written when the object is collected, which
     # is after the JSON has been dumped.
+    filter_spec = history_filter_spec(args)
+    filter_stats: dict = {}
     with _run_git_streaming(git_args, project_root) as proc:
         commits, file_churn = parse_git_log(
-            proc.stdout or [],
+            filter_log_lines(proc.stdout or [], filter_spec, filter_stats),
             max_commits,
             project_root,
             key_types,
@@ -2176,6 +2295,9 @@ def analyze(argv: list[str] | None = None) -> dict:
             "renames_followed": True,
         },
         "unmerged_branches": unmerged,
+        # What --exclude, --exclude-author and the default generated-file
+        # filter removed before any count above was taken.
+        "history_filters": {**filter_spec, **filter_stats},
         "notes": [],
     }
 
