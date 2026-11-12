@@ -75,6 +75,48 @@ _INERT_BASES = frozenset({
 
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
+# A dotted import path written as a string: `"pkg.mod.func"`, `"pkg.mod:Class"`,
+# `"pkg.mod:Class.method"`. Configuration and registration calls name symbols
+# this way (an extension list, a settings value, an entry point), so the symbol
+# has no Name or Attribute reference anywhere.
+_DOTTED_PATH = re.compile(
+    r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+(?::[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)?"
+    r"|[A-Za-z_]\w*:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*"
+)
+
+# A bare noqa comment suppresses every rule; one followed by `: F401, E402`
+# suppresses the listed codes only.
+_NOQA = re.compile(
+    r"#\s*noqa(?![\w-])(?:\s*:\s*(?P<codes>[A-Z]+[0-9]+(?:[\s,]+[A-Z]+[0-9]+)*))?"
+)
+
+
+def dotted_path_targets(text: str) -> set[str]:
+    """The symbol names a dotted-path string points at.
+
+    `"pkg.mod:Class.method"` -> {Class, method}; `"pkg.mod.func"` -> {func};
+    `"pkg.mod.Class.method"` -> {Class, method} (segments from the first
+    capitalised one on, which is where the module path usually ends).
+    """
+    if ":" in text:
+        return set(text.rpartition(":")[2].split("."))
+    parts = text.split(".")
+    names = {parts[-1]}
+    for index, part in enumerate(parts[1:], 1):
+        if part[:1].isupper():
+            names.update(parts[index:])
+            break
+    return names
+
+
+def _suppresses_f401(line: str) -> bool:
+    """Whether a source line carries a `# noqa` that covers F401."""
+    for match in _NOQA.finditer(line):
+        codes = match.group("codes")
+        if codes is None or "F401" in re.split(r"[\s,]+", codes):
+            return True
+    return False
+
 
 def _dotted(node: ast.AST) -> str:
     """`a.b.c` for a Name/Attribute chain, the callee for a Call, else ''."""
@@ -190,6 +232,22 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
             ):
                 result["has_main_guard"] = True
 
+    source_lines = source.splitlines()
+
+    def keep_reason(alias: ast.alias, node: ast.stmt) -> str | None:
+        """Why an import is deliberately kept although nothing uses it here:
+        a `# noqa` covering F401 (a re-export or an import for its side
+        effect), or the PEP 484 explicit re-export spelling `import x as x`."""
+        if alias.asname is not None and alias.asname == alias.name:
+            return "explicit_reexport"
+        lines = {_alias_line(alias, node), node.lineno, node.end_lineno or node.lineno}
+        if any(
+            0 < n <= len(source_lines) and _suppresses_f401(source_lines[n - 1])
+            for n in lines
+        ):
+            return "noqa_f401"
+        return None
+
     # Collect imports (what names are imported).
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -201,6 +259,7 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
                     "line": _alias_line(alias, node),
                     "statement_line": node.lineno,
                     "is_from": False,
+                    "keep_reason": keep_reason(alias, node),
                 })
         elif isinstance(node, ast.ImportFrom):
             for alias in node.names:
@@ -213,11 +272,11 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
                     "line": _alias_line(alias, node),
                     "statement_line": node.lineno,
                     "is_from": True,
+                    "keep_reason": keep_reason(alias, node),
                 })
 
     # `# pragma: debugging` marks a maintainer-only tool invoked by hand from a
     # debugger; being unreferenced is its normal state.
-    source_lines = source.splitlines()
 
     def debugging_pragma(node: ast.AST) -> bool:
         start = getattr(node, "lineno", 0)
@@ -308,6 +367,8 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             if _IDENTIFIER.fullmatch(node.value):
                 result["string_refs"].add(node.value)
+            elif _DOTTED_PATH.fullmatch(node.value):
+                result["string_refs"] |= dotted_path_targets(node.value)
         elif (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
@@ -333,8 +394,14 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
     return result
 
 
-def find_unused_imports(file_analysis: dict) -> list[dict]:
-    """Find imports whose local names are never referenced in the file."""
+def find_unused_imports(
+    file_analysis: dict, excluded: dict[str, int] | None = None
+) -> list[dict]:
+    """Find imports whose local names are never referenced in the file.
+
+    Imports kept on purpose (`# noqa: F401`, `import x as x`) are left out and
+    counted in *excluded* by reason.
+    """
     unused = []
     refs = file_analysis["referenced_names"]
     all_decl = file_analysis["all_declaration"]
@@ -356,6 +423,14 @@ def find_unused_imports(file_analysis: dict) -> list[dict]:
             continue
         # In __init__.py, imports may be re-exports even without __all__.
         if file_analysis["is_init"]:
+            continue
+        # A noqa covering F401, or `import x as x`: kept on purpose (a
+        # re-export, or an import run for its side effect). Counted, not
+        # reported.
+        if imp.get("keep_reason"):
+            if excluded is not None:
+                reason = imp["keep_reason"]
+                excluded[reason] = excluded.get(reason, 0) + 1
             continue
 
         unused.append({
@@ -713,6 +788,64 @@ def find_test_only_symbols(
     return test_only
 
 
+# Configuration files at the project root that name project symbols by dotted
+# path: a paste/ini `use = call:pkg.app:factory`, an extension list in a
+# `.cfg`, an entry point or plugin setting in `pyproject.toml`.
+_CONFIG_SUFFIXES = frozenset({".ini", ".cfg", ".toml", ".conf", ".yaml", ".yml"})
+_CONFIG_TOKEN = re.compile(r"(?<![\w.])[A-Za-z_][\w.]*(?::[A-Za-z_][\w.]*)*")
+
+
+def project_packages(all_files: list[dict]) -> set[str]:
+    """Top-level package (or module) names of the scanned files, relative to
+    the project root (a `src/` layout's `src` is skipped)."""
+    tops: set[str] = set()
+    for fa in all_files:
+        parts = Path(fa["file"]).with_suffix("").parts
+        if parts and parts[0] == "src" and len(parts) > 1:
+            parts = parts[1:]
+        if parts:
+            tops.add(parts[0])
+    return tops
+
+
+def config_dotted_refs(
+    project_root: Path, packages: set[str]
+) -> tuple[set[str], list[str]]:
+    """Symbols named by dotted path in the project root's configuration files,
+    and the files they came from. Only paths that start with one of the
+    project's own *packages* count, so `logging.handlers.X` adds nothing."""
+    names: set[str] = set()
+    files: list[str] = []
+    try:
+        entries = sorted(project_root.iterdir())
+    except OSError:
+        return names, files
+    for path in entries:
+        if not path.is_file() or path.suffix.lower() not in _CONFIG_SUFFIXES:
+            continue
+        try:
+            if path.stat().st_size > _MAX_TEMPLATE_BYTES:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        hit = False
+        for match in _CONFIG_TOKEN.finditer(text):
+            # `call:pkg.app:factory` -- the path starts at the first segment
+            # that names a project package.
+            parts = match.group(0).rstrip(".").split(":")
+            for index, part in enumerate(parts):
+                if part.split(".", 1)[0] in packages:
+                    dotted = ":".join(parts[index:])
+                    if "." in dotted or ":" in dotted:
+                        names |= dotted_path_targets(dotted)
+                        hit = True
+                    break
+        if hit:
+            files.append(path.name)
+    return names, files
+
+
 def find_orphan_files(
     all_files: list[dict], project_root: Path, external_refs: set[str] | None = None
 ) -> list[dict]:
@@ -983,11 +1116,17 @@ def main() -> None:
     # Templates inside the scanned tree are production code too.
     from_templates, template_files = template_refs(scan_root)
     external_refs |= from_templates
+    # So are dotted paths in the root's configuration files.
+    from_config, config_files = config_dotted_refs(
+        project_root, project_packages(file_analyses)
+    )
+    external_refs |= from_config
 
     # Find issues (before converting sets to lists).
     unused_imports: list[dict] = []
+    imports_kept: dict[str, int] = {}
     for fa in file_analyses:
-        unused_imports.extend(find_unused_imports(fa))
+        unused_imports.extend(find_unused_imports(fa, imports_kept))
 
     excluded_methods: dict[str, int] = {}
     excluded_functions: dict[str, int] = {}
@@ -1041,6 +1180,9 @@ def main() -> None:
         "files_capped": max_files > 0 and files_total > max_files,
         "summary": {
             "unused_imports": len(unused_imports),
+            # Unused imports left out on purpose: a noqa covering F401 (a
+            # re-export or a side-effect import) and `import x as x`.
+            "unused_imports_kept_by_reason": dict(sorted(imports_kept.items())),
             "unreferenced_symbols": len(unreferenced),
             # Methods are checked; these say how many were, and how many were
             # left out and why, so an empty list is never mistaken for "every
@@ -1058,6 +1200,9 @@ def main() -> None:
             # Template files (Jinja/HTML) whose `{{ }}`/`{% %}` blocks were read
             # as production references.
             "template_files_scanned": template_files,
+            # Root configuration files whose dotted paths (`pkg.mod:func`)
+            # were read as production references.
+            "config_files_scanned": config_files,
             "orphan_files": len(orphans),
             "commented_code_blocks": len(commented_code),
             "high_confidence_items": len(high_confidence),

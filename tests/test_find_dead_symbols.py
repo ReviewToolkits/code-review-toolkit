@@ -792,6 +792,108 @@ class TestSharedMethodNames(unittest.TestCase):
         self.assertNotIn("Other._close", unreferenced)
 
 
+class TestDottedPathReferences(unittest.TestCase):
+    """Symbols named only by a dotted-path string (`"pkg.mod.func"`,
+    `"pkg.mod:Class"`) in a registration call or a root config file were
+    reported unreferenced."""
+
+    def test_dotted_string_in_a_registration_call_is_a_reference(self):
+        files = {
+            "pkg/__init__.py": "",
+            "pkg/hooks.py": (
+                "def audit_hook(event):\n    return event\n"
+                "class AuditFilter:\n    pass\n"
+                "def orphan_hook(event):\n    return event\n"
+            ),
+            "pkg/app.py": (
+                "def setup(registry):\n"
+                "    registry.add('pkg.hooks.audit_hook')\n"
+                "    registry.add_filter('pkg.hooks:AuditFilter')\n"
+            ),
+        }
+        with TempProject(files) as root:
+            out = _run_main(root, root / "pkg")
+        unreferenced = {u["name"] for u in out["unreferenced_symbols"]}
+        self.assertNotIn("audit_hook", unreferenced)
+        self.assertNotIn("AuditFilter", unreferenced)
+        self.assertIn("orphan_hook", unreferenced)  # true negative
+
+    def test_dotted_path_in_a_root_config_file_is_a_reference(self):
+        files = {
+            "pkg/__init__.py": "",
+            "pkg/server.py": (
+                "def app_factory(config):\n    return config\n"
+                "def unused_factory(config):\n    return config\n"
+            ),
+            "serve.ini": "[app:main]\nuse = call:pkg.server:app_factory\n"
+            "[other]\nhandler = logging.handlers.unused_factory\n",
+        }
+        with TempProject(files) as root:
+            out = _run_main(root, root / "pkg")
+        unreferenced = {u["name"] for u in out["unreferenced_symbols"]}
+        self.assertNotIn("app_factory", unreferenced)
+        # A dotted path outside the project's packages names nothing here.
+        self.assertIn("unused_factory", unreferenced)
+        self.assertEqual(out["summary"]["config_files_scanned"], ["serve.ini"])
+
+    def test_dotted_path_targets(self):
+        self.assertEqual(mod.dotted_path_targets("pkg.mod.func"), {"func"})
+        self.assertEqual(
+            mod.dotted_path_targets("pkg.mod:Klass.method"), {"Klass", "method"}
+        )
+        self.assertEqual(
+            mod.dotted_path_targets("pkg.mod.Klass.method"), {"Klass", "method"}
+        )
+
+
+class TestKeptImports(unittest.TestCase):
+    """`# noqa: F401` imports (re-exports, side-effect imports) were reported
+    unused at high confidence."""
+
+    def _unused(self, source: str) -> tuple[list[str], dict]:
+        kept: dict = {}
+        with TempProject({"mod.py": source}) as root:
+            analysis = mod.analyze_file(root / "mod.py", root)
+            names = [u["name"] for u in mod.find_unused_imports(analysis, kept)]
+        return names, kept
+
+    def test_noqa_f401_import_is_kept_and_counted(self):
+        names, kept = self._unused(
+            "import plugin_loader  # noqa: F401 -- importing registers it\n"
+            "from os import sep  # noqa:E402,F401\n"
+            "from json import dumps  # noqa\n"
+        )
+        self.assertEqual(names, [])
+        self.assertEqual(kept, {"noqa_f401": 3})
+
+    def test_noqa_for_another_code_still_reports(self):
+        names, kept = self._unused("import json  # noqa: E402\n")
+        self.assertEqual(names, ["json"])
+        self.assertEqual(kept, {})
+
+    def test_explicit_reexport_spelling_is_kept(self):
+        names, kept = self._unused(
+            "from os import path as path\nfrom os import sep as separator\n"
+        )
+        self.assertEqual(names, ["separator"])
+        self.assertEqual(kept, {"explicit_reexport": 1})
+
+    def test_noqa_on_a_multiline_import_name_line(self):
+        names, _kept = self._unused(
+            "from os import (\n    sep,  # noqa: F401\n    pathsep,\n)\n"
+        )
+        self.assertEqual(names, ["pathsep"])
+
+    def test_summary_counts_kept_imports(self):
+        files = {"pkg/__init__.py": "", "pkg/a.py": "import json  # noqa: F401\n"}
+        with TempProject(files) as root:
+            out = _run_main(root, root / "pkg")
+        self.assertEqual(out["unused_imports"], [])
+        self.assertEqual(
+            out["summary"]["unused_imports_kept_by_reason"], {"noqa_f401": 1}
+        )
+
+
+
 if __name__ == "__main__":
     unittest.main()
-
