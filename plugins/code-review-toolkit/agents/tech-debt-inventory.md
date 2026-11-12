@@ -24,7 +24,7 @@ where `<plugin_root>` is the root of the code-review-toolkit plugin directory.
 Parse the JSON output. This gives you all explicit debt markers with full text, file/line locations, surrounding context, git blame author/date, and age classification. Use this as your factual foundation — do not re-grep for these markers manually.
 
 Key fields:
-- `items`: complete list of markers, each with `category`, `text`, `full_line`, `context_before`, `context_after`, `age`, `author`, `date`
+- `items`: complete list of markers, each with `category`, `text`, `full_line`, `context_before`, `context_after`, `age`, `author`, `date`. Markers outside `#` comments carry a `source`: `docstring` (a line of a docstring opens with the marker, such as a `Todo:` section), `string` (a placeholder value such as `"TODO"` that ships to users), `template` (`{# #}`, `<!-- -->`, `{% comment %}`), `stylesheet` (`/* */`, and `//` in SCSS/Less) or `script` (`/* */`, `//`). Vendored and minified files are skipped. `summary.by_source` counts them and `summary.non_python_files_scanned` says how many templates, stylesheets and scripts were read
 - `summary.total_markers`: total count
 - `summary.by_category`: counts per category (TODO, FIXME, HACK, XXX, NOQA, TYPE_IGNORE, PRAGMA_NO_COVER, NOSEC, PYLINT_DISABLE, SKIP, XFAIL). SKIP covers `@unittest.skip*`, `@pytest.mark.skip`/`skipif` (also as `@mark.skip`), `pytest.skip()`, `pytest.importorskip()` and `self.skipTest()`; XFAIL covers `@pytest.mark.xfail`, `pytest.xfail()` and `@unittest.expectedFailure`
 - `summary.by_age`: counts per age bucket (fresh/growing/stale/ancient/unknown)
@@ -43,6 +43,19 @@ Key fields:
     (`uses:` at a branch or with no ref) in CI files. A job allowed to fail is a gate that no longer
     gates: say which check it is
   - `markers`: TODO/FIXME/HACK/XXX comments in those files
+  - `warning_filters`: each pytest `filterwarnings` entry on its own (`entry`, `action`,
+    `comment_above`, `age`). An `ignore` entry whose comment links an upstream issue is a workaround:
+    check whether the issue is fixed in the installed version, and report stale ones with their age
+- `dependency_specs`, also from the project root: `declared` dependencies (pyproject, setup.py,
+  setup.cfg, requirements files) with `lower`/`upper` bounds, `floor_only`, `unbounded`, the
+  `installed` version and `installed_below_floor`; `lockfiles`; and `install_sites` (each install
+  command in CI, Dockerfiles, Makefile, tox/nox, with `uses_lockfile`). Installed versions come from
+  the project's own environment only: run the script with `VIRTUAL_ENV=<project venv>` set when one
+  exists outside the checkout. Without one, `installed` is `null` and `installed_reason` says why:
+  report that as unmeasured, never as "nothing installed"
+- `read_from_project_root` and `scan_scope_narrowed`: when the scope is a sub-directory, config
+  debt, dependency specs and tracker-key docs still come from the whole project. Say so when you
+  attribute them to the scoped package
 
 **Tracker keys.** Many projects track deferred work by key (`ABC-12`, `PROJ-7`, `R2-4`) in an issue
 tracker or a ROADMAP, and cite the key in code instead of writing TODO; a low marker count then
@@ -56,6 +69,15 @@ python3 <plugin_root>/scripts/collect_debt.py [scope] --key-regex '\b(?:ABC|PROJ
 Allow an optional letter suffix when the scheme has one (`\bABC-\d+[a-z]?\b`): `\b` cannot match
 between a digit and a letter, so `ABC-29b` is silently skipped otherwise.
 
+Keys are canonicalised: zero padding is dropped (`ABC-007` is `ABC-7`), and a forge issue or pull
+URL becomes `#N`, so it meets the `#N` mentions in changelogs and commits. When the regex has a
+capture group (or a named group `key`), the group is the key:
+`--key-regex '(?:https://forge\.example/org/repo/issues/|#)(?P<key>\d+)'` folds both spellings
+into the bare number. `key_variants` lists each key written more than one way, with every
+spelling's locations, and each bare key that sits beside lettered parts (`ABC-5` and `ABC-5a`). A
+variant spelling is documentation debt in its own right; a bare key next to its parts may be an
+umbrella row or a typo, so read the rows.
+
 `tracker_keys` then lists every key cited in comments, docstrings and docs (project root plus
 `docs/`/`doc/`, whatever the scope — `doc_scope` says so), each with `code_refs`, `doc_refs` (the
 line text, which in a roadmap row usually names the target version), `in_changelog`,
@@ -64,7 +86,16 @@ not searched) and `unmerged_commits`/`unmerged_refs` (commits on branches not me
 `struck_through` reads a key's own roadmap row: `~~KEY~~`, a wholly struck task cell
 (`| ABC-1 | ~~Faster index~~ | v1.0 |`) or a ticked `- [x]` item; a strike through a row that only
 mentions the key does not close it. Derived lists:
-- `open_in_code`: cited in code with no resolution signal — keyed open debt
+- `open_in_code`: cited in code with no resolution signal — keyed open debt, but only **unresolved
+  locally** (`open_in_code_status`): the script never contacts the forge. For each number in
+  `forge_refs_to_check`, check its state before calling it open, and drop or reclassify closed
+  issues and merged PRs (a comment pointing at a merged fix is usually a stale workaround):
+
+  ```bash
+  gh issue view 1234 --repo OWNER/REPO --json state,stateReason,title   # PRs: gh pr view
+  ```
+
+  If `gh` is unavailable or the forge is private, say the state was not checked.
 - `open_in_planning_docs`: in a roadmap/todo/backlog/plan file, not struck through, in no changelog
 - `conflicting_signals`: open in a planning doc, yet a changelog mentions it. Read both: the row may
   be stale, or the changelog may record only part of the work. Never count these as done
@@ -74,6 +105,13 @@ mentions the key does not close it. Derived lists:
 - `changelog_only_keys`: keys whose every mention is a changelog line; history, not debt, so their
   detail is omitted. On a GitHub-tracked project `#NNN` keys are mostly this: the useful inventory
   there is the open issues and pull requests, not the key list
+- `unaccounted`: per key prefix, the numbers between the lowest and highest seen that no code, doc
+  or commit mentions (`unaccounted_skipped` says which prefixes were left out: forge numbers, and
+  sparse or very wide ranges). A gap in a dense sequence is an item that was lost or never
+  recorded: search the unmerged branches and the commit bodies for it before reporting it
+- `overdue_planned_items`: open planning-doc rows whose target version (the highest version token
+  in the key's own row) is at or below `current_version` — promised for a release that has
+  shipped. `items` is `null`, with a `reason`, when no current version could be found
 
 These are heuristics: a commit that mentions a key may have started rather than finished it.
 Without `--key-regex`, `tracker_keys` is `null` and `tracker_keys_reason` says why — report that
@@ -142,9 +180,31 @@ Look for patterns that indicate debt without explicit markers:
 ### Dependency Debt
 
 - **Unbounded dependencies combined with reliance on internals**: a dependency declared without an
-  upper bound, while the project subclasses its classes, imports its private modules (`_internal`,
-  leading-underscore names) or patches it at runtime. That breaks on a routine upgrade; check
-  whether it already has (run the import, or the tests, against the latest release).
+  upper bound (`dependency_specs.floor_only` / `unbounded`), while the project subclasses its
+  classes, imports its private modules (`_internal`, leading-underscore names) or patches it at
+  runtime. That breaks on a routine upgrade; check whether it already has (run the import, or the
+  tests, against the latest release).
+  **When you suspect a break, find the version.** "This could break" is not actionable; "breaks at
+  2.4.0" is. In an exported copy, install candidate releases of the dependency into a throwaway
+  environment and bisect between the floor (or the installed version) and the latest release,
+  running the smallest check that shows the break (an import, one test):
+
+  ```bash
+  cd "$d" && python3 -m venv "$d/venv" && "$d/venv/bin/pip" install -q <copy>   # never the checkout
+  "$d/venv/bin/pip" index versions <dependency>      # the candidate releases
+  for v in 2.1.0 2.3.0 2.4.0; do                     # halve the range each round
+    "$d/venv/bin/pip" install -q "<dependency>==$v" &&
+    TMPDIR="$d" "$d/venv/bin/python" -c 'import <pkg>.<module>' && echo "$v ok" || echo "$v BREAKS"
+  done
+  ```
+
+  Report the first failing release and the last good one, and the bound that fixes it
+  (`<dependency><2.4`). If the bisect needs the network and it is unavailable, say the break is
+  unconfirmed.
+- **Below-floor installs and lockfile-free builds**: an `installed_below_floor` dependency means the
+  environment the tests ran in does not satisfy the declared bounds. An `install_sites` entry with
+  `uses_lockfile: false` in CI or a Dockerfile, while the project has `lockfiles`, means the shipped
+  image resolves dependencies fresh at build time: the tested set and the deployed set can differ.
 - **Runtime deprecations**: APIs the code calls that the installed Python or libraries already
   deprecate. If the test suite can run (in an exported copy), run it once with every warning shown
   and bucket them — `-W error::DeprecationWarning` stops at the first hit, and one repeated warning

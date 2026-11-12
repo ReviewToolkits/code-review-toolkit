@@ -103,6 +103,33 @@ they *do*:
 - Does one validate, normalize or check permissions where its siblings do?
 - Does one clean up on the error path where its siblings do?
 
+Start with `diff_siblings.py`, which makes the comparison systematic instead of depending on
+which files you happen to read:
+
+```bash
+python3 <plugin_root>/scripts/diff_siblings.py [scope] [--min-group 4] [--min-share 0.75]
+```
+
+- `sibling_outliers`: siblings are the methods of one class, the functions or methods sharing a
+  name prefix (`create_*`), and the functions project-wide sharing a registering decorator
+  (`decorator @route`). Each entry is a `feature` that `present_in` of `group_size` siblings have
+  and `missing_from` lacks: a call (`call:audit`), a decorator or one of its keywords
+  (`decorator_kwarg:route(permission=)`, `...(require_csrf=False)`), a keyword passed to a call
+  (`kwarg:client.get(timeout=)`), a context manager (`with:self._lock`) or an early-exit guard
+  (`guard:request.user`). A missing permission keyword, lock or timeout on one route or one method
+  is exactly the outlier this phase hunts.
+- `helper_bypasses`: per class, a `helper` that `callers` methods use to reach a
+  `wrapped_attribute` (an attribute, or a method shown as `name()`), and the methods `bypassing`
+  it by touching that resource directly. A method that reaches the database, the connection or the
+  lock without the helper every other method goes through is the classic damaging
+  outlier. Lifecycle methods (`open`, `close`, `reset`, ...) and the helper's own sub-helpers are
+  left out; a method that deliberately takes another path (a stronger lock, say) is a
+  legitimate difference: say so and dismiss it.
+
+Both lists are ranked candidates, not findings: read each sibling and decide whether it needs the
+missing feature. `summary.groups_examined` says how many sibling groups were compared; when
+`sibling_outliers` exceeds `sibling_outliers_listed`, say how many were left out.
+
 The majority behavior is the project's own standard; the outlier is the candidate bug. Leave
 general "same concern, different approach" analysis across modules to pattern-consistency-checker:
 this agent's job is the side-by-side comparison of close siblings, within a module or class.
@@ -257,6 +284,9 @@ These rules apply to every script call this agent makes.
   d=$(mktemp -d "${TMPDIR:-/tmp}/crt-consistency-auditor.XXXXXX") && echo "$d" &&
   python3 <plugin_root>/scripts/survey_conventions.py [scope] [options] > "$d/out.json" 2> "$d/out.err"; echo "exit=$?"
   ```
+
+  Run `diff_siblings.py` the same way, into the same directory under another name
+  (`> "$d/siblings.json" 2> "$d/siblings.err"`).
 
   Each Bash call is a fresh shell: a `$$` suffix or a shell variable does not survive into the next
   call. Reuse the literal path `echo` printed. Put your own scratch files in the same directory,

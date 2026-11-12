@@ -28,6 +28,7 @@ import ast
 import json
 import re
 import sys
+import textwrap
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -91,6 +92,48 @@ _INERT_BASES = frozenset({
 })
 
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+# A dotted import path written as a string: `"pkg.mod.func"`, `"pkg.mod:Class"`,
+# `"pkg.mod:Class.method"`. Configuration and registration calls name symbols
+# this way (an extension list, a settings value, an entry point), so the symbol
+# has no Name or Attribute reference anywhere.
+_DOTTED_PATH = re.compile(
+    r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+(?::[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)?"
+    r"|[A-Za-z_]\w*:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*"
+)
+
+# A bare noqa comment suppresses every rule; one followed by `: F401, E402`
+# suppresses the listed codes only.
+_NOQA = re.compile(
+    r"#\s*noqa(?![\w-])(?:\s*:\s*(?P<codes>[A-Z]+[0-9]+(?:[\s,]+[A-Z]+[0-9]+)*))?"
+)
+
+
+def dotted_path_targets(text: str) -> set[str]:
+    """The symbol names a dotted-path string points at.
+
+    `"pkg.mod:Class.method"` -> {Class, method}; `"pkg.mod.func"` -> {func};
+    `"pkg.mod.Class.method"` -> {Class, method} (segments from the first
+    capitalised one on, which is where the module path usually ends).
+    """
+    if ":" in text:
+        return set(text.rpartition(":")[2].split("."))
+    parts = text.split(".")
+    names = {parts[-1]}
+    for index, part in enumerate(parts[1:], 1):
+        if part[:1].isupper():
+            names.update(parts[index:])
+            break
+    return names
+
+
+def _suppresses_f401(line: str) -> bool:
+    """Whether a source line carries a `# noqa` that covers F401."""
+    for match in _NOQA.finditer(line):
+        codes = match.group("codes")
+        if codes is None or "F401" in re.split(r"[\s,]+", codes):
+            return True
+    return False
 
 
 def _dotted(node: ast.AST) -> str:
@@ -207,6 +250,22 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
             ):
                 result["has_main_guard"] = True
 
+    source_lines = source.splitlines()
+
+    def keep_reason(alias: ast.alias, node: ast.stmt) -> str | None:
+        """Why an import is deliberately kept although nothing uses it here:
+        a `# noqa` covering F401 (a re-export or an import for its side
+        effect), or the PEP 484 explicit re-export spelling `import x as x`."""
+        if alias.asname is not None and alias.asname == alias.name:
+            return "explicit_reexport"
+        lines = {_alias_line(alias, node), node.lineno, node.end_lineno or node.lineno}
+        if any(
+            0 < n <= len(source_lines) and _suppresses_f401(source_lines[n - 1])
+            for n in lines
+        ):
+            return "noqa_f401"
+        return None
+
     # Collect imports (what names are imported).
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -218,6 +277,7 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
                     "line": _alias_line(alias, node),
                     "statement_line": node.lineno,
                     "is_from": False,
+                    "keep_reason": keep_reason(alias, node),
                 })
         elif isinstance(node, ast.ImportFrom):
             for alias in node.names:
@@ -230,11 +290,11 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
                     "line": _alias_line(alias, node),
                     "statement_line": node.lineno,
                     "is_from": True,
+                    "keep_reason": keep_reason(alias, node),
                 })
 
     # `# pragma: debugging` marks a maintainer-only tool invoked by hand from a
     # debugger; being unreferenced is its normal state.
-    source_lines = source.splitlines()
 
     def debugging_pragma(node: ast.AST) -> bool:
         start = getattr(node, "lineno", 0)
@@ -325,6 +385,8 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             if _IDENTIFIER.fullmatch(node.value):
                 result["string_refs"].add(node.value)
+            elif _DOTTED_PATH.fullmatch(node.value):
+                result["string_refs"] |= dotted_path_targets(node.value)
         elif (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
@@ -347,11 +409,110 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
             if prefix:
                 result["dispatch_prefixes"].add(prefix)
 
+    attrs = _AttrCollector()
+    attrs.visit(tree)
+    result["attr_stores"] = attrs.stores
+    result["attr_loads"] = attrs.loads
+    result["class_declared"] = attrs.declared
+    result["dynamic_attr_classes"] = attrs.dynamic
+
     return result
 
 
-def find_unused_imports(file_analysis: dict) -> list[dict]:
-    """Find imports whose local names are never referenced in the file."""
+class _AttrCollector(ast.NodeVisitor):
+    """Instance-attribute stores (`self.x = ...` in a class), attribute loads
+    through any receiver, the names each class declares in its body, and the
+    classes that read their attributes dynamically (`vars(self)`,
+    `self.__dict__`, a computed `getattr(self, name)`)."""
+
+    _DYNAMIC_CALLS = frozenset({"vars", "asdict", "astuple"})
+
+    def __init__(self) -> None:
+        self.stores: list[dict] = []
+        self.loads: set[str] = set()
+        self.declared: dict[str, set[str]] = {}
+        self.dynamic: set[str] = set()
+        self._classes: list[str] = []
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        declared = self.declared.setdefault(node.name, set())
+        for child in node.body:
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                declared.add(child.name)
+                if child.name in ("__getstate__", "__reduce__", "__reduce_ex__"):
+                    self.dynamic.add(node.name)
+            targets: list[ast.expr] = []
+            if isinstance(child, ast.Assign):
+                targets = child.targets
+            elif isinstance(child, ast.AnnAssign):
+                targets = [child.target]
+            for target in targets:
+                for name in ast.walk(target):
+                    if isinstance(name, ast.Name):
+                        declared.add(name.id)
+            # `__slots__ = ("a", "b")` declares a and b.
+            if isinstance(child, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "__slots__" for t in targets
+            ):
+                for elt in ast.walk(child.value):
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        declared.add(elt.value)
+        self._classes.append(node.name)
+        self.generic_visit(node)
+        self._classes.pop()
+
+    def _store(self, target: ast.expr) -> None:
+        if (
+            self._classes
+            and isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id in ("self", "cls")
+        ):
+            self.stores.append(
+                {"class": self._classes[-1], "attr": target.attr, "line": target.lineno}
+            )
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if isinstance(node.ctx, ast.Store):
+            self._store(node)
+        elif isinstance(node.ctx, ast.Load):
+            self.loads.add(node.attr)
+            if (
+                node.attr == "__dict__"
+                and self._classes
+                and isinstance(node.value, ast.Name)
+                and node.value.id in ("self", "cls")
+            ):
+                self.dynamic.add(self._classes[-1])
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        # `self.n += 1` reads the attribute as well as writing it.
+        if isinstance(node.target, ast.Attribute):
+            self.loads.add(node.target.attr)
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        name = _dotted(node.func).rsplit(".", 1)[-1]
+        if self._classes and node.args and _is_self_receiver(node.args[0]):
+            computed = len(node.args) >= 2 and not (
+                isinstance(node.args[1], ast.Constant)
+            )
+            if name in self._DYNAMIC_CALLS or (
+                name in ("getattr", "attrgetter") and computed
+            ):
+                self.dynamic.add(self._classes[-1])
+        self.generic_visit(node)
+
+
+def find_unused_imports(
+    file_analysis: dict, excluded: dict[str, int] | None = None
+) -> list[dict]:
+    """Find imports whose local names are never referenced in the file.
+
+    Imports kept on purpose (`# noqa: F401`, `import x as x`) are left out and
+    counted in *excluded* by reason.
+    """
     unused = []
     refs = file_analysis["referenced_names"]
     all_decl = file_analysis["all_declaration"]
@@ -373,6 +534,14 @@ def find_unused_imports(file_analysis: dict) -> list[dict]:
             continue
         # In __init__.py, imports may be re-exports even without __all__.
         if file_analysis["is_init"]:
+            continue
+        # A noqa covering F401, or `import x as x`: kept on purpose (a
+        # re-export, or an import run for its side effect). Counted, not
+        # reported.
+        if imp.get("keep_reason"):
+            if excluded is not None:
+                reason = imp["keep_reason"]
+                excluded[reason] = excluded.get(reason, 0) + 1
             continue
 
         unused.append({
@@ -730,6 +899,153 @@ def find_test_only_symbols(
     return test_only
 
 
+def find_write_only_attributes(
+    all_files: list[dict],
+    outside_loads: set[str] | None = None,
+    *,
+    excluded: dict[str, int] | None = None,
+) -> list[dict]:
+    """Instance attributes assigned (`self.x = ...`) but never read anywhere.
+
+    A read is any load of the name through any receiver (`obj.x`, `self.x`,
+    `self.x += 1`) in any scanned file, a string constant naming it
+    (`getattr(o, "x")`), or a mention in *outside_loads* (tests, scripts and
+    templates outside the scanned files). Left out, and counted in *excluded*:
+    attributes the class hierarchy declares in its body (a column, a field, a
+    property or a slot: the store goes through it), classes with a framework
+    base (the framework may read `self.daemon` or `self.name`), classes that
+    read their attributes dynamically (`vars(self)`, `self.__dict__`, a
+    computed `getattr`), dunders, and test files.
+    """
+    loads = set(outside_loads or ())
+    for fa in all_files:
+        loads |= fa.get("attr_loads", set())
+        loads |= fa.get("string_refs", set())
+    framework = _framework_classes(all_files)
+    declared: dict[str, set[str]] = {}
+    dynamic: set[str] = set()
+    bases: dict[str, set[str]] = {}
+    for fa in all_files:
+        for cls, names in fa.get("class_declared", {}).items():
+            declared.setdefault(cls, set()).update(names)
+        dynamic |= fa.get("dynamic_attr_classes", set())
+        for cls, names in fa.get("class_bases", {}).items():
+            bases.setdefault(cls, set()).update(n.rsplit(".", 1)[-1] for n in names)
+    children: dict[str, set[str]] = {}
+    for cls, parents in bases.items():
+        for parent in parents:
+            children.setdefault(parent, set()).add(cls)
+
+    def closure(start: str, edges: dict[str, set[str]]) -> set[str]:
+        seen, stack = {start}, [start]
+        while stack:
+            for nxt in edges.get(stack.pop(), ()):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        return seen
+
+    def skip(reason: str) -> None:
+        if excluded is not None:
+            excluded[reason] = excluded.get(reason, 0) + 1
+
+    found: dict[tuple[str, str, str], dict] = {}
+    for fa in all_files:
+        for store in fa.get("attr_stores", ()):
+            cls, attr = store["class"], store["attr"]
+            key = (fa["file"], cls, attr)
+            if key in found:
+                found[key]["stores"] += 1
+                continue
+            if attr in loads:
+                continue
+            if attr.startswith("__") and attr.endswith("__"):
+                skip("dunder")
+                continue
+            if fa["is_test"]:
+                skip("test_file")
+                continue
+            related = closure(cls, bases) | closure(cls, children)
+            if any(attr in declared.get(c, ()) for c in related):
+                skip("declared_in_class")
+                continue
+            if related & framework:
+                skip("framework_base")
+                continue
+            if related & dynamic:
+                skip("dynamic_access")
+                continue
+            found[key] = {
+                "file": fa["file"],
+                "line": store["line"],
+                "class": cls,
+                "attribute": attr,
+                "stores": 1,
+                "is_public": not attr.startswith("_"),
+                # A public attribute may be read by code outside the project.
+                "confidence": "low" if not attr.startswith("_") else "medium",
+            }
+    return sorted(found.values(), key=lambda f: (f["file"], f["line"]))
+
+
+# Configuration files at the project root that name project symbols by dotted
+# path: a paste/ini `use = call:pkg.app:factory`, an extension list in a
+# `.cfg`, an entry point or plugin setting in `pyproject.toml`.
+_CONFIG_SUFFIXES = frozenset({".ini", ".cfg", ".toml", ".conf", ".yaml", ".yml"})
+_CONFIG_TOKEN = re.compile(r"(?<![\w.])[A-Za-z_][\w.]*(?::[A-Za-z_][\w.]*)*")
+
+
+def project_packages(all_files: list[dict]) -> set[str]:
+    """Top-level package (or module) names of the scanned files, relative to
+    the project root (a `src/` layout's `src` is skipped)."""
+    tops: set[str] = set()
+    for fa in all_files:
+        parts = Path(fa["file"]).with_suffix("").parts
+        if parts and parts[0] == "src" and len(parts) > 1:
+            parts = parts[1:]
+        if parts:
+            tops.add(parts[0])
+    return tops
+
+
+def config_dotted_refs(
+    project_root: Path, packages: set[str]
+) -> tuple[set[str], list[str]]:
+    """Symbols named by dotted path in the project root's configuration files,
+    and the files they came from. Only paths that start with one of the
+    project's own *packages* count, so `logging.handlers.X` adds nothing."""
+    names: set[str] = set()
+    files: list[str] = []
+    try:
+        entries = sorted(project_root.iterdir())
+    except OSError:
+        return names, files
+    for path in entries:
+        if not path.is_file() or path.suffix.lower() not in _CONFIG_SUFFIXES:
+            continue
+        try:
+            if path.stat().st_size > _MAX_TEMPLATE_BYTES:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        hit = False
+        for match in _CONFIG_TOKEN.finditer(text):
+            # `call:pkg.app:factory` -- the path starts at the first segment
+            # that names a project package.
+            parts = match.group(0).rstrip(".").split(":")
+            for index, part in enumerate(parts):
+                if part.split(".", 1)[0] in packages:
+                    dotted = ":".join(parts[index:])
+                    if "." in dotted or ":" in dotted:
+                        names |= dotted_path_targets(dotted)
+                        hit = True
+                    break
+        if hit:
+            files.append(path.name)
+    return names, files
+
+
 def find_orphan_files(
     all_files: list[dict], project_root: Path, external_refs: set[str] | None = None
 ) -> list[dict]:
@@ -790,6 +1106,66 @@ def find_orphan_files(
     return orphans
 
 
+def _parses(text: str) -> bool:
+    """Whether *text* is Python: as written, or as the header of a block
+    (`if x:`, `def f():`, `else:`) whose body was not part of the run."""
+    candidates = [text]
+    if text.rstrip().endswith(":"):
+        stub = text + "\n" + " " * 4 + "pass"
+        head = text.lstrip().split(None, 1)[0].rstrip(":")
+        if head in ("else", "elif", "except", "finally"):
+            opener = "try" if head in ("except", "finally") else "if x"
+            indent = text[: len(text) - len(text.lstrip())]
+            stub = f"{indent}{opener}:\n{indent}    pass\n{stub}"
+        candidates.append(stub)
+    for candidate in candidates:
+        try:
+            ast.parse(textwrap.dedent(candidate))
+        except (SyntaxError, ValueError, RecursionError):
+            continue
+        return True
+    return False
+
+
+def _code_line_count(comment_lines: list[str]) -> int:
+    """How many lines of a comment run parse as Python once de-commented.
+
+    Lines are grown into the shortest run that parses (a call spread over
+    several lines parses only as a whole); a line that starts no parseable run
+    within 20 lines is prose. A bare phrase that happens to parse (`Note`,
+    `see above`) is not counted: a parsed run must hold a statement that is
+    not just a name, or span more than one line.
+    """
+    body = [re.sub(r"^#\s?", "", line) for line in comment_lines]
+    if _is_code("\n".join(body)):
+        return len(body)
+    count = 0
+    start = 0
+    while start < len(body):
+        for end in range(start + 1, min(len(body), start + 20) + 1):
+            if _is_code("\n".join(body[start:end])):
+                count += end - start
+                start = end
+                break
+        else:
+            start += 1
+    return count
+
+
+def _is_code(chunk: str) -> bool:
+    """*chunk* parses, and is more than bare names (`Note`, `TODO`)."""
+    if not chunk.strip() or not _parses(chunk):
+        return False
+    try:
+        stmts = ast.parse(textwrap.dedent(chunk)).body
+    except (SyntaxError, ValueError, RecursionError):
+        return True  # a block header: it parses only with a stub body
+    return not all(
+        isinstance(st, ast.Expr) and isinstance(st.value, (ast.Name, ast.Constant))
+        for st in stmts
+    )
+
+
 def find_commented_code(filepath: Path, project_root: Path) -> list[dict]:
     """Find blocks of commented-out code (not documentation comments)."""
     try:
@@ -834,12 +1210,17 @@ def find_commented_code(filepath: Path, project_root: Path) -> list[dict]:
                     block_lines = []
                     break
                 lead -= 1
-            if len(block_lines) >= 3:  # At least 3 consecutive lines.
+            code_lines = _code_line_count(block_lines) if len(block_lines) >= 3 else 0
+            # At least 3 lines, and most of them must parse as Python once the
+            # `#` is removed: the pattern match alone merged prose comments
+            # with one code-like line (`x = value of the ...`) into a "block".
+            if code_lines >= 3 and code_lines * 2 > len(block_lines):
                 blocks.append({
                     "file": rel,
                     "line_start": block_start,
                     "line_end": block_start + len(block_lines) - 1,
                     "line_count": len(block_lines),
+                    "code_lines": code_lines,
                     "preview": block_lines[0][:80],
                 })
             i = j
@@ -993,11 +1374,21 @@ def main() -> None:
     # Templates inside the scanned tree are production code too.
     from_templates, template_files = template_refs(scan_root)
     external_refs |= from_templates
+    # So are dotted paths in the root's configuration files.
+    from_config, config_files = config_dotted_refs(
+        project_root, project_packages(file_analyses)
+    )
+    external_refs |= from_config
 
     # Find issues (before converting sets to lists).
     unused_imports: list[dict] = []
+    imports_kept: dict[str, int] = {}
     for fa in file_analyses:
-        unused_imports.extend(find_unused_imports(fa))
+        unused_imports.extend(find_unused_imports(fa, imports_kept))
+    attrs_excluded: dict[str, int] = {}
+    write_only = find_write_only_attributes(
+        file_analyses, external_refs | test_refs, excluded=attrs_excluded
+    )
 
     excluded_methods: dict[str, int] = {}
     excluded_functions: dict[str, int] = {}
@@ -1019,7 +1410,10 @@ def main() -> None:
 
     # Drop per-file reference sets to free memory.
     for fa in file_analyses:
-        for key in ("referenced_names", "plain_names", "other_attr_refs"):
+        for key in (
+            "referenced_names", "plain_names", "other_attr_refs", "attr_loads",
+            "attr_stores", "class_declared", "dynamic_attr_classes",
+        ):  # fmt: skip
             fa.pop(key, None)
         fa.pop("self_attr_refs", None)
 
@@ -1044,8 +1438,11 @@ def main() -> None:
         [u for u in unused_imports if u["confidence"] == "medium"]
         + [u for u in unreferenced if u["confidence"] == "medium"]
         + orphans
+        + [w for w in write_only if w["confidence"] == "medium"]
     )
-    low_confidence = [u for u in unreferenced if u["confidence"] == "low"]
+    low_confidence = [u for u in unreferenced if u["confidence"] == "low"] + [
+        w for w in write_only if w["confidence"] == "low"
+    ]
 
     output = {
         "project_root": str(project_root),
@@ -1058,6 +1455,9 @@ def main() -> None:
             # Migration files read as entry points (0 with --include-migrations).
             "migration_entry_points": len(entry_point_files),
             "unused_imports": len(unused_imports),
+            # Unused imports left out on purpose: a noqa covering F401 (a
+            # re-export or a side-effect import) and `import x as x`.
+            "unused_imports_kept_by_reason": dict(sorted(imports_kept.items())),
             "unreferenced_symbols": len(unreferenced),
             # Methods are checked; these say how many were, and how many were
             # left out and why, so an empty list is never mistaken for "every
@@ -1075,6 +1475,13 @@ def main() -> None:
             # Template files (Jinja/HTML) whose `{{ }}`/`{% %}` blocks were read
             # as production references.
             "template_files_scanned": template_files,
+            # Root configuration files whose dotted paths (`pkg.mod:func`)
+            # were read as production references.
+            "config_files_scanned": config_files,
+            "write_only_attributes": len(write_only),
+            "write_only_attributes_excluded_by_reason": dict(
+                sorted(attrs_excluded.items())
+            ),
             "orphan_files": len(orphans),
             "commented_code_blocks": len(commented_code),
             "high_confidence_items": len(high_confidence),
@@ -1086,6 +1493,7 @@ def main() -> None:
         "referenced_only_from_tests": test_only,
         "orphan_files": orphans,
         "commented_code_blocks": commented_code,
+        "write_only_attributes": write_only,
     }
 
     json.dump(output, sys.stdout, indent=2)

@@ -26,13 +26,15 @@ where `<plugin_root>` is the root of the code-review-toolkit plugin directory.
 Parse the JSON output. This gives you unused imports, unreferenced functions/classes, orphan files, and commented-out code blocks — all with confidence ratings. Use this as your factual foundation, then focus your effort on **verification and false-positive filtering**.
 
 Key fields:
-- `unused_imports`: with `confidence` ratings, accounting for `__all__` and `__init__.py` re-exports. `line` is the line of the imported **name** (the line ruff F401 reports), so the two merge by `file:line`; `statement_line` is where the `import` statement starts
+- `unused_imports`: with `confidence` ratings, accounting for `__all__` and `__init__.py` re-exports. `line` is the line of the imported **name** (the line ruff F401 reports), so the two merge by `file:line`; `statement_line` is where the `import` statement starts. Imports kept on purpose are left out and counted in `summary.unused_imports_kept_by_reason`: `noqa_f401` (a noqa comment that covers F401: a re-export or an import run for its side effect, such as one that registers a plugin) and `explicit_reexport` (`import x as x`)
 - `unreferenced_symbols`: functions, classes **and methods** (`type: "method"`) with no reference anywhere — not in the scanned tree, its tests, its scripts, its docs or its templates — with `confidence` ratings, accounting for magic methods, test discovery, and `__main__` guards. A private method with no reference is `medium`; a public one is `low`, because code outside the project may call it. When several classes define a method of the same name, a `self.`/`cls.`/`super().` call counts only within the calling class's hierarchy, so `A._load()` no longer keeps an unrelated `B._load()` alive; a call through any other receiver (`obj._load()`) still counts for every class
 - `referenced_only_from_tests`: production functions, classes and methods whose **only** references are in tests (`mentioned_in_docs` says whether the docs name it too). Not dead — removing one means editing tests, and it may be deliberate API — but a refactor often leaves exactly this behind: the production caller is gone and only the tests written for it keep it alive. Report as CONSIDER, never FIX
 - `orphan_files`: with `confidence` ratings
-- `commented_code_blocks`: with line ranges and previews
+- `write_only_attributes`: instance attributes assigned (`self.x = ...`) that nothing reads: no load of the name through any receiver in the scanned files, its tests, scripts or templates, and no string constant naming it. `medium` for a private attribute, `low` for a public one (code outside the project may read it). `summary.write_only_attributes_excluded_by_reason` counts the stores left out: `declared_in_class` (a column, field, property or slot in the class hierarchy: the store goes through it), `framework_base` (a framework may read `self.daemon` or `self.name`), `dynamic_access` (`vars(self)`, `self.__dict__`, a computed `getattr`), `dunder`, `test_file`
+- `commented_code_blocks`: with line ranges, previews and `code_lines` (how many lines of the run parse as Python once the `#` is removed)
 - `summary`: aggregate counts for each category plus high/medium/low confidence totals. `methods_excluded_by_reason` counts the methods a name-reference scan cannot judge and so left out: `dunder`, `sunder_hook` (`_missing_`), `test_file`, `decorated` (a registering decorator such as `@app.get(...)` or `@validator`), `property_accessor`, `framework_base` (the class inherits from a class outside the project, so a method may override a hook the framework calls), `dynamic_dispatch` (a computed `getattr(self, f"cmd_{x}")` can reach it). Say in the report how many methods were checked and how many were left out; never present an empty list as "every method is used"
 - `summary.functions_excluded_by_reason`: top-level functions left out because a decorator registers them (`@dispatcher.register(list)`, `@app.get(...)`, `@pytest.fixture`)
+- `summary.config_files_scanned`: configuration files at the project root (`.ini`, `.cfg`, `.toml`, `.yaml`, `.conf`) whose dotted paths into the project's own packages (`call:pkg.app:factory`, `pkg.ext.Extension`) were read as production references. A dotted-path string constant in Python code (`"pkg.mod.func"`, `"pkg.mod:Class"`) counts as a reference to the symbols it names, wherever it appears
 - `summary.template_files_scanned`: Jinja/HTML templates inside the scan whose `{{ }}`/`{% %}` blocks were read as production references. Templates elsewhere (a sibling `templates/` directory, a string template) are not read: Grep them before calling a symbol unused
 - `summary.external_reference_scope_kinds`: which directories outside the scan supplied references, as `test`, `docs` or `production` (`setup.py`, `scripts/`, `tools/`, `benchmarks/`, `examples/`, `bin/`)
 
@@ -149,13 +151,16 @@ Not covered by the script — check manually:
 - Platform checks for platforms the project doesn't support
 - Version checks for Python versions below the project's minimum
 
+### Write-Only Attributes
+The script's `write_only_attributes` lists stores with no read anywhere. Before reporting one, Grep the whole repository (including the unmerged branches, see below) for the attribute name, and check for readers the scan cannot see: serialization of the whole object (`pickle`, `copy`, `dataclasses.asdict` on a parent), a C extension or a framework reading it by name, or a comment that calls it a compatibility alias. A confirmed one is usually stranded by a refactor: say which commit removed the last reader.
+
 ### Unused Variables
 Not covered by the script — check manually:
 - Variables assigned but never read (especially in loops or conditional blocks)
 - Caught exception variables that are never used (`except SomeError as e:` where `e` is unused)
 
 ### Commented-Out Code
-The script's `commented_code_blocks` identifies significant blocks of commented-out code (3+ consecutive lines matching code patterns). Review each block — the script distinguishes code from documentation comments.
+The script's `commented_code_blocks` identifies significant blocks of commented-out code: a run of 3+ comment lines that starts with a code-like line, and most of whose lines parse as Python once the `#` is removed (`code_lines`). Prose that merely contains an assignment-like phrase (`ts = timestamp of the request`) no longer qualifies. Review each block: code kept as a worked example next to the code it explains is documentation, not dead code.
 
 ## Before Recommending a Removal
 

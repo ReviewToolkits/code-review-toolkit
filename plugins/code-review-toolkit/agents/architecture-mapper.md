@@ -128,6 +128,39 @@ The script provides the raw data; apply your judgment to assess significance:
   are lazy before rating a cycle.
 - Rate severity accordingly.
 
+**Import-first smoke run (every module, not only cycle members):** a module can fail when it is
+the first thing imported (a test runner, a worker or a tool loading it directly) even when the
+static graph shows no cycle: a parent `__init__` that imports a sibling which imports back, a
+registry filled as a side effect of another import, a name re-exported only after an import the
+package's usual entry point happens to make first. Import each module of the package first, each
+in a fresh interpreter, from the exported copy, and list the failures:
+
+```bash
+cd "$d" && PYTHONDONTWRITEBYTECODE=1 TMPDIR="$d" python3 -I - '<copy>' pkg <<'EOF' > "$d/import-first.txt" 2>&1
+import pathlib, subprocess, sys
+copy, pkg = sys.argv[1], sys.argv[2]
+mods = sorted(".".join(p.relative_to(copy).with_suffix("").parts).removesuffix(".__init__")
+              for p in pathlib.Path(copy, pkg).rglob("*.py") if p.name != "__main__.py")
+probe = ("import importlib, sys; sys.path.insert(0, sys.argv[1]); m = importlib.import_module(sys.argv[2]); "
+         "assert m.__file__.startswith(sys.argv[1]), m.__file__")
+for mod in mods:
+    run = subprocess.run([sys.executable, "-I", "-c", probe, copy, mod],
+                         capture_output=True, text=True, timeout=60)
+    if run.returncode:
+        print(mod, "FAILS:", (run.stderr.strip().splitlines() or ["?"])[-1])
+print(len(mods), "modules imported first")
+EOF
+```
+
+Run it with the project's own interpreter (its venv's `python3`) so third-party imports resolve.
+`__main__.py` is skipped (importing it runs the program). Skip what else cannot be imported on
+its own by design (migration revision files, modules that need a configured settings object) and
+say which you skipped. A
+`ModuleNotFoundError` for an optional dependency is environment, not a defect. A `cannot import
+name`, a partially initialised module or an `AttributeError` at import time is a real import-order
+defect: rate it FIX when a supported entry point (a worker, a CLI command, a test file) imports that
+module first, otherwise CONSIDER, and name the import chain from the traceback.
+
 **Layering violations:**
 - Use `internal_graph` to identify direction problems:
 - Utility/infrastructure modules importing from feature modules
