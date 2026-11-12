@@ -226,5 +226,93 @@ class TestScannersCountAfterExclusion(unittest.TestCase):
         )
 
 
+class TestHistoryFilters(unittest.TestCase):
+    """analyze_history: --exclude, --exclude-author and generated files."""
+
+    def setUp(self):
+        self.mod = import_script("analyze_history")
+
+    def _repo(self, root: Path) -> None:
+        _git(root, "init", "-q", "-b", "main")
+        _git(root, "add", "-A")
+        _git(root, "commit", "-q", "-m", "Add core")
+        for i in range(2):
+            (root / "locale/messages.pot").write_text(f"msgid {i}\n", encoding="utf-8")
+            (root / "locale/fr.po").write_text(f"msgstr {i}\n", encoding="utf-8")
+            _git(root, "add", "-A")
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Catalog Bot",
+                    "-c",
+                    "user.email=b@example.com",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "Update translations",
+                ],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+        (root / "pkg/core.py").write_text(
+            "def work():\n    return 2\n", encoding="utf-8"
+        )
+        (root / "pkg/vendor.py").write_text("V = 2\n", encoding="utf-8")
+        _git(root, "commit", "-q", "-am", "Fix work")
+
+    FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/core.py": "def work():\n    return 1\n",
+        "pkg/vendor.py": "V = 1\n",
+        "locale/messages.pot": "",
+        "locale/fr.po": "",
+    }
+
+    def _run(self, root: Path, *flags: str) -> dict:
+        return self.mod.analyze([str(root), "--no-branches", "--days", "30", *flags])
+
+    def test_generated_catalogs_are_left_out_by_default(self):
+        with TempProject(self.FILES) as root:
+            self._repo(root)
+            result = self._run(root)
+            kept = self._run(root, "--include-generated")
+        files = {f["file"] for f in result["file_churn"]}
+        self.assertFalse({"locale/fr.po", "locale/messages.pot"} & files)
+        # The two catalog-only commits are dropped, not left as empty commits.
+        self.assertEqual(result["summary"]["total_commits"], 2)
+        self.assertEqual(result["history_filters"]["commits_dropped"], 2)
+        self.assertEqual(result["history_filters"]["path_matches"]["*.po"], 3)
+        self.assertIn("locale/fr.po", {f["file"] for f in kept["file_churn"]})
+        self.assertEqual(kept["summary"]["total_commits"], 4)
+
+    def test_exclude_path_and_author(self):
+        with TempProject(self.FILES) as root:
+            self._repo(root)
+            result = self._run(
+                root,
+                "--include-generated",
+                "--exclude",
+                "pkg/vendor.py",
+                "--exclude-author",
+                "*bot*",
+            )
+        files = {f["file"] for f in result["file_churn"]}
+        self.assertNotIn("pkg/vendor.py", files)
+        self.assertIn("pkg/core.py", files)
+        self.assertEqual(result["history_filters"]["commits_dropped_by_author"], 2)
+        self.assertEqual(result["summary"]["total_commits"], 2)
+        self.assertNotIn("unknown_args", result)
+
+    def test_filter_is_a_no_op_without_patterns(self):
+        lines = [
+            "COMMIT:abc|2024-01-01T00:00:00+00:00|2024-01-01T00:00:00+00:00|A|m\n",
+            "1\t0\tx.po\n",
+        ]
+        spec = {"exclude_patterns": [], "generated_patterns": [], "exclude_authors": []}
+        self.assertEqual(list(self.mod.filter_log_lines(lines, spec, {})), lines)
+
+
 if __name__ == "__main__":
     unittest.main()
