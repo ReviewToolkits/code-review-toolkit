@@ -5,7 +5,7 @@ Ported from ft-review-toolkit's lock-discipline, shared-state and stop-the-world
 scanners (which target C extensions) to Python's ``ast``. Each check maps 1:1 to
 a shape in data/python_bug_shapes.json whose ``agent`` is ``concurrency-auditor``.
 
-Three families of checks, all project-level because locks and call chains cross
+Four families of checks, all project-level because locks and call chains cross
 module boundaries:
 
 1. Lock-guard inference. For every class attribute and module global that is
@@ -24,6 +24,10 @@ module boundaries:
    blocking calls while holding a lock, ``await`` while holding a thread lock,
    ``async def`` code that calls a sync project function which blocks or takes a
    thread lock, and signal handlers that do more than set a flag.
+4. Shared stores outside the process, where a web app with sync workers keeps
+   its races: a rate limiter tested before the work and charged after it, a
+   cache key read, modified and written back without an atomic operation, and a
+   session-level ``SET`` that outlives its transaction on a pooled connection.
 
 What counts as a lock: objects built from ``threading``/``multiprocessing``/
 ``asyncio`` primitives; names that look like locks (``_lock``, ``mutex``,
@@ -3391,6 +3395,330 @@ def _module_state(p: Project) -> list[dict]:
 
 
 # --------------------------------------------------------------------------
+# Shared stores outside the process: rate limiters, caches, pooled DB sessions.
+# On a web app with sync workers the concurrent "threads" are processes, so no
+# lock appears in the source; these checks look for the store-level shapes.
+# --------------------------------------------------------------------------
+
+
+def _store_calls(func: Func, methods: frozenset[str]) -> list[ast.Call]:
+    """``<receiver>.<method>(...)`` calls in *func*'s own scope, in source order."""
+    calls = [
+        node
+        for node in _walk_scope(func.node)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in methods
+    ]
+    calls.sort(key=lambda n: (n.lineno, n.col_offset))
+    return calls
+
+
+def _enclosing_stmt(node: ast.AST, parents: dict[int, ast.AST]) -> ast.AST | None:
+    while node is not None and not isinstance(node, ast.stmt):
+        node = parents.get(id(node))
+    return node
+
+
+def _runs_before(
+    earlier: ast.AST, later: ast.AST, root: ast.AST, parents: dict[int, ast.AST]
+) -> bool:
+    """Does *earlier* run on every path to *later*?
+
+    True when *earlier* sits in a simple statement (or in the test of an
+    ``if``/``while``) that precedes, in the same block or an enclosing one, the
+    statement holding *later*. A call inside an earlier branch does not count:
+    that branch may not run.
+    """
+    stmt = _enclosing_stmt(earlier, parents)
+    if isinstance(stmt, (ast.If, ast.While)):
+        if not any(n is earlier for n in ast.walk(stmt.test)):
+            return False
+    elif not isinstance(stmt, (ast.Expr, ast.Assign, ast.AugAssign, ast.AnnAssign)):
+        return False
+    node = later
+    while node is not root and node is not None:
+        parent = parents.get(id(node))
+        for name in ("body", "orelse", "finalbody"):
+            block = getattr(parent, name, None)
+            if not isinstance(block, list):
+                continue
+            for index, sibling in enumerate(block):
+                if sibling is node:
+                    if any(s is stmt for s in block[:index]):
+                        return True
+                    break
+        node = parent
+    return False
+
+
+_LIMITER_WRAPPER_METHODS = frozenset({"test", "hit"})
+
+
+def _check_rate_limiter_test_then_hit(p: Project) -> list[dict]:
+    """``limiter.test(k)`` before the work, ``limiter.hit(k)`` after it."""
+    out: list[dict] = []
+    # receiver text -> {"test": [(func, call)], "hit": [...]}, per class, for
+    # pairs split across methods (`_check_limits()` / `_hit_limits()`).
+    by_class: dict[str, dict[str, dict[str, list[tuple[Func, ast.Call]]]]] = {}
+    for func in p.funcs.values():
+        if func.name in _LIMITER_WRAPPER_METHODS:
+            continue  # a limiter class delegating to the store's own test/hit
+        calls = _store_calls(func, _LIMITER_WRAPPER_METHODS)
+        if not calls:
+            continue
+        per_receiver: dict[str, dict[str, list[ast.Call]]] = {}
+        for call in calls:
+            receiver = _text(call.func.value)
+            per_receiver.setdefault(receiver, {}).setdefault(call.func.attr, []).append(
+                call
+            )
+            if func.cls and receiver.startswith(("self.", "cls.")):
+                by_class.setdefault(func.cls, {}).setdefault(receiver, {}).setdefault(
+                    call.func.attr, []
+                ).append((func, call))
+        parents = _parents(func.node)
+        for receiver, kinds in per_receiver.items():
+            tests, hits = kinds.get("test", []), kinds.get("hit", [])
+            if not tests or not hits:
+                continue
+            first_test = tests[0]
+            later = [
+                h
+                for h in hits
+                if (h.lineno, h.col_offset)
+                > (
+                    first_test.lineno,
+                    first_test.col_offset,
+                )
+            ]
+            if not later:
+                continue
+            if any(_runs_before(h, first_test, func.node, parents) for h in hits):
+                continue  # charged first, checked after: the guarded twin
+            out.append(
+                _finding(
+                    "rate-limiter-test-then-hit",
+                    "FIX",
+                    "medium",
+                    func,
+                    first_test,
+                    f"{receiver}.test() is checked here and {receiver}.hit() is "
+                    f"charged later (line {later[0].lineno}): concurrent requests all "
+                    f"pass the test before any of them is counted",
+                    "gate on the atomic hit() before the work (refund on success if "
+                    "only failures should count); dismiss if a second limiter charged "
+                    "first is the hard bound",
+                )
+            )
+    for kinds_by_receiver in by_class.values():
+        for receiver, kinds in kinds_by_receiver.items():
+            test_funcs = {f.key for f, _ in kinds.get("test", [])}
+            hit_funcs = {f.key for f, _ in kinds.get("hit", [])}
+            if not test_funcs or not hit_funcs or test_funcs & hit_funcs:
+                continue  # same-method pairs were judged above
+            func, call = kinds["test"][0]
+            hit_func = kinds["hit"][0][0]
+            out.append(
+                _finding(
+                    "rate-limiter-test-then-hit",
+                    "FIX",
+                    "low",
+                    func,
+                    call,
+                    f"{receiver}.test() is checked in {func.name}() and "
+                    f"{receiver}.hit() charged in {hit_func.name}(): if a caller runs "
+                    f"work between them, concurrent requests all pass the test",
+                    f"read the callers of {func.name}() and {hit_func.name}(): what runs "
+                    f"between the check and the charge, and is hit()'s result honoured",
+                )
+            )
+    return out
+
+
+_STORE_RECEIVER = re.compile(r"(?i)(redis|valkey|cache|memcache|^r$|^rc$|^kv$)")
+_STORE_READS = frozenset({"get", "hget"})
+_STORE_WRITES = frozenset({"set", "setex", "psetex", "hset"})
+_STORE_ATOMIC = frozenset({"watch", "pipeline", "lock", "transaction"})
+
+
+def _is_store_receiver(node: ast.AST) -> bool:
+    dotted = _dotted(node)
+    return bool(dotted) and bool(_STORE_RECEIVER.search(dotted.split(".")[-1]))
+
+
+def _written_value(call: ast.Call) -> ast.expr | None:
+    for kw in call.keywords:
+        if kw.arg == "value":
+            return kw.value
+    minimum = 3 if call.func.attr in ("setex", "psetex", "hset") else 2
+    return call.args[-1] if len(call.args) >= minimum else None
+
+
+def _store_key(call: ast.Call) -> str:
+    """The key text: the first argument, plus the field for a hash."""
+    count = 2 if call.func.attr in ("hget", "hset") else 1
+    args = call.args[:count]
+    if len(args) < count:
+        return ""
+    return "|".join(_text(a) for a in args)
+
+
+def _check_shared_store_read_modify_write(p: Project) -> list[dict]:
+    """``v = cache.get(k)`` ... ``cache.set(k, f(v))`` with no atomic operation."""
+    out: list[dict] = []
+    for func in p.funcs.values():
+        calls = _store_calls(func, _STORE_READS | _STORE_WRITES | _STORE_ATOMIC)
+        if not calls:
+            continue
+        receivers = {_text(c.func.value) for c in calls if c.func.attr in _STORE_ATOMIC}
+        assigns = sorted(
+            (
+                n
+                for n in _walk_scope(func.node)
+                if isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign))
+                and n.value is not None
+            ),
+            key=lambda n: (n.lineno, n.col_offset),
+        )
+        for read in calls:
+            if read.func.attr not in _STORE_READS or not _is_store_receiver(
+                read.func.value
+            ):
+                continue
+            receiver = _text(read.func.value)
+            if receiver in receivers:
+                continue  # WATCH/MULTI, a pipeline or a store lock is in play
+            key = _store_key(read)
+            holder = next(
+                (a for a in assigns if any(n is read for n in ast.walk(a.value))),
+                None,
+            )
+            if not key or holder is None:
+                continue
+            for write in calls:
+                if (
+                    write.func.attr not in _STORE_WRITES
+                    or (write.lineno, write.col_offset)
+                    <= (read.lineno, read.col_offset)
+                    or _text(write.func.value) != receiver
+                    or _store_key(write) != key
+                ):
+                    continue
+                value = _written_value(write)
+                tainted = _tainted_names(holder, assigns, write)
+                if value is None or not (_names_in(value) & tainted):
+                    continue
+                out.append(
+                    _finding(
+                        "read-modify-write-on-shared-store",
+                        "FIX",
+                        "medium",
+                        func,
+                        write,
+                        f"{receiver}.{write.func.attr}({key.split('|')[0]}, ...) writes "
+                        f"back a value derived from the {read.func.attr}() at line "
+                        f"{read.lineno}: two workers that interleave lose one update",
+                        "use an atomic store operation (INCR/HSET of one field, "
+                        "SET NX/XX, WATCH/MULTI or a script); a cache-aside fill whose "
+                        "value does not derive from the read is fine",
+                    )
+                )
+                break
+    return out
+
+
+def _names_in(node: ast.AST) -> set[str]:
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+def _assigned_names(stmt: ast.AST) -> set[str]:
+    targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+    return {
+        n.id
+        for t in targets
+        for n in ast.walk(t)
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+    }
+
+
+def _tainted_names(holder: ast.AST, assigns: list[ast.AST], until: ast.AST) -> set[str]:
+    """Names derived from the read bound by *holder*, at the point of *until*.
+
+    A rebinding whose value does not use a derived name (``v = compute()`` on a
+    cache miss) drops the name: the write then stores fresh data, not a
+    modified copy.
+    """
+    tainted = _assigned_names(holder)
+    start = (holder.lineno, holder.col_offset)
+    stop = (until.lineno, until.col_offset)
+    for stmt in assigns:
+        if not start < (stmt.lineno, stmt.col_offset) < stop:
+            continue
+        names = _assigned_names(stmt)
+        if _names_in(stmt.value) & tainted:
+            tainted |= names
+        elif not isinstance(stmt, ast.AugAssign):
+            tainted -= names
+    return tainted
+
+
+_SESSION_SET = re.compile(
+    r"(?is)^\s*SET\s+(?!LOCAL\b|TRANSACTION\b|CONSTRAINTS\b)[A-Za-z_]"
+)
+_MIGRATION_DIRS = frozenset({"migrations", "alembic"})
+_POOL_EVENTS = frozenset({"connect", "first_connect", "checkout", "engine_connect"})
+
+
+def _sql_literal(call: ast.Call) -> ast.Constant | None:
+    if not call.args:
+        return None
+    arg = call.args[0]
+    if isinstance(arg, ast.Call) and _dotted(arg.func).split(".")[-1] == "text":
+        arg = arg.args[0] if arg.args else None
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+        return arg
+    return None
+
+
+def _is_pool_listener(func: Func) -> bool:
+    for dec in func.node.decorator_list:
+        if isinstance(dec, ast.Call) and any(
+            isinstance(a, ast.Constant) and a.value in _POOL_EVENTS for a in dec.args
+        ):
+            return True
+    return False
+
+
+def _check_session_level_set(p: Project) -> list[dict]:
+    """``execute("SET name = ...")`` (not ``SET LOCAL``) outside migrations."""
+    out: list[dict] = []
+    for func in p.funcs.values():
+        if _MIGRATION_DIRS & set(Path(func.rel).parts) or _is_pool_listener(func):
+            continue
+        for call in _store_calls(func, frozenset({"execute", "exec_driver_sql"})):
+            literal = _sql_literal(call)
+            if literal is None or not _SESSION_SET.match(literal.value):
+                continue
+            statement = " ".join(literal.value.split())[:60]
+            out.append(
+                _finding(
+                    "session-level-set-leaks-through-pooled-connection",
+                    "FIX",
+                    "medium",
+                    func,
+                    call,
+                    f"'{statement}' lasts for the database session, not the "
+                    f"transaction: after a commit the pooled connection keeps it for "
+                    f"the next request that draws it",
+                    "use SET LOCAL or set_config(name, value, true); dismiss for a "
+                    "dedicated, unpooled connection",
+                )
+            )
+    return out
+
+
+# --------------------------------------------------------------------------
 # Driver
 # --------------------------------------------------------------------------
 
@@ -3408,6 +3736,9 @@ _CHECKS = (
     "transitive-blocking-call-in-async",
     "signal-handler-does-real-work",
     "slot-acquired-before-the-try-that-releases-it",
+    "rate-limiter-test-then-hit",
+    "read-modify-write-on-shared-store",
+    "session-level-set-leaks-through-pooled-connection",
 )
 
 
@@ -3471,6 +3802,15 @@ def analyze(
         ),
         "slot-acquired-before-the-try-that-releases-it": lambda: _check_slot_release(
             project
+        ),
+        "rate-limiter-test-then-hit": lambda: _check_rate_limiter_test_then_hit(
+            project
+        ),
+        "read-modify-write-on-shared-store": lambda: (
+            _check_shared_store_read_modify_write(project)
+        ),
+        "session-level-set-leaks-through-pooled-connection": lambda: (
+            _check_session_level_set(project)
         ),
     }
     # Some checks produce two shapes; run each producer once if either is selected.

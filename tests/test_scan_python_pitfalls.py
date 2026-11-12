@@ -318,6 +318,42 @@ class TestLruCacheOnMethod(unittest.TestCase):
         src = "import functools\nclass C:\n    @staticmethod\n    @functools.lru_cache\n    def m(k):\n        return k\n"
         self.assertNotIn("lru-cache-on-method", shapes(src))
 
+    def _lru(self, decorator: str) -> dict:
+        src = (
+            "import functools\nfrom functools import cache, lru_cache\n"
+            f"class C:\n    @{decorator}\n    def m(self, k):\n        return k\n"
+        )
+        (found,) = [f for f in scan(src) if f["shape"] == "lru-cache-on-method"]
+        return found
+
+    def test_unbounded_cache_is_called_a_lifetime_leak(self):
+        for decorator in (
+            "cache",
+            "functools.cache",
+            "lru_cache(maxsize=None)",
+            "lru_cache(None)",
+        ):
+            with self.subTest(decorator=decorator):
+                found = self._lru(decorator)
+                self.assertEqual(found["confidence"], "high")
+                self.assertIn("process lifetime", found["message"])
+
+    def test_bounded_cache_is_retention_not_a_leak(self):
+        # A maxsize bounds what is kept: the message must not claim every
+        # instance ever passed is retained, and the confidence drops.
+        for decorator, bound in (
+            ("functools.lru_cache", "128"),
+            ("lru_cache()", "128"),
+            ("lru_cache(maxsize=32)", "32"),
+            ("lru_cache(32)", "32"),
+            ("lru_cache(maxsize=SIZE)", "SIZE"),
+        ):
+            with self.subTest(decorator=decorator):
+                found = self._lru(decorator)
+                self.assertEqual(found["confidence"], "medium")
+                self.assertIn(f"up to {bound} entries", found["message"])
+                self.assertNotIn("process lifetime", found["message"])
+
 
 class TestClassLevelMutable(unittest.TestCase):
     def test_class_list(self):
@@ -2200,6 +2236,213 @@ class TestUnformattedFormatString(unittest.TestCase):
         self.assertNotIn(
             SHAPE, shapes("def f():\n    register('{name} is deprecated')\n")
         )
+
+
+class TestIntegrityErrorWithoutRollback(unittest.TestCase):
+    shape = "integrity-error-caught-without-rollback"
+
+    def test_converted_without_rollback(self):
+        src = (
+            "def retitle(db, folder, title):\n"
+            "    folder.title = title\n"
+            "    try:\n"
+            "        db.flush()\n"
+            "    except UniqueViolation:\n"
+            "        raise ValueError('title in use')\n"
+        )
+        found = [f for f in scan(src) if f["shape"] == self.shape]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["line"], 5)
+
+    def test_returned_error_without_rollback(self):
+        src = (
+            "from sqlalchemy.exc import IntegrityError\n"
+            "def add(request, row):\n"
+            "    try:\n"
+            "        request.db.add(row)\n"
+            "        request.db.flush()\n"
+            "    except (KeyError, IntegrityError):\n"
+            "        request.session.flash('already exists')\n"
+            "        return default_response\n"
+        )
+        self.assertIn(self.shape, shapes(src))
+
+    def test_rollback_in_handler_is_the_guarded_twin(self):
+        src = (
+            "def add(db, row):\n"
+            "    try:\n"
+            "        db.add(row)\n"
+            "        db.flush()\n"
+            "    except IntegrityError:\n"
+            "        db.rollback()\n"
+            "        raise ValueError('taken') from None\n"
+        )
+        self.assertNotIn(self.shape, shapes(src))
+
+    def test_savepoint_and_reraise_are_silent(self):
+        savepoint = (
+            "def add(db, row):\n"
+            "    try:\n"
+            "        with db.begin_nested():\n"
+            "            db.add(row)\n"
+            "    except IntegrityError:\n"
+            "        return None\n"
+        )
+        reraise = (
+            "def add(db, row):\n"
+            "    try:\n"
+            "        db.flush()\n"
+            "    except IntegrityError as exc:\n"
+            "        log(exc)\n"
+            "        raise\n"
+        )
+        self.assertNotIn(self.shape, shapes(savepoint))
+        self.assertNotIn(self.shape, shapes(reraise))
+
+
+class TestTranslationOfInterpolatedString(unittest.TestCase):
+    shape = "translation-lookup-of-interpolated-string"
+
+    def test_method_alias_with_fstring_and_concatenation(self):
+        src = (
+            "def view(self, name):\n"
+            "    self.request.session.flash(self.request._(f'Archived {name!r}'))\n"
+            "    flash(request._('Could not archive ' + f'{name!r}'))\n"
+            "    flash(_('Removed {}'.format(name)))\n"
+            "    flash(gettext('Removed %s' % name))\n"
+        )
+        found = [f for f in scan(src) if f["shape"] == self.shape]
+        self.assertEqual([f["line"] for f in found], [2, 3, 4, 5])
+
+    def test_literal_msgid_with_mapping_is_silent(self):
+        src = (
+            "def view(request, name):\n"
+            "    request._('Archived ${name}', mapping={'name': name})\n"
+            "    _('A literal message')\n"
+            "    request._(f'no placeholders')\n"
+        )
+        self.assertNotIn(self.shape, shapes(src))
+
+    def test_non_translation_call_is_silent(self):
+        self.assertNotIn(self.shape, shapes("print(f'{x}')\nlog.info('a' + b)\n"))
+
+
+class TestNonFiniteFloatPassesRangeGuard(unittest.TestCase):
+    shape = "non-finite-float-passes-range-guard"
+
+    def test_positivity_rejection_admits_nan_and_inf(self):
+        src = (
+            "def backoff_from(config):\n"
+            "    delay = float(config['backoff'])\n"
+            "    if delay <= 0:\n"
+            "        raise ValueError('backoff must be positive')\n"
+            "    return delay\n"
+        )
+        found = [f for f in scan(src) if f["shape"] == self.shape]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["line"], 3)
+
+    def test_fallback_return_counts_as_a_rejection(self):
+        src = (
+            "import os\n"
+            "def limit():\n"
+            "    ratio = float(os.environ.get('SAMPLE_RATIO') or 0)\n"
+            "    if ratio <= 0:\n"
+            "        return 0\n"
+            "    return int(ratio * 100)\n"
+        )
+        self.assertIn(self.shape, shapes(src))
+
+    def test_isfinite_and_nan_rejecting_forms_are_silent(self):
+        guarded = (
+            "import math\n"
+            "def f(raw):\n"
+            "    x = float(raw)\n"
+            "    if not math.isfinite(x) or x <= 0:\n"
+            "        raise ValueError(raw)\n"
+            "    return x\n"
+        )
+        negated = (
+            "def f(raw):\n"
+            "    x = float(raw)\n"
+            "    if not x > 0:\n"
+            "        raise ValueError(raw)\n"
+            "    return x\n"
+        )
+        chained = (
+            "def f(raw):\n"
+            "    x = float(raw)\n"
+            "    if not 0 < x <= 1:\n"
+            "        raise ValueError(raw)\n"
+            "    return x\n"
+        )
+        for src in (guarded, negated, chained):
+            with self.subTest(src=src):
+                self.assertNotIn(self.shape, shapes(src))
+
+    def test_accepting_branch_is_silent(self):
+        # NaN takes the else branch here: the guard rejects it.
+        src = (
+            "def f(raw):\n"
+            "    x = float(raw)\n"
+            "    if x > 0:\n"
+            "        return scale(x)\n"
+            "    return None\n"
+        )
+        self.assertNotIn(self.shape, shapes(src))
+
+
+_MODELS = (
+    "from sqlalchemy.dialects.postgresql import JSONB\n"
+    "from sqlalchemy.ext.mutable import MutableDict\n"
+    "from sqlalchemy.orm import Mapped, mapped_column\n"
+    "class Ticket(Base):\n"
+    "    details: Mapped[dict] = mapped_column(JSONB)\n"
+    "    notes: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSONB))\n"
+    "    def mark(self):\n"
+    "        self.details['seen'] = True\n"
+    "class Draft:\n"
+    "    def __init__(self):\n"
+    "        self.details = {}\n"
+    "    def mark(self):\n"
+    "        self.details['seen'] = True\n"
+)
+
+
+class TestUntrackedJsonColumnMutation(unittest.TestCase):
+    shape = "in-place-mutation-of-untracked-json-column"
+
+    def _scan(self, views: str) -> list[dict]:
+        with TempProject({"pkg/models.py": _MODELS, "pkg/views.py": views}) as root:
+            found = mod.analyze(str(root))["findings"]
+        return [f for f in found if f["shape"] == self.shape]
+
+    def test_in_place_writes_in_another_module(self):
+        found = self._scan(
+            "def close(ticket, now):\n"
+            "    ticket.details['closed_at'] = now\n"
+            "    ticket.details.update(state='closed')\n"
+            "    ticket.notes['closed_at'] = now\n"
+        )
+        self.assertEqual(
+            sorted((f["file"], f["line"]) for f in found),
+            [("pkg/models.py", 8), ("pkg/views.py", 2), ("pkg/views.py", 3)],
+        )
+
+    def test_flag_modified_and_reassignment_are_silent(self):
+        found = self._scan(
+            "from sqlalchemy.orm.attributes import flag_modified\n"
+            "def close(ticket, now):\n"
+            "    ticket.details['closed_at'] = now\n"
+            "    flag_modified(ticket, 'details')\n"
+            "def reopen(ticket, now):\n"
+            "    ticket.details = {**ticket.details, 'reopened_at': now}\n"
+        )
+        self.assertEqual([f for f in found if f["file"] == "pkg/views.py"], [])
+
+    def test_same_name_on_a_plain_class_is_silent(self):
+        found = self._scan("x = 1\n")
+        self.assertNotIn(13, [f["line"] for f in found])
 
 
 if __name__ == "__main__":

@@ -1465,5 +1465,209 @@ class TestEnvelopeAndOptions(unittest.TestCase):
                 self.assertEqual(catalog[check]["detected_by"], "scan_concurrency.py")
 
 
+class TestRateLimiterTestThenHit(unittest.TestCase):
+    shape = "rate-limiter-test-then-hit"
+
+    def test_test_before_work_and_hit_after(self):
+        found = of(
+            scan(
+                """
+                def post_comment(request, limiter, text):
+                    if not limiter.test(request.ip):
+                        raise TooMany()
+                    check_spam(text)
+                    limiter.hit(request.ip)
+                """
+            ),
+            self.shape,
+        )
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["confidence"], "medium")
+        self.assertEqual(found[0]["line"], 3)
+
+    def test_hit_first_then_test_is_the_guarded_twin(self):
+        # Charge, then check the incremented count: concurrent requests are all
+        # counted before any is admitted.
+        src = """
+        def fetch_page(request, limiter):
+            limiter.hit(request.ip)
+            if not limiter.test(request.ip):
+                raise TooMany()
+            return render_page(request)
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+    def test_atomic_hit_gate_is_silent(self):
+        src = """
+        def signup(request, limiter):
+            if not limiter.hit(request.ip):
+                raise TooMany()
+            create_profile(request)
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+    def test_hit_in_an_earlier_branch_does_not_count_as_charged_first(self):
+        src = """
+        def send_digest(request, limiter, member):
+            if member.muted:
+                limiter.hit(member.id)
+                return {}
+            if not limiter.test(member.id):
+                raise TooMany()
+            deliver_digest(member)
+            limiter.hit(member.id)
+        """
+        self.assertEqual(len(of(scan(src), self.shape)), 1)
+
+    def test_pair_split_across_methods_is_low_confidence(self):
+        src = """
+        class Gateway:
+            def _check_quota(self, key):
+                if not self.limiters["api"].test(key):
+                    raise TooMany()
+
+            def _charge_quota(self, key):
+                self.limiters["api"].hit(key)
+
+            def call(self, key, payload):
+                self._check_quota(key)
+                if not slow_backend(payload):
+                    self._charge_quota(key)
+                    return False
+                return True
+        """
+        found = of(scan(src), self.shape)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["confidence"], "low")
+        self.assertEqual(found[0]["function"], "Gateway._check_quota")
+
+    def test_limiter_wrapper_class_is_silent(self):
+        src = """
+        class RateLimiter:
+            def test(self, *ids):
+                return self._strategy.test(self._limit, *ids)
+
+            def hit(self, *ids):
+                return self._strategy.hit(self._limit, *ids)
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+
+class TestSharedStoreReadModifyWrite(unittest.TestCase):
+    shape = "read-modify-write-on-shared-store"
+
+    def test_get_modify_set_of_one_key(self):
+        found = of(
+            scan(
+                """
+                import json
+
+                def append_event(redis, order_id, event):
+                    raw = redis.get(f"order:{order_id}")
+                    events = json.loads(raw or "[]")
+                    events.append(event)
+                    redis.set(f"order:{order_id}", json.dumps(events))
+                """
+            ),
+            self.shape,
+        )
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["line"], 8)
+
+    def test_counter_through_setex(self):
+        src = """
+        def bump(self, key):
+            count = int(self.cache.get(key) or 0)
+            self.cache.setex(key, 60, count + 1)
+        """
+        self.assertEqual(len(of(scan(src), self.shape)), 1)
+
+    def test_cache_aside_fill_is_silent(self):
+        # The value written on a miss is computed fresh, not derived from the read.
+        src = """
+        def lookup(cache, key):
+            value = cache.get(key)
+            if value is None:
+                value = expensive(key)
+                cache.set(key, value)
+            return value
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+    def test_atomic_increment_is_silent(self):
+        src = """
+        def bump(redis, key):
+            redis.incr(key)
+            return redis.get(key)
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+    def test_watch_transaction_is_silent(self):
+        src = """
+        def bump(redis, key):
+            redis.watch(key)
+            count = int(redis.get(key) or 0)
+            redis.set(key, count + 1)
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+    def test_different_key_and_non_store_receiver_are_silent(self):
+        src = """
+        def copy(redis, config, a, b):
+            v = redis.get(a)
+            redis.set(b, v)
+            level = config.get("log", "level")
+            config.set("log", "level", level + "!")
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+
+class TestSessionLevelSet(unittest.TestCase):
+    shape = "session-level-set-leaks-through-pooled-connection"
+
+    def test_session_set_in_request_code(self):
+        found = of(
+            scan(
+                """
+                from sqlalchemy import text
+
+                def export_report(request):
+                    request.db.execute(text("SET statement_timeout = '45s'"))
+                    build_export(request)
+                """
+            ),
+            self.shape,
+        )
+        self.assertEqual(len(found), 1)
+        self.assertIn("statement_timeout", found[0]["message"])
+
+    def test_set_local_and_set_config_are_silent(self):
+        src = """
+        from sqlalchemy import text
+
+        def export_report(request):
+            request.db.execute(text("SET LOCAL statement_timeout = '45s'"))
+            request.db.execute(text("SELECT set_config('statement_timeout', '1s', true)"))
+            request.db.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+        """
+        self.assertEqual(of(scan(src), self.shape), [])
+
+    def test_migrations_and_pool_listeners_are_silent(self):
+        files = {
+            "pkg/migrations/env.py": """
+            def run(connection):
+                connection.execute("SET lock_timeout = 4000")
+            """,
+            "pkg/db.py": """
+            from sqlalchemy import event
+
+            @event.listens_for(engine, "connect")
+            def on_connect(dbapi_connection, record):
+                dbapi_connection.execute("SET search_path TO app")
+            """,
+        }
+        self.assertEqual(of(scan_project(files)["findings"], self.shape), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -967,18 +967,64 @@ def _check_lru_cache_on_method(tree: ast.AST) -> list[dict]:
             first = fn.args.args[0].arg if fn.args.args else ""
             if first not in {"self", "cls"}:
                 continue
+            bound = _lru_cache_bound(fn)
+            if bound is None:
+                out.append(
+                    _finding(
+                        "lru-cache-on-method",
+                        "CONSIDER",
+                        "high",
+                        fn,
+                        f"{cls.name}.{fn.name}() is cached on the CLASS with '{first}' in "
+                        f"the key and no size bound, so every instance ever passed is "
+                        f"retained for the process lifetime",
+                        "use cached_property or a per-instance cache; harmless for "
+                        "singletons",
+                    )
+                )
+                continue
             out.append(
                 _finding(
                     "lru-cache-on-method",
                     "CONSIDER",
-                    "high",
+                    "medium",
                     fn,
-                    f"{cls.name}.{fn.name}() is cached on the CLASS with '{first}' in the key, "
-                    f"so every instance ever passed is retained for the process lifetime",
-                    "use cached_property or a per-instance cache; harmless for singletons",
+                    f"{cls.name}.{fn.name}() is cached on the CLASS with '{first}' in the "
+                    f"key: up to {bound} entries, and the instances in them, stay alive "
+                    f"and are shared across instances",
+                    "bounded, so this is retention, not a leak: it matters when the "
+                    "instances are short-lived (per request or session) or hold heavy "
+                    "state, where the hit rate is also near zero (check cache_info())",
                 )
             )
     return out
+
+
+def _lru_cache_bound(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+    """The `maxsize` of the method's `lru_cache`, as text; None when unbounded.
+
+    `@cache` and `@lru_cache(maxsize=None)` are unbounded; a bare `@lru_cache`
+    or `@lru_cache()` keeps functools' default of 128.
+    """
+    for dec in fn.decorator_list:
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        tail = _dotted_name(target).split(".")[-1]
+        if tail == "cache":
+            return None
+        if tail != "lru_cache":
+            continue
+        if not isinstance(dec, ast.Call):
+            return "128"
+        size = dec.args[0] if dec.args else None
+        for kw in dec.keywords:
+            if kw.arg == "maxsize":
+                size = kw.value
+        if size is None:
+            return "128"
+        if isinstance(size, ast.Constant) and size.value is None:
+            return None
+        return ast.unparse(size)
+    return None
 
 
 def _attribute_mutated_anywhere(tree: ast.AST, attr: str) -> bool:
@@ -4894,9 +4940,346 @@ def _check_unformatted_format_string(tree: ast.AST) -> list[dict]:
     return out
 
 
+# --------------------------------------------------------------------------
+# Web / ORM shapes
+# --------------------------------------------------------------------------
+
+_INTEGRITY_ERRORS = frozenset({"IntegrityError", "UniqueViolation"})
+# Calls that leave the session usable (or hand the abort to the framework).
+_SESSION_RECOVERY_CALLS = frozenset(
+    {"rollback", "begin_nested", "abort", "set_rollback", "savepoint"}
+)
+
+
+def _caught_tails(handler: ast.ExceptHandler) -> set[str]:
+    if handler.type is None:
+        return set()
+    parts = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    return {_dotted_name(p).split(".")[-1] for p in parts}
+
+
+def _call_tails(stmts: list[ast.stmt]) -> set[str]:
+    return {
+        _call_tail(node)
+        for stmt in stmts
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.Call)
+    }
+
+
+def _check_integrity_error_without_rollback(tree: ast.AST) -> list[dict]:
+    """`except IntegrityError:` handled without a rollback or a savepoint."""
+    out: list[dict] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try) or "begin_nested" in _call_tails(node.body):
+            continue
+        for handler in node.handlers:
+            caught = _caught_tails(handler) & _INTEGRITY_ERRORS
+            if not caught or _call_tails(handler.body) & _SESSION_RECOVERY_CALLS:
+                continue
+            reraises = any(
+                isinstance(sub, ast.Raise)
+                and (
+                    sub.exc is None
+                    or (isinstance(sub.exc, ast.Name) and sub.exc.id == handler.name)
+                )
+                for stmt in handler.body
+                for sub in ast.walk(stmt)
+            )
+            if reraises:
+                continue  # the framework sees the error and rolls back
+            out.append(
+                _finding(
+                    "integrity-error-caught-without-rollback",
+                    "FIX",
+                    "medium",
+                    handler,
+                    f"{min(caught)} is handled without session.rollback() or a "
+                    f"savepoint: the transaction is aborted, so the next use of the "
+                    f"session raises PendingRollbackError",
+                    "roll back first in the handler, or flush inside "
+                    "session.begin_nested(); dismiss if the caller always discards the "
+                    "session",
+                )
+            )
+    return out
+
+
+_TRANSLATION_CALLS = frozenset(
+    {
+        "_",
+        "gettext",
+        "ngettext",
+        "pgettext",
+        "npgettext",
+        "lazy_gettext",
+        "gettext_lazy",
+        "ugettext",
+        "translate",
+    }
+)
+
+
+def _interpolated(node: ast.AST) -> str | None:
+    """How *node* builds a string at run time, or None for a literal."""
+    if isinstance(node, ast.JoinedStr) and any(
+        isinstance(v, ast.FormattedValue) for v in node.values
+    ):
+        return "an f-string"
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+        sides = (node.left, node.right)
+        if any(
+            isinstance(s, ast.JoinedStr)
+            or (isinstance(s, ast.Constant) and isinstance(s.value, str))
+            for s in sides
+        ):
+            return "a concatenation" if isinstance(node.op, ast.Add) else "%-formatting"
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "format"
+        and isinstance(node.func.value, ast.Constant)
+        and isinstance(node.func.value.value, str)
+    ):
+        return ".format()"
+    return None
+
+
+def _check_translation_of_interpolated_string(tree: ast.AST) -> list[dict]:
+    """`_(f"...")` / `request._("..." + x)`: the msgid is built at run time."""
+    out: list[dict] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and node.args):
+            continue
+        name = _call_tail(node)
+        if name not in _TRANSLATION_CALLS:
+            continue
+        how = _interpolated(node.args[0])
+        if how is None:
+            continue
+        out.append(
+            _finding(
+                "translation-lookup-of-interpolated-string",
+                "FIX",
+                "high" if name != "translate" else "medium",
+                node,
+                f"{_dotted_name(node.func) or name}() is given {how}: the lookup key is "
+                f"the interpolated text, which no catalog entry matches",
+                "pass a literal msgid and the values through the translation's "
+                "mapping/format arguments",
+            )
+        )
+    return out
+
+
+_RANGE_OPS = (ast.Lt, ast.LtE, ast.Gt, ast.GtE)
+_FINITE_CHECKS = frozenset({"isfinite", "isnan", "isinf"})
+
+
+def _floats_bound(scope: ast.AST) -> dict[str, ast.Call]:
+    """Names bound to `float(<non-literal>)` in *scope* (not nested scopes)."""
+    out: dict[str, ast.Call] = {}
+    for node in _walk_same_scope(scope):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Call)
+            and _call_name(node.value) == "float"
+            and node.value.args
+            and not isinstance(node.value.args[0], ast.Constant)
+        ):
+            out[node.targets[0].id] = node.value
+    return out
+
+
+def _rejects_when_true(stmt: ast.If, name: str) -> bool:
+    """Is the `if` body a rejection of *name*, not the accepted branch?
+
+    A raise, `continue`/`break`, or a return or assignment that does not use
+    *name* (`return 0`, `x = DEFAULT`) rejects; `return compute(x)` accepts.
+    """
+    last = stmt.body[-1] if stmt.body else None
+    if isinstance(last, (ast.Raise, ast.Continue, ast.Break)):
+        return True
+    if isinstance(last, (ast.Return, ast.Assign)):
+        return last.value is None or name not in _names_used(last.value)
+    return False
+
+
+def _check_non_finite_float_passes_range_guard(tree: ast.AST) -> list[dict]:
+    """`x = float(raw)`; `if x <= 0: raise` -- 'nan' and 'inf' pass."""
+    out: list[dict] = []
+    for scope in _iter_scopes(tree):
+        floats = _floats_bound(scope)
+        if not floats:
+            continue
+        nodes = list(_walk_same_scope(scope))
+        if any(
+            isinstance(n, ast.Call) and _call_tail(n) in _FINITE_CHECKS for n in nodes
+        ):
+            continue
+        reported: set[str] = set()
+        for stmt in nodes:
+            if not isinstance(stmt, ast.If):
+                continue
+            test = stmt.test
+            if not (
+                isinstance(test, ast.Compare)
+                and len(test.ops) == 1
+                and isinstance(test.ops[0], _RANGE_OPS)
+            ):
+                continue  # `not x > 0` and chained `lo < x <= hi` reject NaN
+            for side in (test.left, test.comparators[0]):
+                if not (isinstance(side, ast.Name) and side.id in floats):
+                    continue
+                if side.id in reported or not _rejects_when_true(stmt, side.id):
+                    continue
+                reported.add(side.id)
+                out.append(
+                    _finding(
+                        "non-finite-float-passes-range-guard",
+                        "CONSIDER",
+                        "medium",
+                        stmt,
+                        f"`{ast.unparse(test)}` rejects out-of-range values of "
+                        f"{side.id} = float(...), but float() accepts 'nan' and 'inf': "
+                        f"NaN fails every comparison, so it passes this guard",
+                        "add `not math.isfinite(...)` to the rejection, or write the "
+                        "test so NaN fails it (`if not 0 < x <= hi`)",
+                    )
+                )
+    return out
+
+
+_COLUMN_FACTORIES = frozenset({"Column", "mapped_column"})
+_JSON_COLUMN_TYPES = frozenset({"JSON", "JSONB", "ARRAY", "HSTORE"})
+_MUTATION_TRACKERS = frozenset(
+    {"MutableDict", "MutableList", "MutableSet", "as_mutable"}
+)
+
+
+def _json_columns(
+    corpus: list[tuple[str, ast.AST]],
+) -> tuple[dict[str, set[str]], set[str]]:
+    """Mapped JSON-like columns: attr -> declaring classes (untracked), and
+    the attribute names some model declares with mutation tracking."""
+    untracked: dict[str, set[str]] = {}
+    tracked: set[str] = set()
+    for _rel, tree in corpus:
+        for cls in ast.walk(tree):
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            for stmt in cls.body:
+                if isinstance(stmt, ast.AnnAssign) and isinstance(
+                    stmt.target, ast.Name
+                ):
+                    name, value = stmt.target.id, stmt.value
+                elif (
+                    isinstance(stmt, ast.Assign)
+                    and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name)
+                ):
+                    name, value = stmt.targets[0].id, stmt.value
+                else:
+                    continue
+                if not (
+                    isinstance(value, ast.Call)
+                    and _call_tail(value) in _COLUMN_FACTORIES
+                ):
+                    continue
+                used = {
+                    n.id if isinstance(n, ast.Name) else n.attr
+                    for n in ast.walk(value)
+                    if isinstance(n, (ast.Name, ast.Attribute))
+                }
+                if used & _MUTATION_TRACKERS:
+                    tracked.add(name)
+                elif used & _JSON_COLUMN_TYPES:
+                    untracked.setdefault(name, set()).add(cls.name)
+    return untracked, tracked
+
+
+def _mutated_attribute(node: ast.AST) -> ast.Attribute | None:
+    """`x.attr[k] = v`, `del x.attr[k]`, `x.attr[k] += 1`, `x.attr.update(...)`."""
+    targets: list[ast.AST] = []
+    if isinstance(node, (ast.Assign, ast.Delete)):
+        targets = list(node.targets)
+    elif isinstance(node, ast.AugAssign):
+        targets = [node.target]
+    for target in targets:
+        if isinstance(target, ast.Subscript) and isinstance(
+            target.value, ast.Attribute
+        ):
+            return target.value
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in _MUTATING_METHODS
+        and isinstance(node.func.value, ast.Attribute)
+    ):
+        return node.func.value
+    return None
+
+
+def _check_untracked_json_column_mutation(
+    corpus: list[tuple[str, ast.AST]],
+) -> list[dict]:
+    """In-place change to a JSON/JSONB/ARRAY column with no mutation tracking."""
+    untracked, tracked = _json_columns(corpus)
+    columns = {k: v for k, v in untracked.items() if k not in tracked}
+    if not columns:
+        return []
+    out: list[dict] = []
+    for rel, tree in corpus:
+        owners: dict[int, str] = {}  # id(function) -> enclosing class name
+        for cls in ast.walk(tree):
+            if isinstance(cls, ast.ClassDef):
+                for item in cls.body:
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        owners[id(item)] = cls.name
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            nodes = list(_walk_same_scope(fn))
+            if any(
+                isinstance(n, ast.Call) and _call_tail(n) == "flag_modified"
+                for n in nodes
+            ):
+                continue
+            for node in nodes:
+                attr = _mutated_attribute(node)
+                if attr is None or attr.attr not in columns:
+                    continue
+                receiver = _dotted_name(attr.value)
+                if (
+                    receiver in ("self", "cls")
+                    and owners.get(id(fn)) not in columns[attr.attr]
+                ):
+                    continue  # another class's attribute of the same name
+                models = "/".join(sorted(columns[attr.attr]))
+                finding = _finding(
+                    "in-place-mutation-of-untracked-json-column",
+                    "FIX",
+                    "medium",
+                    node,
+                    f"{ast.unparse(attr)} is changed in place, but {models}."
+                    f"{attr.attr} is a JSON-like column without MutableDict/"
+                    f"MutableList and nothing calls flag_modified(): the change is "
+                    f"never flushed",
+                    "reassign the attribute, call flag_modified(obj, name), or wrap "
+                    "the column type in MutableDict.as_mutable(); fine for an object "
+                    "that is not flushed yet",
+                )
+                finding["file"] = rel
+                out.append(finding)
+    return out
+
+
 _PROJECT_CHECKS = {
     "divergent-sentinel-across-parallel-modules": _check_divergent_sentinel,
     "unguarded-inverse-of-guarded-operation": _check_unguarded_inverse,
+    "in-place-mutation-of-untracked-json-column": _check_untracked_json_column_mutation,
 }
 
 
@@ -4944,6 +5327,11 @@ _CHECKS = {
     "cleanup-inside-try-triggers-rollback": _check_cleanup_inside_try_triggers_rollback,
     "side-channel-raise-in-finally": _check_side_channel_raise_in_finally,
     "wide-suppress-exception-block": _check_wide_suppress_exception,
+    "integrity-error-caught-without-rollback": _check_integrity_error_without_rollback,
+    "translation-lookup-of-interpolated-string": (
+        _check_translation_of_interpolated_string
+    ),
+    "non-finite-float-passes-range-guard": _check_non_finite_float_passes_range_guard,
 }
 
 

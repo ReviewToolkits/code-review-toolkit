@@ -157,6 +157,14 @@ Then report, explicitly:
   downgraded; confirm whether anything mutates the object.
 - **`late-binding-closure-in-loop` is safe when the callable is consumed inside the same iteration.**
   Trace whether it escapes the loop before reporting.
+- **The web/ORM checks infer types by name.** `in-place-mutation-of-untracked-json-column` matches
+  the attribute name of a JSON column declared without mutation tracking: confirm the receiver is
+  that model and that the object is already persisted. `integrity-error-caught-without-rollback`
+  matters only when something uses the session after the handler (the response render, the
+  end-of-request commit, a caller that catches the converted exception).
+- **`non-finite-float-passes-range-guard` is about where the value goes.** `nan`/`inf` matter when
+  the consumer cannot take them (timeouts, `sleep`, `int()`, a limit); a value only displayed or
+  logged is CONSIDER-low at most.
 - Do not report a shape merely because the scanner emitted it. **A confirmed-by-reading finding with
   a failure scenario is worth more than ten unverified ones**, and the toolkit's credibility depends
   on that ratio.

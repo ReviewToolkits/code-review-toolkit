@@ -181,21 +181,21 @@
     },
     {
       "id": "lru-cache-on-method",
-      "title": "`@lru_cache` on an instance method keeps every `self` alive forever",
+      "title": "`@lru_cache` on an instance method keeps `self` alive in a class-wide cache",
       "agent": "python-pitfall-scanner",
       "severity": "CONSIDER",
-      "pattern": "`@functools.lru_cache` / `@cache` applied to a method taking `self`. The cache is stored on the CLASS and keys include `self`, so every instance ever passed is strongly referenced for the process lifetime -- an unbounded leak -- and cache entries are shared across instances.",
+      "pattern": "`@functools.lru_cache` / `@cache` applied to a method taking `self`. The cache is stored on the CLASS and keys include `self`, so instances passed to it are strongly referenced by the cache and entries are shared across instances. How much is retained depends on `maxsize`: with `@cache` or `lru_cache(maxsize=None)` every instance ever passed stays alive for the process lifetime -- an unbounded leak; with a bound (the default `maxsize=128`) up to that many recent entries, and their instances, stay alive. A per-request or per-session `self` then also makes the hit rate near zero, so the cache costs memory and buys nothing.",
       "guarded_twin": "`functools.cached_property` for per-instance memoization, a per-instance cache dict built in `__init__`, or making the function a `@staticmethod`/module-level function keyed only on the real inputs.",
-      "hunt": "Grep every `lru_cache`/`cache` decorator and check whether the first parameter is `self`/`cls`; long-lived services accumulate these.",
+      "hunt": "Grep every `lru_cache`/`cache` decorator and check whether the first parameter is `self`/`cls`. Read `maxsize`: unbounded caches on classes with many short-lived instances are the leak; bounded ones are retention plus sharing. For a bounded cache, check what `self` is (a per-request service, a session-holding object) and the hit rate (`method.cache_info()` in a test or a shell): hits near zero mean the cache never helps.",
       "expected": "cached values are released when the instance is; memory is stable across instance churn.",
-      "caught_as": "SILENT -- steadily growing RSS in a long-running process; instances that should be collected never are.",
+      "caught_as": "SILENT -- unbounded: steadily growing RSS in a long-running process, instances that should be collected never are. Bounded: per-request objects outlive their request, stale values are served across instances, and the cache rarely hits.",
       "confirmed_examples": [],
       "validation": "documented",
       "references": [
         "functools docs, lru_cache note on methods and object lifetimes",
         "ruff B019 / flake8-bugbear: cached-instance-method"
       ],
-      "differential": "Harmless for singletons or classes with a small fixed instance count. Judge by instance lifecycle, not by the decorator alone.",
+      "differential": "Harmless for singletons or classes with a small fixed instance count. With a bounded `maxsize` it is retention, not a leak: report it as CONSIDER only when the retained instances hold something heavy or stale (sessions, connections, per-request state) or the hit rate is near zero. Judge by instance lifecycle, not by the decorator alone.",
       "detected_by": "scan_python_pitfalls.py",
       "detectability": "implemented"
     },
@@ -2500,6 +2500,689 @@
       "differential": "A template that reads optional keys by design (`{{ item.note or '' }}` with `note` absent on purpose) is fine; the test is whether the attribute EXISTS on the real type.",
       "detected_by": null,
       "detectability": "agent-only"
+    },
+    {
+      "id": "rate-limiter-test-then-hit",
+      "title": "A rate limiter checked with a read (`test`) before the work and charged (`hit`) after it",
+      "agent": "concurrency-auditor",
+      "severity": "FIX",
+      "pattern": "`if not limiter.test(key): reject` ... slow work (password check, email send, external lookup) ... `limiter.hit(key)`, often only on the failure branch. `test()` is a read and `hit()` is the atomic increment, and they are separate store round trips. N parallel requests all pass `test()` before any of them reaches `hit()`, so the limit bounds sequential callers only. The pair is often split across two helpers (`_check_limits()` / `_hit_limits()`) called from one entry point.",
+      "guarded_twin": "Gate on the atomic charge before the work: `if not limiter.hit(key): reject`, then refund or clear on success when only failures should count. A sibling limiter in the same project that is hit first and tested after (or whose `hit()` return value is honoured) is the house idiom.",
+      "hunt": "List every limiter object and every `.test(` / `.hit(` on it, including pairs split across methods of one class. For each pair, read what runs between the test and the hit, and whether the hit's return value is checked. Then hunt the sibling entry points that use the same limiter (login, second factor, account recovery, email changes): a fix usually reaches one of them.",
+      "expected": "a limit of N admits at most N attempts in the window, however the requests interleave.",
+      "caught_as": "SILENT -- the limit holds in every sequential test and is exceeded only by scripted parallel requests.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "`limits` library docs: RateLimiter.test() checks without consuming; hit() consumes and returns whether the limit allowed it"
+      ],
+      "differential": "A limiter documented as an optimistic soft limit whose hard bound is a second limiter charged atomically first is by design (see the false-positive taxonomy). A `hit()` that precedes the `test()` on every path (charge first, then check the incremented count) is the guarded twin. A wrapper class whose own `test`/`hit` methods just delegate is not an instance.",
+      "detected_by": "scan_concurrency.py",
+      "detectability": "implemented"
+    },
+    {
+      "id": "read-modify-write-on-shared-store",
+      "title": "A cache key or database row read into Python, modified, and written back whole",
+      "agent": "concurrency-auditor",
+      "severity": "FIX",
+      "pattern": "`raw = cache.get(key)`; decode; change one field or append one entry; `cache.set(key, encode(value))` -- or the same with a row: load a JSON document or counter column, modify it in Python, assign it back, commit. Two workers that interleave both read the old value and the second write discards the first one's change. On a web app with sync workers the 'threads' are separate processes, so no in-process lock helps and the thread-lock scanner sees nothing.",
+      "guarded_twin": "An atomic store operation: `INCR`/`HINCRBY`/`HSET` of one field, `SET ... NX`/`XX`, a `WATCH`/`MULTI` transaction or a Lua script for a cache; `UPDATE t SET n = n + 1`, `SELECT ... FOR UPDATE` before the read, or a JSON-path update (`jsonb_set`) for a row; or one row per entry instead of one document.",
+      "hunt": "For each shared store client (Redis, memcached, a Django/Flask cache, the ORM session), list the functions that read a key or row and later write the same key or row. Keep the ones whose written value is derived from the read value. For each, name the two entry points that can run concurrently (two requests, a request and a task, two task workers).",
+      "expected": "concurrent updates compose: every change survives.",
+      "caught_as": "SILENT -- lost entries, counters that drift low, an action log missing actions; never reproduces in a single-process test.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): an action log kept as one JSON document on a row was read, appended to and written back whole by every admin action, so two concurrent actions on one record kept only one entry."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "Redis docs, Transactions: WATCH provides check-and-set behaviour for read-modify-write",
+        "PostgreSQL docs, Transaction Isolation: under READ COMMITTED two transactions can read the same row before either updates it"
+      ],
+      "differential": "Cache-aside fills (`v = cache.get(k)`; on a miss compute `v` from the source; `cache.set(k, v)`) are idempotent: the written value does not derive from the read one, so a race only duplicates work. A key only one process ever writes (a single scheduled job holding a lock) is fine. The scanner checks the cache form only; the row form is a manual hunt.",
+      "detected_by": "scan_concurrency.py",
+      "detectability": "implemented"
+    },
+    {
+      "id": "db-check-then-insert-without-unique-constraint",
+      "title": "A get-or-create whose uniqueness is enforced only by the check, not by a constraint on the same columns",
+      "agent": "concurrency-auditor",
+      "severity": "FIX",
+      "pattern": "`row = query(M).filter_by(owner=o).first()`; `if row is None: create the external resource; session.add(M(owner=o, ...))`, where no UNIQUE constraint covers exactly `owner` (it covers a wider tuple, or nothing). Two concurrent requests both see no row and both insert, often after both have created an external object (a payment customer, a remote account). A constraint on a wider tuple looks like protection in review and admits the duplicate.",
+      "guarded_twin": "A UNIQUE constraint on exactly the looked-up columns plus a handled IntegrityError (retry the read), `INSERT ... ON CONFLICT DO NOTHING/UPDATE`, or `SELECT ... FOR UPDATE` on a parent row that serialises the creators.",
+      "hunt": "For each get-or-create (`.first()`/`.one_or_none()` followed by `add()` on a miss), find the model's unique constraints and indexes and compare their columns and normalisation with the lookup's filter. A mismatch, or no constraint, is a candidate; then check for an external side effect between the read and the insert, which turns a duplicate row into a duplicate real-world object.",
+      "expected": "at most one row (and one external object) per logical key, however requests interleave.",
+      "caught_as": "SILENT -- duplicate rows and duplicate external objects; later a scalar lookup raises MultipleResultsFound.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): concurrent requests for one account each found no customer row and each created a customer at an external payment provider and a local row; the unique constraint covered a wider column pair, not the account."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "PostgreSQL docs, INSERT ... ON CONFLICT",
+        "SQLAlchemy docs, ORM Querying Guide: there is no built-in get-or-create; uniqueness comes from the schema"
+      ],
+      "differential": "A pre-check on exactly the constraint's columns and normalisation, where the framework retries or handles the IntegrityError, is a friendly-error check, not a race (see the false-positive taxonomy). A path that only one serialised job runs is fine.",
+      "detected_by": null,
+      "detectability": "implementable"
+    },
+    {
+      "id": "single-use-token-redeemed-twice",
+      "title": "A single-use code or link is checked, then marked used, without a lock or a conditional update",
+      "agent": "concurrency-auditor",
+      "severity": "FIX",
+      "pattern": "`code = query(Code).filter_by(value=v, used=False).first()`; verify; `code.used = True`; commit. Under READ COMMITTED two requests read the unused row before either commits the update, so both succeed. The same shape covers a one-time token tracked by a 'last used' timestamp, an invitation accepted twice, and a confirmation link replayed in parallel.",
+      "guarded_twin": "Burn atomically: `UPDATE codes SET used = true WHERE id = :id AND used = false` and check the row count, or `SELECT ... FOR UPDATE` before the check, or a DELETE ... RETURNING.",
+      "hunt": "List every 'single use' value the application issues (recovery codes, one-time passwords, reset and confirmation links, invitations, nonces). For each, find where it is consumed and whether the consume is a conditional write or a locked read. Compare with any sibling that already does it atomically.",
+      "expected": "a single-use value succeeds once, however many requests present it at the same moment.",
+      "caught_as": "SILENT -- two successes from one code; only parallel requests show it.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "PostgreSQL docs, Transaction Isolation (READ COMMITTED): a concurrent transaction's uncommitted update is invisible to the read"
+      ],
+      "differential": "A value consumed inside a transaction that already holds a row lock on the owner (FOR UPDATE on the user row) is serialised. A replay window that the protocol tolerates by design (a time-step OTP accepted once per step with an atomic last-step update) is fine.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "session-blob-writeback-resurrects-invalidated-session",
+      "title": "A server-side session saved as a whole blob at response time recreates a session a concurrent request deleted",
+      "agent": "concurrency-auditor",
+      "severity": "FIX",
+      "pattern": "The session store loads the whole session dict at request start and writes it back with `SET`/`SETEX` at response time whenever it changed. `invalidate()` (logout, password change) deletes the key. A request already in flight on the same session id then writes its pre-logout snapshot back, and the old cookie works again. Code that marks the session changed on every page view (flash queues, CSRF token creation) makes every request a writer.",
+      "guarded_twin": "Write existing sessions with `SET ... XX` (only if the key still exists), keep an invalidation tombstone or generation counter that the save checks, or rotate the session id on invalidation so the stale writer targets a dead key.",
+      "hunt": "Read the session store's save path and its invalidate path. Check whether save can create a key that invalidate removed. Then list what marks a session changed, to judge how many requests are writers.",
+      "expected": "an invalidated session stays invalid.",
+      "caught_as": "SILENT -- a logged-out cookie that works again after a concurrent request completes.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "Redis docs, SET: the XX option sets the key only if it already exists"
+      ],
+      "differential": "Stores that rotate the session id on every privilege change, or whose save is conditional on the key existing, are the guarded twin. A store whose sessions carry nothing security-relevant is a CONSIDER at most.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "trigger-aggregate-lost-update",
+      "title": "A database trigger recomputes a parent aggregate from a snapshot taken before the parent row is locked",
+      "agent": "concurrency-auditor",
+      "severity": "FIX",
+      "pattern": "An AFTER INSERT/UPDATE/DELETE trigger runs `UPDATE parent SET total = t.sum FROM (SELECT SUM(size) FROM child WHERE parent_id = ...) t`. Under READ COMMITTED the subquery's snapshot is taken before the UPDATE waits for the row lock, so two concurrent child inserts each compute a sum that misses the other's row and the second write wins. Limits checked against the aggregate (a size quota) are then checked against a value that is too low.",
+      "guarded_twin": "Lock the parent row before computing (`PERFORM 1 FROM parent WHERE id = ... FOR UPDATE`), maintain the aggregate incrementally (`total = total + NEW.size`), or recompute it in a serialised background job.",
+      "hunt": "Grep the migrations for trigger functions that UPDATE a table FROM an aggregate subquery (`SUM(`, `COUNT(`, `MAX(`). For each, check whether anything locks the parent row earlier in the writing transaction, and what reads the aggregate (quotas, limits, billing).",
+      "expected": "the stored aggregate equals the aggregate of the committed child rows.",
+      "caught_as": "SILENT -- an aggregate that drifts low under concurrent writers; quota checks pass that should fail.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "PostgreSQL docs, Transaction Isolation: in READ COMMITTED each statement sees a snapshot taken when it starts"
+      ],
+      "differential": "A trigger that only ever runs from a serialised writer (one job, or a path that locks the parent first) is fine. An incremental update (`total = total + NEW.x`) re-reads the locked row and does not lose updates.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "session-level-set-leaks-through-pooled-connection",
+      "title": "`SET` (not `SET LOCAL`) in request or task code leaks the setting to later users of the pooled connection",
+      "agent": "concurrency-auditor",
+      "severity": "FIX",
+      "pattern": "`session.execute(text(\"SET statement_timeout = '45s'\"))` (or `search_path`, `ROLE`, `lock_timeout`) inside a request handler or a task, on an engine with a connection pool. A plain SET lasts for the database session, not the transaction; the pool's reset-on-return issues only a ROLLBACK, which undoes it only when the transaction rolls back. After a commit, every later request that draws that connection inherits the setting.",
+      "guarded_twin": "`SET LOCAL ...` or `SELECT set_config(name, value, true)` (transaction-scoped), often already used by a sibling helper in the same project; or an engine-level `connect` event that sets the value for every connection on purpose.",
+      "hunt": "Grep every SQL string passed to `execute`/`text` for a statement starting with `SET ` that is not `SET LOCAL`, `SET TRANSACTION` or `SET CONSTRAINTS`, outside migrations. For each, check what pool the connection comes from and whether the transaction can commit.",
+      "expected": "a per-request database setting ends with the request.",
+      "caught_as": "SILENT -- unrelated requests run with a long statement timeout (or another role or search path) after one request set it.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): a request handler issued a session-level SET of the statement timeout; after commit the pooled connection kept it for later requests, while an admin helper used the transaction-scoped set_config(..., true)."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "PostgreSQL docs, SET: the effects of SET LOCAL last only until the end of the current transaction",
+        "SQLAlchemy docs, Connection Pooling, Reset On Return"
+      ],
+      "differential": "Migrations and maintenance scripts that run on their own connection are fine. A SET applied to every pooled connection on purpose (an engine `connect` listener) is configuration, not a leak.",
+      "detected_by": "scan_concurrency.py",
+      "detectability": "implemented"
+    },
+    {
+      "id": "row-or-advisory-lock-held-across-slow-io",
+      "title": "A row lock or transaction-scoped advisory lock taken early in a request and held through slow external I/O",
+      "agent": "concurrency-auditor",
+      "severity": "CONSIDER",
+      "pattern": "`SELECT ... FOR UPDATE` (`with_for_update()`), `pg_advisory_xact_lock`, `LOCK TABLE`, or an upsert that locks a shared row, executed before an object-storage upload, an archive scan, an HTTP call or a long computation in the same transaction. Transaction-scoped locks last until commit, so every other writer of that row (or every writer that takes the same global advisory key) waits for the I/O. A flush hook that takes the lock fires on an early autoflush, which moves the acquisition earlier than the code reads.",
+      "guarded_twin": "Do the slow work first and lock last (defer the locking objects to a before-commit hook so they flush at the end), or commit the slow part separately and re-check under the lock.",
+      "hunt": "List every lock-taking statement (FOR UPDATE, advisory locks, LOCK TABLE, upserts on shared rows) and every session hook that issues one. For each, find what runs between the acquisition and the commit on each path that reaches it. Rank by how many other writers contend for the same row or key.",
+      "expected": "database locks are held for the duration of database work, not of network I/O.",
+      "caught_as": "Latency spikes and lock-wait timeouts for unrelated writers while one slow request holds the lock; deadlocks when two such paths lock in different orders.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): a write path took SELECT ... FOR UPDATE on all of a parent's child rows before a file validation step and an object-storage write, so the row locks were held through both."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "PostgreSQL docs, Explicit Locking: row-level and transaction-level advisory locks are held until the transaction ends"
+      ],
+      "differential": "A lock whose purpose is to serialise exactly that slow operation (one upload per name) is by design: check the wait timeout instead. Session-level advisory locks released explicitly before the I/O are fine.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "distributed-lock-timeout-shorter-than-hold",
+      "title": "A Redis or database lease lock whose lease or wait timeout does not match how long the guarded work can take",
+      "agent": "concurrency-auditor",
+      "severity": "CONSIDER",
+      "pattern": "Two failure modes of one mismatch. (1) The lease (`timeout=`) can expire while the holder still works, so a second worker enters, and the first worker's `release()` raises a lock-not-owned error. (2) A short `blocking_timeout=` on one path waits for a lock that another path holds for minutes, so the waiter gives up and its work is dropped (or retried through a retry path that may itself be broken).",
+      "guarded_twin": "A lease longer than the longest run, extended while the work runs (`lock.extend()`), or a per-key lock instead of one global key; a waiter that requeues its work instead of dropping it.",
+      "hunt": "List every distributed lock (`redis.lock`, `Lock` subclasses, advisory locks used as mutexes): its key, its lease, each acquirer's wait timeout, and the longest operation run under it. Compare the lease with the longest hold and each wait with the other holders' hold times.",
+      "expected": "at most one holder at a time, and no work silently dropped because a lock was busy.",
+      "caught_as": "SILENT -- duplicate concurrent runs after a lease lapses; updates that never happen because their task gave up waiting.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): a lease lock around a full index rebuild could lapse before the rebuild finished; a per-item task then entered, and the rebuild's release raised a lock-not-owned error."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "redis-py docs, Lock: `timeout` is the lease, `blocking_timeout` the wait; `extend()` lengthens a held lease"
+      ],
+      "differential": "A short wait on a lock held only for milliseconds is fine. A dropped attempt that is retried later by a working retry path is a latency issue, not a lost update.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "external-side-effect-inside-db-transaction",
+      "title": "An external call made inside the database transaction of the change it accompanies",
+      "agent": "silent-failure-hunter",
+      "severity": "FIX",
+      "pattern": "A request handler or task changes database state and, before commit, calls an external system (email provider, chat webhook, helpdesk, payment API, object store). Either the external call raises and the framework rolls back the essential change (a cosmetic notification blocks the real work), or the external effect lands and a later failure rolls the database back, so the two systems disagree (an email sent for an action that never committed; a subscription cancelled at the provider but still active locally).",
+      "guarded_twin": "Run the external call from an after-commit hook or a task enqueued after commit, so it happens only when the change committed; or wrap a genuinely optional call in its own except-and-log; or compensate (undo the external effect) on rollback.",
+      "hunt": "List every client of an external system. For each call site, find the enclosing transaction boundary (transaction-per-request middleware, a task wrapper, an explicit `with transaction`). Classify the call as essential, optional or irreversible. Report optional calls that can raise inside the transaction, and irreversible calls followed by other fallible work before commit. A remote failure that recurs on every attempt (a deleted remote object) makes it permanent.",
+      "expected": "the database change and the external effect either both happen or neither does; an optional side effect never blocks the essential change.",
+      "caught_as": "SILENT when the systems diverge; a 500 that discards the real work when an optional call fails.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): a task recorded a sent email after the provider accepted it, and a later failure in the same task rolled the record back, so the provider's delivery notifications for that message were then rejected.",
+        "The same review (reproduced): a plan downgrade cancelled the payment provider's subscriptions mid-transaction, and a later failure rolled back the database but not the provider."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "zope.transaction / Django docs: after-commit hooks (`addAfterCommitHook`, `transaction.on_commit`) exist to run side effects only after a successful commit"
+      ],
+      "differential": "When the external call IS the operation and its failure must abort (a charge before granting access), it belongs inside. A call already dispatched from an after-commit hook or a post-commit task is the guarded twin.",
+      "detected_by": null,
+      "detectability": "agent-only",
+      "aliases": [
+        "notification-failure-rolls-back-action",
+        "side-effect-before-commit"
+      ]
+    },
+    {
+      "id": "task-retry-dropped-by-after-commit-publish",
+      "title": "A task base class defers publishing to an after-commit hook, so a task's own `retry()` is discarded when its transaction aborts",
+      "agent": "silent-failure-hunter",
+      "severity": "FIX",
+      "pattern": "A task-queue `Task` subclass overrides `apply_async` to defer publishing to the current transaction's after-commit hook, and the worker runs each task body inside that transaction. `Task.retry()` publishes through `apply_async`, so the retry message is parked on the transaction that the `Retry` exception then aborts; after-commit hooks never run on abort. `autoretry_for` variants run after the transaction ended and fail with a no-transaction error instead. Every retry is logged and none is sent.",
+      "guarded_twin": "Publish retries with the base implementation (`super().apply_async`) or defer only when the caller is a web request, not the worker's own task context; or run the retry decision outside the body's transaction.",
+      "hunt": "Grep task base classes for `apply_async` overrides that call `addAfterCommitHook`/`on_commit`, and the worker wrapper that runs task bodies inside a transaction. Then list every `retry(`, `autoretry_for` and `max_retries` in the project: each one depends on this path. Run one task through the real tracer (not eager mode) with the broker publish recorded.",
+      "expected": "a task that calls retry() is re-published with its countdown.",
+      "caught_as": "SILENT -- the task state says RETRY and the log says 'Retry in Ns', but no message reaches the broker; unit tests mock retry().",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): every retry from the project's task base class was parked on an after-commit hook of the transaction the Retry aborted; autoretry variants were rejected with a no-transaction error."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "Celery docs, Task.retry: retry() re-sends the task through apply_async",
+        "transaction package docs: after-commit hooks run only after a successful commit"
+      ],
+      "differential": "An override that bypasses the hook when no request transaction is active, or when called from the worker's task context, is the guarded twin. A project with no retries configured has nothing to drop.",
+      "detected_by": null,
+      "detectability": "implementable"
+    },
+    {
+      "id": "after-commit-hook-swallows-errors",
+      "title": "Work moved into an after-commit hook fails silently, because the transaction manager logs and swallows hook exceptions",
+      "agent": "silent-failure-hunter",
+      "severity": "CONSIDER",
+      "pattern": "Task publishing, cache purges or notifications run from `addAfterCommitHook` / `on_commit(robust=True)` callbacks. The commit has already succeeded when they run, so the manager catches their exceptions, logs them and returns normally. A broker outage or a bad payload at commit time drops the work with only a log line; the request returns success and nothing retries.",
+      "guarded_twin": "An outbox: write the intent to a table in the same transaction and let a worker deliver it; or a hook that records failures somewhere a retry job reads; or alerting on the swallowed-exception log line.",
+      "hunt": "List every after-commit hook the project registers and what each one does. For each, ask what happens when it raises: who notices, and what retries it. Pay attention to hooks that publish tasks: every task dispatched from a request goes through them.",
+      "expected": "work deferred to commit time is delivered, or its failure is recorded somewhere that retries it.",
+      "caught_as": "SILENT -- a warning or exception log line at commit; the side effect never happens.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "transaction package docs: after-commit hook exceptions are logged and not propagated",
+        "Django docs, transaction.on_commit(robust=True): exceptions are logged and swallowed"
+      ],
+      "differential": "A hook whose failure is genuinely harmless (a best-effort cache warm) is fine. A hook that writes failures to a retry queue is the guarded twin.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "int-max-str-digits-escapes-parser-validation",
+      "title": "A parser `int()`s an unbounded digit run; more than 4300 digits raises a plain ValueError the caller does not catch",
+      "agent": "silent-failure-hunter",
+      "severity": "FIX",
+      "pattern": "A version, id, port or enumerator parser validates syntax with a regex like `\\d+` and then calls `int()` on the match. Since the integer string conversion length limit (3.11, also backported), `int()` on more than 4300 digits raises `ValueError: Exceeds the limit (4300 digits)`. The parser's documented error type (an InvalidVersion-style class, or a 'returns None on bad input' contract) does not cover it, so callers that catch only the documented type leak a 500 or crash a batch.",
+      "guarded_twin": "Bound the digit run in the regex (`\\d{1,N}`), cap the input length before parsing, or catch `ValueError` at the boundary (wider-than-documented catches elsewhere in the codebase show the house idiom).",
+      "hunt": "Grep for `int(` applied to regex groups or `isdigit()`-checked strings in parsers of untrusted input, including third-party parsers the project calls on request data. Feed `'1' * 4301` to every untrusted-input entry point: URL segments, form fields, uploaded metadata.",
+      "expected": "oversized numeric input is rejected with the parser's own error, or a 4xx.",
+      "caught_as": "A 500 (or a crashed batch job) instead of a validation error; reachable without authentication when the parser runs on URL segments or upload metadata.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): an identifier with a numeric component over 4300 digits raised a plain ValueError from a third-party parser instead of the parser's documented error type, and the endpoint answered 500."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "Python docs, Integer string conversion length limitation (sys.set_int_max_str_digits); CVE-2020-10735"
+      ],
+      "differential": "Input whose length is bounded well below 4300 characters before parsing, or a process that sets `sys.set_int_max_str_digits(0)` on purpose, is fine.",
+      "detected_by": null,
+      "detectability": "implementable"
+    },
+    {
+      "id": "error-exit-after-flushed-mutation",
+      "title": "An error path returns normally after a mutation was flushed, and transaction-per-request commits the partial change",
+      "agent": "consistency-auditor",
+      "severity": "FIX",
+      "pattern": "In a framework that commits at the end of every request that returns normally (pyramid_tm, Django ATOMIC_REQUESTS, a task wrapper), a handler mutates rows (often via a service that flushes), then detects a problem and RETURNS an error response, redirect or flash instead of raising. The return is a success to the transaction manager, so the half-done change commits. The same happens when a broad `except` around a DB write, an audit event and an email flashes 'unexpected error' and returns.",
+      "guarded_twin": "RAISE the error response (frameworks treat a raised HTTP exception as an abort), call `request.tm.abort()` / `transaction.set_rollback(True)` / `session.rollback()` before returning, or validate everything before the first mutation. A sibling view that raises its redirect is the house idiom.",
+      "hunt": "For each view or task that mutates state, list its exits after the first mutation (including mutations inside called services). Mark each exit as raise (aborts) or return (commits). An error-shaped return after a mutation is a candidate: build the input that reaches it and check what the database holds afterwards. Then compare with sibling views of the same family.",
+      "expected": "an operation that reports failure leaves no partial change behind.",
+      "caught_as": "SILENT -- the user sees an error message, and the database holds half of the change (a rename applied, an event recorded for an action that 'failed').",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): callbacks that link an external account caught Exception around a database write, an audit event and an email, flashed 'unexpected error' and returned, so the request committed whatever had already been written."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "pyramid_tm docs: the transaction is committed unless the view raises or the response status matches the abort criteria",
+        "Django docs, Tying transactions to HTTP requests (ATOMIC_REQUESTS)"
+      ],
+      "differential": "A return after a mutation that the error message describes as done (partial success reported as such) is fine. A framework configured to abort on 4xx/5xx responses (a commit veto) commits nothing for an error response: check the veto before reporting.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "integrity-error-caught-without-rollback",
+      "title": "An IntegrityError from a flush is caught and handled without rolling back the session",
+      "agent": "python-pitfall-scanner",
+      "severity": "FIX",
+      "pattern": "`try: session.flush() except IntegrityError: return error / raise ValueError(...)`, with no `session.rollback()` and no savepoint (`begin_nested()`). After a failed flush the transaction is aborted: SQLAlchemy raises `PendingRollbackError` on the next use of the session, and PostgreSQL refuses every further statement. The friendly error path the handler intends ends in a 500 when the response renders, the end-of-request commit runs, or a caller that catches the converted exception keeps using the session.",
+      "guarded_twin": "`session.rollback()` first thing in the handler, or `with session.begin_nested(): session.flush()` so only the savepoint rolls back. Sibling handlers of the same error in the project usually do one of these.",
+      "hunt": "List every handler of `IntegrityError`/`UniqueViolation` and the database work in its `try`. Keep those with no rollback or savepoint. For each, follow the exception the handler raises (if any) to the caller that catches it, and check whether that caller uses the session again.",
+      "expected": "a constraint violation becomes the intended error response, and the session stays usable.",
+      "caught_as": "LOUD but misleading -- a 500 with PendingRollbackError (or 'current transaction is aborted') where the code meant to show a validation error.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): a rename service caught the unique violation from its flush and raised ValueError without rolling back; the admin view caught the ValueError, flashed an error, and the next database use raised PendingRollbackError."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "SQLAlchemy docs, 'This Session's transaction has been rolled back due to a previous exception during flush' (PendingRollbackError)",
+        "SQLAlchemy docs, Using SAVEPOINT (Session.begin_nested)"
+      ],
+      "differential": "A handler that re-raises the same exception (bare `raise`) lets the framework roll back, which is fine. A try whose database work runs inside `begin_nested()`, or a handler whose caller always discards the session, is fine.",
+      "detected_by": "scan_python_pitfalls.py",
+      "detectability": "implemented"
+    },
+    {
+      "id": "trigger-maintained-column-read-stale",
+      "title": "A column a database trigger rewrites is read from the ORM's in-memory object after the write that fired the trigger",
+      "agent": "python-pitfall-scanner",
+      "severity": "FIX",
+      "pattern": "A migration creates a BEFORE INSERT/UPDATE trigger that sets column C (`NEW.changed_at = now()` on UPDATE OF email, `NEW.name = normalize(NEW.name)`). The model maps C without `server_onupdate=FetchedValue()` (or `eager_defaults`), so after `obj.<trigger column> = x; session.flush()` the identity map still holds the old C. Code in the same request then reads `obj.C` and stores or compares it (a session timestamp, a cache key, an audit record).",
+      "guarded_twin": "`session.flush(); session.refresh(obj)` before reading C (often with a comment like 'pick up the new value'), or `FetchedValue()` on the column.",
+      "hunt": "List every CREATE TRIGGER in the migrations and the columns it assigns. Grep the Python for reads of each such attribute, and for each read look for a preceding write in the same request or task to a column that fires the trigger, with no refresh or expire between them. Include writes hidden in services (a password rehash on login, normalisation on insert).",
+      "expected": "the value read equals the value the database just stored.",
+      "caught_as": "SILENT -- a stale value persisted elsewhere; for session timestamps, a fresh session invalidated on the next request.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): a login-time password-hash upgrade fired a trigger that bumped a password-changed timestamp; the login recorded the stale in-memory value in the session, and the next request invalidated the new session."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "SQLAlchemy docs, Fetching Server-Generated Defaults (FetchedValue, eager_defaults)"
+      ],
+      "differential": "A read in a later request or transaction, or after the attribute was expired (refresh, commit, expire_all), sees the new value.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "in-place-mutation-of-untracked-json-column",
+      "title": "A JSON/JSONB/ARRAY column without mutation tracking is changed in place, so the change is never flushed",
+      "agent": "python-pitfall-scanner",
+      "severity": "FIX",
+      "pattern": "`obj.col[key] = v`, `obj.col.update(...)`, `obj.col.append(...)` where `col` is `mapped_column(JSONB)` / `Column(JSON)` / `ARRAY(...)` NOT wrapped in `MutableDict.as_mutable(...)` / `MutableList`, and no `flag_modified(obj, 'col')` follows. SQLAlchemy records no attribute history for an in-place change, so the UPDATE omits the column. Tests that assert on the same in-memory object pass.",
+      "guarded_twin": "A sibling column declared `MutableDict.as_mutable(JSONB)`, reassignment (`obj.col = {**obj.col, key: v}`), or `flag_modified(obj, 'col')` after the change.",
+      "hunt": "Collect every JSON/JSONB/ARRAY mapped column and whether it is Mutable-wrapped. Grep subscript assignments and mutating methods on `.<col>`, including through an alias (`d = obj.col; d[k] = v`). Check whether the tests re-read from the database (expire_all, a new session) or assert on the object they mutated.",
+      "expected": "the mutation is persisted.",
+      "caught_as": "SILENT -- the change is visible for the rest of the request and gone after it.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): an admin workflow wrote completed/cancelled timestamps into a plain JSONB column in place, and nothing was persisted; the scanner check finds exactly those sites."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "SQLAlchemy docs, Mutation Tracking (sqlalchemy.ext.mutable): in-place changes to JSON values are not detected unless the type is wrapped"
+      ],
+      "differential": "Fine when the column is Mutable-wrapped, when `flag_modified` is called, or when the object is transient (not yet flushed, so the whole value is inserted). The scanner skips attribute names that some model declares tracked, and nested mutation (`obj.col[a][b] = v`) even of a MutableDict is a separate, manual hunt.",
+      "detected_by": "scan_python_pitfalls.py",
+      "detectability": "implemented"
+    },
+    {
+      "id": "raw-value-compared-with-normalized-column",
+      "title": "A raw value is compared with (or used to look up) a column the database normalises",
+      "agent": "python-pitfall-scanner",
+      "severity": "FIX",
+      "pattern": "A model has a raw column and a normalised twin (`name` and `normalized_name`), or a trigger normalises a column on write. One query compares the raw input with the normalised column, or the normalised input with the raw column. Variant spellings miss: a lookup silently skips rows, an existence check passes and the insert then violates a unique constraint on the normalised value.",
+      "guarded_twin": "The sibling query that normalises both sides with the same function (`func.normalize(Model.name) == func.normalize(value)`), or that compares like with like.",
+      "hunt": "List each column pair (raw / normalised) and each trigger that normalises. Grep every filter on either column and check that the compared value went through the same normalisation. Feed variant spellings (case, separators) through each path.",
+      "expected": "every spelling of a name resolves to the same row.",
+      "caught_as": "SILENT -- rows skipped by a maintenance job or a search update; sometimes a unique violation that aborts a whole batch.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): an incremental reindex filtered the raw name column but was always given normalised names, so it silently skipped every item whose name was not already normalised."
+      ],
+      "validation": "confirmed",
+      "references": [],
+      "differential": "A comparison where the input is already guaranteed normalised (it came from the normalised column) is fine.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "child-by-id-without-parent-check",
+      "title": "A child object fetched by bare id under a parent-scoped route is acted on without checking it belongs to that parent",
+      "agent": "consistency-auditor",
+      "severity": "FIX",
+      "pattern": "A view whose route or context names a parent (project, organization, team) loads a child by primary key from the URL or the form (`session.get(Child, id)`, `service.get_child(id)`), mutates it, and records audit events against the URL's parent, with no `child.parent_id == parent.id` check. The permission check passed for the URL's parent, not for the child's real parent.",
+      "guarded_twin": "A sibling view that filters the lookup by the parent (`.filter(Child.parent == parent, Child.id == id)`) or rejects `child.parent_id != parent.id` before acting.",
+      "hunt": "Enumerate every route whose pattern carries both a parent key and a child id (in the path or the form). For each view, check that the child lookup is scoped by the parent, and compare with the same-file twin that is.",
+      "expected": "a child id from another parent is rejected.",
+      "caught_as": "SILENT -- a stale tab or a crafted form changes another parent's child; the audit trail names the wrong parent.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): admin views under a parent-scoped route loaded a role row by id and changed or removed it without checking it belonged to the parent in the URL; a sibling view in the same file did check."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "OWASP: Insecure Direct Object Reference"
+      ],
+      "differential": "A route factory that resolves the child itself and checks permission on the child's own ACL is the guarded twin. A child type that has no parent (a global object listed under a parent page) is fine.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "creator-scoped-delete-of-group-scoped-object",
+      "title": "An object created under a group permission can be deleted only by its individual creator",
+      "agent": "consistency-auditor",
+      "severity": "CONSIDER",
+      "pattern": "Creation is authorised by a group-level permission (an organization's owners), but the delete path checks `obj.created_by == request.user`, usually because it was copied from the twin that handles personal objects. Co-owners see a delete control that fails with a misleading error, and the capability can be revoked only by the person who added it.",
+      "guarded_twin": "The analogous object at another scope that is deleted under the group permission (any owner may remove it).",
+      "hunt": "For every `created_by`/`added_by` comparison in a delete or edit path, ask whether the object can belong to a group. Diff the personal and the group twin views of the same object type.",
+      "expected": "whoever may create a group-owned object on the group's behalf may also remove it.",
+      "caught_as": "LOUD but misleading -- an 'invalid id' style error for a co-owner; no data loss.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): group-owned registrations could be removed only by the owner who created them; the other owners got an 'invalid id' error."
+      ],
+      "validation": "confirmed",
+      "references": [],
+      "differential": "A design that deliberately ties an object to its creator (a personal token shown on a group page) is a POLICY question, not a defect: check the docs and the creation path.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "aggregate-delete-skips-per-member-side-effects",
+      "title": "Deleting a container removes its members without the events, audit records and notifications that removing one member emits",
+      "agent": "consistency-auditor",
+      "severity": "CONSIDER",
+      "pattern": "`remove_member(x)` records an event on the member and on its targets, writes an audit record and sends a notification. `delete_container()` removes all the members (directly or by cascade) and records one container-level event. Access is revoked for N users or M objects with no trace on any of them.",
+      "guarded_twin": "The single-member removal path, called per member from the container delete, or a cascade listener that emits the same events.",
+      "hunt": "Pair every `delete_<container>` with its `remove_<member>` twin and diff their event, audit and email calls. Include cascades: a database ON DELETE CASCADE removes members without any Python code running.",
+      "expected": "every revocation leaves the same audit trail, however it happened.",
+      "caught_as": "SILENT -- members lose access with no event on their own history and no notification.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): deleting a group stripped every grant it held with no audit record, no per-member event and no email, while removing one grant emitted all three."
+      ],
+      "validation": "confirmed",
+      "references": [],
+      "differential": "A container delete documented as silent (a cleanup of an already-empty container), or one that emits a summary event the per-member history views also read, is fine.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "bulk-dml-bypasses-session-hooks",
+      "title": "A bulk `Query.delete()`/`update()` skips the side effects that ORM session hooks derive from per-object changes",
+      "agent": "pattern-consistency-checker",
+      "severity": "FIX",
+      "pattern": "The project drives side effects (cache purges, search indexing, audit, denormalised counters) from session `after_flush`/`before_flush` or attribute listeners that iterate `session.new`/`dirty`/`deleted`. One code path removes or changes the same rows with a single statement (`Query.delete(synchronize_session=False)`, `session.execute(delete(Model))`, `Query.update(...)`). Those rows never become ORM objects in the session, so the listeners never see them; database ON DELETE CASCADE extends the blind spot to the children.",
+      "guarded_twin": "The per-object path for the same operation (`session.delete(obj)`, a `remove_<thing>()` helper) that the hooks see; or an explicit call that schedules the same side effects for the bulk path.",
+      "hunt": "List the model classes the session hooks key on. Grep bulk statements against each (`.delete(`, `.update(` on a Query, `execute(delete(`, `execute(update(`, `synchronize_session`). Each hit is a candidate unless the side effect is handled explicitly next to it.",
+      "expected": "every way of deleting or updating a hooked model triggers the same side effects.",
+      "caught_as": "SILENT -- stale caches, search entries and missing audit records until a TTL or a full rebuild.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "SQLAlchemy docs, ORM-Enabled INSERT, UPDATE, and DELETE statements: bulk statements do not run Session flush events or cascade relationships in Python"
+      ],
+      "differential": "A bulk path against a model with no hooks, one that schedules the same side effects explicitly, or one whose only caller guarantees it matches zero rows (latent, see the false-positive taxonomy) is not a live bypass.",
+      "detected_by": null,
+      "detectability": "implementable"
+    },
+    {
+      "id": "identity-tuple-diverges-between-constraint-and-lookup",
+      "title": "A record's identity is defined differently by the unique constraint, the lookup, and the reuse path",
+      "agent": "pattern-consistency-checker",
+      "severity": "FIX",
+      "pattern": "A table's UNIQUE constraint covers columns K. The lookup filters K plus an extra column X (an immutable owner id, an issuer, a display name) or a normalised form of K, and the write path reuses an existing row by K alone. A record whose X differs is handed the old row, which the lookup then never matches again; or the lookup matches rows the constraint never deduplicated. The usual trigger is a rename or a second issuer.",
+      "guarded_twin": "A sibling type in the same family whose constraint, lookup and reuse filter the same tuple with the same normalisation, or that records X on first use and checks it only when set.",
+      "hunt": "For every model with a unique constraint, list the columns and normalisation used by (a) the constraint, (b) every lookup, (c) every exists/reuse/upsert, (d) every form that writes it. Any row of that matrix that differs is a candidate; build the failing input by changing exactly the differing column.",
+      "expected": "every path that answers 'is this the same record?' uses the same columns and normalisation.",
+      "caught_as": "SILENT at registration, then a generic not-found or a 500 later (MultipleResultsFound, IntegrityError).",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): a lookup filtered an external account's display name as well as the immutable id the constraint covered, so renaming the external account made later lookups fail with a 500."
+      ],
+      "validation": "confirmed",
+      "references": [],
+      "differential": "An extra lookup column checked separately with an explicit, user-visible error on mismatch is fine.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "acl-preempts-explicit-check",
+      "title": "A business rule encoded in the ACL for some principals pre-empts the explicit check that explains it to the others",
+      "agent": "pattern-consistency-checker",
+      "severity": "CONSIDER",
+      "pattern": "A view first asks for a permission and later performs an explicit check for condition C with a dedicated error. The ACL also withholds the permission under C, but only for some principal types. Those principals get a generic 403, and the dedicated message is unreachable for them; tests of the message use a permissive test security policy, so they pin a path production cannot take.",
+      "guarded_twin": "The principal type the ACL does not gate, which reaches the explicit check and its message.",
+      "hunt": "For each explicit check after a permission check, see whether the ACL encodes the same predicate for any principal type. Then read the test for that branch: a permissive test security policy is the tell.",
+      "expected": "the same condition yields the same error for every kind of caller.",
+      "caught_as": "LOUD but misleading -- a 403 with the wrong explanation for one class of caller.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): a billing-standing rule was enforced by the ACL for one principal type and by an explicit check for another, so the first type got a generic 403 instead of the explanatory error."
+      ],
+      "validation": "confirmed",
+      "references": [],
+      "differential": "An ACL denial that carries a reason the view renders, or an explicit check that is defence in depth with identical wording, is fine.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "append-slash-redirect-swallows-deliberate-404",
+      "title": "A not-found view with append-slash redirects 404s that a view raised on purpose",
+      "agent": "api-surface-reviewer",
+      "severity": "CONSIDER",
+      "pattern": "A framework-level not-found handler redirects to `path + '/'` when that path matches a route (Pyramid `notfound_view_config(append_slash=...)`, Django `APPEND_SLASH`, Flask `strict_slashes`). It also fires for a 404 that a view raised deliberately on a slash-less path whose slash twin is an unrelated route, so the client never sees the 404 and follows a redirect to an unrelated resource, often a 200 page.",
+      "guarded_twin": "A path-scoped not-found view with append-slash disabled for API prefixes, or a view that returns (rather than raises) its 404 response.",
+      "hunt": "List every route without a trailing slash whose views raise or return a 404. Check whether the same path plus '/' matches any route, including redirect routes. Each match is an instance unless that path is excluded from append-slash.",
+      "expected": "a view's own 404 reaches the client as a 404.",
+      "caught_as": "API clients receive 301 -> 200 (a home page) for missing resources; unit tests that call the view directly still see the 404.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): deliberate 404s from a legacy API endpoint became a chain of 301s ending at the home page with 200."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "Pyramid docs, Redirecting to Slash-Appended Routes; Django docs, APPEND_SLASH"
+      ],
+      "differential": "When the slash twin is the same resource, the redirect is the intent.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "content-negotiation-split-across-routes",
+      "title": "Content negotiation done by an `accept=` predicate per route ignores q-values and media-type parameters",
+      "agent": "api-surface-reviewer",
+      "severity": "CONSIDER",
+      "pattern": "Two routes or views share a URL and are selected by an `accept=` predicate each. The router takes the first route whose single offer is acceptable, so the client's q-values are never compared across routes; a range with parameters (`application/json; charset=utf-8`) fails to match a parameterless offer; and a request matching neither predicate falls through to 404 instead of 406 or a documented default.",
+      "guarded_twin": "One view that calls the framework's negotiation over all offers (`request.accept.acceptable_offers([...])`) and picks the renderer.",
+      "hunt": "Grep route and view registrations for `accept=` and group them by URL pattern. Any pattern with more than one accept-split route is an instance. Probe each with 'A, B;q=0.5', 'A; charset=utf-8' and an unmatched type.",
+      "expected": "the highest-q acceptable representation is served; unmatched types get 406 or the documented default.",
+      "caught_as": "The wrong representation for clients with explicit preferences, and a 404 for an existing resource.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): an endpoint negotiated through two accept predicates; q-values were ignored, a parameterised Accept got 404, and unmatched types got a 404 page."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "RFC 9110, section 12.5.1 (Accept)"
+      ],
+      "differential": "A URL with only one representation has nothing to negotiate.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "cross-cutting-header-only-on-some-responses",
+      "title": "A cross-cutting response header (CORS, Vary, Cache-Control) is set on some statuses or branches of an API and not others",
+      "agent": "api-surface-reviewer",
+      "severity": "CONSIDER",
+      "pattern": "An API's success responses carry its header contract, but an error or exception view decorates its response only at the end, after a fallback branch that returns early; or a redirect or a sibling representation of the same API is built by a different code path that never adds the headers. Whether a client sees CORS or caching headers depends on which status or branch it hit.",
+      "guarded_twin": "The main branch of the same function, or a response callback / middleware that adds the headers unconditionally for the API's path prefix.",
+      "hunt": "For each API, run every status it can produce (200, 3xx redirects, 400, 404, 405, 406, 410, 429, 503) and every representation through the app, and diff each response's header set against the 200 response. Then read each return statement of the exception views.",
+      "expected": "every response of an API carries the same CORS, Vary and cache contract.",
+      "caught_as": "Browser clients see opaque CORS failures only for some statuses; caches store error or redirect responses with the wrong lifetime.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): an API's trailing-slash redirect lacked the Access-Control-Allow-Origin header that another redirect of the same API carried."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "Fetch standard, CORS protocol: a cross-origin redirect must itself carry the CORS headers"
+      ],
+      "differential": "An endpoint that is not meant to be cross-origin or cacheable has no contract to break.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "user-doc-claim-not-implemented-by-access-control",
+      "title": "A user-facing doc states a behaviour (who can do what, what happens when) that the permission or view code does not implement",
+      "agent": "project-docs-auditor",
+      "severity": "FIX",
+      "pattern": "The user documentation of a web service promises a behaviour: 'role X can (or cannot) do Y', 'during the grace period writes keep working', 'you will receive an email', 'the API returns 404 for ...'. The ACLs, view permissions and views implement something else, usually because the code changed and the doc did not, or the doc described the plan. Users act on the doc.",
+      "guarded_twin": "A docs page whose roles table matches the permission matrix derived from the code, or a claim with a test that pins it.",
+      "hunt": "Inventory the behavioural claims in the user docs (roles tables, 'can'/'cannot', status codes, emails, limits, grace periods). Derive the permission matrix from the ACLs and each view's `permission=`, and diff it cell by cell against the docs' roles tables. For each other claim, find the code path and check it, or probe it.",
+      "expected": "what the docs say a user can do is what the service lets them do.",
+      "caught_as": "SILENT in the code -- users are surprised by a denial the docs said would not happen, or by an action the docs said was impossible.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): the docs promised a grace period during which a lapsed paid plan keeps write access; the permission code revoked it at once."
+      ],
+      "validation": "confirmed",
+      "references": [],
+      "differential": "A doc describing a deliberately deferred behaviour with a date or an issue link, or an enum split for grandfathering whose introducing commit says so, is a doc note, not a code defect (see the false-positive taxonomy).",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "local-clock-compared-with-utc-store",
+      "title": "A local naive `datetime.now()` is compared with, or stored against, naive-UTC values from a database",
+      "agent": "lint-rule-triager",
+      "severity": "CONSIDER",
+      "pattern": "`datetime.now()`, `date.today()`, `datetime.fromtimestamp(ts)` or a naive `datetime(...)` (no tz) compared with, subtracted from, or written to a column that the project fills with UTC (`server_default=now()` in a UTC database, `utcnow()` elsewhere). The code is correct only while the server's TZ is UTC; elsewhere every window (an expiry window, a repeat-email interval) shifts by the offset.",
+      "guarded_twin": "`datetime.now(UTC)` (aware) on both sides, or the project's own `utcnow()`-equivalent helper, which sibling code usually already uses.",
+      "hunt": "For each DTZ001/DTZ005/DTZ006/DTZ011 hit, follow the value: keep the ones compared with, subtracted from, or stored into a database timestamp. Check how that column is filled. Then grep the project's own now() helper: the sites that bypass it are the candidates.",
+      "expected": "time comparisons are correct whatever the server's TZ.",
+      "caught_as": "SILENT -- correct in production while TZ=UTC; wrong windows on a developer machine, in CI, or after a deployment change.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): naive local datetime.now()/fromtimestamp() calls were compared with or written to naive-UTC columns (an expiry window, an email repeat window), correct only while TZ=UTC."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "ruff DTZ001 / DTZ005 / DTZ006 / DTZ011 flag the call; the destination decides the shape",
+        "Python docs, datetime: naive objects have no notion of time zone"
+      ],
+      "differential": "`datetime.now().timestamp()` is TZ-independent (it round-trips to the epoch) -- see the false-positive taxonomy. A pure in-process duration is `duration-measured-with-wall-clock`; a naive value written into a file or schema that other programs read is `naive-datetime-in-a-persisted-artifact`.",
+      "detected_by": null,
+      "detectability": "implementable"
+    },
+    {
+      "id": "interpolation-placeholder-without-f-prefix",
+      "title": "A string with `{name}` placeholders that was meant to be an f-string has no `f` prefix",
+      "agent": "lint-rule-triager",
+      "severity": "CONSIDER",
+      "pattern": "`raise ValueError(\"unknown mode {mode}\")` or `log(\"retrying {attempt}\")` where `mode`/`attempt` are names in scope and nothing formats the string later. The user sees the literal braces. Usually an f-prefix dropped in an edit or a copy from a sibling line.",
+      "guarded_twin": "The sibling line with the `f` prefix, or an explicit `.format(...)` / `%` call.",
+      "hunt": "Take each RUF027 hit (preview-only in ruff today). Keep it when every placeholder names a variable in scope and the string reaches output without `.format`, `%`, `string.Template` or a translation call with a mapping. Then grep for the same message elsewhere: its sibling often has the prefix.",
+      "expected": "messages show values, not braces.",
+      "caught_as": "SILENT -- error messages and logs with literal `{name}` text.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "ruff RUF027 (missing-f-string-syntax), preview"
+      ],
+      "differential": "Translation strings with `${name}` or `{name}` placeholders resolved through a `mapping=`/`.format` after the lookup are correct (see the false-positive taxonomy). Templates formatted later, docs and regex quantifiers like `{2,3}` are not instances. The translation variant that IS a defect is the opposite case: `translation-lookup-of-interpolated-string`.",
+      "detected_by": null,
+      "detectability": "implementable"
+    },
+    {
+      "id": "translation-lookup-of-interpolated-string",
+      "title": "A translation call receives an f-string or a concatenation, so the lookup key never matches the catalog",
+      "agent": "python-pitfall-scanner",
+      "severity": "FIX",
+      "pattern": "`request._(f\"Archived {name!r}\")`, `_(\"Could not archive \" + name)` or `gettext(\"...{}\".format(x))`. The runtime msgid is the interpolated text, which never matches a catalog entry, so every locale shows the source language; extraction tools record nothing, or a fragment. ruff's INT001-INT003 catch bare `_()`/`gettext()` names only, not method aliases such as `request._` or `localizer.translate`.",
+      "guarded_twin": "A literal msgid with the values passed through the translation's mapping (`request._(\"Archived ${name}\", mapping={\"name\": name})`), which the same files usually do dozens of times.",
+      "hunt": "Every call to `_`, `gettext`, `ngettext`, `pgettext`, `lazy_gettext` or a `translate` method (bare or as a method) whose first argument is an f-string, a `+` or `%` expression, or `.format(...)`. Also check that `${x}` placeholders in literal msgids match the mapping's keys.",
+      "expected": "msgids are literals; values arrive through the mapping.",
+      "caught_as": "SILENT in source-language test runs; only non-source-language users see untranslated text.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): flash messages passed an f-string or a concatenation to a request-bound translation method; the scanner check finds exactly those sites."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "ruff INT001 / INT002 / INT003 (flake8-gettext)",
+        "GNU gettext manual: the msgid must be a literal for extraction and lookup"
+      ],
+      "differential": "A wrapper whose parameter is passed straight through (`def t(msg): return localizer.translate(msg)`, called with literals) is fine: check its callers instead. A project with no message catalogs is not translating anything.",
+      "detected_by": "scan_python_pitfalls.py",
+      "detectability": "implemented"
+    },
+    {
+      "id": "fixture-value-outside-producer-domain",
+      "title": "A test fixture supplies a value (or a value type) the real producer never generates, so the bug survives behind it",
+      "agent": "test-investigation-agent",
+      "severity": "CONSIDER",
+      "pattern": "A test injects an already-parsed or differently typed value where production delivers a raw one: a UUID object in a router's match dict that is always a string in production, a dict where the column returns a JSON string (or the reverse), a library-wrapped exception where the real listener re-raises the raw driver error, a placeholder where a real hex digest goes. The code under test is correct for the fixture and wrong for production, so the test passes; or a correct fix fails the test and gets rejected.",
+      "guarded_twin": "Fixtures that build the value exactly as the production boundary does (the router's string, `str(user_id)`, the ORM's real column type, a real digest), or an integration test through the real producer.",
+      "hunt": "For each fixture field and each injected request attribute (match dict, POST, session), find the production producer (router, security policy, ORM column, driver) and compare the value's type and domain. Then check whether the code under test branches on that type or domain (str vs UUID comparison, a missing parse, a key lookup).",
+      "expected": "tests exercise the code with values production can produce, so type- and domain-dependent bugs fail them.",
+      "caught_as": "SILENT -- a passing test that masks a production bug, or a correct fix that fails CI.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): fixtures supplied UUID objects where the router delivers strings, and dict payloads where production stored JSON text, hiding several defects and making correct fixes fail."
+      ],
+      "validation": "confirmed",
+      "references": [],
+      "differential": "A fixture value outside the producer's domain on purpose, in a test about rejecting bad input, is the point of that test.",
+      "detected_by": null,
+      "detectability": "agent-only",
+      "aliases": [
+        "fixture-type-divergence"
+      ]
+    },
+    {
+      "id": "non-finite-float-passes-range-guard",
+      "title": "A float parsed from config or the environment passes a `<= 0` / range rejection test as `nan` or `inf`",
+      "agent": "python-pitfall-scanner",
+      "severity": "CONSIDER",
+      "pattern": "`x = float(raw)` followed by a rejection test of the form `if x <= 0: raise` (or `x < lo`, `x > hi`). `float()` accepts 'nan', 'inf' and 'infinity'. Every comparison with NaN is False, so NaN passes every rejection test written this way, and inf passes a positivity check. The 'validated' value then reaches a consumer that cannot take it: a socket or asyncio timeout (OverflowError, ValueError), `time.sleep`, `int()`, `range()`, or a limit that NaN silently disables.",
+      "guarded_twin": "`if not math.isfinite(x) or x <= 0: raise`, or a test written so NaN fails it (`if not 0 < x <= hi: raise`).",
+      "hunt": "Every `float(` whose result is compared with a constant inside a validator or a config loader; every config or env coercion helper that maps strings to float; every timeout, limit and interval read from config. Feed 'nan' and 'inf' to each.",
+      "expected": "a non-finite value is rejected where the value is validated, with a config error.",
+      "caught_as": "SILENT at validation; it fails later, at first use, with an unrelated-looking OverflowError/ValueError, or it silently disables a limit.",
+      "confirmed_examples": [
+        "A private review of a threaded/async FastAPI service (reproduced): a timeout validator parsed float(...) from configuration and rejected only `<= 0`; 'inf' and 'nan' both passed, and every outbound call then failed at the socket."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "Python docs, float(): accepts 'nan', 'inf' and 'infinity'; math.isfinite",
+        "IEEE 754: every ordered comparison with NaN is false"
+      ],
+      "differential": "`math.inf` used deliberately as an 'unlimited' sentinel and documented as such is fine, and so is a value that a later check rejects. A test written in the NaN-rejecting form (`if not x > 0`, `if not lo < x <= hi`) is the guarded twin.",
+      "detected_by": "scan_python_pitfalls.py",
+      "detectability": "implemented"
     }
   ]
 }
