@@ -63,3 +63,43 @@ gh issue list --repo "$R" --state all --limit 300 --json number,title,state,body
 
 Note `--state all` **is** valid for `gh issue list` (unlike `gh search issues`) — that inconsistency
 is what caused the confusion in the first place.
+
+## Whole-catalog sweeps: dump once, search locally (toolkit-local)
+
+_This section is code-review-toolkit's own addition and is not in the family copy yet. Keep it
+below the vendored recipe, and drop it here once the family copy carries it._
+
+The recipe above is right for a handful of findings. A sweep over a whole `findings.json` (hundreds
+of findings, three or more queries each) hits two limits:
+
+- **The search API allows 30 requests a minute**, shared by every agent using the same token. A
+  sweep stalls on HTTP 403 long before it finishes.
+- **REST list endpoints stop returning items at about 30,000, without an error.** Past that point a
+  page comes back empty, and `gh api --paginate` ends normally, so a truncated listing reads
+  exactly like a complete one. Issue comments on a large tracker pass that mark.
+
+Dump the tracker once in update-time windows (each well under the cap, every item de-duplicated by
+id), then search the dump:
+
+```bash
+d=$(mktemp -d "${TMPDIR:-/tmp}/crt-tracker.XXXXXX") && echo "$d"
+python3 <plugin_root>/scripts/dump_tracker.py dump --repo OWNER/REPO --out "$d"
+python3 <plugin_root>/scripts/dump_tracker.py search "$d" retry timeout          # terms are AND
+python3 <plugin_root>/scripts/dump_tracker.py search "$d" '~upload\s+limit' --pr --open
+```
+
+- `dump` writes `issues.jsonl` (issues and PRs, with `merged`), `comments.jsonl` and
+  `manifest.json`. It costs one REST request per 100 items (about 500 for 20,000 issues and 30,000
+  comments), against the 5,000-an-hour core limit, not the search limit.
+- **Read `complete` in the manifest.** `true` means the dump holds as many issues and PRs as the
+  search API counts for the repository; `false` means items are missing; `null` means the count
+  couldn't be checked or a request failed (see `errors`). Never call a finding novel from an
+  incomplete dump.
+- `search` matches each term as a case-insensitive substring of the title, body or any
+  conversation comment (`~` makes a term a regular expression); hits rank title > body > comment.
+  Filters: `--title`, `--pr`/`--issue`, `--open`/`--closed`, `--since YEAR`, `--no-comments`.
+- Use at least three queries per finding (the symptom, the mechanism, the location or symbol), then
+  read every plausible hit in full (`gh api repos/OWNER/REPO/issues/N` and its comments).
+- A dump doesn't hold PR review (inline) comments, Discussions or private security advisories. For
+  a FIX or security finding with no hit, double-check once with the search API above before calling
+  it novel, and record what the dump didn't cover.

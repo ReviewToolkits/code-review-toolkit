@@ -41,6 +41,20 @@ gh api -X GET search/issues -f q="repo:$R is:issue TERM1 TERM2" \
 - **Search human language plus a label**, not a bare identifier. Identifiers tokenize unreliably.
 - Put every filter inside `q`: `is:issue`, `state:open`, `in:title`, `label:bug`, `repo:O/R`.
 
+### Sweeping a whole findings.json
+
+For more than a few dozen findings, per-finding search API calls hit its 30-a-minute limit, and
+REST listings of a large tracker stop at about 30,000 items without an error. Dump the tracker
+once and search it locally, as the "Whole-catalog sweeps" section of the guide describes:
+
+```bash
+python3 <plugin_root>/scripts/dump_tracker.py dump --repo OWNER/REPO --out <private dir>
+python3 <plugin_root>/scripts/dump_tracker.py search <private dir> TERM1 TERM2
+```
+
+Check `complete` in the dump's `manifest.json` before you trust a miss, and double-check the
+misses on FIX and security findings with one search API call each.
+
 ### Not on GitHub
 
 - **GitLab.** `glab issue list --search "TERM1 TERM2" --all` if `glab` is installed; otherwise the
