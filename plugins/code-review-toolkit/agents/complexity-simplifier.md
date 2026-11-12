@@ -126,6 +126,14 @@ Per-function metrics can't see the complexity that produced most defects. When o
 
 Cite finding ids as the other agents wrote them, so consolidation can merge them. When no other reports are available, say so and skip this step.
 
+### Step 2c: Read Each Top Hotspot's Direct Callers and Callees
+
+The score ranks functions one at a time, but a hotspot's defects often sit in the small helpers it calls, or in the callers that prepare its input: each scores below 5 and never reaches the hotspot list. For every hotspot that gets a full write-up:
+
+1. List its direct callees and callers **in the same module** (`grep -n "<name>(" <file>`, and the calls inside its body).
+2. Read each one. Check what the hotspot assumes of it: the value it returns on the empty, missing or error case, the exception it raises, whether it mutates its argument, whether a caller validates the input the hotspot relies on.
+3. Report a defect found there under the hotspot's entry (`via callee <name>`), with the helper's own location, whatever the helper's score.
+
 ### Step 3: Analyze Simplification Strategies
 
 For each reported hotspot, suggest specific simplification strategies. Choose from:
