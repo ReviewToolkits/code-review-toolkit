@@ -284,6 +284,30 @@ Then **spot-check it yourself**: re-read a sample of locations (all FIX findings
 every finding whose agents disagreed. The deduplication and contradiction rules below are the
 consolidation agent's instructions.
 
+**Labels that leave the run carry the run id.** Short ids repeat across runs and projects (two
+reviews can each have an `SF-1`), and one handed over bare can bring a fact from the wrong review
+into a slice agent's prompt. In every handoff (reproduction slices, prior art, the security gate,
+a later run's memory), cite a finding as `<run_id>/<id>`, e.g. `proj_v3/PRJ-014`, and give its
+title with it. Agent-internal ids never leave the run: map them to the consolidated id first.
+
+**Second look at single-finder findings.** A finding only one agent reached is the least likely to
+be found again: in one measured re-run, about half of the single-finder items came back (77% of the
+FIX ones), against about 90% of the items two or more agents had found. A miss on re-run means the
+area wasn't covered well, so its siblings probably weren't either. After consolidation:
+
+1. List the FIX findings, and the findings with a `security_claim`, whose `agents` has one entry.
+2. Group them by area (module or package).
+3. Dispatch one targeted agent per area, preferably of a different type from the finder (a
+   silent-failure-hunter over a python-pitfall-scanner finding on an error path, a
+   pattern-consistency-checker over a consistency-auditor one). Give it the area and the shapes of
+   the findings there, not the findings themselves, and ask for defects of those shapes and their
+   siblings.
+4. Consolidate its report like any other. A re-found finding gains the second agent in `agents`;
+   a new one is a new finding. Note in `notes` which findings stayed single-finder.
+
+When the review is planned up front, the cheaper version is overlap: give each high-risk area
+(auth, payments, data deletion, anything security-relevant) two agents whose scopes both cover it.
+
 #### Step 2: Re-anchor against unmerged branches
 
 For every FIX finding, check each unmerged branch that touches its files
