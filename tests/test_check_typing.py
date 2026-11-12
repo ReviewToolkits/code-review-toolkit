@@ -702,6 +702,124 @@ class TestSilencedImports(unittest.TestCase):
         self.assertTrue(info["site_packages"])
 
 
+_PHANTOM_SRC = (
+    "from typing import TYPE_CHECKING\n"  # 1
+    "from untyped_lib import Thing\n"  # 2
+    "from otherlib import Widget\n"  # 3
+    "if TYPE_CHECKING:\n"  # 4
+    "    from pkg.plugins import Reporter\n"  # 5
+    "    from nowhere import Gadget\n"  # 6
+    "    from devonly import Tool\n"  # 7
+    "def f(a: Thing, b: 'Reporter') -> None: ...\n"  # 8
+    "def g(x) -> Widget: ...\n"  # 9
+    "class Base(Gadget): ...\n"  # 10
+    "class C(Base): ...\n"  # 11
+    "def h(v: Unknown, t: Tool) -> None: ...\n"  # 12
+    "from typing import Optional\n"  # 13
+    "def k(a: Optional[Thing]) -> None: ...\n"  # 14
+)
+_UNFOLLOWED = 'becomes "Any" due to an unfollowed import  [no-any-unimported]\n'
+_PHANTOM_HITS = (
+    f'pkg/m.py:8: error: Argument 1 to "f" {_UNFOLLOWED}'
+    f'pkg/m.py:8: error: Argument 2 to "f" {_UNFOLLOWED}'
+    f"pkg/m.py:9: error: Return type {_UNFOLLOWED}"
+    f"pkg/m.py:11: error: Base type Base {_UNFOLLOWED}"
+    f'pkg/m.py:12: error: Argument 1 to "h" {_UNFOLLOWED}'
+    f'pkg/m.py:12: error: Argument 2 to "h" {_UNFOLLOWED}'
+    f'pkg/m.py:14: error: Argument 1 to "k" {_UNFOLLOWED}'
+    "Found 7 errors in 1 file (checked 2 source files)\n"
+)
+_SILENCED_OUT = (
+    'pkg/m.py:2: error: Skipping analyzing "untyped_lib": module is installed, '
+    "but missing library stubs or py.typed marker  [import-untyped]\n"
+    "pkg/m.py:7: error: Cannot find implementation or library stub for module "
+    'named "devonly"  [import-not-found]\n'
+    "Found 2 errors in 1 file (checked 2 source files)\n"
+)
+
+
+class TestPhantomOrigins(unittest.TestCase):
+    """Hundreds of phantom hits on a project that silences untyped libraries,
+    none real: each hit now says whether its module exists at all."""
+
+    _FILES: ClassVar[dict[str, str]] = {
+        "mypy.ini": "[mypy]\nignore_missing_imports = True\n",
+        "pkg/__init__.py": "",
+        "pkg/m.py": _PHANTOM_SRC,
+        # Installed-looking third-party packages, found on the search path.
+        "untyped_lib/__init__.py": "",
+        "otherlib.py": "",
+    }
+
+    def _result(self):
+        result, _ = _run(
+            self._FILES,
+            {
+                "": "Success: no issues found in 2 source files\n",
+                "--disallow-any-unimported": _PHANTOM_HITS,
+                "silenced": _SILENCED_OUT,
+            },
+        )
+        return result
+
+    def test_each_hit_is_traced_to_its_module_and_origin(self):
+        result = self._result()
+        hits = result["phantom_import_findings"]
+        self.assertEqual(
+            [
+                (f["phantom_modules"], f["phantom_origin"], f["real_phantom"])
+                for f in hits
+            ],
+            [
+                (["untyped_lib"], "silenced-by-config", False),
+                (["pkg.plugins"], "module-missing", True),
+                (["otherlib"], "importable-unfollowed", False),
+                # A local base class is followed to the import behind it.
+                (["nowhere"], "module-missing", True),
+                ([], "unresolved-name", False),
+                # Not installed here, but the config silences it on purpose.
+                (["devonly"], "module-missing", False),
+                # `typing` exists and is not silenced; the Any is untyped_lib's.
+                (["typing", "untyped_lib"], "silenced-by-config", False),
+            ],
+        )
+
+    def test_real_phantoms_are_counted_separately(self):
+        summary = self._result()["summary"]
+        self.assertEqual(summary["phantom_imports"], 7)
+        self.assertEqual(summary["phantom_imports_real"], 2)
+        self.assertEqual(summary["phantom_missing_modules"], ["nowhere", "pkg.plugins"])
+        self.assertEqual(
+            summary["phantom_imports_by_origin"],
+            {
+                "importable-unfollowed": 1,
+                "module-missing": 3,
+                "silenced-by-config": 2,
+                "unresolved-name": 1,
+            },
+        )
+        self.assertEqual(summary["phantom_origin_basis"], "silenced-imports-pass")
+
+    def test_no_hits_is_a_measured_zero(self):
+        result, _ = _run(_PKG, {"": _BASE_ERR + _ONE_ERROR})
+        self.assertEqual(result["summary"]["phantom_imports_real"], 0)
+
+    def test_skipped_pass_is_null(self):
+        result, _ = _run(_PKG, {"": _BASE_ERR + _ONE_ERROR}, strict_pass=False)
+        self.assertIsNone(result["summary"]["phantom_imports_real"])
+
+    def test_unaskable_interpreter_is_not_a_clean_zero(self):
+        with TempProject({"pkg/m.py": _PHANTOM_SRC}) as root:
+            hit = {
+                "file": str(root / "pkg/m.py"),
+                "line": 9,
+                "message": "Return type x",
+            }
+            summary = mod.classify_phantoms([hit], set(), set(), None, [], [root])
+        self.assertEqual(hit["phantom_origin"], "not-measured")
+        self.assertTrue(summary["basis"].startswith("not-measured"))
+
+
 class TestDeriveConfig(unittest.TestCase):
     def test_ini_copy_turns_every_section_off_and_keeps_paths(self):
         with tempfile.TemporaryDirectory() as tmp:

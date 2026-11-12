@@ -836,6 +836,318 @@ def _own_packages(project_root: Path, scan_root: Path) -> set[str]:
     return own
 
 
+# ---------------------------------------------------------------------------
+# Phantom imports: which hits are real?
+# ---------------------------------------------------------------------------
+#
+# `--disallow-any-unimported` fires wherever an annotation names a type from a
+# module mypy did not follow. On a project that silences untyped libraries
+# with ignore_missing_imports that is hundreds of hits, none of them a phantom:
+# the module exists, the config just turned it into Any on purpose. A REAL
+# phantom names a module that does not exist at all (a misspelled or moved
+# `TYPE_CHECKING` import). Each hit is traced from its annotation to the
+# import that bound the name, and that module is looked up -- without being
+# imported -- on the search path of the interpreter mypy resolves against.
+
+_ARG_HIT = re.compile(r'^Argument (\d+) to "[^"]*" becomes')
+_BASE_HIT = re.compile(r"^Base type (\S+) becomes")
+
+_FIND_PROBE = (
+    "import importlib.machinery as im, json, os, sys\n"
+    "req = json.loads(sys.stdin.read())\n"
+    "paths = req['paths'] + [p for p in sys.path if p]\n"
+    "suffixes = im.all_suffixes() + ['.pyi']\n"
+    "builtin = set(sys.builtin_module_names)\n"
+    "def find(mod):\n"
+    "    parts = mod.split('.')\n"
+    "    if len(parts) == 1 and parts[0] in builtin:\n"
+    "        return True\n"
+    "    search = paths\n"
+    "    for i, part in enumerate(parts):\n"
+    "        last = i == len(parts) - 1\n"
+    "        names = [part, part + '-stubs'] if i == 0 else [part]\n"
+    "        dirs = [os.path.join(b, n) for b in search for n in names\n"
+    "                if os.path.isdir(os.path.join(b, n))]\n"
+    "        is_file = any(os.path.isfile(os.path.join(b, part + s))\n"
+    "                      for b in search for s in suffixes)\n"
+    "        if last:\n"
+    "            return bool(dirs) or is_file\n"
+    "        if not dirs:\n"
+    "            return False\n"
+    "        search = dirs\n"
+    "    return True\n"
+    "print(json.dumps({m: find(m) for m in req['modules']}))\n"
+)
+
+
+def find_modules(
+    python: str | None, modules: list[str], paths: list[str]
+) -> dict[str, bool] | None:
+    """Whether each module exists on *python*'s search path (plus *paths*).
+
+    Nothing is imported: the probe walks the path entries like the import
+    system would (packages, namespace directories, module files, stubs
+    packages). None when the interpreter cannot be asked.
+    """
+    if not python:
+        return None
+    if not modules:
+        return {}
+    try:
+        out = subprocess.run(
+            [python, "-I", "-B", "-c", _FIND_PROBE],
+            input=json.dumps({"modules": modules, "paths": paths}),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        found = json.loads(out.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return found if isinstance(found, dict) else None
+
+
+def _file_module(path: Path) -> str:
+    """The dotted module name of *path*, from the packages above it."""
+    parts = [] if path.stem == "__init__" else [path.stem]
+    parent = path.parent
+    while (parent / "__init__.py").is_file():
+        parts.insert(0, parent.name)
+        parent = parent.parent
+    return ".".join(parts)
+
+
+def _imports_of(tree: ast.Module, module: str, is_pkg: bool) -> dict[str, str]:
+    """Local name -> the module that must exist for the binding to be real.
+
+    `from a.b import C` binds C to module `a.b` (C may itself be a submodule,
+    which `a.b` existing does not need); `import a.b` binds `a` and needs
+    `a.b`; `import a.b as m` binds `m`. Relative imports are made absolute.
+    """
+    package = module.split(".") if is_pkg else module.split(".")[:-1]
+    bound: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.level:
+                keep = len(package) - (node.level - 1)
+                if keep < 0:
+                    continue
+                source = ".".join(
+                    package[:keep] + ([node.module] if node.module else [])
+                )
+            else:
+                source = node.module or ""
+            for alias in node.names:
+                if alias.name != "*" and source:
+                    bound[alias.asname or alias.name] = source
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname:
+                    bound[alias.asname] = alias.name
+                else:
+                    top = alias.name.split(".")[0]
+                    # The longest `import a.b.c` is what must exist.
+                    if len(alias.name) > len(bound.get(top, "")):
+                        bound[top] = alias.name
+    return bound
+
+
+def _annotation_names(node: ast.AST | None) -> list[str]:
+    """Root names an annotation uses (`a` for `a.b.C`), quoted ones included."""
+    if node is None:
+        return []
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        try:
+            node = ast.parse(node.value, mode="eval").body
+        except (SyntaxError, ValueError, RecursionError):
+            return []
+    names: list[str] = []
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name):
+            names.append(sub.id)
+        elif isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+            names.extend(_annotation_names(sub))
+    return names
+
+
+def _hit_annotations(tree: ast.Module, line: int, message: str) -> list[ast.AST]:
+    """The annotation (or base class) a phantom hit at *line* is about."""
+    out: list[ast.AST] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.lineno != line:
+                continue
+            a = node.args
+            ordered = [*a.posonlyargs, *a.args]
+            ordered += [a.vararg] if a.vararg else []
+            ordered += a.kwonlyargs + ([a.kwarg] if a.kwarg else [])
+            m = _ARG_HIT.match(message)
+            if m and 0 < int(m.group(1)) <= len(ordered):
+                out.append(ordered[int(m.group(1)) - 1].annotation)
+            elif message.startswith("Return type"):
+                out.append(node.returns)
+            else:
+                out += [x.annotation for x in ordered] + [node.returns]
+        elif isinstance(node, ast.ClassDef) and node.lineno == line:
+            m = _BASE_HIT.match(message)
+            bases = node.bases
+            if m:
+                named = [b for b in bases if ast.unparse(b).endswith(m.group(1))]
+                bases = named or bases
+            out += bases
+        elif isinstance(node, ast.AnnAssign) and node.lineno == line:
+            out.append(node.annotation)
+    return [x for x in out if x is not None]
+
+
+def _local_definitions(tree: ast.Module) -> dict[str, list[ast.AST]]:
+    """Module-level classes (their bases) and aliases (their value), by name."""
+    defs: dict[str, list[ast.AST]] = {}
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            defs[node.name] = list(node.bases)
+        elif (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            defs[node.targets[0].id] = [node.value]
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.value is not None
+        ):
+            defs[node.target.id] = [node.value]
+    return defs
+
+
+def phantom_hit_modules(path: Path, line: int, message: str, cache: dict) -> list[str]:
+    """Modules the annotation behind one phantom hit takes its names from.
+
+    A name defined in the same file (a local base class or alias) is followed
+    to where its own names come from, a few levels deep.
+    """
+    if path not in cache:
+        tree = parse_source(path)
+        if tree is None:
+            cache[path] = None
+        else:
+            module = _file_module(path)
+            cache[path] = (
+                tree,
+                _imports_of(tree, module, path.stem == "__init__"),
+                _local_definitions(tree),
+            )
+    entry = cache[path]
+    if entry is None:
+        return []
+    tree, bound, local = entry
+    modules: list[str] = []
+    seen: set[str] = set()
+    frontier = [
+        (n, 0)
+        for a in _hit_annotations(tree, line, message)
+        for n in _annotation_names(a)
+    ]
+    while frontier:
+        name, depth = frontier.pop(0)
+        if name in seen:
+            continue
+        seen.add(name)
+        if name in bound:
+            if bound[name] not in modules:
+                modules.append(bound[name])
+        elif name in local and depth < 3:
+            frontier += [
+                (n, depth + 1) for x in local[name] for n in _annotation_names(x)
+            ]
+    return modules
+
+
+def _covers(module: str, silenced: set[str]) -> bool:
+    return any(
+        module == s or module.startswith(s + ".") or s.startswith(module + ".")
+        for s in silenced
+    )
+
+
+def classify_phantoms(
+    findings: list[dict],
+    silenced: set[str] | None,
+    own: set[str],
+    python: str | None,
+    search_paths: list[str],
+    roots: list[Path],
+) -> dict:
+    """Tag each phantom hit with where its Any comes from; return the summary.
+
+    `phantom_origin` is one of:
+
+    - ``module-missing``: the module the name is imported from does not exist
+      on mypy's search path. ``real_phantom`` is true unless the config also
+      silences it for an outside package (a dependency simply not installed
+      in this environment, which `module_found: false` still shows);
+    - ``silenced-by-config``: the modules exist, and one of them is one
+      ignore_missing_imports turned into Any on purpose (an annotation mixing
+      `typing` or project types with it gets its Any from that one);
+    - ``importable-unfollowed``: the module exists and is not silenced by the
+      config (a `# type: ignore` on its import, follow_imports, no stubs);
+    - ``unresolved-name``: the annotation could not be traced to an import.
+    """
+    cache: dict = {}
+    per_hit: list[tuple[dict, list[str]]] = []
+    wanted: set[str] = set()
+    for f in findings:
+        path = Path(f["file"])
+        if not path.is_absolute():
+            path = next(
+                (r / path for r in roots if (r / path).is_file()), roots[0] / path
+            )
+        modules = phantom_hit_modules(path, f["line"], f["message"], cache)
+        per_hit.append((f, modules))
+        wanted.update(modules)
+    found = find_modules(python, sorted(wanted), search_paths)
+    by_origin: dict[str, int] = {}
+    missing: set[str] = set()
+    for f, modules in per_hit:
+        f["phantom_modules"] = modules
+        if not modules:
+            origin, real = "unresolved-name", False
+        elif found is None:
+            origin, real = "not-measured", False
+        else:
+            absent = [m for m in modules if not found.get(m, False)]
+            if absent:
+                origin = "module-missing"
+                real = any(
+                    m.split(".")[0] in own or not (silenced and _covers(m, silenced))
+                    for m in absent
+                )
+                if real:
+                    missing.update(absent)
+            elif silenced is not None and any(_covers(m, silenced) for m in modules):
+                origin, real = "silenced-by-config", False
+            else:
+                origin, real = "importable-unfollowed", False
+            f["module_found"] = not absent
+        f["phantom_origin"] = origin
+        f["real_phantom"] = real
+        by_origin[origin] = by_origin.get(origin, 0) + 1
+    return {
+        "real": sum(1 for f, _ in per_hit if f["real_phantom"]),
+        "by_origin": dict(sorted(by_origin.items())),
+        "missing_modules": sorted(missing),
+        "basis": (
+            "not-measured: mypy's interpreter could not be asked"
+            if found is None and wanted
+            else "silenced-imports-pass"
+            if silenced is not None
+            else "no-silenced-imports-pass"
+        ),
+    }
+
+
 def _count_untyped_defs(files: list[Path]) -> int:
     """Functions with no parameter or return annotation (mypy's "untyped")."""
     count = 0
@@ -1192,6 +1504,22 @@ def _analyze_with_cache(
         status = "FAILED"
         failure_reason = parse_mismatch
 
+    project_root = Path(envelope["project_root"])
+    scan_root = Path(envelope["scan_root"])
+    own = _own_packages(project_root, scan_root)
+    phantom_summary = None
+    if phantom_imports:
+        phantom_summary = classify_phantoms(
+            phantom_imports,
+            None
+            if silenced is None
+            else {f["module"] for f in silenced if f.get("module")},
+            own,
+            (mypy_python or {}).get("executable"),
+            [str(project_root), str(project_root / "src"), str(scan_root.parent)],
+            [Path.cwd(), project_root, scan_root.parent],
+        )
+
     drift = tag_dependency_drift(
         findings,
         Path(envelope["project_root"]),
@@ -1304,6 +1632,29 @@ def _analyze_with_cache(
             "silenced_imports_source": silenced_source,
             "silenced_imports_reason": silenced_reason,
             "parse_mismatch": parse_mismatch,
+            # Of phantom_imports: hits whose module does not exist at all (a
+            # misspelled or moved import), the ones worth reading first. The
+            # rest come from modules that exist but were silenced or not
+            # followed -- see phantom_origin on each finding. null when the
+            # pass did not run or the modules could not be looked up.
+            "phantom_imports_real": (
+                None
+                if phantom_imports is None
+                else 0
+                if phantom_summary is None
+                else None
+                if phantom_summary["basis"].startswith("not-measured")
+                else phantom_summary["real"]
+            ),
+            "phantom_imports_by_origin": (
+                None if phantom_summary is None else phantom_summary["by_origin"]
+            ),
+            "phantom_missing_modules": (
+                None if phantom_summary is None else phantom_summary["missing_modules"]
+            ),
+            "phantom_origin_basis": (
+                None if phantom_summary is None else phantom_summary["basis"]
+            ),
             "strict_pass_ran": phantom_imports is not None,
             "labelled_passes": {
                 name: {
