@@ -339,5 +339,50 @@ class TestVultureCapKeepsTheMostConfident(unittest.TestCase):
         self.assertTrue(out["findings_capped"])
 
 
+class TestExcludeInAnalysisScripts(unittest.TestCase):
+    """The import graph, debt and survey scripts accept --exclude."""
+
+    def test_analyze_imports(self):
+        out = check_exclude(self, "analyze_imports")
+        self.assertNotIn("pkg/vendor/lib.py", [f["file"] for f in out["files"]])
+
+    def test_collect_debt(self):
+        out = check_exclude(self, "collect_debt")
+        self.assertEqual(out["summary"]["total_markers"], 1)
+
+    def test_surveys_and_exception_map(self):
+        for name in (
+            "survey_conventions",
+            "survey_docstrings",
+            "survey_error_handling",
+            "map_exceptions",
+        ):
+            with self.subTest(name=name):
+                check_exclude(self, name)
+
+
+class TestUnknownFlagWarning(unittest.TestCase):
+    """An unknown flag is reported on stderr; stdout stays valid JSON."""
+
+    def test_unknown_flag_warns_without_corrupting_json(self):
+        mod = import_script("analyze_imports")
+        with TempProject({"m.py": "x = 1\n"}) as root:
+            out, err, code = run_main(mod, [str(root), "--exclud", "m.py"])
+        self.assertEqual(code, 0)
+        self.assertIn("unknown flag(s) ignored: --exclud", err)
+        self.assertIn("--exclude", err)  # the accepted flags are listed
+        self.assertEqual(out["files_total"], 1)
+
+    def test_scripts_own_flags_are_not_warned_about(self):
+        for name, flags in (
+            ("survey_conventions", ["--include-tests"]),
+            ("survey_error_handling", ["--no-implicit"]),
+            ("collect_debt", ["--key-regex", "[A-Z]+-[0-9]+"]),
+            ("map_exceptions", ["--code-key", "code"]),
+        ):
+            with self.subTest(name=name):
+                assert_no_unknown_flag_warning(self, name, flags)
+
+
 if __name__ == "__main__":
     unittest.main()

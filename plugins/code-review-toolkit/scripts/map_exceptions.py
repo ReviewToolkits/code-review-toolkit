@@ -42,6 +42,12 @@ helper.
 
 Usage:
     python map_exceptions.py [path] [--max-files N] [--code-key NAME ...]
+        [--exclude PAT[,PAT]]
+
+``--exclude PAT[,PAT]`` (repeatable) leaves out files whose project-relative
+path matches: a plain pattern as a substring, a glob (``vendor/*``) at any
+depth. Excluded files are not counted; the envelope reports ``files_excluded``
+and ``exclude_matches``.
 """
 
 from __future__ import annotations
@@ -57,12 +63,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scan_common import (
     build_envelope,
-    collect_python_files,
     emit,
-    parse_common_args,
+    parse_scan_args,
     parse_source,
     relative_to_root,
     resolve_target,
+    select_python_files,
 )
 
 DEFAULT_CODE_KEYS = ("code", "error_code", "error_type", "err_code")
@@ -444,12 +450,19 @@ def _all_ancestors(name: str, project: dict[str, list[str]]) -> list[str]:
 
 
 def analyze(
-    target: str, *, max_files: int = 0, code_keys: list[str] | None = None
+    target: str,
+    *,
+    max_files: int = 0,
+    code_keys: list[str] | None = None,
+    exclude: list[str] | None = None,
 ) -> dict:
     """Map exceptions and error codes under *target*."""
     keys = frozenset(DEFAULT_CODE_KEYS) | frozenset(code_keys or ())
     resolved, project_root, scan_root = resolve_target(target)
-    files, files_total = collect_python_files(resolved, max_files)
+    selection = select_python_files(
+        resolved, project_root=project_root, max_files=max_files, exclude=exclude
+    )
+    files, files_total = selection.files, selection.files_total
     scans: list[_FileScan] = []
     unparsed: list[str] = []
     for path in files:
@@ -673,7 +686,7 @@ def analyze(
     for c in consumers:
         by_module[c["file"]]["consumed"].add(c["literal"])
 
-    output = build_envelope(project_root, scan_root, files_total, len(files))
+    output = build_envelope(project_root, scan_root, files_total, len(files), selection)
     output["files_unparsed"] = unparsed
     output["code_keys"] = sorted(keys)
     output["summary"] = {
@@ -739,8 +752,15 @@ def _extract_code_keys(argv: list[str]) -> tuple[list[str], list[str]]:
 
 def main() -> None:
     argv, code_keys = _extract_code_keys(sys.argv[1:])
-    target, max_files = parse_common_args(argv)
-    emit(analyze(target, max_files=max_files, code_keys=code_keys))
+    args = parse_scan_args(argv, __doc__)
+    emit(
+        analyze(
+            args.target,
+            max_files=args.max_files,
+            code_keys=code_keys,
+            exclude=args.exclude,
+        )
+    )
 
 
 if __name__ == "__main__":
