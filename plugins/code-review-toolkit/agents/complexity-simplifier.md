@@ -246,6 +246,11 @@ For each group worth reporting: the copies (file:lines, function), `exact`/`rena
 ### Hotspots × Findings
 [The Step 2b table, or "no other agents' reports available"]
 
+### Defects Surfaced While Reading Hotspots
+[Correctness bugs you found while reading hotspot code: not complexity, but real. Each with the
+fields from `<plugin_root>/docs/finding-fields.md`. Reading the most complex code closely is how
+these surface, and they are lost if the report has only a simplification slot.]
+
 ## Cross-Cutting Observations
 
 [Patterns of complexity that appear across multiple hotspots. These often point to architectural improvements rather than function-level refactoring:]
@@ -288,6 +293,13 @@ For each group worth reporting: the copies (file:lines, function), `exact`/`rena
 - **Decorator stacking**: More than 3 decorators on a function is a code smell. Consider whether the function has too many cross-cutting concerns.
 - **Property complexity**: `@property` methods should be trivial. Complex property getters should be explicit methods.
 - **Magic method complexity**: `__init__` should be simple assignment. Complex initialization should use classmethods as alternative constructors.
+
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.
 
 ## Running the script
 

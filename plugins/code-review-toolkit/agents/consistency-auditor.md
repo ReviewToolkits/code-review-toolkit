@@ -269,6 +269,13 @@ For each:
 - **Cap your output**: Report at most 5 high-severity, 5 medium-severity, and 10 low-severity items in the summary. Offer to provide more detail on specific categories.
 - **Be specific**: Always include file paths and line numbers. "Some files use bare except" is useless; "src/runner.py:142, src/fetcher.py:89 use bare except while 12 other exception handlers use specific types" is actionable.
 
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.
+
 ## Running the script
 
 These rules apply to every script call this agent makes.

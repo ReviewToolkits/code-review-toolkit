@@ -299,6 +299,13 @@ Note: Simple functions with obvious correctness are ACCEPTABLE even without test
 - **POLICY**: Testing strategy decisions that affect the whole project (e.g., adopt integration tests, set coverage targets)
 - **ACCEPTABLE**: Simple functions with obvious correctness, trivial delegation, or one-line accessors that don't need tests
 
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.
+
 ## Running the script
 
 These rules apply to every script call this agent makes.

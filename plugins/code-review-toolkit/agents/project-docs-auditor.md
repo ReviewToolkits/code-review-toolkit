@@ -423,6 +423,13 @@ For each:
 - **Environment variables**: `os.environ["VAR"]`, `os.environ.get("VAR")`, `os.getenv("VAR")`.
 - **Configuration files**: Look for YAML/TOML/JSON loading patterns to determine what config keys the code expects.
 
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.
+
 ## Running the script
 
 These rules apply to every script call this agent makes.

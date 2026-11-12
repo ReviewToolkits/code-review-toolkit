@@ -243,13 +243,14 @@ hundreds of kilobytes. Dispatch **one consolidation agent** that reads every `ag
 
 | Field | Content |
 |---|---|
-| `id` | stable id (`<PREFIX>-001`), ordered FIX → CONSIDER → POLICY, worst failure first |
+| `id` | stable id (`<PREFIX>-001`), ordered FIX → CONSIDER → POLICY, worst failure first. Classify by the rubric in `<plugin_root>/docs/finding-fields.md` (FIX = observable wrong outcome + trigger), whatever class the agent gave |
 | `title`, `classification`, `status` | status per the reproduction convention: `candidate` / `confirmed` / `reproduced` / `refuted` |
 | `locations` | `path:line` list, checked against the file |
 | `mechanism`, `failure_scenario` | how it fails; concrete inputs → wrong outcome |
 | `agents`, `source_refs` | who found it, and where in their reports |
 | `repro` | artifact paths, if reproduced |
 | `propagation_gap_of`, `prior_art`, `introduced_by` | fix-propagation and history context |
+| `branch_status` | per unmerged branch that touches the finding's files: `fixed` / `partially-fixed` / `unchanged` / `moved` / `worse`, and whether the reproducer confirmed it (Step 2) |
 | `security_claim` | `{attacker, preconditions, gain}`, **empty unless all three can be named concretely**. Touching auth, rate limits or uploads is not a claim; "would help an attacker" is not a claim |
 | `publication_sensitive` | `true` when publication should wait for coordination with the project. Cheap and right under doubt; it never makes a finding a security claim |
 | `notes` | dedup decisions, corrections |

@@ -362,6 +362,13 @@ For each:
 - **POLICY**: Project-wide error handling strategy decisions (e.g., adopt a custom exception hierarchy, standardize logging levels for errors)
 - **ACCEPTABLE**: Intentional broad catches in appropriate contexts — top-level CLI handlers, cleanup code, logging utilities where suppression is the correct behavior
 
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.
+
 ## Running the script
 
 These rules apply to every script call this agent makes.

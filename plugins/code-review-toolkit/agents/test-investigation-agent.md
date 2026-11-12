@@ -264,6 +264,13 @@ exactly what invariants to check.]
 
 7. **Bug-fix tests deserve the most attention.** If the script identified bug-fix tests, analyze ALL of them before moving to other tiers. A test written to prevent a regression is the strongest possible signal about what can go wrong.
 
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.
+
 ## Running the script
 
 These rules apply to every script call this agent makes.

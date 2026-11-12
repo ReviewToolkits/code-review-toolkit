@@ -310,6 +310,13 @@ A PR that does not apply cleanly to HEAD is reported as such, not skipped. Witho
 - **POLICY**: New feature introduces a pattern requiring a project-level decision, or co-change coupling suggests architectural restructuring
 - **ACCEPTABLE**: Fix is complete and correct, similar code is already properly handled, or co-change is natural for the module structure
 
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.
+
 ## Running the script
 
 These rules apply to every script call this agent makes.

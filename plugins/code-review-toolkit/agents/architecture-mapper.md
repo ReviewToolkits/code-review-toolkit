@@ -262,6 +262,13 @@ Structure your output as follows:
 - Some projects use lazy imports for performance — note these but don't flag them as issues.
 - `__all__` explicitly defines public API — respect it when assessing what a module exposes.
 
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.
+
 ## Running the script
 
 These rules apply to every script call this agent makes.

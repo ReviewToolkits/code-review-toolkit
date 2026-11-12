@@ -251,6 +251,13 @@ For each finding, rate your **confidence** that it's genuinely dead:
 - **POLICY**: Decisions about dead code management (e.g., establish a policy on commented-out code, set up automated unused import removal)
 - **ACCEPTABLE**: Unused imports that serve as re-exports, functions referenced only via plugin/registration systems, code kept intentionally for reference
 
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.
+
 ## Running the script
 
 These rules apply to every script call this agent makes.

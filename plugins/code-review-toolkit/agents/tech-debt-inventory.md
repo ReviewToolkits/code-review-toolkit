@@ -331,6 +331,13 @@ For each:
 - **POLICY**: Debt management decisions (e.g., establish TODO format conventions, set a maximum debt age, create a cleanup sprint cadence)
 - **ACCEPTABLE**: Fresh, intentional deferrals with clear context — recent TODOs with tracking issues, type:ignore with explanatory comments, deliberate scope limitations
 
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.
+
 ## Running the script
 
 These rules apply to every script call this agent makes.

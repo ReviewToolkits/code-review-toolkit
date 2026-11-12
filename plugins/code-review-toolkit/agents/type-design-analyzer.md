@@ -295,6 +295,13 @@ by definition as well as by name.
 - **POLICY**: Typing strategy decisions (e.g., enable mypy strict mode, adopt `X | None` over `Optional[X]`, set annotation coverage targets)
 - **ACCEPTABLE**: Untyped private functions with obvious types, legitimate `Any` usage for genuinely dynamic data, simple internal code where annotations add noise
 
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.
+
 ## Running the script
 
 These rules apply to every script call this agent makes.

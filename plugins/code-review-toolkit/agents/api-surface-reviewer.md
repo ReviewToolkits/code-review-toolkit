@@ -359,3 +359,10 @@ For each:
 - **CONSIDER**: Inconsistency worth aligning for learnability but not causing active confusion
 - **POLICY**: API design decisions that require project-level agreement (e.g., adopt consistent verb prefixes, standardize error types)
 - **ACCEPTABLE**: Minor naming variation that doesn't affect usability or where alignment would cause breaking changes disproportionate to the benefit
+
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.

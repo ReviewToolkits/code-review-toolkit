@@ -241,6 +241,13 @@ For each:
 - **POLICY**: Requires a project-level decision on which pattern to standardize on
 - **ACCEPTABLE**: Intentional variation between modules with genuinely different requirements, or where unification would increase complexity
 
+## Every finding
+
+Whatever this agent's template, each finding carries the fields in
+`<plugin_root>/docs/finding-fields.md` (`status`, a concrete failure scenario, the reproducer when
+there is one, `branch_status` when unmerged branches were checked, a `path:line` that exists) and is
+classified by that file's rubric: FIX needs an observable wrong outcome plus a trigger.
+
 ## Running the script
 
 These rules apply to every script call this agent makes.

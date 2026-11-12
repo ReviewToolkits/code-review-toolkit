@@ -129,6 +129,31 @@ class TestAgentWiring(unittest.TestCase):
                 self.assertIn(f"scripts/{script.group(1)} [scope]", text)
 
 
+class TestEveryAgentCarriesTheFindingFields(unittest.TestCase):
+    """Per-finding slots drifted: status, failure scenario, reproducer and
+    branch status were missing from eight templates. Every finding-producing
+    agent cites one shared field list and rubric instead."""
+
+    # Produces verdicts on others' findings, not findings of its own.
+    _EXEMPT = {"security-claims-skeptic"}
+
+    def test_every_agent_cites_finding_fields(self):
+        for name in _agent_names():
+            if name in self._EXEMPT:
+                continue
+            with self.subTest(agent=name):
+                self.assertIn(
+                    "<plugin_root>/docs/finding-fields.md",
+                    (_AGENTS / f"{name}.md").read_text(encoding="utf-8"),
+                )
+
+    def test_the_field_list_names_every_field(self):
+        text = (_PLUGIN / "docs" / "finding-fields.md").read_text(encoding="utf-8")
+        for field in ("status", "Failure scenario", "Reproducer", "branch_status", "FIX"):
+            with self.subTest(field=field):
+                self.assertIn(field, text)
+
+
 class TestCatalogReferencesResolve(unittest.TestCase):
     """The shape catalog points at agents and scripts; both must exist."""
 
