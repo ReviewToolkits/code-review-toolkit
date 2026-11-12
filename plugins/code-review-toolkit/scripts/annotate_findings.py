@@ -13,6 +13,9 @@ For each finding (a file and a line), report:
 - `pickaxe` (when the finding gives `pattern`): the oldest commit that added
   that exact string (`git log -S`).
 - `first_release`: the first release tag containing `introduced_by`.
+- `introduced_by.bulk`: true for an empty-subject or very large commit (an
+  import, a squash, a mirror sync); the lines were introduced at or before
+  it (`at_or_before`, `bulk_reasons`).
 - `related_fixes`: fix commits that changed the enclosing function.
 - `branches`: for each unmerged remote branch, whether the enclosing
   function is unchanged, changed, or gone there.
@@ -75,6 +78,12 @@ _TIME_BUDGET = 270  # seconds; the agent's Bash call allows 300
 _MAX_BRANCHES = 30
 _MAX_LINE_HISTORY = 10
 _MAX_RELATED = 15
+# A commit this large, or with no subject, or a sizeable first commit, is a
+# bulk import, a squash of a long branch or a mirror sync: it carries the
+# lines but did not write them. A 3,000-line feature commit is not bulk.
+_BULK_LINES = 5000
+_BULK_FILES = 100
+_BULK_ROOT_LINES = 1000
 _DEFAULT_RELEASE = r"^v?[0-9]+(\.[0-9]+)+$"
 
 
@@ -222,6 +231,39 @@ def line_history(
         commit["type"] = classify_commit_detail(commit["subject"], key_types)["type"]
         commit["ignored_rev"] = commit["sha"] in ignore_revs
     return history
+
+
+_SHORTSTAT_RE = re.compile(
+    r"(\d+) files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?"
+)
+
+
+def bulk_reasons(git_root: Path, sha: str, subject: str, cache: dict) -> list[str]:
+    """Why `sha` is a bulk commit, or [] when it is not.
+
+    Bulk: an empty subject, a very large change, or a sizeable first commit
+    (code imported from elsewhere). On a validation project an empty-subject import of thousands of lines
+    was `introduced_by` for findings, and read as "this commit wrote it".
+    """
+    if sha in cache:
+        return cache[sha]
+    reasons = []
+    if not subject.strip():
+        reasons.append("empty subject")
+    stat = _git(["show", "--shortstat", "--format=P%P", sha], git_root) or ""
+    is_root = stat.startswith("P") and not stat.splitlines()[0][1:].strip()
+    match = _SHORTSTAT_RE.search(stat)
+    if match:
+        files = int(match.group(1))
+        lines = int(match.group(2) or 0) + int(match.group(3) or 0)
+        if lines >= _BULK_LINES:
+            reasons.append(f"{lines} lines changed")
+        if files >= _BULK_FILES:
+            reasons.append(f"{files} files changed")
+        if is_root and lines >= _BULK_ROOT_LINES and lines < _BULK_LINES:
+            reasons.append(f"first commit, {lines} lines (an import)")
+    cache[sha] = reasons
+    return reasons
 
 
 def _commit_ref(sha: str, date: str, subject: str, ctype: str | None = None) -> dict:
@@ -574,6 +616,21 @@ def annotate_one(
             out["introduced_by"]["method"] = (
                 "git log -L, merges, layout-only changes and listed reformats skipped"
             )
+            reasons = bulk_reasons(
+                git_root,
+                introduced["sha"],
+                introduced["subject"],
+                options["bulk_cache"],
+            )
+            out["introduced_by"]["bulk"] = bool(reasons)
+            if reasons:
+                # The lines arrived in this commit; they were written in it or
+                # earlier (an import, a squash, a mirror sync).
+                out["introduced_by"]["bulk_reasons"] = reasons
+                out["introduced_by"]["at_or_before"] = True
+                out["introduced_by"]["method"] += (
+                    "; bulk commit, so the lines were introduced at or before it"
+                )
     out["blame"] = blame_line(git_root, rel, line, options["ignore_revs_file"])
 
     pattern = finding.get("pattern")
@@ -719,6 +776,7 @@ def analyze(
         "since": since,
         "ignore_revs_file": ignore_revs_file,
         "ignore_revs": ignore_revs,
+        "bulk_cache": {},
     }
     annotations: list[dict] = []
     skipped: list[dict] = []

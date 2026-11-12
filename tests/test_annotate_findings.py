@@ -281,5 +281,62 @@ class TestReformatsAndMerges(unittest.TestCase):
         self.assertFalse(ann["introduced_by"]["message"].startswith("Merge"))
 
 
+class TestBulkCommits(unittest.TestCase):
+    """An import or squash carries lines it did not write."""
+
+    def _root(self):
+        project = GitTempProject(
+            [{"files": {"pkg/m.py": "a = 1\n"}, "message": "Start the package"}]
+        )
+        root = project.__enter__()
+        self.addCleanup(project.__exit__, None, None, None)
+        return root
+
+    def _annotate(self, root, line=2):
+        result = mod.analyze(
+            str(root), findings=[{"file": "pkg/m.py", "line": line}], no_branches=True
+        )
+        return result["annotations"][0]["introduced_by"]
+
+    def test_ordinary_commit_is_not_bulk(self):
+        root = self._root()
+        intro = self._annotate(root, line=1)
+        self.assertIs(intro["bulk"], False)
+        self.assertNotIn("at_or_before", intro)
+
+    def test_empty_subject_commit_is_bulk(self):
+        root = self._root()
+        (root / "pkg" / "m.py").write_text("a = 1\nb = 2\n", encoding="utf-8")
+        _git(root, "commit", "-qa", "--allow-empty-message", "-m", "")
+        intro = self._annotate(root)
+        self.assertIs(intro["bulk"], True)
+        self.assertTrue(intro["at_or_before"])
+        self.assertEqual(intro["bulk_reasons"], ["empty subject"])
+        self.assertIn("at or before", intro["method"])
+
+    def test_sizeable_first_commit_is_an_import(self):
+        root = self._root()
+        old = mod._BULK_ROOT_LINES
+        mod._BULK_ROOT_LINES = 1
+        self.addCleanup(setattr, mod, "_BULK_ROOT_LINES", old)
+        intro = self._annotate(root, line=1)
+        self.assertIs(intro["bulk"], True)
+        self.assertEqual(len(intro["bulk_reasons"]), 1)
+        self.assertRegex(intro["bulk_reasons"][0], r"^first commit, \d+ lines")
+
+    def test_large_commit_is_bulk(self):
+        root = self._root()
+        old = mod._BULK_LINES
+        mod._BULK_LINES = 3
+        self.addCleanup(setattr, mod, "_BULK_LINES", old)
+        (root / "pkg" / "m.py").write_text(
+            "a = 1\nb = 2\nc = 3\nd = 4\n", encoding="utf-8"
+        )
+        _git(root, "commit", "-qam", "Import the vendored tree")
+        intro = self._annotate(root)
+        self.assertIs(intro["bulk"], True)
+        self.assertEqual(intro["bulk_reasons"], ["3 lines changed"])
+
+
 if __name__ == "__main__":
     unittest.main()
