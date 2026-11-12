@@ -946,6 +946,70 @@ class TestCommentedCodePrecision(unittest.TestCase):
         self.assertEqual(blocks[0]["code_lines"], 3)
 
 
+class TestWriteOnlyAttributes(unittest.TestCase):
+    """`self.x` assigned and never read anywhere had no category."""
+
+    FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/store.py": (
+            "import threading\n"
+            "class Store:\n"
+            "    kind = 'plain'\n"
+            "    def __init__(self, data):\n"
+            "        self._cfg = data\n"
+            "        self._alias = data\n"
+            "        self.public_note = 'x'\n"
+            "        self.kind = 'custom'\n"
+            "        self._count = 0\n"
+            "    def bump(self):\n"
+            "        self._count += 1\n"
+            "    def get(self, key):\n"
+            "        return self._cfg[key]\n"
+            "class Worker(threading.Thread):\n"
+            "    def __init__(self):\n"
+            "        super().__init__()\n"
+            "        self.stop_flag = False\n"
+            "class Snapshot:\n"
+            "    def __init__(self):\n"
+            "        self._hidden = 1\n"
+            "    def dump(self):\n"
+            "        return dict(vars(self))\n"
+            "class Probe:\n"
+            "    def __init__(self):\n"
+            "        self._seen_by_tests = 1\n"
+        ),
+        "tests/test_store.py": (
+            "from pkg.store import Probe\n"
+            "def test_probe():\n"
+            "    assert Probe()._seen_by_tests == 1\n"
+        ),
+    }
+
+    def _run(self) -> dict:
+        with TempProject(self.FILES) as root:
+            return _run_main(root, root / "pkg")
+
+    def test_write_only_attribute_is_reported(self):
+        out = self._run()
+        found = {(w["class"], w["attribute"]): w for w in out["write_only_attributes"]}
+        self.assertEqual(set(found), {("Store", "_alias"), ("Store", "public_note")})
+        self.assertEqual(found[("Store", "_alias")]["confidence"], "medium")
+        self.assertEqual(found[("Store", "public_note")]["confidence"], "low")
+        self.assertEqual(out["summary"]["write_only_attributes"], 2)
+
+    def test_read_declared_framework_dynamic_and_test_read_are_not(self):
+        out = self._run()
+        attrs = {w["attribute"] for w in out["write_only_attributes"]}
+        # read, read by `+=`, declared in the class body, framework base,
+        # vars(self), read only by a test file.
+        for name in ("_cfg", "_count", "kind", "stop_flag", "_hidden"):
+            self.assertNotIn(name, attrs)
+        self.assertNotIn("_seen_by_tests", attrs)
+        self.assertEqual(
+            out["summary"]["write_only_attributes_excluded_by_reason"],
+            {"declared_in_class": 1, "dynamic_access": 1, "framework_base": 1},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

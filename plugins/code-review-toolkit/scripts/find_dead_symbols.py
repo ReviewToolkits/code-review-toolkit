@@ -392,7 +392,100 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
             if prefix:
                 result["dispatch_prefixes"].add(prefix)
 
+    attrs = _AttrCollector()
+    attrs.visit(tree)
+    result["attr_stores"] = attrs.stores
+    result["attr_loads"] = attrs.loads
+    result["class_declared"] = attrs.declared
+    result["dynamic_attr_classes"] = attrs.dynamic
+
     return result
+
+
+class _AttrCollector(ast.NodeVisitor):
+    """Instance-attribute stores (`self.x = ...` in a class), attribute loads
+    through any receiver, the names each class declares in its body, and the
+    classes that read their attributes dynamically (`vars(self)`,
+    `self.__dict__`, a computed `getattr(self, name)`)."""
+
+    _DYNAMIC_CALLS = frozenset({"vars", "asdict", "astuple"})
+
+    def __init__(self) -> None:
+        self.stores: list[dict] = []
+        self.loads: set[str] = set()
+        self.declared: dict[str, set[str]] = {}
+        self.dynamic: set[str] = set()
+        self._classes: list[str] = []
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        declared = self.declared.setdefault(node.name, set())
+        for child in node.body:
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                declared.add(child.name)
+                if child.name in ("__getstate__", "__reduce__", "__reduce_ex__"):
+                    self.dynamic.add(node.name)
+            targets: list[ast.expr] = []
+            if isinstance(child, ast.Assign):
+                targets = child.targets
+            elif isinstance(child, ast.AnnAssign):
+                targets = [child.target]
+            for target in targets:
+                for name in ast.walk(target):
+                    if isinstance(name, ast.Name):
+                        declared.add(name.id)
+            # `__slots__ = ("a", "b")` declares a and b.
+            if isinstance(child, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "__slots__" for t in targets
+            ):
+                for elt in ast.walk(child.value):
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        declared.add(elt.value)
+        self._classes.append(node.name)
+        self.generic_visit(node)
+        self._classes.pop()
+
+    def _store(self, target: ast.expr) -> None:
+        if (
+            self._classes
+            and isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id in ("self", "cls")
+        ):
+            self.stores.append(
+                {"class": self._classes[-1], "attr": target.attr, "line": target.lineno}
+            )
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if isinstance(node.ctx, ast.Store):
+            self._store(node)
+        elif isinstance(node.ctx, ast.Load):
+            self.loads.add(node.attr)
+            if (
+                node.attr == "__dict__"
+                and self._classes
+                and isinstance(node.value, ast.Name)
+                and node.value.id in ("self", "cls")
+            ):
+                self.dynamic.add(self._classes[-1])
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        # `self.n += 1` reads the attribute as well as writing it.
+        if isinstance(node.target, ast.Attribute):
+            self.loads.add(node.target.attr)
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        name = _dotted(node.func).rsplit(".", 1)[-1]
+        if self._classes and node.args and _is_self_receiver(node.args[0]):
+            computed = len(node.args) >= 2 and not (
+                isinstance(node.args[1], ast.Constant)
+            )
+            if name in self._DYNAMIC_CALLS or (
+                name in ("getattr", "attrgetter") and computed
+            ):
+                self.dynamic.add(self._classes[-1])
+        self.generic_visit(node)
 
 
 def find_unused_imports(
@@ -787,6 +880,95 @@ def find_test_only_symbols(
             "confidence": "medium",
         })
     return test_only
+
+
+def find_write_only_attributes(
+    all_files: list[dict],
+    outside_loads: set[str] | None = None,
+    *,
+    excluded: dict[str, int] | None = None,
+) -> list[dict]:
+    """Instance attributes assigned (`self.x = ...`) but never read anywhere.
+
+    A read is any load of the name through any receiver (`obj.x`, `self.x`,
+    `self.x += 1`) in any scanned file, a string constant naming it
+    (`getattr(o, "x")`), or a mention in *outside_loads* (tests, scripts and
+    templates outside the scanned files). Left out, and counted in *excluded*:
+    attributes the class hierarchy declares in its body (a column, a field, a
+    property or a slot: the store goes through it), classes with a framework
+    base (the framework may read `self.daemon` or `self.name`), classes that
+    read their attributes dynamically (`vars(self)`, `self.__dict__`, a
+    computed `getattr`), dunders, and test files.
+    """
+    loads = set(outside_loads or ())
+    for fa in all_files:
+        loads |= fa.get("attr_loads", set())
+        loads |= fa.get("string_refs", set())
+    framework = _framework_classes(all_files)
+    declared: dict[str, set[str]] = {}
+    dynamic: set[str] = set()
+    bases: dict[str, set[str]] = {}
+    for fa in all_files:
+        for cls, names in fa.get("class_declared", {}).items():
+            declared.setdefault(cls, set()).update(names)
+        dynamic |= fa.get("dynamic_attr_classes", set())
+        for cls, names in fa.get("class_bases", {}).items():
+            bases.setdefault(cls, set()).update(n.rsplit(".", 1)[-1] for n in names)
+    children: dict[str, set[str]] = {}
+    for cls, parents in bases.items():
+        for parent in parents:
+            children.setdefault(parent, set()).add(cls)
+
+    def closure(start: str, edges: dict[str, set[str]]) -> set[str]:
+        seen, stack = {start}, [start]
+        while stack:
+            for nxt in edges.get(stack.pop(), ()):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        return seen
+
+    def skip(reason: str) -> None:
+        if excluded is not None:
+            excluded[reason] = excluded.get(reason, 0) + 1
+
+    found: dict[tuple[str, str, str], dict] = {}
+    for fa in all_files:
+        for store in fa.get("attr_stores", ()):
+            cls, attr = store["class"], store["attr"]
+            key = (fa["file"], cls, attr)
+            if key in found:
+                found[key]["stores"] += 1
+                continue
+            if attr in loads:
+                continue
+            if attr.startswith("__") and attr.endswith("__"):
+                skip("dunder")
+                continue
+            if fa["is_test"]:
+                skip("test_file")
+                continue
+            related = closure(cls, bases) | closure(cls, children)
+            if any(attr in declared.get(c, ()) for c in related):
+                skip("declared_in_class")
+                continue
+            if related & framework:
+                skip("framework_base")
+                continue
+            if related & dynamic:
+                skip("dynamic_access")
+                continue
+            found[key] = {
+                "file": fa["file"],
+                "line": store["line"],
+                "class": cls,
+                "attribute": attr,
+                "stores": 1,
+                "is_public": not attr.startswith("_"),
+                # A public attribute may be read by code outside the project.
+                "confidence": "low" if not attr.startswith("_") else "medium",
+            }
+    return sorted(found.values(), key=lambda f: (f["file"], f["line"]))
 
 
 # Configuration files at the project root that name project symbols by dotted
@@ -1193,6 +1375,10 @@ def main() -> None:
     imports_kept: dict[str, int] = {}
     for fa in file_analyses:
         unused_imports.extend(find_unused_imports(fa, imports_kept))
+    attrs_excluded: dict[str, int] = {}
+    write_only = find_write_only_attributes(
+        file_analyses, external_refs | test_refs, excluded=attrs_excluded
+    )
 
     excluded_methods: dict[str, int] = {}
     excluded_functions: dict[str, int] = {}
@@ -1214,7 +1400,10 @@ def main() -> None:
 
     # Drop per-file reference sets to free memory.
     for fa in file_analyses:
-        for key in ("referenced_names", "plain_names", "other_attr_refs"):
+        for key in (
+            "referenced_names", "plain_names", "other_attr_refs", "attr_loads",
+            "attr_stores", "class_declared", "dynamic_attr_classes",
+        ):  # fmt: skip
             fa.pop(key, None)
         fa.pop("self_attr_refs", None)
 
@@ -1235,8 +1424,11 @@ def main() -> None:
         [u for u in unused_imports if u["confidence"] == "medium"]
         + [u for u in unreferenced if u["confidence"] == "medium"]
         + orphans
+        + [w for w in write_only if w["confidence"] == "medium"]
     )
-    low_confidence = [u for u in unreferenced if u["confidence"] == "low"]
+    low_confidence = [u for u in unreferenced if u["confidence"] == "low"] + [
+        w for w in write_only if w["confidence"] == "low"
+    ]
 
     output = {
         "project_root": str(project_root),
@@ -1269,6 +1461,10 @@ def main() -> None:
             # Root configuration files whose dotted paths (`pkg.mod:func`)
             # were read as production references.
             "config_files_scanned": config_files,
+            "write_only_attributes": len(write_only),
+            "write_only_attributes_excluded_by_reason": dict(
+                sorted(attrs_excluded.items())
+            ),
             "orphan_files": len(orphans),
             "commented_code_blocks": len(commented_code),
             "high_confidence_items": len(high_confidence),
@@ -1280,6 +1476,7 @@ def main() -> None:
         "referenced_only_from_tests": test_only,
         "orphan_files": orphans,
         "commented_code_blocks": commented_code,
+        "write_only_attributes": write_only,
     }
 
     json.dump(output, sys.stdout, indent=2)
