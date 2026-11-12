@@ -348,9 +348,56 @@ def _param_count(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> int:
     return count
 
 
+# A flat accumulator or validator: many independent top-level blocks, none
+# carrying much of the load. "Validate field A; validate field B; ..." sums to
+# a high cognitive complexity, but a reader holds one block at a time, so it
+# ranked above genuinely tangled code on a validation project.
+_FLAT_MIN_BLOCKS = 6
+_FLAT_MAX_SHARE = 0.35
+# Nine copies of a five-deep loop nest are not flat, however evenly the load
+# spreads: deep nesting is what flatness is contrasted with.
+_FLAT_MAX_DEPTH = 4
+
+
+def flatness(func_node: ast.AST, nesting_depth: int) -> dict:
+    """How the function's cognitive load spreads over its top-level blocks.
+
+    Each top-level statement is scored on its own (cognitive complexity is
+    additive across siblings). Returns `top_level_blocks` (statements with a
+    non-zero score), `largest_block_cognitive`, `largest_block_share` (null
+    when nothing scores) and `flat`: at least _FLAT_MIN_BLOCKS scoring blocks,
+    no block above _FLAT_MAX_SHARE of the total, and `nesting_depth` at most
+    _FLAT_MAX_DEPTH.
+    """
+    scores = []
+    for stmt in getattr(func_node, "body", []):
+        visitor = _CognitiveVisitor()
+        visitor.visit(stmt)
+        scores.append(visitor.score)
+    total = sum(scores)
+    largest = max(scores, default=0)
+    share = round(largest / total, 2) if total else None
+    blocks = sum(1 for score in scores if score > 0)
+    return {
+        "top_level_blocks": blocks,
+        "largest_block_cognitive": largest,
+        "largest_block_share": share,
+        "flat": share is not None
+        and blocks >= _FLAT_MIN_BLOCKS
+        and share <= _FLAT_MAX_SHARE
+        and nesting_depth <= _FLAT_MAX_DEPTH,
+    }
+
+
 def _compute_score(metrics: dict) -> float:
-    """Compute an overall complexity score (1-10) from individual metrics."""
+    """Compute an overall complexity score (1-10) from individual metrics.
+
+    For a flat function (`metrics["flat"]`), the cognitive term reads the
+    largest top-level block instead of the sum, and the branch-count term is
+    dropped: both only counted the independent checks again.
+    """
     score = 1.0
+    flat = bool(metrics.get("flat"))
 
     # Line count contribution (>50 is notable, >100 is high, >200 is critical).
     lc = metrics["line_count"]
@@ -378,7 +425,7 @@ def _compute_score(metrics: dict) -> float:
         score += 1.0
 
     # Cognitive complexity (>15 is notable, >30 is high, >50 is critical).
-    cc = metrics["cognitive_complexity"]
+    cc = metrics["largest_block_cognitive"] if flat else metrics["cognitive_complexity"]
     if cc > 50:
         score += 3.0
     elif cc > 30:
@@ -387,7 +434,7 @@ def _compute_score(metrics: dict) -> float:
         score += 1.0
 
     # Branch count (>10 is notable).
-    if metrics["branch_count"] > 10:
+    if metrics["branch_count"] > 10 and not flat:
         score += 1.0
 
     # Local variables (>10 is notable).
@@ -518,6 +565,7 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
             "return_count": _count_returns(node),
             "local_variable_count": _count_local_variables(node),
             "cognitive_complexity": cognitive_v.score,
+            **flatness(node, nesting_v.max_depth),
         }
 
         segments = qualname.split(".")[:-1]
@@ -546,6 +594,9 @@ def analyze_file(filepath: Path, project_root: Path) -> dict:
             "decorator_count": len(node.decorator_list),
             "metrics": metrics,
             "score": round(_compute_score(metrics), 1),
+            # The score without the flat discount; equal to `score` unless
+            # `metrics.flat` is true.
+            "score_undiscounted": round(_compute_score({**metrics, "flat": False}), 1),
         }
 
     # Every function at any depth: module level, methods, nested classes, and
