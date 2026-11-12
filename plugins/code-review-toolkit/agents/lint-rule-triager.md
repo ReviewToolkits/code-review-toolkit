@@ -26,7 +26,8 @@ likely-defects and strong smells; run it only when tier 1 is exhausted or the us
 
 | Field | What it means for your report |
 |---|---|
-| `version_matches_pin` false | Every count below is **non-comparable** with a calibrated run. Say so in the report; do not silently compare against a previous run's numbers. |
+| `version_matches_pin` false and `version_validated` false | Every count below is **non-comparable** with a calibrated run. Say so in the report; do not silently compare against a previous run's numbers. (`version_validated` true: the tiers were re-validated on this version, see `validated_versions`, so the counts compare.) |
+| `ruff_bin.reason` | Which ruff ran and why. By default the script prefers a ruff matching the project's pin (the active virtualenv's, or an in-tree `.venv`); "no ruff matching" means it fell back to PATH. |
 | `project_ruff_pin` set, and `version_matches_project_pin` false | The project runs a different ruff than this run did (its lock file, pre-commit rev or requirements say which). See "Two pins" below. |
 | `rule_validation.unknown` non-empty | Codes ruff does not recognise — a stale selection. Report it. |
 | `rule_validation.removed` non-empty | Rules deleted from ruff. **A membership test would have passed for these**; they are found by reading `status`. Report and stop selecting them. |
@@ -34,6 +35,10 @@ likely-defects and strong smells; run it only when tier 1 is exhausted or the us
 | `stderr` non-empty | Remapped codes and no-effect selections warn here and nowhere else. Read it. |
 | `error` non-null | The run is incomplete. An incomplete lint pass reported as clean is worse than no pass. |
 | `unlinted` non-empty | ruff could not read those paths ("Failed to lint" on stderr), and it still exits 0 with no findings. A sandboxed ruff, such as the snap package, cannot read `/tmp`. `error` is set. Re-run with `--ruff-bin` pointing at a different ruff; never report those paths as clean. |
+
+**Use the review venv's ruff.** When `brief.md` records the Phase 0 review venv and the project
+pins ruff, pass `--ruff-bin <venv>/bin/ruff`: that venv lives outside the checkout, so the script
+cannot find it by itself.
 
 **Two pins.** When the project pins a ruff (`project_ruff_pin.version`) that is not the toolkit's
 `pinned_version`, one run cannot be both comparable with the calibration and true to the project.
@@ -185,7 +190,7 @@ that shape.
 ```markdown
 ## Lint-derived findings ([N] tier-1 of [M] rules, ruff [version])
 
-[If version_matches_pin is false, or rule_validation is not clean, say so HERE, first.]
+[If version_matches_pin and version_validated are both false, or rule_validation is not clean, say so HERE, first.]
 
 ### Confirmed defects
 | Code | File:line | Failure scenario | Shape |

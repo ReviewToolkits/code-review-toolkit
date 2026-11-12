@@ -810,6 +810,71 @@ def write_fake_ruff(directory, *, fail):
     return path
 
 
+def write_versioned_ruff(path, version):
+    """An executable that answers `--version` like ruff *version*."""
+    import os
+    import sys
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"#!{sys.executable}\nprint('ruff {version}')\n", encoding="utf-8")
+    os.chmod(path, 0o755)
+    return path
+
+
+class TestRuffBinResolution(unittest.TestCase):
+    """The default ruff is the project's pinned one when it can be found."""
+
+    def _resolve(self, ruff_bin, pin, venv_version="9.9.1"):
+        import os
+        from unittest.mock import patch
+
+        from helpers import TempProject
+
+        with TempProject({"m.py": "x = 1\n"}) as root:
+            local = write_versioned_ruff(root / ".venv" / "bin" / "ruff", venv_version)
+            env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+            with patch.dict(os.environ, env, clear=True):
+                used, how = mod.resolve_ruff_bin(
+                    ruff_bin,
+                    root,
+                    {"version": pin, "source": "uv.lock"} if pin else None,
+                )
+            return used, how, str(local)
+
+    def test_a_venv_ruff_matching_the_pin_is_preferred(self):
+        used, how, local = self._resolve("ruff", "9.9.1")
+        self.assertEqual(used, local)
+        self.assertIn("matches the project's pinned ruff 9.9.1", how["reason"])
+
+    def test_an_explicit_ruff_bin_is_always_used(self):
+        used, how, _ = self._resolve("/opt/ruff", "9.9.1")
+        self.assertEqual(used, "/opt/ruff")
+        self.assertEqual(how["reason"], "explicit --ruff-bin")
+
+    def test_no_match_falls_back_to_path_and_says_so(self):
+        used, how, local = self._resolve("ruff", "9.9.2")
+        self.assertEqual(used, "ruff")
+        self.assertIn("no ruff matching the project's pin 9.9.2", how["reason"])
+        self.assertEqual(how["candidates"][0], {"path": local, "version": "9.9.1"})
+
+    def test_no_pin_keeps_ruff_on_path(self):
+        used, _, _ = self._resolve("ruff", None)
+        self.assertEqual(used, "ruff")
+
+    def test_the_envelope_records_the_choice_and_validation(self):
+        from helpers import TempProject
+
+        with TempProject({"m.py": "x = 1\n"}) as root:
+            result = _analyze_with_fake_ruff(root, [])
+        self.assertEqual(result["ruff_bin"]["used"], "ruff")
+        self.assertTrue(result["version_validated"])
+        self.assertIn(mod.PINNED_RUFF_VERSION, result["validated_versions"])
+
+    def test_the_pin_is_a_validated_version(self):
+        self.assertIn(mod.PINNED_RUFF_VERSION, mod.VALIDATED_RUFF_VERSIONS)
+        self.assertNotEqual(mod.PINNED_RUFF_VERSION, "0.16.0")
+
+
 class TestUnlintedPaths(unittest.TestCase):
     """ruff exits 0 with no findings for a path it could not read."""
 

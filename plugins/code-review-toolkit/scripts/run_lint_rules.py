@@ -15,6 +15,8 @@ Design constraints, every one of them measured (see docs/decision-log.md D-10):
   0.16.0, and it is not a superset -- 18 rules were dropped. A ruff bump is a
   calibration event, so the version is recorded in every envelope and a mismatch
   against ``PINNED_RUFF_VERSION`` is reported rather than ignored.
+  ``VALIDATED_RUFF_VERSIONS`` lists the versions the tiers were re-validated
+  on; by default the ruff that matches the project's own pin is preferred.
 * **Always an explicit ``--select``, never ``--extend-select``**, which composes
   with a default that just changed sevenfold.
 * **JSON output only.** Concise output changed shape between versions *and*
@@ -67,7 +69,14 @@ from scan_common import (  # noqa: E402
 )
 
 # A ruff bump is a calibration event. Bump this WITH a fixture-corpus re-run.
-PINNED_RUFF_VERSION = "0.16.0"
+PINNED_RUFF_VERSION = "0.17.3"
+
+# Versions the tier lists were re-validated on, against the pin: every
+# selected code stable (`rule_validation` clean), the preview-only codes still
+# preview-gated, and identical per-code counts at --tier 2 on the validation
+# corpora. A run on any of these is comparable with the calibration. Add a
+# version here only after that re-run, never because it is installed.
+VALIDATED_RUFF_VERSIONS = ("0.16.0", "0.17.3")
 
 _RUFF_TIMEOUT = 300
 
@@ -1226,6 +1235,61 @@ def ruff_version(ruff_bin: str) -> str | None:
     return parts[1] if len(parts) > 1 else None
 
 
+def _ruff_candidates(project_root: Path) -> list[str]:
+    """Ruff binaries that may be the project's own, most specific first."""
+    import os
+
+    found = []
+    venv = os.environ.get("VIRTUAL_ENV")
+    dirs = [Path(venv)] if venv else []
+    dirs += [project_root / ".venv", project_root / "venv"]
+    for directory in dirs:
+        for name in ("bin/ruff", "Scripts/ruff.exe"):
+            path = directory / name
+            if path.is_file() and str(path) not in found:
+                found.append(str(path))
+    return found
+
+
+def resolve_ruff_bin(
+    ruff_bin: str, project_root: Path, project_pin: dict | None
+) -> tuple[str, dict]:
+    """The ruff to run, and how it was chosen.
+
+    An explicit ``--ruff-bin`` path is always used. For the default
+    (``ruff``, whatever is first on PATH), a ruff whose version equals the
+    project's pin is preferred: the active virtualenv's, then an in-tree
+    ``.venv`` / ``venv``. Hits from a ruff the project does not run are not
+    the project's lint.
+    """
+    if ruff_bin != "ruff":
+        return ruff_bin, {"used": ruff_bin, "reason": "explicit --ruff-bin"}
+    pinned = (project_pin or {}).get("version")
+    if not pinned:
+        return ruff_bin, {
+            "used": ruff_bin,
+            "reason": "the project pins no exact ruff version: ruff on PATH",
+        }
+    checked = []
+    for candidate in [*_ruff_candidates(project_root), ruff_bin]:
+        version = ruff_version(candidate)
+        checked.append({"path": candidate, "version": version})
+        if version == pinned:
+            return candidate, {
+                "used": candidate,
+                "reason": f"matches the project's pinned ruff {pinned}",
+                "candidates": checked,
+            }
+    return ruff_bin, {
+        "used": ruff_bin,
+        "reason": (
+            f"no ruff matching the project's pin {pinned} was found (pass the "
+            "review venv's ruff with --ruff-bin): ruff on PATH"
+        ),
+        "candidates": checked,
+    }
+
+
 def validate_rules(ruff_bin: str, codes: list[str]) -> dict:
     """Classify every selected code against ruff's own rule metadata.
 
@@ -1766,6 +1830,10 @@ def analyze(
     """Run the tiered ruff selection over *target*."""
     scan_root = Path(target).resolve()
     project_root = find_project_root(scan_root)
+    project_pin = detect_project_ruff_pin(project_root)
+    ruff_bin, ruff_bin_resolution = resolve_ruff_bin(
+        ruff_bin, project_root, project_pin
+    )
     version = ruff_version(ruff_bin)
 
     if version is None:
@@ -1777,7 +1845,6 @@ def analyze(
             "findings": [],
         }
 
-    project_pin = detect_project_ruff_pin(project_root)
     codes = _tier_codes(tier)
     validation = validate_rules(ruff_bin, codes)
     # Never send ruff a code it will reject; an unknown code aborts the whole run.
@@ -1905,6 +1972,13 @@ def analyze(
         # A mismatch does not fail the run, but it makes every count in this
         # envelope non-comparable with a calibrated one. Say so.
         "version_matches_pin": version == PINNED_RUFF_VERSION,
+        # A version the tiers were re-validated on: its counts compare with
+        # the calibration even when it is not the exact pin.
+        "version_validated": version in VALIDATED_RUFF_VERSIONS,
+        "validated_versions": list(VALIDATED_RUFF_VERSIONS),
+        # Which ruff ran, and why (an explicit --ruff-bin, or the one that
+        # matches the project's pin).
+        "ruff_bin": ruff_bin_resolution,
         # The ruff the PROJECT pins (lock file, pre-commit, requirements).
         # When it differs from both this run and PINNED_RUFF_VERSION, run once
         # per version and report the difference.
