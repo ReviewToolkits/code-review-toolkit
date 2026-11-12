@@ -961,18 +961,64 @@ def _check_lru_cache_on_method(tree: ast.AST) -> list[dict]:
             first = fn.args.args[0].arg if fn.args.args else ""
             if first not in {"self", "cls"}:
                 continue
+            bound = _lru_cache_bound(fn)
+            if bound is None:
+                out.append(
+                    _finding(
+                        "lru-cache-on-method",
+                        "CONSIDER",
+                        "high",
+                        fn,
+                        f"{cls.name}.{fn.name}() is cached on the CLASS with '{first}' in "
+                        f"the key and no size bound, so every instance ever passed is "
+                        f"retained for the process lifetime",
+                        "use cached_property or a per-instance cache; harmless for "
+                        "singletons",
+                    )
+                )
+                continue
             out.append(
                 _finding(
                     "lru-cache-on-method",
                     "CONSIDER",
-                    "high",
+                    "medium",
                     fn,
-                    f"{cls.name}.{fn.name}() is cached on the CLASS with '{first}' in the key, "
-                    f"so every instance ever passed is retained for the process lifetime",
-                    "use cached_property or a per-instance cache; harmless for singletons",
+                    f"{cls.name}.{fn.name}() is cached on the CLASS with '{first}' in the "
+                    f"key: up to {bound} entries, and the instances in them, stay alive "
+                    f"and are shared across instances",
+                    "bounded, so this is retention, not a leak: it matters when the "
+                    "instances are short-lived (per request or session) or hold heavy "
+                    "state, where the hit rate is also near zero (check cache_info())",
                 )
             )
     return out
+
+
+def _lru_cache_bound(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+    """The `maxsize` of the method's `lru_cache`, as text; None when unbounded.
+
+    `@cache` and `@lru_cache(maxsize=None)` are unbounded; a bare `@lru_cache`
+    or `@lru_cache()` keeps functools' default of 128.
+    """
+    for dec in fn.decorator_list:
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        tail = _dotted_name(target).split(".")[-1]
+        if tail == "cache":
+            return None
+        if tail != "lru_cache":
+            continue
+        if not isinstance(dec, ast.Call):
+            return "128"
+        size = dec.args[0] if dec.args else None
+        for kw in dec.keywords:
+            if kw.arg == "maxsize":
+                size = kw.value
+        if size is None:
+            return "128"
+        if isinstance(size, ast.Constant) and size.value is None:
+            return None
+        return ast.unparse(size)
+    return None
 
 
 def _attribute_mutated_anywhere(tree: ast.AST, attr: str) -> bool:

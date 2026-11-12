@@ -318,6 +318,42 @@ class TestLruCacheOnMethod(unittest.TestCase):
         src = "import functools\nclass C:\n    @staticmethod\n    @functools.lru_cache\n    def m(k):\n        return k\n"
         self.assertNotIn("lru-cache-on-method", shapes(src))
 
+    def _lru(self, decorator: str) -> dict:
+        src = (
+            "import functools\nfrom functools import cache, lru_cache\n"
+            f"class C:\n    @{decorator}\n    def m(self, k):\n        return k\n"
+        )
+        (found,) = [f for f in scan(src) if f["shape"] == "lru-cache-on-method"]
+        return found
+
+    def test_unbounded_cache_is_called_a_lifetime_leak(self):
+        for decorator in (
+            "cache",
+            "functools.cache",
+            "lru_cache(maxsize=None)",
+            "lru_cache(None)",
+        ):
+            with self.subTest(decorator=decorator):
+                found = self._lru(decorator)
+                self.assertEqual(found["confidence"], "high")
+                self.assertIn("process lifetime", found["message"])
+
+    def test_bounded_cache_is_retention_not_a_leak(self):
+        # A maxsize bounds what is kept: the message must not claim every
+        # instance ever passed is retained, and the confidence drops.
+        for decorator, bound in (
+            ("functools.lru_cache", "128"),
+            ("lru_cache()", "128"),
+            ("lru_cache(maxsize=32)", "32"),
+            ("lru_cache(32)", "32"),
+            ("lru_cache(maxsize=SIZE)", "SIZE"),
+        ):
+            with self.subTest(decorator=decorator):
+                found = self._lru(decorator)
+                self.assertEqual(found["confidence"], "medium")
+                self.assertIn(f"up to {bound} entries", found["message"])
+                self.assertNotIn("process lifetime", found["message"])
+
 
 class TestClassLevelMutable(unittest.TestCase):
     def test_class_list(self):

@@ -181,21 +181,21 @@
     },
     {
       "id": "lru-cache-on-method",
-      "title": "`@lru_cache` on an instance method keeps every `self` alive forever",
+      "title": "`@lru_cache` on an instance method keeps `self` alive in a class-wide cache",
       "agent": "python-pitfall-scanner",
       "severity": "CONSIDER",
-      "pattern": "`@functools.lru_cache` / `@cache` applied to a method taking `self`. The cache is stored on the CLASS and keys include `self`, so every instance ever passed is strongly referenced for the process lifetime -- an unbounded leak -- and cache entries are shared across instances.",
+      "pattern": "`@functools.lru_cache` / `@cache` applied to a method taking `self`. The cache is stored on the CLASS and keys include `self`, so instances passed to it are strongly referenced by the cache and entries are shared across instances. How much is retained depends on `maxsize`: with `@cache` or `lru_cache(maxsize=None)` every instance ever passed stays alive for the process lifetime -- an unbounded leak; with a bound (the default `maxsize=128`) up to that many recent entries, and their instances, stay alive. A per-request or per-session `self` then also makes the hit rate near zero, so the cache costs memory and buys nothing.",
       "guarded_twin": "`functools.cached_property` for per-instance memoization, a per-instance cache dict built in `__init__`, or making the function a `@staticmethod`/module-level function keyed only on the real inputs.",
-      "hunt": "Grep every `lru_cache`/`cache` decorator and check whether the first parameter is `self`/`cls`; long-lived services accumulate these.",
+      "hunt": "Grep every `lru_cache`/`cache` decorator and check whether the first parameter is `self`/`cls`. Read `maxsize`: unbounded caches on classes with many short-lived instances are the leak; bounded ones are retention plus sharing. For a bounded cache, check what `self` is (a per-request service, a session-holding object) and the hit rate (`method.cache_info()` in a test or a shell): hits near zero mean the cache never helps.",
       "expected": "cached values are released when the instance is; memory is stable across instance churn.",
-      "caught_as": "SILENT -- steadily growing RSS in a long-running process; instances that should be collected never are.",
+      "caught_as": "SILENT -- unbounded: steadily growing RSS in a long-running process, instances that should be collected never are. Bounded: per-request objects outlive their request, stale values are served across instances, and the cache rarely hits.",
       "confirmed_examples": [],
       "validation": "documented",
       "references": [
         "functools docs, lru_cache note on methods and object lifetimes",
         "ruff B019 / flake8-bugbear: cached-instance-method"
       ],
-      "differential": "Harmless for singletons or classes with a small fixed instance count. Judge by instance lifecycle, not by the decorator alone.",
+      "differential": "Harmless for singletons or classes with a small fixed instance count. With a bounded `maxsize` it is retention, not a leak: report it as CONSIDER only when the retained instances hold something heavy or stale (sessions, connections, per-request state) or the hit rate is near zero. Judge by instance lifecycle, not by the decorator alone.",
       "detected_by": "scan_python_pitfalls.py",
       "detectability": "implemented"
     },
