@@ -75,7 +75,10 @@ Every finding carries `shape_id`.
 and written down that they meant it. On coverage.py, 6 of 19 tier-1 findings carried one and **every
 one was a deliberate idiom** — `open = open  # pylint: disable=redefined-builtin`, which captures the
 builtin at import time so later mocking cannot break the module. Dismiss those *with the author's
-stated reason*, do not re-litigate them.
+stated reason*, do not re-litigate them. Count from `summary.suppression_dismissal_signals`, not
+`summary.has_suppression_comment`: the latter also counts a `# type: ignore` or a
+`# pragma: no cover` on the line, which address mypy and coverage and say nothing about the ruff
+rule (`suppression_names_rule: false`, not a signal).
 
 **A suppression on a security rule (`S…`) or any `# nosec` is a claim to check, not a dismissal.**
 The calibration above was all `redefined-builtin`; it does not transfer. A `# nosec` asserts that a

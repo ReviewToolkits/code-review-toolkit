@@ -119,6 +119,34 @@ class TestSuppressionDetails(unittest.TestCase):
         out = mod.suppression_details("E722", "except:  # noqa: E722")
         self.assertTrue(out["suppression_is_dismissal_signal"])
 
+    def test_type_ignore_and_coverage_pragma_are_not_signals(self):
+        # They address mypy and coverage: a B006 under `# pragma: no cover`
+        # was dismissed as if the author had considered the ruff rule.
+        for line in (
+            "def f(x=[]):  # pragma: no cover",
+            "def f(x=[]):  # type: ignore[assignment]",
+            "def f(x=[]):  # type: ignore",
+        ):
+            with self.subTest(line=line):
+                out = mod.suppression_details("B006", line)
+                self.assertIsNotNone(out["suppression_comment"])
+                self.assertFalse(out["suppression_names_rule"])
+                self.assertFalse(out["suppression_is_dismissal_signal"])
+
+    def test_a_noqa_after_a_type_ignore_still_counts(self):
+        out = mod.suppression_details(
+            "F401", "import x  # type: ignore[import]  # noqa: F401"
+        )
+        self.assertTrue(out["suppression_names_rule"])
+        self.assertTrue(out["suppression_is_dismissal_signal"])
+
+    def test_pylint_naming_a_ruff_code_is_checked(self):
+        # pylint's W0603 is ruff's PLW0603.
+        out = mod.suppression_details("PLW0603", "global x  # pylint: disable=W0603")
+        self.assertTrue(out["suppression_names_rule"])
+        out = mod.suppression_details("PLW0603", "global x  # pylint: disable=W0611")
+        self.assertFalse(out["suppression_names_rule"])
+
     def test_no_comment(self):
         out = mod.suppression_details("S307", "x = eval(s)")
         self.assertIsNone(out["suppression_comment"])
@@ -136,6 +164,17 @@ class TestSuppressionDetails(unittest.TestCase):
             result = _analyze_with_fake_ruff(root, hits)
         self.assertEqual(result["summary"]["has_suppression_comment"], 2)
         self.assertEqual(result["summary"]["suppression_needs_verification"], 1)
+        self.assertEqual(result["summary"]["suppression_dismissal_signals"], 1)
+
+    def test_a_coverage_pragma_is_not_counted_as_a_dismissal(self):
+        from helpers import TempProject
+
+        source = "def f(x=[]):  # pragma: no cover\n    return x\n"
+        with TempProject({"m.py": source}) as root:
+            hits = [_fake_hit(root, "m.py", 1, "[]", code="B006")]
+            result = _analyze_with_fake_ruff(root, hits)
+        self.assertEqual(result["summary"]["has_suppression_comment"], 1)
+        self.assertEqual(result["summary"]["suppression_dismissal_signals"], 0)
 
 
 class TestNormalize(unittest.TestCase):

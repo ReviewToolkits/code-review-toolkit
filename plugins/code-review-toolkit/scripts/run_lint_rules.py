@@ -209,6 +209,9 @@ _SUPPRESSION_TAIL = re.compile(
     re.IGNORECASE,
 )
 _SUPPRESSION_CODES = re.compile(r"\b([A-Z]{1,4}\d{2,4})\b")
+# The suppression kinds that can address a ruff rule. A comment with none of
+# these (only `type: ignore` or `pragma`) is not a dismissal signal for one.
+_RUFF_SUPPRESSION = re.compile(r"noqa|nosec|pylint:\s*disable")
 _SECURITY_RULE = re.compile(r"^S\d{3}$")
 
 
@@ -235,8 +238,14 @@ def suppression_details(code: str, text: str) -> dict:
     aliases = {code}
     if _SECURITY_RULE.match(code):
         aliases.add("B" + code[1:])
-    if "type:" in head or "pragma" in head or "pylint" in head:
-        names_rule = None  # cannot name a ruff code
+    if code.startswith("PL") and len(code) > 3:
+        aliases.add(code[2:])  # pylint's own `W0603` is ruff's PLW0603
+    if not _RUFF_SUPPRESSION.search(head):
+        # Only a `# type: ignore` or a `# pragma` (e.g. `no cover`): it
+        # addresses mypy or coverage, so it says nothing about a ruff rule.
+        names_rule = False
+    elif "pylint" in head and not named:
+        names_rule = None  # pylint's symbolic names cannot name a ruff code
     elif not named:
         names_rule = None  # a blanket suppression
     else:
@@ -245,7 +254,8 @@ def suppression_details(code: str, text: str) -> dict:
     return {
         "suppression_comment": comment,
         # True: it names this rule; False: it names only other rules (stale or
-        # misdirected); None: blanket, or a kind that cannot name a ruff code.
+        # misdirected), or is only a type-ignore / coverage pragma, which
+        # addresses another tool; None: blanket, or pylint's symbolic names.
         "suppression_names_rule": names_rule,
         "suppression_is_dismissal_signal": not exempt and names_rule is not False,
     }
@@ -1555,7 +1565,15 @@ def analyze(
                     if not f["shape_id"] and not f.get("suspect_tool_bug")
                 }
             ),
+            # Any suppression-like comment on the hit's line, including a
+            # `type: ignore` or a coverage pragma, which say nothing about a
+            # ruff rule. Triage on the next count, not this one.
             "has_suppression_comment": len(suppressed),
+            # Hits whose comment is a dismissal signal for THIS rule (see each
+            # hit's `suppression_is_dismissal_signal`).
+            "suppression_dismissal_signals": sum(
+                1 for f in suppressed if f["suppression_is_dismissal_signal"]
+            ),
             # Suppressed hits whose comment must be VERIFIED, not trusted: a
             # security rule, a `nosec`, or a comment naming a different rule.
             "suppression_needs_verification": sum(
