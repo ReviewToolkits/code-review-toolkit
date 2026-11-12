@@ -22,6 +22,7 @@ import json
 import re
 import unittest
 from pathlib import Path
+from typing import ClassVar
 
 _PLUGIN = Path(__file__).resolve().parent.parent / "plugins" / "code-review-toolkit"
 _AGENTS = _PLUGIN / "agents"
@@ -135,7 +136,7 @@ class TestEveryAgentCarriesTheFindingFields(unittest.TestCase):
     agent cites one shared field list and rubric instead."""
 
     # Produces verdicts on others' findings, not findings of its own.
-    _EXEMPT = {"security-claims-skeptic"}
+    _EXEMPT: ClassVar[set[str]] = {"security-claims-skeptic"}
 
     def test_every_agent_cites_finding_fields(self):
         for name in _agent_names():
