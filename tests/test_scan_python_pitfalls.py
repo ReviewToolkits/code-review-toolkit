@@ -1186,6 +1186,41 @@ class TestRaiseWithoutFrom(unittest.TestCase):
         self.assertNotIn("raise-without-from-in-except", shapes(src))
 
 
+class TestRaiseWithoutFromGrading(unittest.TestCase):
+    """Style-grade by default; medium only where the original is dropped."""
+
+    def _conf(self, handler):
+        src = f"def f(t):\n    try:\n        return int(t)\n    {handler}\n"
+        hits = [f for f in scan(src) if f["shape"] == "raise-without-from-in-except"]
+        return hits[0]["confidence"]
+
+    def test_a_bound_and_unused_exception_is_medium(self):
+        # True positive: the handler captured the error and then dropped it.
+        self.assertEqual(
+            self._conf("except ValueError as err:\n        raise ConfigError('bad')"),
+            "medium",
+        )
+
+    def test_the_original_in_the_message_is_low(self):
+        self.assertEqual(
+            self._conf(
+                "except ValueError as err:\n        raise ConfigError(f'bad: {err}')"
+            ),
+            "low",
+        )
+
+    def test_no_binding_is_low(self):
+        self.assertEqual(
+            self._conf("except KeyError:\n        raise ConfigError('missing key')"),
+            "low",
+        )
+
+    def test_an_http_response_exception_is_low(self):
+        self.assertEqual(
+            self._conf("except ValueError as err:\n        raise HTTPNotFound()"), "low"
+        )
+
+
 class TestRaiseWithoutFromDifferentials(unittest.TestCase):
     shape = "raise-without-from-in-except"
 

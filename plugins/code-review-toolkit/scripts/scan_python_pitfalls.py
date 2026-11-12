@@ -591,6 +591,7 @@ _COUNTED_CHECKS = frozenset(
         "class-level-mutable-attribute",
         "eq-without-hash",
         "except-exception-too-broad",
+        "raise-without-from-in-except",
     }
 )
 
@@ -2344,6 +2345,7 @@ def _raises_in_handler(handler: ast.ExceptHandler):
 
 def _check_raise_without_from(tree: ast.AST) -> list[dict]:
     out: list[dict] = []
+    shape = "raise-without-from-in-except"
     for candidate in ast.walk(tree):
         if not isinstance(candidate, ast.ExceptHandler):
             continue
@@ -2356,14 +2358,42 @@ def _check_raise_without_from(tree: ast.AST) -> list[dict]:
             # Re-raising the caught name itself needs no cause.
             if isinstance(node.exc, ast.Name) and node.exc.id == handler.name:
                 continue
+            _note(shape, "considered")
+            # Style-grade by default: the implicit chain ("During handling of
+            # the above exception...") still prints the original, and these
+            # dominated the totals on a web app. Medium only where the
+            # original's details are visibly dropped: the handler binds the
+            # exception and then never uses it.
+            raised = _raised_name(node)
+            if raised.startswith("HTTP") or raised.endswith(("Redirect", "Response")):
+                conf = "low"
+                why = (
+                    "an HTTP response exception: control flow, not an error chain "
+                    "-- `from None` states that if wanted"
+                )
+            elif handler.name and not any(
+                handler.name in _names_used(stmt) for stmt in handler.body
+            ):
+                conf = "medium"
+                why = (
+                    f"the handler binds `{handler.name}` and never uses it: the new "
+                    "exception's message drops the original's details -- use "
+                    f"`from {handler.name}`, or put them in the message"
+                )
+            else:
+                conf = "low"
+                why = (
+                    "style: the implicit chain still shows the original; use "
+                    "`from err` to chain or `from None` to suppress deliberately"
+                )
             finding = _finding(
-                "raise-without-from-in-except",
+                shape,
                 "CONSIDER",
-                "medium",
+                conf,
                 node,
                 "raising a new exception inside `except` without `from` loses the "
                 "explicit cause",
-                "use `from err` to chain or `from None` to suppress deliberately",
+                why,
             )
             if _raised_name(node) == "SystemExit":
                 # An exit prints no traceback, so there is no chain to show.
