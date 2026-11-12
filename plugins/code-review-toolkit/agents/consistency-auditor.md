@@ -107,6 +107,28 @@ The majority behavior is the project's own standard; the outlier is the candidat
 general "same concern, different approach" analysis across modules to pattern-consistency-checker:
 this agent's job is the side-by-side comparison of close siblings, within a module or class.
 
+### Phase 2c: Framework wiring on web applications
+
+On a web application, the siblings that must agree include the two ends of each piece of
+framework wiring: the place a setting is written and the places it is read, a route's declared
+permission and the permission its siblings require, an event's emitter and its handlers' payload
+keys. Run the wiring cross-reference (see [Running the script](#running-the-script)) and compare
+within each family:
+
+```bash
+python3 <plugin_root>/scripts/map_wiring.py [scope]
+```
+
+- `routes.declared`: group the routes of one resource and compare their `permissions`, `methods`
+  and `renderers`. A sibling route with a weaker permission, or none, is the outlier to check.
+- `settings.read_never_written` with `default_at_every_read: false`, and keys read with different
+  defaults at different sites (compare the `read_at` sites of one key).
+- `signals.keys_read_not_sent` and `signals.attributes_read_not_set`: a handler that reads a payload
+  key or event attribute no emitter provides.
+
+A section with `"status": "not_detected"` was not checked: say so instead of reporting no
+divergence. `<plugin_root>/docs/registry-diff.md` confirms a lead against the booted app.
+
 ### Phase 3: Check Against Explicit Rules
 
 If CLAUDE.md (or equivalent project configuration) exists, compare the discovered conventions against the documented rules:
