@@ -5066,6 +5066,86 @@ def _check_translation_of_interpolated_string(tree: ast.AST) -> list[dict]:
     return out
 
 
+_RANGE_OPS = (ast.Lt, ast.LtE, ast.Gt, ast.GtE)
+_FINITE_CHECKS = frozenset({"isfinite", "isnan", "isinf"})
+
+
+def _floats_bound(scope: ast.AST) -> dict[str, ast.Call]:
+    """Names bound to `float(<non-literal>)` in *scope* (not nested scopes)."""
+    out: dict[str, ast.Call] = {}
+    for node in _walk_same_scope(scope):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Call)
+            and _call_name(node.value) == "float"
+            and node.value.args
+            and not isinstance(node.value.args[0], ast.Constant)
+        ):
+            out[node.targets[0].id] = node.value
+    return out
+
+
+def _rejects_when_true(stmt: ast.If, name: str) -> bool:
+    """Is the `if` body a rejection of *name*, not the accepted branch?
+
+    A raise, `continue`/`break`, or a return or assignment that does not use
+    *name* (`return 0`, `x = DEFAULT`) rejects; `return compute(x)` accepts.
+    """
+    last = stmt.body[-1] if stmt.body else None
+    if isinstance(last, (ast.Raise, ast.Continue, ast.Break)):
+        return True
+    if isinstance(last, (ast.Return, ast.Assign)):
+        return last.value is None or name not in _names_used(last.value)
+    return False
+
+
+def _check_non_finite_float_passes_range_guard(tree: ast.AST) -> list[dict]:
+    """`x = float(raw)`; `if x <= 0: raise` -- 'nan' and 'inf' pass."""
+    out: list[dict] = []
+    for scope in _iter_scopes(tree):
+        floats = _floats_bound(scope)
+        if not floats:
+            continue
+        nodes = list(_walk_same_scope(scope))
+        if any(
+            isinstance(n, ast.Call) and _call_tail(n) in _FINITE_CHECKS for n in nodes
+        ):
+            continue
+        reported: set[str] = set()
+        for stmt in nodes:
+            if not isinstance(stmt, ast.If):
+                continue
+            test = stmt.test
+            if not (
+                isinstance(test, ast.Compare)
+                and len(test.ops) == 1
+                and isinstance(test.ops[0], _RANGE_OPS)
+            ):
+                continue  # `not x > 0` and chained `lo < x <= hi` reject NaN
+            for side in (test.left, test.comparators[0]):
+                if not (isinstance(side, ast.Name) and side.id in floats):
+                    continue
+                if side.id in reported or not _rejects_when_true(stmt, side.id):
+                    continue
+                reported.add(side.id)
+                out.append(
+                    _finding(
+                        "non-finite-float-passes-range-guard",
+                        "CONSIDER",
+                        "medium",
+                        stmt,
+                        f"`{ast.unparse(test)}` rejects out-of-range values of "
+                        f"{side.id} = float(...), but float() accepts 'nan' and 'inf': "
+                        f"NaN fails every comparison, so it passes this guard",
+                        "add `not math.isfinite(...)` to the rejection, or write the "
+                        "test so NaN fails it (`if not 0 < x <= hi`)",
+                    )
+                )
+    return out
+
+
 _COLUMN_FACTORIES = frozenset({"Column", "mapped_column"})
 _JSON_COLUMN_TYPES = frozenset({"JSON", "JSONB", "ARRAY", "HSTORE"})
 _MUTATION_TRACKERS = frozenset(
@@ -5245,6 +5325,7 @@ _CHECKS = {
     "translation-lookup-of-interpolated-string": (
         _check_translation_of_interpolated_string
     ),
+    "non-finite-float-passes-range-guard": _check_non_finite_float_passes_range_guard,
 }
 
 

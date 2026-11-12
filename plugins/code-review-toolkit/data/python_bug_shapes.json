@@ -3161,6 +3161,28 @@
       "aliases": [
         "fixture-type-divergence"
       ]
+    },
+    {
+      "id": "non-finite-float-passes-range-guard",
+      "title": "A float parsed from config or the environment passes a `<= 0` / range rejection test as `nan` or `inf`",
+      "agent": "python-pitfall-scanner",
+      "severity": "CONSIDER",
+      "pattern": "`x = float(raw)` followed by a rejection test of the form `if x <= 0: raise` (or `x < lo`, `x > hi`). `float()` accepts 'nan', 'inf' and 'infinity'. Every comparison with NaN is False, so NaN passes every rejection test written this way, and inf passes a positivity check. The 'validated' value then reaches a consumer that cannot take it: a socket or asyncio timeout (OverflowError, ValueError), `time.sleep`, `int()`, `range()`, or a limit that NaN silently disables.",
+      "guarded_twin": "`if not math.isfinite(x) or x <= 0: raise`, or a test written so NaN fails it (`if not 0 < x <= hi: raise`).",
+      "hunt": "Every `float(` whose result is compared with a constant inside a validator or a config loader; every config or env coercion helper that maps strings to float; every timeout, limit and interval read from config. Feed 'nan' and 'inf' to each.",
+      "expected": "a non-finite value is rejected where the value is validated, with a config error.",
+      "caught_as": "SILENT at validation; it fails later, at first use, with an unrelated-looking OverflowError/ValueError, or it silently disables a limit.",
+      "confirmed_examples": [
+        "A private review of a threaded/async FastAPI service (reproduced): a timeout validator parsed float(...) from configuration and rejected only `<= 0`; 'inf' and 'nan' both passed, and every outbound call then failed at the socket."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "Python docs, float(): accepts 'nan', 'inf' and 'infinity'; math.isfinite",
+        "IEEE 754: every ordered comparison with NaN is false"
+      ],
+      "differential": "`math.inf` used deliberately as an 'unlimited' sentinel and documented as such is fine, and so is a value that a later check rejects. A test written in the NaN-rejecting form (`if not x > 0`, `if not lo < x <= hi`) is the guarded twin.",
+      "detected_by": "scan_python_pitfalls.py",
+      "detectability": "implemented"
     }
   ]
 }

@@ -2327,6 +2327,71 @@ class TestTranslationOfInterpolatedString(unittest.TestCase):
         self.assertNotIn(self.shape, shapes("print(f'{x}')\nlog.info('a' + b)\n"))
 
 
+class TestNonFiniteFloatPassesRangeGuard(unittest.TestCase):
+    shape = "non-finite-float-passes-range-guard"
+
+    def test_positivity_rejection_admits_nan_and_inf(self):
+        src = (
+            "def backoff_from(config):\n"
+            "    delay = float(config['backoff'])\n"
+            "    if delay <= 0:\n"
+            "        raise ValueError('backoff must be positive')\n"
+            "    return delay\n"
+        )
+        found = [f for f in scan(src) if f["shape"] == self.shape]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["line"], 3)
+
+    def test_fallback_return_counts_as_a_rejection(self):
+        src = (
+            "import os\n"
+            "def limit():\n"
+            "    ratio = float(os.environ.get('SAMPLE_RATIO') or 0)\n"
+            "    if ratio <= 0:\n"
+            "        return 0\n"
+            "    return int(ratio * 100)\n"
+        )
+        self.assertIn(self.shape, shapes(src))
+
+    def test_isfinite_and_nan_rejecting_forms_are_silent(self):
+        guarded = (
+            "import math\n"
+            "def f(raw):\n"
+            "    x = float(raw)\n"
+            "    if not math.isfinite(x) or x <= 0:\n"
+            "        raise ValueError(raw)\n"
+            "    return x\n"
+        )
+        negated = (
+            "def f(raw):\n"
+            "    x = float(raw)\n"
+            "    if not x > 0:\n"
+            "        raise ValueError(raw)\n"
+            "    return x\n"
+        )
+        chained = (
+            "def f(raw):\n"
+            "    x = float(raw)\n"
+            "    if not 0 < x <= 1:\n"
+            "        raise ValueError(raw)\n"
+            "    return x\n"
+        )
+        for src in (guarded, negated, chained):
+            with self.subTest(src=src):
+                self.assertNotIn(self.shape, shapes(src))
+
+    def test_accepting_branch_is_silent(self):
+        # NaN takes the else branch here: the guard rejects it.
+        src = (
+            "def f(raw):\n"
+            "    x = float(raw)\n"
+            "    if x > 0:\n"
+            "        return scale(x)\n"
+            "    return None\n"
+        )
+        self.assertNotIn(self.shape, shapes(src))
+
+
 _MODELS = (
     "from sqlalchemy.dialects.postgresql import JSONB\n"
     "from sqlalchemy.ext.mutable import MutableDict\n"
