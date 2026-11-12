@@ -484,5 +484,46 @@ class TestCoverageOmit(unittest.TestCase):
         self.assertIn("pkg/shim.py", result["untested_sources"])
 
 
+class TestComplexityScope(_ExportAndCheckout, unittest.TestCase):
+    """measure_complexity: --exclude, migrations, and history from a checkout."""
+
+    def test_exclude(self):
+        out = check_exclude(self, "measure_complexity", ("--no-clones",))
+        self.assertNotIn("pkg/vendor/lib.py", [f["file"] for f in out["files"]])
+
+    def test_own_flags_are_not_warned_about(self):
+        assert_no_unknown_flag_warning(
+            self, "measure_complexity", ["--no-clones", "--key-type", "B=fix"]
+        )
+
+    def test_skips_revisions(self):
+        with TempProject(MIGRATION_PROJECT) as root:
+            out, _, _ = run_main(
+                import_script("measure_complexity"), [str(root / "pkg"), "--no-clones"]
+            )
+        self.assertEqual(out["migration_files_skipped"], 3)
+        self.assertEqual(out["summary"]["total_functions"], 1)
+
+    def test_warns_on_stderr_without_history(self):
+        mod = import_script("measure_complexity")
+        out, err, _ = run_main(mod, [str(self.export), "--no-clones"])
+        self.assertFalse(out["history_crossing"]["history_available"])
+        self.assertIn("no usable git history", err)
+        self.assertIn("--git-dir", err)
+
+    def test_git_dir_maps_paths_by_relative_path(self):
+        mod = import_script("measure_complexity")
+        out, err, _ = run_main(
+            mod, [str(self.export), "--no-clones", "--git-dir", str(self.repo)]
+        )
+        self.assertNotIn("warning", err)
+        top = out["history_crossing"]["top_fixed_functions"]
+        self.assertTrue(top["available"])
+        self.assertEqual(top["functions"][0]["qualified_name"], "pkg/core.py::work")
+        self.assertEqual(
+            out["history_crossing"]["history_root"], str(self.repo.resolve())
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
