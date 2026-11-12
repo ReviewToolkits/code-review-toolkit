@@ -741,5 +741,135 @@ class TestCanonicalKeys(unittest.TestCase):
         self.assertFalse(keys["docs_outside_scan_scope"])
 
 
+class TestOverduePlannedItems(unittest.TestCase):
+    """Roadmap rows targeting a release that already shipped were not flagged."""
+
+    ROADMAP = (
+        "| Key | Task | Target |\n|---|---|---|\n"
+        "| ABC-1 | Faster index | v1.2 |\n"
+        "| ABC-2 | Streaming | 2.0 |\n"
+        "| ABC-3 | Docs pass, after ABC-4 (v1.0) | 3.1 |\n"
+        "| ABC-4 | Cleanup | v1.3.0 |\n"
+        "| ABC-5 | ~~Old work~~ | v0.9 |\n"
+    )
+
+    def _run(self, version_line: str) -> dict:
+        files = {"pkg/__init__.py": "", "ROADMAP.md": self.ROADMAP}
+        with TempProject(files) as root:
+            (root / "pyproject.toml").write_text(
+                f'[project]\nname = "x"\n{version_line}\n', encoding="utf-8"
+            )
+            out = _run_main([str(root), "--key-regex", r"ABC-\d+"])
+        return out["tracker_keys"]["overdue_planned_items"]
+
+    def test_rows_at_or_below_the_current_version(self):
+        overdue = self._run('version = "1.3"')
+        self.assertEqual(overdue["current_version"], "1.3")
+        self.assertEqual(overdue["current_version_source"], "pyproject.toml [project]")
+        self.assertEqual(
+            [(i["key"], i["target_version"]) for i in overdue["items"]],
+            [("ABC-1", "1.2"), ("ABC-4", "1.3")],
+        )
+
+    def test_unknown_version_is_null_with_a_reason(self):
+        overdue = self._run("")
+        self.assertIsNone(overdue["items"])
+        self.assertIn("no static version", overdue["reason"])
+
+
+class TestDependencySpecs(unittest.TestCase):
+    """No inventory of dependency bounds, installed versions or lockfile use."""
+
+    def test_bounds_installed_versions_and_install_sites(self):
+        pyproject = (
+            '[project]\nname = "x"\n'
+            "dependencies = [\n"
+            '  "alpha>=2.0",\n'
+            '  "beta>=1,<2",\n'
+            '  "gamma",\n'
+            "]\n"
+            "[project.optional-dependencies]\n"
+            'test = ["delta~=3.1"]\n'
+        )
+        files = {
+            "pkg/__init__.py": "",
+            "setup.py": "from setuptools import setup\nsetup(install_requires=['epsilon>=0.5'])\n",
+            "Dockerfile": (
+                "FROM python\nRUN pip install -r requirements.lock\nRUN pip install .\n"
+            ),
+            ".github/workflows/ci.yml": "steps:\n  - run: uv sync --frozen\n",
+            "uv.lock": "version = 1\n",
+            ".venv/lib/python3.12/site-packages/alpha-1.5.dist-info/METADATA": "",
+            ".venv/lib/python3.12/site-packages/Beta-1.4.dist-info/METADATA": "",
+        }
+        with TempProject(files) as root:
+            (root / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+            (root / "requirements.lock").write_text(
+                "alpha==1.5 --hash=sha256:0\n", encoding="utf-8"
+            )
+            (root / "requirements.txt").write_text(
+                "-r requirements.lock\n", encoding="utf-8"
+            )
+            import os
+            from unittest import mock
+
+            with mock.patch.dict(os.environ, {"VIRTUAL_ENV": ""}):
+                out = _run_main([str(root / "pkg")])
+        deps = out["dependency_specs"]
+        by_name = {d["name"]: d for d in deps["declared"]}
+        self.assertEqual(set(by_name), {"alpha", "beta", "gamma", "delta", "epsilon"})
+        self.assertEqual(deps["floor_only"], ["alpha", "epsilon"])
+        self.assertEqual(deps["unbounded"], ["gamma"])
+        self.assertEqual(by_name["alpha"]["installed"], "1.5")
+        self.assertTrue(by_name["alpha"]["installed_below_floor"])
+        self.assertFalse(by_name["beta"]["installed_below_floor"])
+        self.assertIsNone(by_name["gamma"]["installed"])
+        self.assertEqual(by_name["delta"]["group"], "optional:test")
+        self.assertIn("uv.lock", deps["lockfiles"])
+        sites = {
+            (s["file"], s["line"]): s["uses_lockfile"] for s in deps["install_sites"]
+        }
+        self.assertEqual(
+            sites,
+            {
+                ("Dockerfile", 2): True,  # -r of a hashed requirements file
+                ("Dockerfile", 3): False,
+                (".github/workflows/ci.yml", 2): True,
+            },
+        )
+
+    def test_setup_cfg_requirements(self):
+        cfg = (
+            "[options]\ninstall_requires =\n    alpha>=1\n    beta\n"
+            "[options.extras_require]\ntest =\n    gamma>=7\n"
+        )
+        with TempProject({"pkg/__init__.py": "", "setup.cfg": cfg}) as root:
+            out = _run_main([str(root)])
+        self.assertEqual(
+            [
+                (d["line"], d["name"], d["group"])
+                for d in out["dependency_specs"]["declared"]
+            ],
+            [
+                (3, "alpha", "dependencies"),
+                (4, "beta", "dependencies"),
+                (7, "gamma", "optional:test"),
+            ],
+        )
+
+    def test_no_project_environment_is_null_not_missing(self):
+        with TempProject({"pkg/__init__.py": ""}) as root:
+            (root / "requirements.txt").write_text("alpha>=1\n", encoding="utf-8")
+            import os
+            from unittest import mock
+
+            with mock.patch.dict(os.environ, {"VIRTUAL_ENV": ""}):
+                out = _run_main([str(root)])
+        deps = out["dependency_specs"]
+        self.assertIsNone(deps["installed_from"])
+        self.assertIn("no project environment", deps["installed_reason"])
+        self.assertIsNone(deps["declared"][0]["installed"])
+
+
 if __name__ == "__main__":
     unittest.main()

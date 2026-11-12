@@ -745,6 +745,8 @@ def collect_tracker_keys(
                 for m in pattern.finditer(span.group(1))
             }
             own, row_done = _row_keys(line, pattern)
+            first_match = pattern.search(line)
+            first_key = canonical_key(first_match) if first_match else None
             if row_done:
                 struck |= own
             for match in pattern.finditer(line):
@@ -766,6 +768,9 @@ def collect_tracker_keys(
                             "file": rel,
                             "line": number,
                             "struck": key in struck,
+                            # The line is ABOUT this key (its table row, or
+                            # its first key), not a passing cross-reference.
+                            "primary": key in own if own else key == first_key,
                             "text": line.strip()[:200],
                         }
                     )
@@ -1297,6 +1302,403 @@ def collect_config_debt(project_root: Path) -> dict:
     return result
 
 
+# --- roadmap targets and dependency specs -----------------------------------
+
+_VERSION_TOKEN = re.compile(r"(?<![\w.\-/])v?(\d+(?:\.\d+){1,2})(?![\w.]*\d)(?![\w-])")
+
+
+def _version_tuple(text: str) -> tuple[int, ...] | None:
+    match = re.match(r"v?(\d+(?:\.\d+)*)", text.strip())
+    if not match:
+        return None
+    parts = [int(p) for p in match.group(1).split(".")]
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()  # 1.2.0 == 1.2
+    return tuple(parts)
+
+
+def project_version(project_root: Path, use_git: bool) -> tuple[str | None, str]:
+    """``(version, where it came from)`` -- or ``(None, why not)``.
+
+    Static metadata first (`pyproject.toml`, `setup.cfg`, `setup.py`), then a
+    `__version__` in a top-level package, then the latest local git tag.
+    """
+    sections = {
+        "pyproject.toml": ("project", "tool.poetry"),
+        "setup.cfg": ("metadata",),
+    }
+    for name, wanted in sections.items():
+        path = project_root / name
+        if not path.is_file():
+            continue
+        section = ""
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            header = _SECTION.match(line)
+            if header:
+                section = header.group(1)
+                continue
+            key, sep, value = line.partition("=")
+            if sep and key.strip() == "version" and section in wanted:
+                value = value.strip().strip("\"'")
+                if _version_tuple(value):
+                    return value, f"{name} [{section}]"
+    setup = project_root / "setup.py"
+    if setup.is_file():
+        try:
+            match = re.search(
+                r"""\bversion\s*=\s*["']([^"']+)["']""",
+                setup.read_text(encoding="utf-8", errors="replace"),
+            )
+        except OSError:
+            match = None
+        if match and _version_tuple(match.group(1)):
+            return match.group(1), "setup.py"
+    for pattern in ("*/__init__.py", "*/_version.py", "*/version.py", "*/__about__.py",
+                    "src/*/__init__.py", "src/*/_version.py", "src/*/version.py"):  # fmt: skip
+        for path in sorted(project_root.glob(pattern)):
+            if _is_excluded(path, project_root):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            match = re.search(
+                r"""^__version__\s*(?::\s*\w+\s*)?=\s*["']([^"']+)["']""",
+                text,
+                re.MULTILINE,
+            )
+            if match and _version_tuple(match.group(1)):
+                return match.group(1), str(path.relative_to(project_root))
+    if use_git:
+        try:
+            result = subprocess.run(
+                ["git", "describe", "--tags", "--abbrev=0"],
+                capture_output=True,
+                text=True,
+                cwd=str(project_root),
+                timeout=10,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            result = None
+        tag = result.stdout.strip() if result and result.returncode == 0 else ""
+        if _version_tuple(tag.lstrip("v")):
+            return tag, "latest git tag"
+    return None, "no static version, __version__ or version tag found"
+
+
+def overdue_planned_items(tracker: dict, project_root: Path, use_git: bool) -> dict:
+    """Open planning-doc rows whose target version is at or below the
+    project's current version: promised for a release that has shipped."""
+    version, source = project_version(project_root, use_git)
+    result: dict = {
+        "current_version": version,
+        "current_version_source": source if version else None,
+        "items": None if version is None else [],
+    }
+    if version is None:
+        result["reason"] = source
+        return result
+    current = _version_tuple(version)
+    by_key = {k["key"]: k for k in tracker["keys"]}
+    for key in tracker["open_in_planning_docs"]:
+        for ref in by_key.get(key, {}).get("doc_refs", []):
+            if (
+                ref["struck"]
+                or not ref.get("primary")
+                or not Path(ref["file"]).name.lower().startswith(_PLANNING_STEMS)
+            ):
+                continue
+            targets = [
+                t
+                for t in (
+                    _version_tuple(m) for m in _VERSION_TOKEN.findall(ref["text"])
+                )
+                if t
+            ]
+            if not targets:
+                continue
+            target = max(targets)
+            if target <= current:
+                result["items"].append(
+                    {
+                        "key": key,
+                        "target_version": ".".join(map(str, target)),
+                        "file": ref["file"],
+                        "line": ref["line"],
+                        "text": ref["text"],
+                    }
+                )
+                break
+    return result
+
+
+_LOCKFILE_NAMES = ("uv.lock", "poetry.lock", "Pipfile.lock", "pdm.lock", "pylock.toml")
+_INSTALL = re.compile(
+    r"\b(?:uv\s+pip\s+install|pip3?\s+install|python3?\s+-m\s+pip\s+install"
+    r"|uv\s+sync|poetry\s+install|pdm\s+(?:install|sync)|pipenv\s+(?:install|sync))\b.*"
+)
+_SPEC_CLAUSE = re.compile(r"(===|==|~=|>=|<=|!=|>|<)\s*([^,;\s]+)")
+
+
+def _parse_requirement(text: str) -> dict | None:
+    text = text.split("#", 1)[0].strip()
+    match = re.match(
+        r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(\[[^\]]*\])?\s*(\(?[^;@]*\)?)\s*(@\s*\S+)?\s*(;.*)?$",
+        text,
+    )
+    if not match or text.startswith(("-", ".", "/")):
+        return None
+    clauses = _SPEC_CLAUSE.findall(match.group(3) or "")
+    lower = upper = None
+    for op, ver in clauses:
+        if op in (">=", ">", "~=", "==", "==="):
+            lower = ver
+        if op in ("<", "<=", "==", "==="):
+            upper = ver
+        if op == "~=":
+            upper = f"next release after {ver}"
+    return {
+        "name": match.group(1),
+        "spec": (match.group(3) or "").strip() or None,
+        "lower": lower,
+        "upper": upper,
+        "direct_reference": bool(match.group(4)),
+        "unbounded": not clauses and not match.group(4),
+        "floor_only": lower is not None and upper is None,
+        "marker": (match.group(5) or "").lstrip(";").strip() or None,
+    }
+
+
+def _site_packages(project_root: Path) -> tuple[Path | None, str]:
+    """The project's environment: $VIRTUAL_ENV, else `.venv`/`venv`/`env` in
+    the project root. Never the interpreter running this script."""
+    import os
+
+    candidates = []
+    if os.environ.get("VIRTUAL_ENV"):
+        candidates.append(Path(os.environ["VIRTUAL_ENV"]))
+    candidates += [project_root / n for n in (".venv", "venv", "env")]
+    for env in candidates:
+        for site in sorted(env.glob("lib/python*/site-packages")) + sorted(
+            env.glob("Lib/site-packages")
+        ):
+            if site.is_dir():
+                return site, str(env)
+    return None, (
+        "no project environment found ($VIRTUAL_ENV, .venv, venv, env); the "
+        "toolkit's own interpreter is not the project's, so it is not used"
+    )
+
+
+def _installed_versions(site: Path) -> dict[str, str]:
+    found: dict[str, str] = {}
+    for meta in site.glob("*.dist-info"):
+        name, _, version = meta.name[: -len(".dist-info")].partition("-")
+        found[re.sub(r"[-_.]+", "-", name).lower()] = version
+    return found
+
+
+def _is_lock_path(path: Path) -> bool:
+    """A requirements file an install reads that pins everything (hashes,
+    pip-compile output) -- installing from it is installing from a lock."""
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+    return path.suffix == ".lock" or _is_lockfile(lines)
+
+
+def _setup_py_requirements(path: Path) -> list[tuple[int, str, str]]:
+    """``(line, requirement, group)`` from literal `install_requires` and
+    `extras_require` arguments of a `setup()` call."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError, ValueError, RecursionError):
+        return []
+    out: list[tuple[int, str, str]] = []
+
+    def strings(node: ast.AST, group: str) -> None:
+        if isinstance(node, (ast.List, ast.Tuple)):
+            for elt in node.elts:
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                    out.append((elt.lineno, elt.value, group))
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not (
+            isinstance(node.func, (ast.Name, ast.Attribute))
+            and (getattr(node.func, "id", None) or getattr(node.func, "attr", None))
+            == "setup"
+        ):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg == "install_requires":
+                strings(keyword.value, "dependencies")
+            elif keyword.arg == "extras_require" and isinstance(
+                keyword.value, ast.Dict
+            ):
+                for key, value in zip(keyword.value.keys, keyword.value.values):
+                    if isinstance(key, ast.Constant):
+                        strings(value, f"optional:{key.value}")
+    return out
+
+
+def collect_dependency_specs(project_root: Path) -> dict:
+    """Declared dependencies with their bounds and the installed version,
+    lockfiles, and how CI and container builds install."""
+    declared: list[dict] = []
+
+    def add(rel: str, number: int, text: str, group: str) -> None:
+        req = _parse_requirement(text)
+        if req:
+            declared.append({"file": rel, "line": number, "group": group, **req})
+
+    pyproject = project_root / "pyproject.toml"
+    if pyproject.is_file():
+        lines = pyproject.read_text(encoding="utf-8", errors="replace").splitlines()
+        section, in_list, group = "", False, None
+        for i, line in enumerate(lines):
+            header = _SECTION.match(line)
+            if header:
+                section, in_list = header.group(1), False
+                continue
+            stripped = line.strip()
+            key, sep, value = line.partition("=")
+            key = key.strip().strip('"')
+            if sep and not in_list:
+                if section == "project" and key == "dependencies":
+                    group = "dependencies"
+                elif section == "project.optional-dependencies":
+                    group = f"optional:{key}"
+                elif section == "dependency-groups":
+                    group = f"group:{key}"
+                else:
+                    continue
+                in_list = "[" in value and "]" not in value.split("#", 1)[0]
+                for match in _TOML_STRING.finditer(value.split("#", 1)[0]):
+                    add(
+                        "pyproject.toml",
+                        i + 1,
+                        next(g for g in match.groups() if g is not None),
+                        group,
+                    )
+                continue
+            if in_list:
+                for match in _TOML_STRING.finditer(stripped.split("#", 1)[0]):
+                    add(
+                        "pyproject.toml",
+                        i + 1,
+                        next(g for g in match.groups() if g is not None),
+                        group,
+                    )
+                if stripped.startswith("]"):
+                    in_list = False
+    setup_py = project_root / "setup.py"
+    if setup_py.is_file():
+        for number, text, group in _setup_py_requirements(setup_py):
+            add("setup.py", number, text, group)
+    setup_cfg = project_root / "setup.cfg"
+    if setup_cfg.is_file():
+        lines = setup_cfg.read_text(encoding="utf-8", errors="replace").splitlines()
+        section = ""
+        for i, line in enumerate(lines):
+            header = _SECTION.match(line)
+            if header:
+                section = header.group(1)
+                continue
+            key, sep, _ = line.partition("=")
+            key = key.strip()
+            if not sep or line[:1] in (" ", "\t"):
+                continue
+            if section == "options" and key == "install_requires":
+                group = "dependencies"
+            elif section == "options.extras_require":
+                group = f"optional:{key}"
+            else:
+                continue
+            _value, end = _value_lines(lines, i, False)
+            parts = [line.partition("=")[2], *lines[i + 1 : end + 1]]
+            for offset, part in enumerate(parts):
+                if part.strip():
+                    add("setup.cfg", i + offset + 1, part.strip(), group)
+    lockfiles = [n for n in _LOCKFILE_NAMES if (project_root / n).is_file()]
+    for pattern in _REQUIREMENT_GLOBS:
+        for path in sorted(project_root.glob(pattern)):
+            rel = str(path.relative_to(project_root))
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            if _is_lockfile(lines):
+                lockfiles.append(rel)
+                continue
+            for i, line in enumerate(lines):
+                add(rel, i + 1, line, rel)
+    site, env_source = _site_packages(project_root)
+    installed = _installed_versions(site) if site else {}
+    for dep in declared:
+        version = installed.get(re.sub(r"[-_.]+", "-", dep["name"]).lower())
+        dep["installed"] = version if site else None
+        floor = _version_tuple(dep["lower"]) if dep["lower"] else None
+        have = _version_tuple(version) if version else None
+        dep["installed_below_floor"] = have < floor if floor and have else None
+    install_sites: list[dict] = []
+    sources = [p for g in _CI_GLOBS for p in sorted(project_root.glob(g))]
+    sources += sorted(project_root.glob("Dockerfile*")) + sorted(
+        project_root.glob("*/Dockerfile*")
+    )
+    for name in ("Makefile", "tox.ini", "noxfile.py"):
+        if (project_root / name).is_file():
+            sources.append(project_root / name)
+    for path in sources:
+        if not path.is_file() or _is_excluded(path, project_root):
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        rel = str(path.relative_to(project_root))
+        for i, line in enumerate(lines):
+            match = _INSTALL.search(line)
+            if not match or line.lstrip().startswith("#"):
+                continue
+            command = match.group(0).strip()
+            referenced = re.findall(
+                r"(?:-r|--requirement|-c|--constraint)[=\s]+(\S+)", command
+            )
+            uses_lock = any(
+                _is_lock_path(project_root / ref) for ref in referenced
+            ) or bool(
+                re.search(
+                    r"--frozen|--locked|--require-hashes|--deploy|--frozen-lockfile",
+                    command,
+                )
+                or re.search(r"\b(?:poetry install|pipenv sync|pdm sync)\b", command)
+                or any(lock in command for lock in lockfiles)
+            )
+            install_sites.append(
+                {
+                    "file": rel,
+                    "line": i + 1,
+                    "command": command[:200],
+                    "uses_lockfile": uses_lock,
+                }
+            )
+    return {
+        "declared": declared,
+        "floor_only": sorted({d["name"] for d in declared if d["floor_only"]}),
+        "unbounded": sorted({d["name"] for d in declared if d["unbounded"]}),
+        "installed_from": env_source if site else None,
+        "installed_reason": None if site else env_source,
+        "lockfiles": lockfiles,
+        "install_sites": install_sites,
+    }
+
+
 _TOML_STRING = re.compile(
     r"'''(.*?)'''"
     r'|"""(.*?)"""'
@@ -1489,6 +1891,9 @@ def main() -> None:
         # comments, project-wide tool suppressions, CI failure allowances and
         # TODO-style comments in config, requirements and CI files.
         "config_debt": collect_config_debt(project_root),
+        # Declared dependencies (bounds, installed version from the project's
+        # own environment), lockfiles and how CI/containers install.
+        "dependency_specs": collect_dependency_specs(project_root),
     }
     # Each pytest filterwarnings entry on its own, with its age.
     output["config_debt"]["warning_filters"] = collect_warning_filters(
@@ -1504,12 +1909,16 @@ def main() -> None:
     # What is read from the project root whatever the scan scope.
     output["read_from_project_root"] = [
         "config_debt",
+        "dependency_specs",
         *(["tracker_keys (docs)"] if key_pattern is not None else []),
     ]
     output["scan_scope_narrowed"] = scan_root.resolve() != project_root.resolve()
     if key_pattern is not None:
         output["tracker_keys"] = collect_tracker_keys(
             project_root, all_files, key_pattern, use_git, scan_root=scan_root
+        )
+        output["tracker_keys"]["overdue_planned_items"] = overdue_planned_items(
+            output["tracker_keys"], project_root, use_git
         )
     else:
         # Not measured -- say so instead of omitting the section, so an agent

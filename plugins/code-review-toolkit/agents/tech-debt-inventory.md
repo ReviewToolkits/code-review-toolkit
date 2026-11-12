@@ -46,8 +46,15 @@ Key fields:
   - `warning_filters`: each pytest `filterwarnings` entry on its own (`entry`, `action`,
     `comment_above`, `age`). An `ignore` entry whose comment links an upstream issue is a workaround:
     check whether the issue is fixed in the installed version, and report stale ones with their age
+- `dependency_specs`, also from the project root: `declared` dependencies (pyproject, setup.py,
+  setup.cfg, requirements files) with `lower`/`upper` bounds, `floor_only`, `unbounded`, the
+  `installed` version and `installed_below_floor`; `lockfiles`; and `install_sites` (each install
+  command in CI, Dockerfiles, Makefile, tox/nox, with `uses_lockfile`). Installed versions come from
+  the project's own environment only: run the script with `VIRTUAL_ENV=<project venv>` set when one
+  exists outside the checkout. Without one, `installed` is `null` and `installed_reason` says why:
+  report that as unmeasured, never as "nothing installed"
 - `read_from_project_root` and `scan_scope_narrowed`: when the scope is a sub-directory, config
-  debt and tracker-key docs still come from the whole project. Say so when you
+  debt, dependency specs and tracker-key docs still come from the whole project. Say so when you
   attribute them to the scoped package
 
 **Tracker keys.** Many projects track deferred work by key (`ABC-12`, `PROJ-7`, `R2-4`) in an issue
@@ -102,6 +109,9 @@ mentions the key does not close it. Derived lists:
   or commit mentions (`unaccounted_skipped` says which prefixes were left out: forge numbers, and
   sparse or very wide ranges). A gap in a dense sequence is an item that was lost or never
   recorded: search the unmerged branches and the commit bodies for it before reporting it
+- `overdue_planned_items`: open planning-doc rows whose target version (the highest version token
+  in the key's own row) is at or below `current_version` — promised for a release that has
+  shipped. `items` is `null`, with a `reason`, when no current version could be found
 
 These are heuristics: a commit that mentions a key may have started rather than finished it.
 Without `--key-regex`, `tracker_keys` is `null` and `tracker_keys_reason` says why — report that
@@ -170,9 +180,31 @@ Look for patterns that indicate debt without explicit markers:
 ### Dependency Debt
 
 - **Unbounded dependencies combined with reliance on internals**: a dependency declared without an
-  upper bound, while the project subclasses its classes, imports its private modules (`_internal`,
-  leading-underscore names) or patches it at runtime. That breaks on a routine upgrade; check
-  whether it already has (run the import, or the tests, against the latest release).
+  upper bound (`dependency_specs.floor_only` / `unbounded`), while the project subclasses its
+  classes, imports its private modules (`_internal`, leading-underscore names) or patches it at
+  runtime. That breaks on a routine upgrade; check whether it already has (run the import, or the
+  tests, against the latest release).
+  **When you suspect a break, find the version.** "This could break" is not actionable; "breaks at
+  2.4.0" is. In an exported copy, install candidate releases of the dependency into a throwaway
+  environment and bisect between the floor (or the installed version) and the latest release,
+  running the smallest check that shows the break (an import, one test):
+
+  ```bash
+  cd "$d" && python3 -m venv "$d/venv" && "$d/venv/bin/pip" install -q <copy>   # never the checkout
+  "$d/venv/bin/pip" index versions <dependency>      # the candidate releases
+  for v in 2.1.0 2.3.0 2.4.0; do                     # halve the range each round
+    "$d/venv/bin/pip" install -q "<dependency>==$v" &&
+    TMPDIR="$d" "$d/venv/bin/python" -c 'import <pkg>.<module>' && echo "$v ok" || echo "$v BREAKS"
+  done
+  ```
+
+  Report the first failing release and the last good one, and the bound that fixes it
+  (`<dependency><2.4`). If the bisect needs the network and it is unavailable, say the break is
+  unconfirmed.
+- **Below-floor installs and lockfile-free builds**: an `installed_below_floor` dependency means the
+  environment the tests ran in does not satisfy the declared bounds. An `install_sites` entry with
+  `uses_lockfile: false` in CI or a Dockerfile, while the project has `lockfiles`, means the shipped
+  image resolves dependencies fresh at build time: the tested set and the deployed set can differ.
 - **Runtime deprecations**: APIs the code calls that the installed Python or libraries already
   deprecate. If the test suite can run (in an exported copy), run it once with every warning shown
   and bucket them — `-W error::DeprecationWarning` stops at the first hit, and one repeated warning
