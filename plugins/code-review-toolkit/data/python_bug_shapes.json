@@ -2994,6 +2994,69 @@
       "differential": "An ACL denial that carries a reason the view renders, or an explicit check that is defence in depth with identical wording, is fine.",
       "detected_by": null,
       "detectability": "agent-only"
+    },
+    {
+      "id": "append-slash-redirect-swallows-deliberate-404",
+      "title": "A not-found view with append-slash redirects 404s that a view raised on purpose",
+      "agent": "api-surface-reviewer",
+      "severity": "CONSIDER",
+      "pattern": "A framework-level not-found handler redirects to `path + '/'` when that path matches a route (Pyramid `notfound_view_config(append_slash=...)`, Django `APPEND_SLASH`, Flask `strict_slashes`). It also fires for a 404 that a view raised deliberately on a slash-less path whose slash twin is an unrelated route, so the client never sees the 404 and follows a redirect to an unrelated resource, often a 200 page.",
+      "guarded_twin": "A path-scoped not-found view with append-slash disabled for API prefixes, or a view that returns (rather than raises) its 404 response.",
+      "hunt": "List every route without a trailing slash whose views raise or return a 404. Check whether the same path plus '/' matches any route, including redirect routes. Each match is an instance unless that path is excluded from append-slash.",
+      "expected": "a view's own 404 reaches the client as a 404.",
+      "caught_as": "API clients receive 301 -> 200 (a home page) for missing resources; unit tests that call the view directly still see the 404.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): deliberate 404s from a legacy API endpoint became a chain of 301s ending at the home page with 200."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "Pyramid docs, Redirecting to Slash-Appended Routes; Django docs, APPEND_SLASH"
+      ],
+      "differential": "When the slash twin is the same resource, the redirect is the intent.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "content-negotiation-split-across-routes",
+      "title": "Content negotiation done by an `accept=` predicate per route ignores q-values and media-type parameters",
+      "agent": "api-surface-reviewer",
+      "severity": "CONSIDER",
+      "pattern": "Two routes or views share a URL and are selected by an `accept=` predicate each. The router takes the first route whose single offer is acceptable, so the client's q-values are never compared across routes; a range with parameters (`application/json; charset=utf-8`) fails to match a parameterless offer; and a request matching neither predicate falls through to 404 instead of 406 or a documented default.",
+      "guarded_twin": "One view that calls the framework's negotiation over all offers (`request.accept.acceptable_offers([...])`) and picks the renderer.",
+      "hunt": "Grep route and view registrations for `accept=` and group them by URL pattern. Any pattern with more than one accept-split route is an instance. Probe each with 'A, B;q=0.5', 'A; charset=utf-8' and an unmatched type.",
+      "expected": "the highest-q acceptable representation is served; unmatched types get 406 or the documented default.",
+      "caught_as": "The wrong representation for clients with explicit preferences, and a 404 for an existing resource.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): an endpoint negotiated through two accept predicates; q-values were ignored, a parameterised Accept got 404, and unmatched types got a 404 page."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "RFC 9110, section 12.5.1 (Accept)"
+      ],
+      "differential": "A URL with only one representation has nothing to negotiate.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "cross-cutting-header-only-on-some-responses",
+      "title": "A cross-cutting response header (CORS, Vary, Cache-Control) is set on some statuses or branches of an API and not others",
+      "agent": "api-surface-reviewer",
+      "severity": "CONSIDER",
+      "pattern": "An API's success responses carry its header contract, but an error or exception view decorates its response only at the end, after a fallback branch that returns early; or a redirect or a sibling representation of the same API is built by a different code path that never adds the headers. Whether a client sees CORS or caching headers depends on which status or branch it hit.",
+      "guarded_twin": "The main branch of the same function, or a response callback / middleware that adds the headers unconditionally for the API's path prefix.",
+      "hunt": "For each API, run every status it can produce (200, 3xx redirects, 400, 404, 405, 406, 410, 429, 503) and every representation through the app, and diff each response's header set against the 200 response. Then read each return statement of the exception views.",
+      "expected": "every response of an API carries the same CORS, Vary and cache contract.",
+      "caught_as": "Browser clients see opaque CORS failures only for some statuses; caches store error or redirect responses with the wrong lifetime.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): an API's trailing-slash redirect lacked the Access-Control-Allow-Origin header that another redirect of the same API carried."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "Fetch standard, CORS protocol: a cross-origin redirect must itself carry the CORS headers"
+      ],
+      "differential": "An endpoint that is not meant to be cross-origin or cacheable has no contract to break.",
+      "detected_by": null,
+      "detectability": "agent-only"
     }
   ]
 }
