@@ -525,5 +525,107 @@ class TestComplexityScope(_ExportAndCheckout, unittest.TestCase):
         )
 
 
+class TestInvariantsScope(_ExportAndCheckout, unittest.TestCase):
+    """extract_test_invariants: --exclude, and bug-fix history from a checkout."""
+
+    def test_exclude(self):
+        check_exclude(self, "extract_test_invariants")
+
+    def test_own_flags_are_not_warned_about(self):
+        assert_no_unknown_flag_warning(
+            self, "extract_test_invariants", ["--max-tests", "5", "--all"]
+        )
+
+    def test_with_git_on_an_export_is_null_and_warned(self):
+        mod = import_script("extract_test_invariants")
+        out, err, code = run_main(mod, [str(self.export), "--with-git"])
+        self.assertEqual(code, 0)
+        self.assertIsNone(out["summary"]["bug_fix_tests_total"])
+        self.assertIsNone(out["summary"]["bug_fix_tests_found"])
+        self.assertEqual(out["bug_fix_scan"]["status"], "no_git_history")
+        self.assertIn("--git-dir", err)
+
+    def test_git_dir_reads_the_checkout(self):
+        mod = import_script("extract_test_invariants")
+        out, err, code = run_main(
+            mod, [str(self.export), "--with-git", "--git-dir", str(self.repo / ".git")]
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out["summary"]["bug_fix_tests_total"], 1)
+        self.assertEqual(out["bug_fix_tests"][0]["test_functions"], ["test_regression"])
+        self.assertEqual(out["bug_fix_scan"]["git_root"], str(self.repo.resolve()))
+
+
+class TestInvariantCaps(unittest.TestCase):
+    """The hard-coded selection and history caps can be raised."""
+
+    def _project(self, n_tests: int) -> dict:
+        tests = "".join(
+            f"def test_case_{i}():\n    assert work({i}) == {i + 1}\n\n"
+            for i in range(n_tests)
+        )
+        return {
+            "pkg/__init__.py": "",
+            "pkg/core.py": "def work(x):\n    return x + 1\n",
+            "tests/test_core.py": "from pkg.core import work\n\n" + tests,
+        }
+
+    def test_max_tests_raises_the_selection(self):
+        mod = import_script("extract_test_invariants")
+        with TempProject(self._project(40)) as root:
+            default = mod.analyze(str(root))
+            raised = mod.analyze(str(root), max_tests=40)
+        self.assertEqual(default["summary"]["selected_test_functions"], 30)
+        self.assertTrue(default["summary"]["tests_capped"])
+        self.assertEqual(raised["summary"]["selected_test_functions"], 40)
+        self.assertFalse(raised["summary"]["tests_capped"])
+
+    def test_commit_window_and_group_cap_flags(self):
+        mod = import_script("extract_test_invariants")
+        with TempProject(self._project(3)) as root:
+            _git(root, "init", "-q", "-b", "main")
+            _git(root, "add", "-A")
+            _git(root, "commit", "-q", "-m", "Add core")
+            test = root / "tests/test_core.py"
+            for i in range(3):
+                test.write_text(
+                    test.read_text(encoding="utf-8")
+                    + f"def test_fix_{i}():\n    assert work(0) == 1\n\n",
+                    encoding="utf-8",
+                )
+                _git(root, "commit", "-q", "-am", f"Fix crash number {i}")
+            one = mod.analyze(str(root), with_git=True, max_commits=1)
+            capped = mod.analyze(str(root), with_git=True, max_bug_fix_groups=2)
+            unbounded = mod.analyze(
+                str(root), with_git=True, max_commits=None, max_fix_commits=None
+            )
+        self.assertEqual(one["summary"]["bug_fix_tests_total"], 1)
+        self.assertEqual(one["bug_fix_scan"]["commits_scanned"], 1)
+        self.assertEqual(capped["summary"]["bug_fix_tests_total"], 3)
+        self.assertEqual(len(capped["bug_fix_tests"]), 2)
+        self.assertTrue(capped["summary"]["bug_fix_tests_capped"])
+        self.assertIsNone(unbounded["bug_fix_scan"]["commit_cap"])
+        self.assertEqual(unbounded["bug_fix_scan"]["fix_commits_found"], 3)
+
+    def test_tests_and_source_roots(self):
+        mod = import_script("extract_test_invariants")
+        files = {
+            "lib/core.py": "def work(x):\n    return x + 1\n",
+            "checks/check_core.py": (
+                "from lib.core import work\n\n\ndef test_work():\n    assert work(1) == 2\n"
+            ),
+        }
+        with TempProject(files) as root:
+            result = mod.analyze(
+                str(root),
+                source_roots=[str(root / "lib")],
+                test_roots=[str(root / "checks")],
+            )
+        self.assertEqual(result["test_discovery"]["method"], "--tests")
+        self.assertEqual(result["summary"]["test_files"], 1)
+        self.assertEqual(result["summary"]["source_files"], 1)
+        self.assertEqual(result["summary"]["total_test_functions"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
