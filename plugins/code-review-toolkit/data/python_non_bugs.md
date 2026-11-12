@@ -488,3 +488,29 @@ after the work is done. A review flagged exactly this, and a control test refute
 - With a deferring offload the hazard is the reverse. The deferred `CancelledError` (a
   `BaseException`) skips `except Exception` arms, so a release placed only in those arms leaks the
   slot.
+
+### 49. A unique-constraint pre-check without a lock *(a large web application with an ORM and a task queue)*
+
+**Looks like:** `db-check-then-insert-without-unique-constraint` -- `SELECT ... first()` then
+`add()` on a miss, with no `FOR UPDATE`.
+
+**Why it is not a bug:** when a UNIQUE constraint covers exactly the looked-up columns, with the same
+normalisation, the database rejects the second insert. If the framework retries an `IntegrityError`
+(a retry-on-conflict request wrapper) or the code handles it, the collision becomes the pre-check's
+own friendly error on the retry. The pre-check exists for the message, not for safety.
+
+**Real bug:** the check's columns or normalisation differ from the constraint's (a wider tuple, a
+raw versus a normalised name), there is no constraint, or a non-idempotent side effect (an external
+customer created, an email sent) runs between the check and the insert.
+
+### 50. A test-then-hit limiter documented as soft, with an atomic backstop
+
+**Looks like:** `rate-limiter-test-then-hit` -- `limiter.test()` before the work, `limiter.hit()`
+after it.
+
+**Why it is not a bug:** some limits deliberately count only successes (a creation quota), accept
+the burst, and bound it with a second limiter that is charged atomically (`if not attempts.hit():`)
+before the work. A comment that calls the first check optimistic is the usual tell.
+
+**Real bug:** no atomic limiter is charged first on that path, or the limiter guards guessing
+(passwords, one-time codes, recovery codes), where a burst is the attack.

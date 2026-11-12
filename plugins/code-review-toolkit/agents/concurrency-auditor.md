@@ -94,6 +94,9 @@ Per shape, what to check:
 | `transitive-blocking-call-in-async` | How long can the other path hold the lock (the `meanwhile` hop)? Seconds-long operations (restore, compaction, model loads) make it a FIX. |
 | `signal-handler-does-real-work` | Can the main thread be inside that lock (often `logging`'s) when the signal lands? |
 | `slot-acquired-before-the-try-that-releases-it` | Can the flagged line raise or be cancelled while the slot is held? Check that the slot is really taken on that path, and that no caller releases it. |
+| `rate-limiter-test-then-hit` | What runs between the test and the hit? Slow work there (a password check, an email, a lookup) is the window. `low` = the pair is split across two methods: read the caller that runs both. Dismiss a documented soft limit backed by an atomic limiter charged first. |
+| `read-modify-write-on-shared-store` | Can two workers (requests, tasks) update this key at once? Then one update is lost. Check it isn't a single-writer key. |
+| `session-level-set-leaks-through-pooled-connection` | Does the connection come from a pool, and can the transaction commit? Then the setting outlives the request. |
 
 Consult `data/python_non_bugs.md` for the false-positive taxonomy, and dismiss with the stated
 reason.
@@ -135,6 +138,38 @@ locks it found:
   - **Blocking I/O without a deadline.** HTTP clients with no `timeout=` (or `timeout=None`),
     `subprocess.run` without `timeout=`, socket reads with no timeout: one stalled peer hangs
     the whole run.
+- **Concurrency that lives in the database, cache or task queue.** A web app with sync workers
+  (gunicorn/uWSGI processes, task-queue workers) usually declares no locks and no `async def`, yet
+  runs many copies of every handler at once. An empty `locks_declared` there means "out of the
+  thread-lock model", not "clean". The three store checks above still run; hunt the rest by hand:
+  - **Build the database guard map.** Grep `with_for_update`, `FOR UPDATE`, `SKIP LOCKED`,
+    `pg_advisory`, `LOCK TABLE`, `ON CONFLICT`, every `UniqueConstraint`/`unique=True`, and every
+    distributed lock (`redis.lock`, `Lock` subclasses). This is the project's real locking contract.
+  - **Check-then-act across transactions.** A get-or-create whose lookup columns differ from the
+    unique constraint (`db-check-then-insert-without-unique-constraint`), a single-use code or
+    link burned with a read then a write (`single-use-token-redeemed-twice`), a "last owner"
+    check under READ COMMITTED, and a row read into Python, changed and written back
+    (`read-modify-write-on-shared-store`, row form).
+  - **Locks held across slow work.** Row and advisory locks last until commit
+    (`row-or-advisory-lock-held-across-slow-io`); flush hooks that take a lock fire on the first
+    autoflush. Distributed leases shorter than the work, or waits shorter than the holder's hold
+    (`distributed-lock-timeout-shorter-than-hold`).
+  - **Sessions and settings.** A session store that writes the whole blob back at response time
+    (`session-blob-writeback-resurrects-invalidated-session`); `SET` without `LOCAL` on a pooled
+    connection.
+  - **Triggers.** Aggregates a trigger recomputes from a pre-lock snapshot
+    (`trigger-aggregate-lost-update`): read the migrations, not only the Python.
+  - **Periodic jobs that can overlap.** Two runs of a scheduled task selecting the same batch
+    without `SKIP LOCKED` or a lock do the work twice (emails sent twice).
+  - **Side effects tied to the transaction.** A side effect before commit, a retry published
+    through an after-commit hook, and a hook that swallows its errors are
+    silent-failure-hunter's shapes (`external-side-effect-inside-db-transaction`,
+    `task-retry-dropped-by-after-commit-publish`, `after-commit-hook-swallows-errors`); note
+    them and cross-reference rather than skip them.
+
+  Reproduce these with two real database sessions (or two store clients), one per thread, and
+  force the interleaving with a `threading.Event` between the read and the write; a single
+  session cannot race with itself.
 
 ## Phase 5 — Reproduce what you can
 
