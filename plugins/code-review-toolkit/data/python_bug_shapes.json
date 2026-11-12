@@ -2878,6 +2878,122 @@
       "differential": "A comparison where the input is already guaranteed normalised (it came from the normalised column) is fine.",
       "detected_by": null,
       "detectability": "agent-only"
+    },
+    {
+      "id": "child-by-id-without-parent-check",
+      "title": "A child object fetched by bare id under a parent-scoped route is acted on without checking it belongs to that parent",
+      "agent": "consistency-auditor",
+      "severity": "FIX",
+      "pattern": "A view whose route or context names a parent (project, organization, team) loads a child by primary key from the URL or the form (`session.get(Child, id)`, `service.get_child(id)`), mutates it, and records audit events against the URL's parent, with no `child.parent_id == parent.id` check. The permission check passed for the URL's parent, not for the child's real parent.",
+      "guarded_twin": "A sibling view that filters the lookup by the parent (`.filter(Child.parent == parent, Child.id == id)`) or rejects `child.parent_id != parent.id` before acting.",
+      "hunt": "Enumerate every route whose pattern carries both a parent key and a child id (in the path or the form). For each view, check that the child lookup is scoped by the parent, and compare with the same-file twin that is.",
+      "expected": "a child id from another parent is rejected.",
+      "caught_as": "SILENT -- a stale tab or a crafted form changes another parent's child; the audit trail names the wrong parent.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): admin views under a parent-scoped route loaded a role row by id and changed or removed it without checking it belonged to the parent in the URL; a sibling view in the same file did check."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "OWASP: Insecure Direct Object Reference"
+      ],
+      "differential": "A route factory that resolves the child itself and checks permission on the child's own ACL is the guarded twin. A child type that has no parent (a global object listed under a parent page) is fine.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "creator-scoped-delete-of-group-scoped-object",
+      "title": "An object created under a group permission can be deleted only by its individual creator",
+      "agent": "consistency-auditor",
+      "severity": "CONSIDER",
+      "pattern": "Creation is authorised by a group-level permission (an organization's owners), but the delete path checks `obj.created_by == request.user`, usually because it was copied from the twin that handles personal objects. Co-owners see a delete control that fails with a misleading error, and the capability can be revoked only by the person who added it.",
+      "guarded_twin": "The analogous object at another scope that is deleted under the group permission (any owner may remove it).",
+      "hunt": "For every `created_by`/`added_by` comparison in a delete or edit path, ask whether the object can belong to a group. Diff the personal and the group twin views of the same object type.",
+      "expected": "whoever may create a group-owned object on the group's behalf may also remove it.",
+      "caught_as": "LOUD but misleading -- an 'invalid id' style error for a co-owner; no data loss.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): group-owned registrations could be removed only by the owner who created them; the other owners got an 'invalid id' error."
+      ],
+      "validation": "confirmed",
+      "references": [],
+      "differential": "A design that deliberately ties an object to its creator (a personal token shown on a group page) is a POLICY question, not a defect: check the docs and the creation path.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "aggregate-delete-skips-per-member-side-effects",
+      "title": "Deleting a container removes its members without the events, audit records and notifications that removing one member emits",
+      "agent": "consistency-auditor",
+      "severity": "CONSIDER",
+      "pattern": "`remove_member(x)` records an event on the member and on its targets, writes an audit record and sends a notification. `delete_container()` removes all the members (directly or by cascade) and records one container-level event. Access is revoked for N users or M objects with no trace on any of them.",
+      "guarded_twin": "The single-member removal path, called per member from the container delete, or a cascade listener that emits the same events.",
+      "hunt": "Pair every `delete_<container>` with its `remove_<member>` twin and diff their event, audit and email calls. Include cascades: a database ON DELETE CASCADE removes members without any Python code running.",
+      "expected": "every revocation leaves the same audit trail, however it happened.",
+      "caught_as": "SILENT -- members lose access with no event on their own history and no notification.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): deleting a group stripped every grant it held with no audit record, no per-member event and no email, while removing one grant emitted all three."
+      ],
+      "validation": "confirmed",
+      "references": [],
+      "differential": "A container delete documented as silent (a cleanup of an already-empty container), or one that emits a summary event the per-member history views also read, is fine.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "bulk-dml-bypasses-session-hooks",
+      "title": "A bulk `Query.delete()`/`update()` skips the side effects that ORM session hooks derive from per-object changes",
+      "agent": "pattern-consistency-checker",
+      "severity": "FIX",
+      "pattern": "The project drives side effects (cache purges, search indexing, audit, denormalised counters) from session `after_flush`/`before_flush` or attribute listeners that iterate `session.new`/`dirty`/`deleted`. One code path removes or changes the same rows with a single statement (`Query.delete(synchronize_session=False)`, `session.execute(delete(Model))`, `Query.update(...)`). Those rows never become ORM objects in the session, so the listeners never see them; database ON DELETE CASCADE extends the blind spot to the children.",
+      "guarded_twin": "The per-object path for the same operation (`session.delete(obj)`, a `remove_<thing>()` helper) that the hooks see; or an explicit call that schedules the same side effects for the bulk path.",
+      "hunt": "List the model classes the session hooks key on. Grep bulk statements against each (`.delete(`, `.update(` on a Query, `execute(delete(`, `execute(update(`, `synchronize_session`). Each hit is a candidate unless the side effect is handled explicitly next to it.",
+      "expected": "every way of deleting or updating a hooked model triggers the same side effects.",
+      "caught_as": "SILENT -- stale caches, search entries and missing audit records until a TTL or a full rebuild.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "SQLAlchemy docs, ORM-Enabled INSERT, UPDATE, and DELETE statements: bulk statements do not run Session flush events or cascade relationships in Python"
+      ],
+      "differential": "A bulk path against a model with no hooks, one that schedules the same side effects explicitly, or one whose only caller guarantees it matches zero rows (latent, see the false-positive taxonomy) is not a live bypass.",
+      "detected_by": null,
+      "detectability": "implementable"
+    },
+    {
+      "id": "identity-tuple-diverges-between-constraint-and-lookup",
+      "title": "A record's identity is defined differently by the unique constraint, the lookup, and the reuse path",
+      "agent": "pattern-consistency-checker",
+      "severity": "FIX",
+      "pattern": "A table's UNIQUE constraint covers columns K. The lookup filters K plus an extra column X (an immutable owner id, an issuer, a display name) or a normalised form of K, and the write path reuses an existing row by K alone. A record whose X differs is handed the old row, which the lookup then never matches again; or the lookup matches rows the constraint never deduplicated. The usual trigger is a rename or a second issuer.",
+      "guarded_twin": "A sibling type in the same family whose constraint, lookup and reuse filter the same tuple with the same normalisation, or that records X on first use and checks it only when set.",
+      "hunt": "For every model with a unique constraint, list the columns and normalisation used by (a) the constraint, (b) every lookup, (c) every exists/reuse/upsert, (d) every form that writes it. Any row of that matrix that differs is a candidate; build the failing input by changing exactly the differing column.",
+      "expected": "every path that answers 'is this the same record?' uses the same columns and normalisation.",
+      "caught_as": "SILENT at registration, then a generic not-found or a 500 later (MultipleResultsFound, IntegrityError).",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): a lookup filtered an external account's display name as well as the immutable id the constraint covered, so renaming the external account made later lookups fail with a 500."
+      ],
+      "validation": "confirmed",
+      "references": [],
+      "differential": "An extra lookup column checked separately with an explicit, user-visible error on mismatch is fine.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "acl-preempts-explicit-check",
+      "title": "A business rule encoded in the ACL for some principals pre-empts the explicit check that explains it to the others",
+      "agent": "pattern-consistency-checker",
+      "severity": "CONSIDER",
+      "pattern": "A view first asks for a permission and later performs an explicit check for condition C with a dedicated error. The ACL also withholds the permission under C, but only for some principal types. Those principals get a generic 403, and the dedicated message is unreachable for them; tests of the message use a permissive test security policy, so they pin a path production cannot take.",
+      "guarded_twin": "The principal type the ACL does not gate, which reaches the explicit check and its message.",
+      "hunt": "For each explicit check after a permission check, see whether the ACL encodes the same predicate for any principal type. Then read the test for that branch: a permissive test security policy is the tell.",
+      "expected": "the same condition yields the same error for every kind of caller.",
+      "caught_as": "LOUD but misleading -- a 403 with the wrong explanation for one class of caller.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): a billing-standing rule was enforced by the ACL for one principal type and by an explicit check for another, so the first type got a generic 403 instead of the explanatory error."
+      ],
+      "validation": "confirmed",
+      "references": [],
+      "differential": "An ACL denial that carries a reason the view renders, or an explicit check that is defence in depth with identical wording, is fine.",
+      "detected_by": null,
+      "detectability": "agent-only"
     }
   ]
 }

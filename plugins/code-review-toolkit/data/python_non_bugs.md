@@ -528,3 +528,26 @@ early; the message leaves only after a successful commit.
 **Real bug:** the deferral itself has the residual risks -- the hook swallows publish errors
 (`after-commit-hook-swallows-errors`), and the task's own retries go through the same deferral
 (`task-retry-dropped-by-after-commit-publish`). Read the base class before dismissing.
+
+### 52. A bulk delete in a path guarded to match nothing
+
+**Looks like:** `bulk-dml-bypasses-session-hooks` -- `Query.delete()` on a model whose cache or
+search side effects run from session flush hooks.
+
+**Why it is not a bug (yet):** the only caller guarantees the statement matches zero rows (it runs
+after a check that the container is empty, or after the per-object path already removed the rows).
+Nothing bypasses the hooks today.
+
+**Real bug:** any caller can reach it with rows present. Report the guarded case as a latent
+CONSIDER and cite the guard, so the next change to the caller does not silently make it live.
+
+### 53. An ACL twin that lacks a guard its consumer re-checks
+
+**Looks like:** `acl-preempts-explicit-check` or a consistency finding -- one principal type's ACL
+entry grants a permission without a condition that another type's entry applies.
+
+**Why it is not a bug:** the permission's only consumer re-checks the condition explicitly, with
+the same outcome for every principal type. The ACL difference is defence in depth, not a gap.
+
+**Real bug:** some consumer of the permission does not re-check the condition, or the two paths
+give different errors for the same condition (that is `acl-preempts-explicit-check`).
