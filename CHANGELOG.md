@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.17.0] - 2026-11-11
+
+Two things: a **security-claims gate**, so a review never again sends a security team a long list of
+ordinary bugs, and the **fix round** for the feedback from three privately reviewed projects (116
+items, #93–#101), led by web-application support: framework wiring, ORM schema checks, database-
+and cache-level concurrency, and 34 new shapes. 20 agents, 9 commands, 36 scripts; 159 shapes, 67
+executable.
+
 ### Fix round: feedback from three review runs (#93–#101)
 
 The open feedback from a three-pass review of a large web application with an ORM and a task

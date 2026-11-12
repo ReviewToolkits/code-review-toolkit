@@ -1,8 +1,8 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "code-review-toolkit",
-  "version": "1.16.0",
-  "description": "Codebase exploration and analysis toolkit: 19 specialized agents for correctness defects, concurrency defects (lock-guard inference, deadlocks, event-loop stalls), defect-grade lint and type-checker triage, architecture mapping, git history analysis, consistency auditing, complexity analysis, test coverage, error handling, documentation, type design, dead code detection, tech debt inventory, pattern consistency, and API surface review.",
+  "version": "1.17.0",
+  "description": "Codebase exploration and analysis toolkit: 20 specialized agents for correctness defects, concurrency defects (lock-guard inference, deadlocks, event-loop stalls), defect-grade lint and type-checker triage, architecture mapping, git history analysis, consistency auditing, complexity analysis, test coverage, error handling, documentation, type design, dead code detection, tech debt inventory, pattern consistency, API surface review, web-framework and ORM checks, and a security-claims gate that judges claimed vulnerabilities against the project's own threat model before disclosure.",
   "owner": {
     "name": "Danzin",
     "email": "lafleurfuzzer@gmail.com"
@@ -10,9 +10,9 @@
   "plugins": [
     {
       "name": "code-review-toolkit",
-      "description": "19 specialized agents and 8 commands for exploring, analyzing, and improving existing Python codebases. Includes analysis scripts for correctness and concurrency scanning against a bug-shape catalog, tiered lint triage, mypy integrity checks, import graphing, complexity measurement, test correlation, type coverage, dead symbol detection, tech debt collection, and git history analysis.",
+      "description": "20 specialized agents and 9 commands for exploring, analyzing, and improving existing Python codebases. Includes analysis scripts for correctness and concurrency scanning against a bug-shape catalog, tiered lint triage, mypy integrity checks, import graphing, complexity measurement, test correlation, type coverage, dead symbol detection, tech debt collection, git history analysis, web-framework wiring and ORM-schema checks, a Phase 3 publication pipeline, and threat-model discovery with a security-claims gate.",
       "source": "./plugins/code-review-toolkit",
-      "version": "1.16.0",
+      "version": "1.17.0",
       "category": "code-quality",
       "keywords": [
         "code-review",
