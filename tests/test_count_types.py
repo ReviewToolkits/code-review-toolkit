@@ -828,3 +828,105 @@ class TestUntypedBoundaries(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEnumsThroughProjectBases(unittest.TestCase):
+    """An enum subclassing a project enum mixin was not in the enum inventory."""
+
+    _FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/base.py": (
+            "from enum import Enum\n"
+            "class LabelledEnum(str, Enum):\n"
+            "    def label(self) -> str:\n"
+            "        return self.value.title()\n"
+        ),
+        "pkg/colors.py": (
+            "from pkg.base import LabelledEnum\n"
+            "from pkg import base\n"
+            "class Color(LabelledEnum):\n"
+            "    RED = 'red'\n"
+            "    BLUE = 'blue'\n"
+            "class Shade(Color.__class__):\n"
+            "    pass\n"
+            "class Tone(base.LabelledEnum):\n"
+            "    LOW = 'low'\n"
+            "class Plain:\n"
+            "    RED = 'red'\n"
+            "    LIMIT = 3\n"
+            "    def f(self):\n"
+            "        return 1\n"
+        ),
+    }
+
+    def test_subclasses_of_project_enums_are_enums(self):
+        result = _analyze_tree(self._FILES)
+        self.assertEqual(
+            result["container_inventory"]["Enum"], ["Color", "LabelledEnum", "Tone"]
+        )
+        color = next(
+            c for f in result["files"] for c in f["classes"] if c["name"] == "Color"
+        )
+        self.assertEqual(color["enum_members"], ["RED", "BLUE"])
+        self.assertEqual(color["unannotated_attributes"], [])
+        self.assertEqual(color["enum_via"], "LabelledEnum")
+
+    def test_an_ordinary_class_is_not_an_enum(self):
+        result = _analyze_tree(self._FILES)
+        classes = {c["name"]: c for f in result["files"] for c in f["classes"]}
+        self.assertIsNone(classes["Plain"]["container_type"])
+        self.assertIsNone(classes["Shade"]["container_type"])
+
+
+class TestProtocolDefaultBodies(unittest.TestCase):
+    """A Protocol's default method bodies run only for explicit subclasses;
+    neither the bodies nor the absence of such subclasses was reported."""
+
+    _FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/proto.py": (
+            "from typing import Protocol\n"
+            "class Store(Protocol):\n"
+            "    def get(self, key: str) -> bytes: ...\n"
+            "    def warm(self) -> None:\n"
+            '        """Default no-op."""\n'
+            "        return None\n"
+            "    def close(self) -> None:\n"
+            "        raise NotImplementedError\n"
+            "class Sink(Protocol):\n"
+            "    def flush(self) -> int:\n"
+            "        return 0\n"
+            "class LoudSink(Sink, Protocol):\n"
+            "    def shout(self) -> None: ...\n"
+            "class Pure(Protocol):\n"
+            "    def a(self) -> None:\n"
+            '        """Only a stub."""\n'
+            "    def b(self) -> None:\n"
+            "        pass\n"
+        ),
+        "pkg/impl.py": (
+            "from pkg.proto import LoudSink\n"
+            "class MemoryStore:\n"
+            "    def get(self, key: str) -> bytes:\n"
+            "        return b''\n"
+            "class FileSink(LoudSink):\n"
+            "    def shout(self) -> None:\n"
+            "        print('!')\n"
+        ),
+    }
+
+    def test_protocols_with_bodies_and_their_explicit_subclasses(self):
+        result = _analyze_tree(self._FILES)
+        found = {p["name"]: p for p in result["protocols_with_default_bodies"]}
+        self.assertEqual(sorted(found), ["Sink", "Store"])
+        self.assertEqual(found["Store"]["default_methods"], ["warm"])
+        # Structural conformance (MemoryStore) inherits nothing.
+        self.assertEqual(found["Store"]["explicit_subclasses"], [])
+        self.assertFalse(found["Store"]["bodies_inherited"])
+        # Reached through a protocol that extends it.
+        self.assertEqual(
+            [s["name"] for s in found["Sink"]["explicit_subclasses"]], ["FileSink"]
+        )
+        self.assertTrue(found["Sink"]["bodies_inherited"])
+        self.assertEqual(result["summary"]["protocols_with_default_bodies"], 2)
+        self.assertEqual(result["summary"]["protocols_with_uninherited_bodies"], 1)

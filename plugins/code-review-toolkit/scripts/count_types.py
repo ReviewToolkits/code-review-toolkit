@@ -524,6 +524,144 @@ class _SymbolIndex:
         ]
 
 
+def _is_stub_body(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """A body that only declares: docstring, `...`, `pass`, `raise NotImplementedError`."""
+    body = list(node.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    if not body:
+        return True
+    if len(body) != 1:
+        return False
+    stmt = body[0]
+    if isinstance(stmt, ast.Pass):
+        return True
+    if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
+        return stmt.value.value is Ellipsis
+    if isinstance(stmt, ast.Raise) and stmt.exc is not None:
+        exc = stmt.exc.func if isinstance(stmt.exc, ast.Call) else stmt.exc
+        return _terminal_name(exc) == "NotImplementedError"
+    return False
+
+
+def _class_resolver(index: _SymbolIndex, file_analyses: list[dict]):
+    """`(classes, resolve)`: every scanned class by `(module, name)`, and a
+    function mapping a base as written in a module to the class it names."""
+    classes: dict[tuple[str, str], tuple[str, dict]] = {}
+    for fa in file_analyses:
+        module = _module_dotted(fa["file"])
+        for cls in fa["classes"]:
+            classes.setdefault((module, cls["name"]), (fa["file"], cls))
+
+    def find(module: str, name: str, depth: int = 0) -> tuple[str, str] | None:
+        if (module, name) in classes:
+            return module, name
+        info = index.modules.get(module)
+        if info is None or depth > 10:
+            return None
+        imported = info["from_imports"].get(name)
+        if imported is None:
+            return None
+        target = index.find_module(imported[0])
+        return find(target, imported[1], depth + 1) if target else None
+
+    def resolve(module: str, base: str) -> tuple[str, str] | None:
+        base = base.split("[", 1)[0].strip()
+        if "." not in base:
+            return find(module, base)
+        head, _, attr = base.rpartition(".")
+        target = (
+            index.module_ref(module, head)
+            if "." not in head
+            else index.find_module(head)
+        )
+        return find(target, attr) if target else None
+
+    return classes, resolve
+
+
+def _inherit_enums(index: _SymbolIndex, file_analyses: list[dict]) -> None:
+    """Mark subclasses of in-project enums as enums, to a fixpoint.
+
+    `class Color(MyStrEnum)` where `MyStrEnum(str, Enum)` is a project mixin
+    has no Enum base in its own source; only following the project's classes
+    shows it is one. Its assignments then are members, not attributes.
+    """
+    classes, resolve = _class_resolver(index, file_analyses)
+    changed = True
+    while changed:
+        changed = False
+        for (module, _name), (_file, cls) in classes.items():
+            if cls["container_type"] is not None:
+                continue
+            for base in cls["bases"]:
+                hit = resolve(module, base)
+                if hit and classes[hit][1]["container_type"] == "Enum":
+                    cls["container_type"] = "Enum"
+                    cls["enum_via"] = base
+                    cls["enum_members"] = cls["unannotated_attributes"]
+                    cls["unannotated_attributes"] = []
+                    changed = True
+                    break
+
+
+def _protocols_with_default_bodies(
+    index: _SymbolIndex, file_analyses: list[dict]
+) -> list[dict]:
+    """Protocols whose methods have real bodies, and who can inherit them.
+
+    A Protocol's default body runs only for a class that names the protocol
+    as a base; a class that merely conforms structurally never gets it. With
+    no explicit subclass the bodies are dead code that reads like behaviour.
+    """
+    classes, resolve = _class_resolver(index, file_analyses)
+    parents: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for key, (_file, cls) in classes.items():
+        parents[key] = [h for b in cls["bases"] if (h := resolve(key[0], b))]
+
+    def ancestors(key: tuple[str, str]) -> set[tuple[str, str]]:
+        seen: set[tuple[str, str]] = set()
+        stack = list(parents.get(key, []))
+        while stack:
+            cur = stack.pop()
+            if cur not in seen:
+                seen.add(cur)
+                stack.extend(parents.get(cur, []))
+        return seen
+
+    out = []
+    for key, (file, cls) in sorted(
+        classes.items(), key=lambda kv: (kv[1][0], kv[1][1]["line"])
+    ):
+        if cls["container_type"] != "Protocol" or not cls.get("default_methods"):
+            continue
+        subclasses = [
+            {"file": sub_file, "name": sub["name"], "line": sub["line"]}
+            for sub_key, (sub_file, sub) in classes.items()
+            if sub["container_type"] != "Protocol" and key in ancestors(sub_key)
+        ]
+        out.append(
+            {
+                "file": file,
+                "name": cls["name"],
+                "line": cls["line"],
+                "default_methods": cls["default_methods"],
+                "explicit_subclasses": sorted(
+                    subclasses, key=lambda s: (s["file"], s["line"])
+                ),
+                # False: nothing in scope inherits the bodies, so they never run
+                # (a subclass outside the scanned tree may still exist).
+                "bodies_inherited": bool(subclasses),
+            }
+        )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Per-file analysis
 # ---------------------------------------------------------------------------
@@ -855,6 +993,9 @@ def analyze_file(
             "name": node.name,
             "line": node.lineno,
             "is_public": is_public,
+            # As written, for resolving project bases (`StrEnum` subclasses,
+            # explicit Protocol implementations) once every module is read.
+            "bases": [ast.unparse(b) for b in node.bases],
             "container_type": container_type,
             "annotated_attributes": annotated_attrs,
             "unannotated_attributes": unannotated_attrs,
@@ -868,6 +1009,12 @@ def analyze_file(
 
         if container_type == "dataclass":
             info["frozen"] = _check_frozen_dataclass(node)
+        if container_type == "Protocol":
+            # Bodies beyond a stub: they run only for a class that subclasses
+            # the protocol explicitly; structural implementations never see them.
+            info["default_methods"] = [
+                m.name for m in method_nodes if not _is_stub_body(m)
+            ]
 
         for child in method_nodes:
             _add_nested(child, f"{node.name}.{child.name}")
@@ -1335,6 +1482,8 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
         analyze_file(f, project_root, index=index, collector=collector)
         for f in all_files
     ]
+    _inherit_enums(index, file_analyses)
+    protocols = _protocols_with_default_bodies(index, file_analyses)
 
     # Aggregate statistics.
     all_functions: list[dict] = []
@@ -1458,6 +1607,12 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
             "inconsistent_parameters": len(inconsistent),
             "untyped_boundaries": len(boundaries),
             "container_types": {k: len(v) for k, v in container_types.items()},
+            # Protocols with non-stub method bodies, and how many of them no
+            # class in scope subclasses explicitly (their bodies never run).
+            "protocols_with_default_bodies": len(protocols),
+            "protocols_with_uninherited_bodies": sum(
+                1 for p in protocols if not p["bodies_inherited"]
+            ),
         },
         "container_inventory": {k: sorted(v) for k, v in container_types.items()},
         "any_usages": all_any,
@@ -1478,6 +1633,7 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
         "untyped_boundaries_total": len(boundaries),
         "untyped_boundaries_capped": len(boundaries) > _LIST_CAP,
         "untyped_boundaries": boundaries[:_LIST_CAP],
+        "protocols_with_default_bodies": protocols,
         "files": file_analyses,
     }
     return output
