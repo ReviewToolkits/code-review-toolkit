@@ -15,7 +15,7 @@ Analyze the scope provided. Default: the entire project. You may receive archite
 
 ### 0. Run the survey
 
-Run `survey_docstrings.py` on the scope first (see "Running the script"). It returns four
+Run `survey_docstrings.py` on the scope first (see "Running the script"). It returns five
 inventories. Each one is a starting point for a step below, not a finding: read the code before
 you report anything from it.
 
@@ -25,6 +25,7 @@ you report anything from it.
 | `contract_issues` | step 2 | `Returns:` / `Raises:` / `Args:` sections checked against the body, signature and annotation |
 | `claims` | step 2b | sentences that promise something testable, by `category` |
 | `suppressions` | step 3 | `# nosec` / `# noqa` / `# type: ignore` / `# pragma: no cover` comments, with rule ids and reason |
+| `dead_references` | step 2 | names a docstring cites that resolve to nothing (`summary.docstring_references_checked` says how many were checked) |
 
 Test files are skipped unless you pass `--include-tests`. `skipped.unparseable` lists files the
 survey could not read; name them in the report.
@@ -89,7 +90,22 @@ Start from `contract_issues`. Each entry has a `kind`, a `confidence` and the `d
 - `raises-undocumented`: a `raise` outside any `try`, missing from an existing `Raises:` section.
 - `args-documented-not-in-signature`: a documented parameter the signature no longer has.
 
-For each one, read the function and confirm or dismiss it. Then cover what the survey can't see:
+For each one, read the function and confirm or dismiss it.
+
+Then read `dead_references`: names cited by a docstring that resolve to nothing. The survey takes a
+Sphinx role (`:func:`/`:class:`/`:exc:`/...), a `Raises:` entry, an exception named in prose ("a
+`FooExists` exception is raised"), and a backticked name that looks like code (`helper()`, a dotted
+path, a CamelCase class); plain backticked words are prose and are skipped, and so are URLs. A name
+resolves when the project defines, imports or mentions it anywhere in its code, or it is a builtin
+or a stdlib module; a dotted path into the project's own packages must resolve module by module, and
+a dotted string the code uses as a metric, logger or event name is not a path. `reason` says what
+failed; `confidence` is `high` for a dotted path, `medium` for a bare name (it may come from a
+package the code never names, such as a stdlib class: check before reporting). This is the shape
+`dead-cross-reference-in-a-docstring`. The survey cannot see its worst variant: a reference that
+resolves, but to an unrelated entity of the same name that survived a rename. For each confirmed
+dead reference, `git log -S'<name>'` finds the commit that removed or renamed it.
+
+Then cover what the survey can't see:
 
 For documented code, verify accuracy:
 - Do parameter descriptions match actual parameters (names, types, optionality)?

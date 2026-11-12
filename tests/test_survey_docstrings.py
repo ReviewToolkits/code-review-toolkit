@@ -4,6 +4,7 @@ import io
 import json
 import unittest
 from contextlib import redirect_stdout
+from typing import ClassVar
 from unittest import mock
 
 from helpers import TempProject, import_script
@@ -473,6 +474,81 @@ class TestFiles(unittest.TestCase):
             mod.main()
         self.assertEqual(ctx.exception.code, 0)
         self.assertIn("Usage:", out.getvalue())
+
+
+class TestDeadReferences(unittest.TestCase):
+    """The shape `dead-cross-reference-in-a-docstring` had no detector."""
+
+    FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/errors.py": "class StoreError(Exception):\n    pass\n",
+        "pkg/store.py": (
+            "import zipfile\n"
+            "from pkg.errors import StoreError\n"
+            "\n"
+            "class Store:\n"
+            "    def __init__(self):\n"
+            "        self.path = None\n"
+            "    def open(self):\n"
+            "        return zipfile.ZipFile(self.path)\n"
+            "\n"
+            "def save(item, *, retries=3):\n"
+            '    """Save *item*.\n'
+            "\n"
+            "    Delegates to :func:`pkg.store.write_all` and then :meth:`Store.flush`.\n"
+            "    See ``Store.open()``, `pkg.errors.StoreError` and :class:`ZipFile`.\n"
+            "    Times each call under ``pkg.save.timer``; see https://docs.test/x#`frag`.\n"
+            "    Pass `retries` to change how often it tries; the `item` is copied.\n"
+            "    A DuplicateItem exception is raised when the item is stored twice.\n"
+            "\n"
+            "    Raises:\n"
+            "        StoreError: when the store is closed.\n"
+            "        RecordLocked: when another writer holds the record.\n"
+            '    """\n'
+            "    metrics = {'pkg.save.timer': 0}\n"
+            "    raise StoreError(item)\n"
+        ),
+    }
+
+    def test_dead_references_are_reported_with_a_reason(self):
+        result = _survey(self.FILES)
+        found = {(d["reference"], d["form"]) for d in result["dead_references"]}
+        self.assertEqual(
+            found,
+            {
+                ("pkg.store.write_all", "role"),
+                ("Store.flush", "role"),
+                ("DuplicateItem", "prose_raises"),
+                ("RecordLocked", "raises"),
+            },
+        )
+        by_ref = {d["reference"]: d for d in result["dead_references"]}
+        self.assertEqual(
+            by_ref["pkg.store.write_all"]["reason"], "module pkg.store has no write_all"
+        )
+        self.assertEqual(by_ref["pkg.store.write_all"]["confidence"], "high")
+        self.assertEqual(by_ref["RecordLocked"]["confidence"], "medium")
+        self.assertEqual(by_ref["Store.flush"]["line"], 13)
+        self.assertEqual(by_ref["Store.flush"]["function"], "save")
+        self.assertEqual(result["summary"]["dead_references"], 4)
+        self.assertGreater(result["summary"]["docstring_references_checked"], 4)
+
+    def test_names_defined_elsewhere_in_the_project_resolve(self):
+        files = dict(self.FILES)
+        files["tools/extra.py"] = (
+            "def write_all():\n    pass\nclass RecordLocked(Exception):\n    pass\n"
+        )
+        files["pkg/store.py"] = files["pkg/store.py"].replace(
+            ":func:`pkg.store.write_all`", ":func:`write_all`"
+        )
+        result = _survey(files, include_tests=False)
+        with TempProject(files) as root:
+            scoped = mod.analyze(str(root / "pkg"))
+        refs = {d["reference"] for d in scoped["dead_references"]}
+        self.assertNotIn("write_all", refs)  # defined outside the scanned scope
+        self.assertNotIn("RecordLocked", refs)
+        self.assertIn("Store.flush", refs)
+        self.assertEqual(len(result["dead_references"]), 2)
 
 
 if __name__ == "__main__":
