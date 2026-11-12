@@ -61,6 +61,7 @@ from __future__ import annotations
 import argparse
 import ast
 import configparser
+import functools
 import json
 import os
 import re
@@ -1148,6 +1149,102 @@ def classify_phantoms(
     }
 
 
+# ---------------------------------------------------------------------------
+# Stale stub packages
+# ---------------------------------------------------------------------------
+#
+# A `types-foo` / `foo-stubs` distribution installs `foo-stubs/`, which mypy
+# prefers over the package's own inline types (PEP 561 resolution order). Once
+# `foo` ships `py.typed` itself, the stub package is at best redundant and at
+# worst describes an older API: calls the real library rejects pass, and
+# calls it accepts fail. Nothing in mypy's output says the stub won.
+
+_STUB_PROBE = (
+    "import importlib.metadata as m, json, os, sys\n"
+    "paths = sys.argv[1:] or [p for p in sys.path if p]\n"
+    "out, seen = [], set()\n"
+    "for d in m.distributions(path=paths):\n"
+    "    name = d.metadata['Name'] or ''\n"
+    # Stub-only distributions are named `types-*` (typeshed) or `*-stubs`
+    # (PEP 561); reading every distribution's file list would be slow.
+    "    if not (name.lower().startswith('types-') or name.lower().endswith('-stubs')):\n"
+    "        continue\n"
+    "    tops = sorted({f.parts[0] for f in d.files or []\n"
+    "                   if f.parts and f.parts[0].endswith('-stubs')})\n"
+    "    for top in tops:\n"
+    "        mod = top[:-len('-stubs')]\n"
+    "        if (name, mod) in seen:\n"
+    "            continue\n"
+    "        seen.add((name, mod))\n"
+    "        typed = os.path.join(str(d.locate_file(top)), 'py.typed')\n"
+    "        try:\n"
+    "            with open(typed) as fh:\n"
+    "                partial = 'partial' in fh.read()\n"
+    "        except OSError:\n"
+    "            partial = False\n"
+    "        runtime = next((os.path.join(b, mod) for b in paths\n"
+    "                        if os.path.isdir(os.path.join(b, mod))), None)\n"
+    "        if runtime is None:\n"
+    "            continue\n"
+    "        if not os.path.isfile(os.path.join(runtime, 'py.typed')):\n"
+    "            continue\n"
+    "        out.append({'stub_distribution': name, 'stub_version': d.version,\n"
+    "                    'module': mod, 'stub_partial': partial,\n"
+    "                    'runtime_distribution': None, 'runtime_version': None})\n"
+    "if out:\n"
+    "    owners = {}\n"
+    "    for d in m.distributions(path=paths):\n"
+    "        for f in d.files or []:\n"
+    "            if f.parts and not f.parts[0].endswith(('-stubs', '.dist-info')):\n"
+    "                owners.setdefault(f.parts[0].split('.')[0], set()).add(\n"
+    "                    (d.metadata['Name'] or '', d.version))\n"
+    "    for e in out:\n"
+    "        dist = sorted(o for o in owners.get(e['module'], ())\n"
+    "                      if o[0] != e['stub_distribution'])\n"
+    "        if dist:\n"
+    "            e['runtime_distribution'], e['runtime_version'] = dist[0]\n"
+    "print(json.dumps(sorted(out, key=lambda e: (e['module'], e['stub_distribution']))))\n"
+)
+
+
+def stale_stub_packages(
+    python: str | None, paths: list[str] | None = None
+) -> tuple[list[dict] | None, str | None]:
+    """Installed stub distributions whose runtime package ships `py.typed`.
+
+    Asked of the interpreter mypy resolves against (``-I -B``: nothing is
+    imported from the caller's directory or written anywhere). *paths*
+    replaces its ``sys.path`` (tests). Returns ``(entries, None)`` or
+    ``(None, reason)``. A partial stub package (``partial`` in its own
+    ``py.typed``) is meant to be merged with the inline types, so it is
+    listed with ``stub_partial: true`` rather than left out.
+    """
+    if not python:
+        return None, "not measured: could not tell which interpreter mypy runs under"
+    entries, reason = _stub_probe(python, tuple(paths or ()))
+    return (None if entries is None else [dict(e) for e in entries]), reason
+
+
+@functools.lru_cache(maxsize=8)
+def _stub_probe(python: str, paths: tuple[str, ...]) -> tuple[list | None, str | None]:
+    # Cached per interpreter: an environment does not change within one run,
+    # and the probe reads every installed distribution's metadata.
+    try:
+        out = subprocess.run(
+            [python, "-I", "-B", "-c", _STUB_PROBE, *paths],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        entries = json.loads(out.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None, "not measured: mypy's interpreter could not be queried"
+    if not isinstance(entries, list):
+        return None, "not measured: unexpected probe output"
+    return entries, None
+
+
 def _count_untyped_defs(files: list[Path]) -> int:
     """Functions with no parameter or return annotation (mypy's "untyped")."""
     count = 0
@@ -1520,6 +1617,10 @@ def _analyze_with_cache(
             [Path.cwd(), project_root, scan_root.parent],
         )
 
+    stale_stubs, stale_stubs_reason = stale_stub_packages(
+        (mypy_python or {}).get("executable")
+    )
+
     drift = tag_dependency_drift(
         findings,
         Path(envelope["project_root"]),
@@ -1655,6 +1756,12 @@ def _analyze_with_cache(
             "phantom_origin_basis": (
                 None if phantom_summary is None else phantom_summary["basis"]
             ),
+            # Installed `types-*` / `*-stubs` packages that shadow a library
+            # which now ships its own inline types (py.typed): mypy checks the
+            # project against the stub, not the library. null when the
+            # interpreter could not be asked -- see stale_stub_packages_reason.
+            "stale_stub_packages": (None if stale_stubs is None else len(stale_stubs)),
+            "stale_stub_packages_reason": stale_stubs_reason,
             "strict_pass_ran": phantom_imports is not None,
             "labelled_passes": {
                 name: {
@@ -1673,6 +1780,7 @@ def _analyze_with_cache(
         "stale_ignore_findings": stale_ignores or [],
         "untyped_body_findings": untyped_body or [],
         "silenced_import_findings": silenced or [],
+        "stale_stub_packages": stale_stubs or [],
         # Notes that belong to no error: `annotation-unchecked` (an annotated
         # variable inside an untyped function body mypy skips), reveal_type.
         "standalone_notes": standalone_notes,

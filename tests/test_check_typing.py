@@ -820,6 +820,67 @@ class TestPhantomOrigins(unittest.TestCase):
         self.assertTrue(summary["basis"].startswith("not-measured"))
 
 
+def _dist(site: Path, name: str, version: str, files: list[str]) -> None:
+    info = site / f"{name.replace('-', '_')}-{version}.dist-info"
+    info.mkdir(parents=True)
+    (info / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
+    )
+    (info / "RECORD").write_text("".join(f"{f},,\n" for f in files))
+    for f in files:
+        (site / f).parent.mkdir(parents=True, exist_ok=True)
+        (site / f).write_text("")
+
+
+class TestStaleStubPackages(unittest.TestCase):
+    """A types-* package shadowing a library that now ships its own inline
+    types went unnoticed: mypy checks against the stub, not the library."""
+
+    def _site(self, root: Path) -> Path:
+        site = root / "site"
+        # Runtime ships py.typed and a stub package still shadows it: stale.
+        _dist(site, "fancylib", "3.0", ["fancylib/__init__.py", "fancylib/py.typed"])
+        _dist(site, "types-fancylib", "1.2", ["fancylib-stubs/__init__.pyi"])
+        # Runtime without py.typed: the stubs are the only types. Not stale.
+        _dist(site, "plainlib", "1.0", ["plainlib/__init__.py"])
+        _dist(site, "types-plainlib", "1.0", ["plainlib-stubs/__init__.pyi"])
+        # Stubs for something not installed: nothing to shadow.
+        _dist(site, "ghost-stubs", "0.1", ["ghost-stubs/__init__.pyi"])
+        # A partial stub package is listed, but says so.
+        _dist(site, "typedlib", "2.0", ["typedlib/__init__.py", "typedlib/py.typed"])
+        _dist(site, "typedlib-stubs", "2.0", ["typedlib-stubs/__init__.pyi"])
+        (site / "typedlib-stubs" / "py.typed").write_text("partial\n")
+        return site
+
+    def test_only_stubs_shadowing_inline_types_are_listed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            site = self._site(Path(tmp))
+            entries, reason = mod.stale_stub_packages(sys.executable, [str(site)])
+        self.assertIsNone(reason)
+        self.assertEqual(
+            [(e["stub_distribution"], e["module"], e["stub_partial"]) for e in entries],
+            [
+                ("types-fancylib", "fancylib", False),
+                ("typedlib-stubs", "typedlib", True),
+            ],
+        )
+        self.assertEqual(entries[0]["runtime_distribution"], "fancylib")
+        self.assertEqual(entries[0]["runtime_version"], "3.0")
+        self.assertEqual(entries[0]["stub_version"], "1.2")
+
+    def test_unknown_interpreter_is_null_with_a_reason(self):
+        entries, reason = mod.stale_stub_packages(None)
+        self.assertIsNone(entries)
+        self.assertIn("not measured", reason)
+
+    def test_reported_in_the_output(self):
+        result, _ = _run(_PKG, {"": _BASE_ERR + _ONE_ERROR})
+        self.assertIsInstance(result["stale_stub_packages"], list)
+        self.assertEqual(
+            result["summary"]["stale_stub_packages"], len(result["stale_stub_packages"])
+        )
+
+
 class TestDeriveConfig(unittest.TestCase):
     def test_ini_copy_turns_every_section_off_and_keeps_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
