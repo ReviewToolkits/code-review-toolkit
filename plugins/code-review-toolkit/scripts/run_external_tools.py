@@ -1142,9 +1142,39 @@ def parse_coverage_json(path: Path, project_root: Path) -> dict:
     }
 
 
-def parse_coverage_sqlite(path: Path, project_root: Path) -> dict | None:
-    """Parse .coverage SQLite database using the coverage package."""
+def _coverage_analysis(
+    cov, error: type[Exception], filename: str, project_root: Path
+) -> tuple | None:
+    """``(statements, missing)`` for one measured file, or None.
+
+    ``Coverage.analysis2`` re-parses the source to learn which lines are
+    statements, so it needs the file on disk; a data file recorded on another
+    machine, or with ``relative_files``, names paths that may not resolve.
+    """
+    if cov is None:
+        return None
+    path = Path(filename)
+    if not path.is_absolute():
+        path = project_root / path
+    if not path.is_file():
+        return None
     try:
+        _, statements, _, missing, _ = cov.analysis2(str(path))
+    except (error, OSError, SyntaxError, ValueError):
+        return None
+    return statements, missing
+
+
+def parse_coverage_sqlite(path: Path, project_root: Path) -> dict | None:
+    """Parse a ``.coverage`` SQLite database using the coverage package.
+
+    The data file stores only the executed lines. Statement counts and missed
+    lines come from ``Coverage.analysis2()``, which re-parses each source file
+    under the project's own coverage config (its exclusions apply); a file
+    that cannot be analysed keeps its executed lines and says why.
+    """
+    try:
+        import coverage
         from coverage import CoverageData
     except ImportError:
         return None
@@ -1152,28 +1182,70 @@ def parse_coverage_sqlite(path: Path, project_root: Path) -> dict | None:
     covdata = CoverageData(basename=str(path))
     covdata.read()
 
+    config = find_config_file("coverage", project_root)
+    try:
+        cov = coverage.Coverage(
+            data_file=str(path),
+            config_file=str(project_root / config) if config else False,
+        )
+        cov.load()
+    except (coverage.CoverageException, OSError, ValueError):
+        cov = None
+
     files: list[dict] = []
+    total_statements = total_covered = unanalysed = 0
     for filename in covdata.measured_files():
         lines = covdata.lines(filename)
         if lines is None:
             continue
-        files.append({
+        entry: dict = {
             "file": make_relative(filename, project_root),
             "covered_lines": sorted(lines),
-            "note": (
-                "Statement count unavailable from .coverage; "
-                "use coverage.json or coverage.xml for complete data"
-            ),
-        })
+        }
+        analysed = _coverage_analysis(
+            cov, coverage.CoverageException, filename, project_root
+        )
+        if analysed is None:
+            unanalysed += 1
+            entry["note"] = (
+                "Statement count unavailable: the source file could not be "
+                "analysed (missing, or recorded under another path)"
+            )
+        else:
+            statements, missing = analysed
+            covered = len(statements) - len(missing)
+            total_statements += len(statements)
+            total_covered += covered
+            entry.update(
+                statements=len(statements),
+                covered=covered,
+                missing_lines=sorted(missing),
+                coverage_percent=(
+                    round(100 * covered / len(statements), 1) if statements else 100.0
+                ),
+            )
+        files.append(entry)
 
-    return {
+    result = {
         "source": str(path.relative_to(project_root)),
-        "note": (
-            "Parsed from .coverage SQLite; for complete data generate "
-            "coverage.json or coverage.xml"
+        "total_statements": total_statements,
+        "total_covered": total_covered,
+        "coverage_percent": (
+            round(100 * total_covered / total_statements, 1)
+            if total_statements
+            else None
         ),
-        "files": files,
+        # Files whose statements could not be counted: their lines are absent
+        # from the totals above, so a nonzero count means partial totals.
+        "files_unanalysed": unanalysed,
+        "files": sorted(files, key=lambda f: f.get("coverage_percent", -1)),
     }
+    if unanalysed:
+        result["note"] = (
+            f"{unanalysed} measured file(s) could not be analysed; their "
+            "statement counts and missed lines are missing from the totals"
+        )
+    return result
 
 
 def read_coverage_data(

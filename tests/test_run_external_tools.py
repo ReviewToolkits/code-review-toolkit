@@ -6,6 +6,7 @@ import subprocess
 import time
 import unittest
 from pathlib import Path
+from typing import ClassVar
 from unittest.mock import patch, MagicMock
 
 from helpers import TempProject, import_script
@@ -609,6 +610,94 @@ class TestCoverageJsonParsing(unittest.TestCase):
             )
             result = mod.parse_coverage_json(root / "coverage.json", root)
             self.assertEqual(result["files"], [])
+
+
+class _FakeCoverageData:
+    def __init__(self, basename):
+        self.basename = basename
+
+    def read(self):
+        pass
+
+    def measured_files(self):
+        return list(_FakeCoverage.executed)
+
+    def lines(self, filename):
+        return _FakeCoverage.executed[filename]
+
+
+class _FakeCoverage:
+    """Stands in for coverage.Coverage: analysis2 returns statements/missing."""
+
+    executed: ClassVar[dict] = {}
+    statements: ClassVar[dict] = {}
+
+    def __init__(self, data_file=None, config_file=True):
+        self.data_file = data_file
+
+    def load(self):
+        pass
+
+    def analysis2(self, filename):
+        stmts = self.statements[filename]
+        missing = [n for n in stmts if n not in self.executed[filename]]
+        return filename, stmts, [], missing, ""
+
+
+class TestCoverageSqliteParsing(unittest.TestCase):
+    """The .coverage path recovers statement counts and missed lines."""
+
+    def _parse_with_fake(self, root, executed, statements):
+        fake = MagicMock(
+            Coverage=_FakeCoverage,
+            CoverageData=_FakeCoverageData,
+            CoverageException=Exception,
+        )
+        _FakeCoverage.executed = executed
+        _FakeCoverage.statements = statements
+        with patch.dict("sys.modules", {"coverage": fake}):
+            return mod.parse_coverage_sqlite(root / ".coverage", root)
+
+    def test_statements_and_missing_lines_are_recovered(self):
+        with TempProject({"pkg/m.py": "a = 1\nb = 2\nif a:\n    c = 3\n"}) as root:
+            (root / ".coverage").write_bytes(b"")
+            src = str(root / "pkg" / "m.py")
+            result = self._parse_with_fake(root, {src: [1, 2, 3]}, {src: [1, 2, 3, 4]})
+        entry = result["files"][0]
+        self.assertEqual(entry["file"], "pkg/m.py")
+        self.assertEqual(entry["statements"], 4)
+        self.assertEqual(entry["covered"], 3)
+        self.assertEqual(entry["missing_lines"], [4])
+        self.assertEqual(entry["coverage_percent"], 75.0)
+        self.assertEqual(result["total_statements"], 4)
+        self.assertEqual(result["files_unanalysed"], 0)
+
+    def test_a_missing_source_file_is_reported_not_counted(self):
+        with TempProject({"m.py": "x = 1\n"}) as root:
+            (root / ".coverage").write_bytes(b"")
+            gone = "/nonexistent/elsewhere/gone.py"
+            result = self._parse_with_fake(root, {gone: [1]}, {})
+        self.assertEqual(result["files_unanalysed"], 1)
+        self.assertIsNone(result["coverage_percent"])  # unmeasured, not 0
+        self.assertEqual(result["files"][0]["covered_lines"], [1])
+        self.assertIn("could not be analysed", result["files"][0]["note"])
+
+    @unittest.skipUnless(
+        mod.check_coverage_importable(), "the coverage package is not installed"
+    )
+    def test_real_coverage_data_file(self):
+        from coverage import CoverageData
+
+        with TempProject(
+            {"m.py": "a = 1\nif a:\n    b = 2\nelse:\n    c = 3\n"}
+        ) as root:
+            data = CoverageData(basename=str(root / ".coverage"))
+            data.add_lines({str(root / "m.py"): [1, 2, 3]})
+            data.write()
+            result = mod.parse_coverage_sqlite(root / ".coverage", root)
+        entry = result["files"][0]
+        self.assertEqual(entry["statements"], 4)
+        self.assertEqual(entry["missing_lines"], [5])
 
 
 # ---------------------------------------------------------------------------
