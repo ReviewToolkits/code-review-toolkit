@@ -3057,6 +3057,25 @@
       "differential": "An endpoint that is not meant to be cross-origin or cacheable has no contract to break.",
       "detected_by": null,
       "detectability": "agent-only"
+    },
+    {
+      "id": "user-doc-claim-not-implemented-by-access-control",
+      "title": "A user-facing doc states a behaviour (who can do what, what happens when) that the permission or view code does not implement",
+      "agent": "project-docs-auditor",
+      "severity": "FIX",
+      "pattern": "The user documentation of a web service promises a behaviour: 'role X can (or cannot) do Y', 'during the grace period writes keep working', 'you will receive an email', 'the API returns 404 for ...'. The ACLs, view permissions and views implement something else, usually because the code changed and the doc did not, or the doc described the plan. Users act on the doc.",
+      "guarded_twin": "A docs page whose roles table matches the permission matrix derived from the code, or a claim with a test that pins it.",
+      "hunt": "Inventory the behavioural claims in the user docs (roles tables, 'can'/'cannot', status codes, emails, limits, grace periods). Derive the permission matrix from the ACLs and each view's `permission=`, and diff it cell by cell against the docs' roles tables. For each other claim, find the code path and check it, or probe it.",
+      "expected": "what the docs say a user can do is what the service lets them do.",
+      "caught_as": "SILENT in the code -- users are surprised by a denial the docs said would not happen, or by an action the docs said was impossible.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): the docs promised a grace period during which a lapsed paid plan keeps write access; the permission code revoked it at once."
+      ],
+      "validation": "confirmed",
+      "references": [],
+      "differential": "A doc describing a deliberately deferred behaviour with a date or an issue link, or an enum split for grandfathering whose introducing commit says so, is a doc note, not a code defect (see the false-positive taxonomy).",
+      "detected_by": null,
+      "detectability": "agent-only"
     }
   ]
 }

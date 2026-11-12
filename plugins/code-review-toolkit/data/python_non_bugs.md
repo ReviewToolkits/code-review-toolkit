@@ -551,3 +551,15 @@ the same outcome for every principal type. The ACL difference is defence in dept
 
 **Real bug:** some consumer of the permission does not re-check the condition, or the two paths
 give different errors for the same condition (that is `acl-preempts-explicit-check`).
+
+### 54. An enum value split for grandfathering
+
+**Looks like:** `user-doc-claim-not-implemented-by-access-control` -- the docs describe a status's
+behaviour, and objects in an older status of the same family behave differently.
+
+**Why it is not a bug:** a new status value got the new behaviour while the old value keeps the old
+one on purpose, so existing objects are not changed retroactively, and the introducing commit says
+so. Docs that describe only the new value are a low-severity doc note.
+
+**Real bug:** the split is not explained anywhere (commit, comment, migration), or the old value was
+meant to be migrated and the migration never ran.
