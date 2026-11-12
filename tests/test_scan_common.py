@@ -8,6 +8,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from typing import ClassVar
 
 from helpers import TempProject, import_script
 
@@ -136,10 +137,33 @@ class TestParseCommonArgs(unittest.TestCase):
             mod.parse_common_args(["src/", "--max-files", "10"]), ("src/", 10)
         )
 
-    def test_unknown_flags_ignored(self):
-        self.assertEqual(
-            mod.parse_common_args(["--verbose", "src/", "--deep"]), ("src/", 0)
-        )
+    def test_unknown_flags_ignored_with_a_warning_on_stderr(self):
+        err, out = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            parsed = mod.parse_common_args(["--verbose", "src/", "--deep"])
+        self.assertEqual(parsed, ("src/", 0))
+        self.assertIn("unknown flag(s) ignored: --verbose --deep", err.getvalue())
+        # stdout carries the script's JSON: never a warning.
+        self.assertEqual(out.getvalue(), "")
+
+    def test_exclude_is_unknown_to_parse_common_args(self):
+        # A script still on parse_common_args does not filter: --exclude must
+        # not look accepted there.
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mod.parse_common_args(["src/", "--exclude", "x"])
+        self.assertIn("--exclude", err.getvalue())
+
+    def test_declared_flags_are_not_warned_about(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            parsed = mod.parse_common_args(
+                ["--include-tests", "src/", "--mode", "fast"],
+                flags={"--include-tests"},
+                value_flags={"--mode"},
+            )
+        self.assertEqual(parsed, ("src/", 0))
+        self.assertEqual(err.getvalue(), "")
 
     def test_bad_max_files_exits_cleanly(self):
         # Must be SystemExit(2), not an unhandled ValueError traceback.
@@ -304,6 +328,222 @@ class TestRelativeToRoot(unittest.TestCase):
         self.assertEqual(
             mod.relative_to_root(Path("/other/m.py"), Path("/p")), "/other/m.py"
         )
+
+
+class TestParseScanArgs(unittest.TestCase):
+    """The shared parser: --exclude, script flags, unknown-flag warnings."""
+
+    def _parse(self, argv, **kw):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            parsed = mod.parse_scan_args(argv, **kw)
+        return parsed, err.getvalue()
+
+    def test_exclude_repeatable_and_comma_separated(self):
+        parsed, err = self._parse(
+            ["src", "--exclude", "a,b", "--exclude=c", "--exclude", "a"]
+        )
+        self.assertEqual(parsed.exclude, ["a", "b", "c"])
+        self.assertEqual(parsed.target, "src")
+        self.assertEqual(err, "")
+
+    def test_value_flag_value_is_not_the_target(self):
+        parsed, err = self._parse(
+            ["--key-type", "B=fix", "src", "--key-type", "F=feature"],
+            value_flags={"--key-type"},
+        )
+        self.assertEqual(parsed.target, "src")
+        self.assertEqual(parsed.values["--key-type"], ["B=fix", "F=feature"])
+        self.assertEqual(parsed.value("--key-type"), "F=feature")
+        self.assertEqual(err, "")
+
+    def test_unknown_flag_and_extra_positional_warn(self):
+        parsed, err = self._parse(["src", "other", "--bogus"])
+        self.assertEqual(parsed.target, "src")
+        self.assertEqual(parsed.unknown, ["--bogus"])
+        self.assertIn("--bogus", err)
+        self.assertIn("ignored: other", err)
+
+    def test_value_flag_without_value_warns(self):
+        parsed, err = self._parse(["src", "--exclude"])
+        self.assertEqual(parsed.exclude, [])
+        self.assertIn("--exclude needs a value", err)
+
+    def test_max_files_equals_form(self):
+        parsed, _ = self._parse(["--max-files=7"])
+        self.assertEqual((parsed.target, parsed.max_files), (".", 7))
+
+
+class TestPathMatches(unittest.TestCase):
+    """--exclude patterns: substrings stay substrings, globs match at any depth."""
+
+    def test_plain_pattern_is_a_substring(self):
+        self.assertTrue(mod.path_matches("pkg/vendor/x.py", "vendor"))
+        self.assertFalse(mod.path_matches("pkg/core.py", "vendor"))
+
+    def test_trailing_slash_means_a_directory(self):
+        self.assertTrue(mod.path_matches("pkg/build/x.py", "build/"))
+        self.assertFalse(mod.path_matches("pkg/rebuild/x.py", "build/"))
+
+    def test_glob_matches_at_any_depth(self):
+        self.assertTrue(
+            mod.path_matches("pkg/migrations/versions/a.py", "migrations/*")
+        )
+        self.assertTrue(mod.path_matches("a/b/c_pb2.py", "*_pb2.py"))
+        self.assertFalse(mod.path_matches("pkg/core.py", "migrations/*"))
+
+    def test_anchored_glob(self):
+        self.assertTrue(mod.path_matches("pkg/gen/x.py", "pkg/gen/*"))
+        self.assertFalse(mod.path_matches("pkg/core.py", "pkg/gen/*"))
+
+    def test_split_patterns(self):
+        self.assertEqual(mod.split_patterns(["a, b", "", "c,a"]), ["a", "b", "c"])
+        self.assertEqual(mod.split_patterns(None), [])
+
+
+_REVISION = (
+    'revision = "abc"\ndown_revision: str | None = None\n\ndef upgrade():\n    pass\n'
+)
+
+
+class TestMigrationKind(unittest.TestCase):
+    """Migration revisions are recognised by layout AND content."""
+
+    def test_alembic_revision(self):
+        with TempProject({"pkg/migrations/versions/abc_add.py": _REVISION}) as root:
+            path = root / "pkg/migrations/versions/abc_add.py"
+            self.assertEqual(mod.migration_kind(path), "revision")
+
+    def test_alembic_env(self):
+        files = {
+            "db/migrations/env.py": "from alembic import context\n",
+            "db/migrations/versions/__init__.py": "",
+        }
+        with TempProject(files) as root:
+            self.assertEqual(mod.migration_kind(root / "db/migrations/env.py"), "env")
+            init = root / "db/migrations/versions/__init__.py"
+            self.assertIsNone(mod.migration_kind(init))
+
+    def test_django_migration(self):
+        src = (
+            "from django.db import migrations\n\n"
+            "class Migration(migrations.Migration):\n    dependencies = []\n"
+        )
+        with TempProject({"shop/migrations/0001_initial.py": src}) as root:
+            path = root / "shop/migrations/0001_initial.py"
+            self.assertEqual(mod.migration_kind(path), "revision")
+
+    def test_revision_variables_outside_a_migration_dir_are_not_migrations(self):
+        with TempProject({"pkg/release.py": _REVISION}) as root:
+            self.assertIsNone(mod.migration_kind(root / "pkg/release.py"))
+
+    def test_helper_in_a_migrations_dir_is_not_a_revision(self):
+        with TempProject({"pkg/migrations/helpers.py": "def f():\n    pass\n"}) as root:
+            self.assertIsNone(mod.migration_kind(root / "pkg/migrations/helpers.py"))
+
+
+class TestSelectPythonFiles(unittest.TestCase):
+    """Exclusion and migration skipping happen before counting and capping."""
+
+    FILES: ClassVar[dict[str, str]] = {
+        "a_gen/x.py": "",
+        "a_gen/y.py": "",
+        "pkg/core.py": "",
+        "pkg/migrations/versions/abc.py": _REVISION,
+    }
+
+    def test_excluded_files_are_not_counted_or_capped(self):
+        with TempProject(self.FILES) as root:
+            sel = mod.select_python_files(root, max_files=1, exclude=["a_gen/"])
+        self.assertEqual([p.name for p in sel.files], ["core.py"])
+        self.assertEqual(sel.files_total, 2)
+        self.assertEqual(sel.excluded, ["a_gen/x.py", "a_gen/y.py"])
+        self.assertEqual(sel.exclude_matches, {"a_gen/": 2})
+
+    def test_migrations_skip_and_detect(self):
+        with TempProject(self.FILES) as root:
+            skip = mod.select_python_files(
+                root / "pkg", project_root=root, migrations="skip"
+            )
+            keep = mod.select_python_files(
+                root / "pkg", project_root=root, migrations="detect"
+            )
+            off = mod.select_python_files(root / "pkg", project_root=root)
+        self.assertEqual([p.name for p in skip.files], ["core.py"])
+        self.assertEqual(skip.envelope_fields()["migration_files_skipped"], 1)
+        self.assertEqual(
+            skip.envelope_fields()["migration_dirs"], ["pkg/migrations/versions"]
+        )
+        self.assertEqual(len(keep.files), 2)
+        self.assertEqual(keep.envelope_fields()["migration_files_skipped"], 0)
+        self.assertEqual(keep.envelope_fields()["migration_files_detected"], 1)
+        self.assertNotIn("migration_files_detected", off.envelope_fields())
+
+    def test_envelope_carries_the_selection(self):
+        with TempProject(self.FILES) as root:
+            sel = mod.select_python_files(root, exclude=["nothing-here"])
+            env = mod.build_envelope(root, root, sel.files_total, len(sel.files), sel)
+        self.assertEqual(env["files_excluded"], 0)
+        self.assertEqual(env["exclude_matches"], {"nothing-here": 0})
+        self.assertFalse(env["files_capped"])
+
+
+class TestCoverageOmitConfig(unittest.TestCase):
+    """The project's coverage `omit`, read the way coverage.py reads it."""
+
+    def test_pyproject_omit(self):
+        with TempProject({"pkg/a.py": ""}) as root:
+            (root / "pyproject.toml").write_text(
+                '[tool.coverage.run]\nomit = ["pkg/migrations/*", "*/shim.py"]\n',
+                encoding="utf-8",
+            )
+            patterns, source = mod.coverage_omit_patterns(root)
+            self.assertEqual(patterns, ["pkg/migrations/*", "*/shim.py"])
+            self.assertEqual(source, "pyproject.toml [tool.coverage.run]")
+            self.assertTrue(
+                mod.coverage_omitted(root / "pkg/migrations/v/x.py", patterns, root)
+            )
+            self.assertTrue(mod.coverage_omitted(root / "lib/shim.py", patterns, root))
+            self.assertFalse(mod.coverage_omitted(root / "pkg/a.py", patterns, root))
+
+    def test_coveragerc_wins_over_pyproject(self):
+        with TempProject({"pkg/a.py": ""}) as root:
+            (root / ".coveragerc").write_text(
+                "[run]\nomit = a/*, b/*\n", encoding="utf-8"
+            )
+            (root / "pyproject.toml").write_text(
+                '[tool.coverage.run]\nomit = ["c/*"]\n', encoding="utf-8"
+            )
+            self.assertEqual(
+                mod.coverage_omit_patterns(root), (["a/*", "b/*"], ".coveragerc [run]")
+            )
+
+    def test_setup_cfg_section(self):
+        with TempProject({"pkg/a.py": ""}) as root:
+            (root / "setup.cfg").write_text(
+                "[coverage:run]\nomit =\n    gen/*\n", encoding="utf-8"
+            )
+            self.assertEqual(
+                mod.coverage_omit_patterns(root),
+                (["gen/*"], "setup.cfg [coverage:run]"),
+            )
+
+    def test_no_config(self):
+        with TempProject({"pkg/a.py": ""}) as root:
+            self.assertEqual(mod.coverage_omit_patterns(root), ([], None))
+
+
+class TestHistoryRootArg(unittest.TestCase):
+    """--git-dir maps the scan root into the checkout by relative path."""
+
+    def test_default_is_the_scanned_tree(self):
+        root, scan = Path("/e"), Path("/e/pkg")
+        self.assertEqual(mod.history_root_arg(None, root, scan), (root, scan))
+
+    def test_dot_git_and_mapping(self):
+        with TempProject({"pkg/a.py": ""}) as export:
+            got = mod.history_root_arg("/checkout/.git", export, export / "pkg")
+        self.assertEqual(got, (Path("/checkout"), Path("/checkout/pkg")))
 
 
 if __name__ == "__main__":
