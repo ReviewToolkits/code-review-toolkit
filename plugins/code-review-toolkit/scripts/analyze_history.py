@@ -194,7 +194,21 @@ _TYPE_WORDS: dict[str, str] = {
 }
 
 # The scope may be left unclosed (`feat(api: ...`): the type is still stated.
-_CONVENTIONAL_RE = re.compile(r"^\s*([A-Za-z]+)(?:\([^)]*\)?)?!?:\s")
+_CONVENTIONAL_RE = re.compile(r"^\s*([A-Za-z]+)(?:\(([^)]*)\)?)?!?:\s")
+
+# A `fix` whose scope names docs, styling or translations fixes no behaviour of
+# the program: `fix(docs): correct the install command`, `fix(style): align the footer`.
+# On a validation project they were counted as fixes and crowded real fixes
+# out of recent_fixes.
+_DOC_SCOPE_WORDS = "docs doc documentation readme changelog typo typos blog"
+_CHORE_SCOPE_WORDS = (
+    "style styles css scss sass less theme i18n l10n translation translations "
+    "locale locales"
+)
+_NON_CODE_FIX_SCOPES: dict[str, str] = {
+    **dict.fromkeys(_DOC_SCOPE_WORDS.split(), "docs"),
+    **dict.fromkeys(_CHORE_SCOPE_WORDS.split(), "chore"),
+}
 _LEADING_TAGS_RE = re.compile(r"^\s*((?:\[[^\[\]\n]+\]\s*)+)")
 _TAG_RE = re.compile(r"\[([^\[\]]+)\]")
 # Tracker keys: `ABC-123` (Jira style) or a single capital followed by digits,
@@ -263,6 +277,44 @@ _LEADING_VERBS: dict[str, str] = {
     for category, verbs in _VERBS_BY_TYPE.items()
     for verb in verbs.split()
 }
+# Hardening subjects state a fix as the rule now enforced: "Reject invites that
+# end before they start", "Require a confirmed calendar before sharing it",
+# "Verify the rule before expanding it". None names a bug, so on a
+# validation project many real fixes were left `unknown` and missing from
+# recent_fixes. They are a weaker signal than "fix" (source `hardening`), and
+# yield to the tie-breaks below.
+_HARDENING_VERB_WORDS = (
+    "reject rejects require requires restore restores validate validates "
+    "verify verifies ensure ensures guard guards disallow disallows enforce "
+    "enforces pin pins escape escapes forbid forbids sanitize sanitizes "
+    "sanitise sanitises harden hardens deny denies handle handles never"
+)
+_HARDENING_VERBS = frozenset(_HARDENING_VERB_WORDS.split())
+# Past tenses are left out: "Verified-sender icon in the inbox" and "Pinned projects
+# list" open with an adjective, not a verb.
+_DEPENDENCY_VERBS = frozenset(("pin", "pins", "require", "requires"))
+# "Don't drop the cache on reload", "Do not retry a rejected payment".
+_NEGATED_IMPERATIVE_RE = re.compile(r"^(?:don'?t|do\s+not)\b", re.IGNORECASE)
+# "Keep the sync cursor across reconnects": keeping state through an event is
+# a fix; "Keep a changelog" is not.
+_KEEP_WHEN_RE = re.compile(
+    r"^keeps?\b.*\b(?:when|across|after|during|if|until|while|between)\b",
+    re.IGNORECASE,
+)
+# Tie-breaks for a hardening verb. "Handle the new export format" and "Validate
+# the new --strict option" add capability; "Pin pytest to 8.2" and "Require
+# Python 3.10" are dependency chores; "Ensure the tests pass on Windows" is
+# test or CI work, left to the keyword fallback.
+_HARDENING_FEATURE_RE = re.compile(
+    r"\b(?:new(?!\s*lines?\b)|support|options?|flags?|features?|settings?"
+    r"|configurable)\b",
+    re.IGNORECASE,
+)
+_DEPENDENCY_WORDS_RE = re.compile(r"\b(?:dependenc(?:y|ies)|deps)\b", re.IGNORECASE)
+_VERSION_RE = re.compile(r"\b\d+(?:\.\d+)+\b|[<>=~!]=\s*\d|[<>]\s*\d")
+_HARDENING_SKIP_RE = re.compile(
+    r"\b(?:tests?|ci|workflows?|pipelines?|builds?)\b", re.IGNORECASE
+)
 _EXPLICIT_FIX_RE = re.compile(
     r"\b(?:fix(?:es|ed|ing)?|bugs?|bugfix(?:es)?|hotfix(?:es)?|crash(?:es|ed|ing)?"
     r"|regressions?|segfaults?|leak(?:s|ed|ing)?)\b",
@@ -288,6 +340,33 @@ def _leading_verb_type(subject: str) -> str | None:
     if category == "feature" and _EXPLICIT_FIX_RE.search(subject):
         return "fix"
     return category
+
+
+def _hardening_type(subject: str) -> str | None:
+    """The type of a hardening subject ("Reject X when Y"), or None.
+
+    Returns "fix", or "feature"/"chore" when a tie-break overrides the verb,
+    or None when the subject does not open with a hardening verb.
+    """
+    stripped = subject.strip()
+    words = re.findall(r"[A-Za-z][\w-]*", stripped[:80])
+    if not words:
+        return None
+    if not (
+        words[0].lower() in _HARDENING_VERBS
+        or _NEGATED_IMPERATIVE_RE.match(stripped)
+        or _KEEP_WHEN_RE.match(stripped)
+    ):
+        return None
+    if _HARDENING_SKIP_RE.search(stripped):
+        return None
+    if _DEPENDENCY_WORDS_RE.search(stripped) or (
+        words[0].lower() in _DEPENDENCY_VERBS and _VERSION_RE.search(stripped)
+    ):
+        return "chore"
+    if _HARDENING_FEATURE_RE.search(stripped):
+        return "feature"
+    return "fix"
 
 
 # Precedence when one commit carries several typed signals of equal rank.
@@ -393,9 +472,12 @@ def classify_commit_detail(
     leading bracketed tag that names a type (`[fix][cli] ...`), a tracker key
     mapped by `key_types` (`... (K7)` with `K=fix`, or the whole key `K7=fix`),
     a strong word (`docstrings`, `flake8`, "add tests"), the subject's leading
-    verb, and last a word-boundary keyword match. Returns
-    {"type", "source", "tags", "keys"}; source is one of conventional / tag /
-    key / strong / verb / keyword / None.
+    verb, a leading hardening verb ("Reject X when Y"), and last a
+    word-boundary keyword match. Returns {"type", "source", "tags", "keys"};
+    source is one of conventional / tag / key / strong / verb / hardening /
+    keyword / None. A conventional `fix` whose scope names docs, styling or
+    translations (`fix(docs): ...`) is reclassified as docs or chore, and the
+    result then also carries `demoted_from: "fix"` and `demoted_by: "scope"`.
     """
     tags: list[str] = []
     tag_match = _LEADING_TAGS_RE.match(message)
@@ -408,6 +490,11 @@ def classify_commit_detail(
     conv = _CONVENTIONAL_RE.match(message)
     if conv and conv.group(1).lower() in _TYPE_WORDS:
         detail.update(type=_TYPE_WORDS[conv.group(1).lower()], source="conventional")
+        scope = (conv.group(2) or "").strip().lower()
+        if detail["type"] == "fix" and scope in _NON_CODE_FIX_SCOPES:
+            detail.update(
+                type=_NON_CODE_FIX_SCOPES[scope], demoted_from="fix", demoted_by="scope"
+            )
         return detail
     tag_type = _best_type(_TYPE_WORDS.get(t, "") for t in tags)
     if tag_type:
@@ -432,6 +519,10 @@ def classify_commit_detail(
     verb_type = _leading_verb_type(rest)
     if verb_type:
         detail.update(type=verb_type, source="verb")
+        return detail
+    hardening = _hardening_type(rest)
+    if hardening:
+        detail.update(type=hardening, source="hardening")
         return detail
     for category, pattern in _KEYWORD_RES:
         if pattern.search(message):
@@ -601,6 +692,14 @@ def parse_git_log(
                 "type": detail["type"],
                 "type_source": detail["source"],
                 "keys": detail["keys"],
+                **(
+                    {
+                        "demoted_from": detail["demoted_from"],
+                        "demoted_by": detail["demoted_by"],
+                    }
+                    if "demoted_from" in detail
+                    else {}
+                ),
                 # Paths as they were at this commit (what `git show` needs).
                 "files": [],
                 # The same files under their newest name, following renames.
@@ -657,6 +756,9 @@ def parse_git_log(
     if current_commit is not None and commit_count <= max_commits:
         commits.append(current_commit)
 
+    for commit in commits:
+        demote_non_code_fix(commit)
+
     # Build file_stats list.
     head_files = _files_at_head(project_root) if project_root is not None else None
     file_stats: list[dict] = []
@@ -693,6 +795,72 @@ def parse_git_log(
     # Sort by commits descending.
     file_stats.sort(key=lambda x: x["commits"], reverse=True)
     return commits, file_stats
+
+
+# Files that carry no program behaviour: prose, stylesheets, translation
+# catalogs, images and fonts. Templates and JavaScript are code and stay out.
+_DOC_SUFFIXES = frozenset((".md", ".markdown", ".rst", ".txt", ".adoc"))
+_NON_DOC_ASSET_SUFFIXES = (
+    ".css .scss .sass .less .styl .po .pot .mo .png .jpg .jpeg .gif .svg .ico "
+    ".webp .woff .woff2 .ttf .otf .eot"
+)
+_NON_CODE_SUFFIXES = _DOC_SUFFIXES | frozenset(_NON_DOC_ASSET_SUFFIXES.split())
+
+
+def demote_non_code_fix(commit: dict) -> bool:
+    """Reclassify a `fix` whose in-scope files are all non-code as docs/chore.
+
+    "Fix the header colour in dark mode" touching one stylesheet, or "Fix
+    the French plural forms" touching only `.po` catalogs, fixes nothing a
+    code review can propagate. The commit keeps its `type_source` and gains
+    `demoted_from` and `demoted_by: "files"`. A commit with no listed files is left alone: no
+    evidence. Returns whether the commit was changed.
+    """
+    files = commit.get("files") or []
+    if commit.get("type") != "fix" or not files:
+        return False
+    suffixes = [Path(f).suffix.lower() for f in files]
+    if not all(s in _NON_CODE_SUFFIXES for s in suffixes):
+        return False
+    commit["type"] = "docs" if all(s in _DOC_SUFFIXES for s in suffixes) else "chore"
+    commit["demoted_from"] = "fix"
+    commit["demoted_by"] = "files"
+    return True
+
+
+_MAX_UNKNOWN_LISTED = 50
+
+
+def unknown_touching_source(
+    commits: list[dict], limit: int = _MAX_UNKNOWN_LISTED
+) -> dict:
+    """The `unknown` commits that change Python files, for hand triage.
+
+    The classifier reads subjects only. A fix worded as neither a fix nor a
+    hardening rule ("Make the scheduler honour quiet hours") stays
+    `unknown`, and is then missing from recent_fixes and from every fix-based
+    count. These are the commits to read by hand before quoting a ratio.
+    """
+    listed: list[dict] = []
+    total = 0
+    for commit in commits:
+        if commit.get("type") != "unknown":
+            continue
+        py_files = [f for f in commit.get("files", []) if f.endswith(".py")]
+        if not py_files:
+            continue
+        total += 1
+        if len(listed) < limit:
+            listed.append(
+                {
+                    "commit_short": commit["hash"][:7],
+                    "date": commit["date"],
+                    "message": commit["message"],
+                    "python_files": py_files[:10],
+                    "python_files_total": len(py_files),
+                }
+            )
+    return {"total": total, "commits": listed, "truncated": total > len(listed)}
 
 
 def _files_at_head(project_root: Path) -> set[str] | None:
@@ -1842,6 +2010,31 @@ def last_commit_date(git_root: Path, rel_scope: str) -> str | None:
     return result.stdout.strip() or None
 
 
+def unknown_note(commits: list[dict], unknown: int) -> str:
+    """The note for a history with many `unknown` commits.
+
+    --key-type only helps when the unknown commits carry tracker keys. On a
+    history whose commits reference pull requests as `(#123)`, the advice sent
+    a reviewer looking for a key scheme that did not exist; there the limit is
+    the subject-only classifier, and the way forward is reading the commits.
+    """
+    keyed = sum(1 for c in commits if c["type"] == "unknown" and c.get("keys"))
+    head = f"{unknown} of {len(commits)} commits are `unknown`. "
+    if keyed and keyed * 10 >= unknown:
+        return head + (
+            f"{keyed} of them carry tracker keys (see tracker_keys.by_prefix): "
+            "find what each prefix means and re-run with --key-type "
+            "PREFIX=TYPE (e.g. --key-type B=fix,F=feature) before quoting a "
+            "fix:feature ratio."
+        )
+    return head + (
+        f"Only {keyed} of them carry a tracker key, so --key-type will not "
+        "help. The classifier reads subjects only; read the commits in "
+        "unknown_touching_source (unknown commits that change Python files) "
+        "and classify them by hand before quoting a fix:feature ratio."
+    )
+
+
 def parse_args(argv: list[str]) -> dict:
     """Parse command-line arguments."""
     args: dict = {
@@ -2027,10 +2220,13 @@ def analyze(argv: list[str] | None = None) -> dict:
     # Classify commits.
     commits_by_type: dict[str, int] = defaultdict(int)
     classified_by: dict[str, int] = defaultdict(int)
+    fixes_demoted: dict[str, int] = defaultdict(int)
     authors: set[str] = set()
     for commit in commits:
         commits_by_type[commit["type"]] += 1
         classified_by[commit.get("type_source") or "none"] += 1
+        if commit.get("demoted_from"):
+            fixes_demoted[commit["demoted_by"]] += 1
         authors.add(commit["author"])
 
     git_root = git_toplevel(project_root)
@@ -2150,9 +2346,14 @@ def analyze(argv: list[str] | None = None) -> dict:
             "total_commits": len(commits),
             "commits_by_type": dict(commits_by_type),
             # Which signal decided each commit's type: conventional / tag /
-            # key / keyword / none (= unknown).
+            # key / key-majority / strong / verb / hardening / keyword /
+            # none (= unknown).
             "classified_by": dict(classified_by),
             "key_types": key_types,
+            # `fix` commits reclassified as docs/chore, by reason: `scope`
+            # (`fix(docs): ...`) or `files` (only docs, stylesheets,
+            # translations or images changed).
+            "fixes_demoted": dict(fixes_demoted),
             "files_changed": len(file_churn),
             "functions_changed": len(function_churn),
             "authors": len(authors),
@@ -2165,6 +2366,7 @@ def analyze(argv: list[str] | None = None) -> dict:
         "function_churn": function_churn,
         "function_attribution": attribution_meta,
         "recent_fixes": recent_fixes,
+        "unknown_touching_source": unknown_touching_source(commits),
         "recent_features": recent_features,
         "recent_refactors": recent_refactors,
         "behavioural_non_code_commits": behavioural,
@@ -2229,12 +2431,7 @@ def analyze(argv: list[str] | None = None) -> dict:
         )
     unknown = commits_by_type.get("unknown", 0)
     if commits and unknown / len(commits) > 0.15:
-        result["notes"].append(
-            f"{unknown} of {len(commits)} commits are `unknown`. If the project "
-            "marks commits with tracker keys (see tracker_keys.by_prefix), "
-            "re-run with --key-type PREFIX=TYPE (e.g. --key-type B=fix,F=feature) "
-            "before quoting a fix:feature ratio."
-        )
+        result["notes"].append(unknown_note(commits, unknown))
 
     if function_churn_note:
         result["function_churn_note"] = function_churn_note

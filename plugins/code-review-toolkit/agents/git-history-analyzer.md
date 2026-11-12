@@ -26,7 +26,8 @@ of explore), use that data directly — do NOT re-run
 run its raw JSON is at
 `<run_dir>/artifacts/git-history-context/analyze_history.json`: read
 `recent_fixes`, `recent_features`, `behavioural_non_code_commits`,
-`co_change_clusters` and `unmerged_branches` from there rather than
+`unknown_touching_source`, `co_change_clusters` and `unmerged_branches`
+from there rather than
 from the prose report. Only run the script yourself if neither the file
 nor the context output was provided, and then save its output to the
 same path.
@@ -65,7 +66,7 @@ This is the highest-value capability.
 **Sources.** A "fix" for this capability is any commit that changed how one place handles a case, not only a commit whose subject says fix. Take, in this order:
 
 1. A list the orchestrator or the caller supplied: commits, PRs or finding ids. Use it as given.
-2. `recent_fixes`.
+2. `recent_fixes`, then the fixes git-history-context found by hand in `unknown_touching_source` (commits the subject-only classifier could not type).
 3. `feat:`, `refactor:` and `docs:` commits that changed **one of several parallel paths**: one handler of a family, one backend of several, one sync/async twin, one of the per-format encoders. A feature that adds validation to one path is a fix for the paths it skipped. Look in `recent_features`, `recent_refactors` and `behavioural_non_code_commits.flagged` (docs or chore commits that changed code). On one validation project these were the most productive sources, and a keyword grep for `fix|race|leak` finds none of them.
 4. Older fixes, read on the **re-introduction** axis (step 5 below).
 
