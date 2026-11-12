@@ -1,6 +1,6 @@
 ---
 name: project-docs-auditor
-description: Use this agent to audit out-of-code documentation (README, CLAUDE.md, CONTRIBUTING.md, configuration files) for accuracy against the actual codebase. Unlike the documentation-auditor (which covers in-code docstrings and comments), this agent focuses on external-facing documentation. It has three concrete, verifiable capabilities — reference validation (do things mentioned in docs exist in code?, backed by `check_doc_refs.py`), cross-file consistency (do documentation files agree with each other and with project metadata?), and structural completeness (does the project document what it actually exposes?). Every finding is mechanically verifiable, not subjectively opinionated.\n\n<example>\nContext: The user is preparing a release and wants to verify documentation accuracy.\nuser: "Before the release, can you check that our README is actually accurate?"\nassistant: "I'll use the project-docs-auditor to validate all references in the README against the current code and check for stale or broken documentation."\n<commentary>\nPre-release documentation accuracy check — the core use case. The agent will find renamed functions, changed CLI flags, and outdated examples.\n</commentary>\n</example>\n\n<example>\nContext: The user has refactored code and wants to check if docs are stale.\nuser: "I just renamed a bunch of functions and reorganized the modules — are the docs still correct?"\nassistant: "I'll use the project-docs-auditor to find any documentation references that point to the old names or structure."\n<commentary>\nPost-refactoring documentation drift detection. The agent excels at finding references to entities that no longer exist.\n</commentary>\n</example>\n\n<example>\nContext: The explore command dispatching this agent as part of a full review.\nuser: "/code-review-toolkit:explore . all"\nassistant: "[As part of the full exploration, the project-docs-auditor checks external documentation accuracy alongside the documentation-auditor's in-code analysis.]"\n<commentary>\nWhen run as part of a full exploration, this agent complements the documentation-auditor by covering external-facing docs.\n</commentary>\n</example>
+description: Use this agent to audit out-of-code documentation (README, CLAUDE.md, CONTRIBUTING.md, configuration files) for accuracy against the actual codebase. Unlike the documentation-auditor (which covers in-code docstrings and comments), this agent focuses on external-facing documentation. It has four concrete, verifiable capabilities — reference validation (do things mentioned in docs exist in code?, backed by `check_doc_refs.py`), cross-file consistency (do documentation files agree with each other and with project metadata?), structural completeness (does the project document what it actually exposes?), and behavioural claims (does the code do what the user docs promise?). Every finding is mechanically verifiable, not subjectively opinionated.\n\n<example>\nContext: The user is preparing a release and wants to verify documentation accuracy.\nuser: "Before the release, can you check that our README is actually accurate?"\nassistant: "I'll use the project-docs-auditor to validate all references in the README against the current code and check for stale or broken documentation."\n<commentary>\nPre-release documentation accuracy check — the core use case. The agent will find renamed functions, changed CLI flags, and outdated examples.\n</commentary>\n</example>\n\n<example>\nContext: The user has refactored code and wants to check if docs are stale.\nuser: "I just renamed a bunch of functions and reorganized the modules — are the docs still correct?"\nassistant: "I'll use the project-docs-auditor to find any documentation references that point to the old names or structure."\n<commentary>\nPost-refactoring documentation drift detection. The agent excels at finding references to entities that no longer exist.\n</commentary>\n</example>\n\n<example>\nContext: The explore command dispatching this agent as part of a full review.\nuser: "/code-review-toolkit:explore . all"\nassistant: "[As part of the full exploration, the project-docs-auditor checks external documentation accuracy alongside the documentation-auditor's in-code analysis.]"\n<commentary>\nWhen run as part of a full exploration, this agent complements the documentation-auditor by covering external-facing docs.\n</commentary>\n</example>
 model: opus
 color: emerald
 ---
@@ -34,6 +34,15 @@ Before starting analysis, discover and list all documentation that exists in the
 
 **Deployment and operations files (they document how to run the project, and drift silently):**
 - `Dockerfile`, `docker-compose.yml` / `compose.yaml`: exposed ports, env vars, entry commands, health checks, volumes — compare each with what the code actually reads and serves
+- **Exposed port vs bind host.** For every `EXPOSE` / `ports:` / `-p HOST:CONTAINER`, find the host
+  the server actually binds in that container: the entry command's `--host`/`--bind`, the env var
+  or config default the code resolves (`HOST`, `BIND`, `server.host`), and the framework default
+  when none is given (several servers default to `127.0.0.1`). A server bound to loopback behind
+  an exposed port is unreachable from outside the container while everything looks right. An
+  in-container `HEALTHCHECK` (`curl localhost:8000`) runs inside the same network namespace, so it
+  passes against a loopback bind and cannot catch this; only a request from outside (another
+  container, the host through the published port) can. Report the chain: the documented port, the
+  bind the code resolves, and where each comes from
 - `*.example` / `*.sample` / `dotenv.example` / `config.yml.example`: every key must exist in the code with the documented meaning and default
 - `Makefile` / `justfile` / `noxfile.py` / `tox.ini`: targets that reference scripts, paths or flags that no longer exist
 - CI configuration (`.github/workflows/`, `.gitlab-ci.yml` or a variant name, `.circleci/`): commands, Python versions, whether what CI tests matches what the docs promise, and whether each step actually runs (see "CI Steps That Pass Without Running")
@@ -289,6 +298,33 @@ Check whether the project documents what it actually exposes. This is NOT "does 
 - **FIX**: A CLI command exists but is completely undocumented (users can't discover it)
 - **CONSIDER**: A configuration option exists but isn't documented (users might need it)
 - **ACCEPTABLE**: An internal module isn't mentioned in external docs (it's internal — users don't need to know about it)
+
+## Capability 4: Behavioural Claims
+
+User docs promise behaviour, not just names: "returns 404 when the project does not exist",
+"the response includes `expires_at`", "only owners can delete", "at most 100 items per page",
+"you will receive an email when ...". These claims are where readers get hurt, and the top
+findings of past runs came from them. Capabilities 1-3 never test them.
+
+1. **Extract the claims.** Read the user-facing docs (guides, API reference, FAQ, error-message
+   help pages) and list each sentence that states a checkable behaviour, by kind: `status` (HTTP
+   codes, exit codes, error messages), `field` (a response, payload or config field and its
+   type/default), `permission` (who may do what), `limit` (sizes, counts, rates, timeouts,
+   retention), `notification` (emails, webhooks, events and when they fire), `ordering` and
+   `idempotency`. Keep the doc location and the exact wording.
+2. **Find the code that decides it.** For each claim, find the handler, the permission check, the
+   constant or the setting, and any test that pins the behaviour (`grep` the status code, field
+   name or limit value; the route for the documented URL).
+3. **Verify, cheapest first.** A test that asserts the documented behaviour settles it; a constant
+   that differs from the documented limit contradicts it. When neither settles it, write a small
+   reproducer in an export (see the "Run the examples" guidance above) and run it.
+4. **Report** each contradiction under "Behaviour Defects Found Through the Docs" when the code
+   is wrong, or under "Broken References" when the doc is: name the doc line, the code line, and
+   how you verified it (test, constant, reproducer). Report unverified claims as such, never as
+   correct.
+
+Cap this capability at the 30 claims a user is most likely to rely on (status codes, permissions
+and limits first) and say how many you extracted.
 
 ## Output Format
 
