@@ -50,6 +50,15 @@ packages are unchecked. ``mypy_python`` records the interpreter whose
 site-packages mypy resolved against, since every import result depends on it.
 The passes are independent and run concurrently.
 
+Each phantom hit is traced to the module its annotation imports from and
+tagged ``phantom_origin``; ``phantom_imports_real`` counts the hits whose
+module does not exist. ``stale_stub_packages`` lists installed ``types-*`` /
+``*-stubs`` distributions that shadow a library's own inline types. Through
+``analyze()``: ``extra_passes`` adds labelled passes for any mypy flags,
+``cache_dir`` keeps the cache for later runs, and ``boundary_map`` runs the
+opt-in typed-boundary overlay -- bare boundary parameters (``request``)
+annotated in an exported copy, so mypy checks what flows through them.
+
 Usage:
     python check_typing.py [path] [--mypy-bin PATH] [--max-files N]
         [--no-strict-pass] [--no-unreachable-pass] [--no-unused-ignores-pass]
@@ -75,6 +84,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scan_common import (  # noqa: E402
+    EXCLUDE_DIRS,
     build_envelope,
     discover_python_files,
     emit,
@@ -368,6 +378,7 @@ def _run_mypy(
     config: str | None,
     extra: list[str],
     cache_dir: str,
+    mypy_path: str | None = None,
 ) -> tuple[str, str, int | None]:
     # --no-color-output is load-bearing, not cosmetic. mypy honours FORCE_COLOR
     # even when stdout is a pipe, and the ANSI codes it injects sit between the
@@ -394,6 +405,11 @@ def _run_mypy(
     cmd.extend(extra)
     cmd.extend(targets)
     env = {**os.environ, "FORCE_COLOR": "0", "MYPY_FORCE_COLOR": "0", "NO_COLOR": "1"}
+    if mypy_path:
+        # Searched before the config's own mypy_path (the overlay's stubs).
+        env["MYPYPATH"] = os.pathsep.join(
+            p for p in (mypy_path, os.environ.get("MYPYPATH", "")) if p
+        )
     try:
         out = subprocess.run(
             cmd,
@@ -1361,6 +1377,228 @@ def _labelled_pass(
     return {"ran": True, "error": None, "findings": added}
 
 
+# ---------------------------------------------------------------------------
+# User-chosen passes and the typed-boundary overlay
+# ---------------------------------------------------------------------------
+
+# Flags an extra pass may not carry: they change where the output goes or how
+# it reads, and a pass whose output does not parse would report nothing.
+_EXTRA_PASS_DENY = (
+    "--config-file",
+    "--cache-dir",
+    "--output",
+    "-O",
+    "--pretty",
+    "--no-error-summary",
+    "--color-output",
+    "--force-color",
+    "--version",
+    "--help",
+)
+
+
+def validate_extra_passes(flags: list[str]) -> tuple[list[tuple[str, str]], list[dict]]:
+    """`(passes, rejected)`: each accepted flag as `(label, flag)`.
+
+    A flag must be one long option (``--strict-optional``,
+    ``--always-true=DEBUG``); one this script already runs as a labelled pass
+    is accepted once.
+    """
+    passes: list[tuple[str, str]] = []
+    rejected: list[dict] = []
+    for flag in flags:
+        flag = flag.strip()
+        why = None
+        if not flag.startswith("--") or " " in flag:
+            why = "not a single --long-option"
+        elif flag.split("=", 1)[0] in _EXTRA_PASS_DENY:
+            why = "changes where the output goes or how it parses"
+        if why:
+            rejected.append({"flag": flag, "reason": why})
+            continue
+        label = flag[2:]
+        if label not in {lbl for lbl, _ in passes}:
+            passes.append((label, flag))
+    return passes, rejected
+
+
+def _pass_dir(name: str) -> str:
+    return re.sub(r"[^\w.-]", "_", name)
+
+
+_OVERLAY_PASS = "boundary-overlay"
+_OVERLAY_ALIAS = "_crt_boundary_{}"
+_CONFIG_NAMES = ("mypy.ini", ".mypy.ini", "setup.cfg", "pyproject.toml")
+
+
+def _export_tree(project_root: Path, export: Path) -> None:
+    """Copy the project's Python sources and config files to *export*."""
+    for dirpath, dirnames, filenames in os.walk(project_root):
+        dirnames[:] = [
+            d for d in dirnames if d not in EXCLUDE_DIRS and not d.startswith(".")
+        ]
+        rel = Path(dirpath).relative_to(project_root)
+        for name in filenames:
+            if not (
+                name.endswith((".py", ".pyi"))
+                or name == "py.typed"
+                or (rel == Path(".") and name in _CONFIG_NAMES)
+            ):
+                continue
+            dest = export / rel / name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(Path(dirpath) / name, dest)
+
+
+def _boundary_edits(
+    tree: ast.Module, rel: str, by_name: dict[str, str], sites: list[dict]
+) -> list[tuple[int, int, str, str]]:
+    """`(line, byte_col, param, qualified_type)` for each bare parameter to annotate."""
+    wanted = {
+        (s["line"], s["param"]): s["annotation"] for s in sites if s.get("file") == rel
+    }
+    edits = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        a = node.args
+        for arg in a.posonlyargs + a.args + a.kwonlyargs:
+            if arg.annotation is not None:
+                continue
+            qualified = wanted.get((node.lineno, arg.arg)) or by_name.get(arg.arg)
+            if qualified and "." in qualified and arg.end_col_offset is not None:
+                edits.append((arg.lineno, arg.end_col_offset, arg.arg, qualified))
+    return edits
+
+
+def apply_boundary_overlay(
+    export: Path,
+    project_root: Path,
+    files: list[Path],
+    boundary_map: dict[str, str] | list[dict],
+) -> dict:
+    """Annotate bare boundary parameters in the exported copy of *files*.
+
+    *boundary_map* is either ``{param_name: "pkg.mod.Type"}`` (every bare
+    parameter of that name) or a list of sites ``{file, line, param,
+    annotation}`` -- `file` project-relative, `line` the def's line, as in
+    count_types' `untyped_boundaries` once a qualified type is filled in. Each
+    annotation is a quoted ``"_crt_boundary_N.Type"`` with ``import pkg.mod
+    as _crt_boundary_N`` appended at the end of the file, so no line moves and
+    every finding maps back to the original line.
+    """
+    by_name = boundary_map if isinstance(boundary_map, dict) else {}
+    sites = boundary_map if isinstance(boundary_map, list) else []
+    annotated: list[dict] = []
+    used: set[str] = set()
+    for path in files:
+        rel = str(path.relative_to(project_root))
+        tree = parse_source(path)
+        if tree is None:
+            continue
+        edits = _boundary_edits(tree, rel, by_name, sites)
+        if not edits:
+            continue
+        target = export / rel
+        lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
+        aliases: dict[str, str] = {}
+        for line, col, param, qualified in sorted(edits, reverse=True):
+            module, _, name = qualified.rpartition(".")
+            alias = aliases.setdefault(module, _OVERLAY_ALIAS.format(len(aliases)))
+            raw = lines[line - 1].encode("utf-8")
+            text = f': "{alias}.{name}"'.encode()
+            lines[line - 1] = (raw[:col] + text + raw[col:]).decode("utf-8")
+            annotated.append(
+                {"file": rel, "line": line, "param": param, "type": qualified}
+            )
+            used.add(param)
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines += [
+            f"import {m} as {a}  # crt boundary overlay\n" for m, a in aliases.items()
+        ]
+        target.write_text("".join(lines), encoding="utf-8")
+    wanted_names = set(by_name) | {s.get("param") for s in sites}
+    return {
+        "sites_annotated": sorted(annotated, key=lambda e: (e["file"], e["line"])),
+        "unmatched": sorted(n for n in wanted_names - used if n),
+    }
+
+
+def _overlay_pass(
+    mypy_bin: str,
+    project_root: Path,
+    files: list[Path],
+    targets: list[str],
+    config: str | None,
+    flags: list[str],
+    cache_dir: str,
+    baseline: set[tuple],
+    boundary_map: dict[str, str] | list[dict],
+    stubs: str | None = None,
+) -> dict:
+    """Annotate the boundaries in an export and report what mypy then adds.
+
+    *stubs* is a directory searched first for stubs (``MYPYPATH``): a minimal
+    ``.pyi`` for a library the config silences is what gives the annotated
+    parameter attributes worth checking.
+    """
+    export = Path(cache_dir) / "export"
+    shutil.rmtree(export, ignore_errors=True)
+    export.mkdir(parents=True)
+    _export_tree(project_root, export)
+    applied = apply_boundary_overlay(export, project_root, files, boundary_map)
+    result = {"ran": False, "error": None, "findings": [], **applied}
+    if not applied["sites_annotated"]:
+        result["error"] = "no bare parameter matched the boundary map"
+        return result
+
+    def moved(path: str) -> str:
+        p = Path(path)
+        try:
+            return str(export / p.resolve().relative_to(project_root))
+        except ValueError:
+            return path
+
+    out, err, rc = _run_mypy(
+        mypy_bin,
+        [moved(t) for t in targets],
+        moved(config) if config else None,
+        flags,
+        os.path.join(cache_dir, "mypy"),
+        mypy_path=stubs,
+    )
+    found, stats = parse_output(out)
+    if rc is None or not stats["files_checked"]:
+        result["error"] = _diagnose_failure(err, out, rc)
+        return result
+    edited = {(e["file"], e["line"]) for e in applied["sites_annotated"]}
+    for f in found:
+        # mypy prints a path under the caller's cwd relative to it, so a
+        # cache directory below the cwd yields `cache/.../export/pkg/m.py`.
+        path = Path(f["file"])
+        if not path.is_absolute() and (Path.cwd() / path).is_file():
+            path = Path.cwd() / path
+        try:
+            f["file"] = str(project_root / path.resolve().relative_to(export.resolve()))
+        except ValueError:
+            pass
+        if _finding_key(f) in baseline:
+            continue
+        rel = f["file"]
+        if Path(rel).is_absolute():
+            try:
+                rel = str(Path(rel).relative_to(project_root))
+            except ValueError:
+                pass
+        # `request: Request = None` is the overlay's own doing, not a defect.
+        f["overlay_artifact"] = (rel, f["line"]) in edited and f["code"] == "assignment"
+        f["pass"] = _OVERLAY_PASS
+        result["findings"].append(f)
+    result["ran"] = True
+    return result
+
+
 def analyze(
     target: str,
     *,
@@ -1371,8 +1609,22 @@ def analyze(
     unused_ignores_pass: bool = True,
     untyped_defs_pass: bool = True,
     silenced_imports_pass: bool = True,
+    extra_passes: list[str] | None = None,
+    cache_dir: str | None = None,
+    boundary_map: dict[str, str] | list[dict] | None = None,
+    boundary_stubs: str | None = None,
+    boundary_flags: list[str] | None = None,
 ) -> dict:
     """Run mypy over *target*, plus labelled extra passes.
+
+    *extra_passes* adds one labelled pass per mypy flag, reported like the
+    built-in ones. *cache_dir* replaces the private temporary cache (kept
+    afterwards, so later runs reuse it; never inside the reviewed project).
+    *boundary_map* runs the opt-in typed-boundary overlay: see
+    `apply_boundary_overlay`; *boundary_stubs* is a stub directory for it,
+    and *boundary_flags* extra mypy flags for it (``--check-untyped-defs``:
+    what a labelled pass with the same flags finds is subtracted, so the
+    overlay reports only what the annotations expose).
 
     The passes are ``--disallow-any-unimported`` (phantom imports),
     ``--warn-unreachable`` (code a wrong annotation has silently removed from
@@ -1409,9 +1661,29 @@ def analyze(
         }
 
     config = find_mypy_config(project_root)
+    extra, rejected = validate_extra_passes(extra_passes or [])
+    overlay_flags, rejected_overlay = validate_extra_passes(boundary_flags or [])
+    rejected += [{**r, "for": _OVERLAY_PASS} for r in rejected_overlay]
     # mypy's cache goes to a private temporary directory, never the reviewed
-    # project or the caller's cwd, and is removed however the run ends.
-    cache_root = tempfile.mkdtemp(prefix="crt-mypy-cache-")
+    # project or the caller's cwd, and is removed however the run ends -- or
+    # to the caller's own --cache-dir, which is kept.
+    keep_cache = cache_dir is not None
+    if keep_cache:
+        cache_path = Path(cache_dir).expanduser().resolve()
+        if cache_path == project_root or project_root in cache_path.parents:
+            return {
+                **envelope,
+                "status": "FAILED",
+                "error": (
+                    f"cache dir {cache_path} is inside the reviewed project; "
+                    "a review must not write there"
+                ),
+                "findings": [],
+            }
+        cache_path.mkdir(parents=True, exist_ok=True)
+        cache_root = str(cache_path)
+    else:
+        cache_root = tempfile.mkdtemp(prefix="crt-mypy-cache-")
     try:
         return _analyze_with_cache(
             mypy_bin=mypy_bin,
@@ -1430,9 +1702,23 @@ def analyze(
             mypy_python=mypy_python_info(mypy_bin, config),
             untyped_defs=_count_untyped_defs(files[:max_files] if capped else files),
             cache_root=cache_root,
+            extra_passes=extra,
+            rejected_passes=rejected,
+            overlay=(
+                None
+                if boundary_map is None
+                else (
+                    boundary_map,
+                    files[:max_files] if capped else files,
+                    boundary_stubs,
+                    [flag for _, flag in overlay_flags],
+                )
+            ),
+            cache_kept=keep_cache,
         )
     finally:
-        shutil.rmtree(cache_root, ignore_errors=True)
+        if not keep_cache:
+            shutil.rmtree(cache_root, ignore_errors=True)
 
 
 def _analyze_with_cache(
@@ -1447,6 +1733,10 @@ def _analyze_with_cache(
     cache_root: str,
     untyped_defs: int | None = None,
     mypy_python: dict | None = None,
+    extra_passes: list[tuple[str, str]] | None = None,
+    rejected_passes: list[dict] | None = None,
+    overlay: tuple | None = None,
+    cache_kept: bool = False,
 ) -> dict:
     stdout, stderr, returncode = _run_mypy(
         mypy_bin, targets, config, cap_flags, os.path.join(cache_root, "baseline")
@@ -1510,6 +1800,13 @@ def _analyze_with_cache(
     untyped_checked = config_enables(config, "check_untyped_defs")
     if untyped_checked:
         wanted.pop("check-untyped-defs", None)
+    extra_names: dict[str, str] = {}
+    if status == "OK":
+        for label, flag in extra_passes or []:
+            if label in wanted or label in passes:
+                continue  # a built-in pass already covers this flag
+            extra_names["extra:" + label] = label
+            wanted["extra:" + label] = ([flag], config)
     baseline = {_finding_key(f) for f in findings}
     labelled: dict[str, dict] = {}
     if wanted:
@@ -1522,12 +1819,57 @@ def _analyze_with_cache(
                     pass_config,
                     [*cap_flags, *flags],
                     name,
-                    os.path.join(cache_root, name),
+                    os.path.join(cache_root, _pass_dir(name)),
                     baseline,
                 )
                 for name, (flags, pass_config) in wanted.items()
             }
             labelled = {name: fut.result() for name, fut in futures.items()}
+
+    overlay_result = None
+    if overlay is not None:
+        if status != "OK":
+            overlay_result = {
+                "ran": False,
+                "error": "not run: the baseline run failed",
+                "findings": [],
+                "sites_annotated": [],
+                "unmatched": [],
+            }
+        else:
+            overlay_map, overlay_files, overlay_stubs, overlay_extra = overlay
+            # What a labelled pass with a subset of the overlay's flags found
+            # is the flags' doing, not the annotations'.
+            known = set(baseline)
+            for name, (flags, pass_config) in wanted.items():
+                result = labelled.get(name)
+                if (
+                    result
+                    and result["ran"]
+                    and pass_config == config
+                    and flags
+                    and set(flags) <= set(overlay_extra)
+                ):
+                    known |= {_finding_key(f) for f in result["findings"]}
+            overlay_result = _overlay_pass(
+                mypy_bin,
+                Path(envelope["project_root"]),
+                overlay_files,
+                targets,
+                config,
+                [*cap_flags, *overlay_extra],
+                os.path.join(cache_root, _OVERLAY_PASS),
+                known,
+                overlay_map,
+                overlay_stubs,
+            )
+        labelled[_OVERLAY_PASS] = overlay_result
+    extra_findings = [
+        f
+        for name in extra_names
+        if labelled.get(name, {}).get("ran")
+        for f in labelled[name]["findings"]
+    ]
 
     def pass_findings(name: str, code: str | None = None) -> list[dict] | None:
         result = labelled.get(name)
@@ -1762,6 +2104,39 @@ def _analyze_with_cache(
             # interpreter could not be asked -- see stale_stub_packages_reason.
             "stale_stub_packages": (None if stale_stubs is None else len(stale_stubs)),
             "stale_stub_packages_reason": stale_stubs_reason,
+            # Passes the caller added (extra_passes): label -> findings added,
+            # null when the pass failed; rejected flags with the reason.
+            "extra_passes": {
+                label: len(labelled[name]["findings"])
+                if labelled.get(name, {}).get("ran")
+                else None
+                for name, label in extra_names.items()
+            },
+            "extra_passes_rejected": rejected_passes or [],
+            # The opt-in typed-boundary overlay: what was annotated, and the
+            # errors mypy reports once it is (overlay_artifact marks errors the
+            # annotation itself causes, such as a None default). null if it
+            # did not run.
+            "boundary_overlay": (
+                None
+                if overlay_result is None
+                else {
+                    "ran": overlay_result["ran"],
+                    "error": overlay_result["error"],
+                    "sites_annotated": len(overlay_result["sites_annotated"]),
+                    "unmatched": overlay_result["unmatched"],
+                    "added": (
+                        sum(
+                            1
+                            for f in overlay_result["findings"]
+                            if not f["overlay_artifact"]
+                        )
+                        if overlay_result["ran"]
+                        else None
+                    ),
+                }
+            ),
+            "cache_dir_kept": cache_kept,
             "strict_pass_ran": phantom_imports is not None,
             "labelled_passes": {
                 name: {
@@ -1781,6 +2156,10 @@ def _analyze_with_cache(
         "untyped_body_findings": untyped_body or [],
         "silenced_import_findings": silenced or [],
         "stale_stub_packages": stale_stubs or [],
+        # One list for every pass added with extra_passes (`pass` names it).
+        "extra_pass_findings": extra_findings,
+        "boundary_overlay_findings": (overlay_result or {}).get("findings", []),
+        "boundary_overlay_sites": (overlay_result or {}).get("sites_annotated", []),
         # Notes that belong to no error: `annotation-unchecked` (an annotated
         # variable inside an untyped function body mypy skips), reveal_type.
         "standalone_notes": standalone_notes,

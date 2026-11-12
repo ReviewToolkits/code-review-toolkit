@@ -93,6 +93,8 @@ _FINDING_LISTS: dict[str, dict[str, _Key]] = {
         "dependency_drift_findings": ("file", "code"),
         "silenced_import_findings": ("file", "module"),
         "stale_stub_packages": ("stub_distribution", "module"),
+        "extra_pass_findings": ("pass", "file", "code"),
+        "boundary_overlay_findings": ("file", "code"),
     },
     "check_known_findings": {
         "findings": ("id", "shape"),
@@ -166,7 +168,9 @@ _INVENTORY_LISTS: dict[str, frozenset[str]] = {
     "run_external_tools": frozenset(
         {"tools_run", "tools_skipped", "configured_but_not_installed"}
     ),
-    "check_typing": frozenset({"line_groups", "standalone_notes"}),
+    "check_typing": frozenset(
+        {"line_groups", "standalone_notes", "boundary_overlay_sites"}
+    ),
     "count_types": frozenset({"alias_inventory"}),
     "extract_test_invariants": frozenset({"bug_fix_tests"}),
     "correlate_tests": frozenset({"source_coverage"}),

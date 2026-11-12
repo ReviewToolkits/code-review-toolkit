@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -24,7 +25,8 @@ if args == ["--version"]:
     print("mypy 9.9.9 (compiled: no)")
     sys.exit(0)
 with open(os.environ["FAKE_MYPY_LOG"], "a") as log:
-    log.write(json.dumps({{"argv": args, "cwd": os.getcwd()}}) + "\\n")
+    log.write(json.dumps({{"argv": args, "cwd": os.getcwd(),
+                           "mypypath": os.environ.get("MYPYPATH")}}) + "\\n")
 cache = args[args.index("--cache-dir") + 1] if "--cache-dir" in args else ".mypy_cache"
 os.makedirs(cache, exist_ok=True)
 with open(os.path.join(cache, "marker"), "w") as fh:
@@ -35,10 +37,13 @@ key = ""
 if "--config-file" in args and "ignore-missing-imports-off" in args[args.index("--config-file") + 1]:
     key = "silenced"
 for flag in ("--disallow-any-unimported", "--warn-unreachable", "--warn-unused-ignores",
-             "--check-untyped-defs"):
+             "--check-untyped-defs", *[k for k in responses if k.startswith("--")]):
     if flag in args:
         key = flag
+if any("boundary-overlay" in a for a in args):
+    key = "overlay"
 out = responses.get(key, responses.get("", ""))
+out = out.replace("{{TARGET_REL}}", os.path.relpath(args[-1]))
 sys.stdout.write(out)
 sys.exit(1 if ": error:" in out else 0)
 """
@@ -879,6 +884,236 @@ class TestStaleStubPackages(unittest.TestCase):
         self.assertEqual(
             result["summary"]["stale_stub_packages"], len(result["stale_stub_packages"])
         )
+
+
+class TestExtraPassesAndCacheDir(unittest.TestCase):
+    """There was no way to add a labelled mypy pass or to choose (and keep)
+    the cache directory."""
+
+    _EXTRA = "pkg/m.py:2: error: Item None has no attribute  [union-attr]\n"
+
+    def test_extra_pass_is_labelled_and_diffed_against_the_baseline(self):
+        result, flags_seen = _run(
+            _PKG,
+            {
+                "": _BASE_ERR + _ONE_ERROR,
+                "--strict-optional": _BASE_ERR + self._EXTRA + _TWO_ERRORS,
+            },
+            extra_passes=["--strict-optional"],
+        )
+        extra = result["extra_pass_findings"]
+        self.assertEqual([f["pass"] for f in extra], ["extra:strict-optional"])
+        self.assertEqual(extra[0]["code"], "union-attr")
+        self.assertEqual(result["summary"]["extra_passes"], {"strict-optional": 1})
+        self.assertEqual(result["summary"]["total"], 1)
+        self.assertEqual(sum("--strict-optional" in f for f in flags_seen), 1)
+
+    def test_bad_and_duplicate_flags(self):
+        result, flags_seen = _run(
+            _PKG,
+            {"": _BASE_ERR + _ONE_ERROR},
+            extra_passes=["--config-file=x.ini", "strict", "--warn-unreachable"],
+        )
+        self.assertEqual(
+            [r["flag"] for r in result["summary"]["extra_passes_rejected"]],
+            ["--config-file=x.ini", "strict"],
+        )
+        # Already a built-in labelled pass: run once, not twice.
+        self.assertEqual(sum("--warn-unreachable" in f for f in flags_seen), 1)
+        self.assertEqual(result["summary"]["extra_passes"], {})
+
+    def test_cache_dir_is_used_and_kept(self):
+        with tempfile.TemporaryDirectory() as cache:
+            with TempProject(_PKG) as root, FakeMypy(_CLEAN_RUN) as fake:
+                result = mod.analyze(
+                    str(root / "pkg"), mypy_bin=str(fake.bin), cache_dir=cache
+                )
+                dirs = [
+                    c["argv"][c["argv"].index("--cache-dir") + 1] for c in fake.calls()
+                ]
+            self.assertTrue(all(d.startswith(cache) for d in dirs))
+            self.assertTrue(any(Path(cache).iterdir()))
+            self.assertTrue(result["summary"]["cache_dir_kept"])
+
+    def test_cache_dir_inside_the_project_is_refused(self):
+        with TempProject(_PKG) as root, FakeMypy(_CLEAN_RUN) as fake:
+            result = mod.analyze(
+                str(root / "pkg"), mypy_bin=str(fake.bin), cache_dir=str(root / "c")
+            )
+            self.assertEqual(result["status"], "FAILED")
+            self.assertFalse((root / "c").exists())
+            self.assertEqual(fake.calls(), [])
+
+
+_BOUNDARY_SRC = (
+    "def view(request, x=1):\n"  # 1
+    "    return request.missing\n"  # 2
+    "def typed(request: int):\n"  # 3
+    "    return request\n"  # 4
+    "async def handler(ctx, request=None):\n"  # 5
+    "    return ctx\n"  # 6
+)
+
+
+class TestBoundaryOverlay(unittest.TestCase):
+    """The typed-boundary overlay (annotate request parameters in an export,
+    re-run mypy, read what it adds) was a manual recipe."""
+
+    def test_bare_parameters_are_annotated_without_moving_lines(self):
+        with TempProject({"pkg/__init__.py": "", "pkg/v.py": _BOUNDARY_SRC}) as root:
+            export = root.parent / (root.name + "-export")
+            try:
+                mod._export_tree(root, export)
+                applied = mod.apply_boundary_overlay(
+                    export,
+                    root,
+                    [root / "pkg/v.py"],
+                    {"request": "web.req.Request", "nobody": "x.Y"},
+                )
+                lines = (export / "pkg/v.py").read_text().splitlines()
+            finally:
+                shutil.rmtree(export, ignore_errors=True)
+        self.assertEqual(
+            [(e["line"], e["param"]) for e in applied["sites_annotated"]],
+            [(1, "request"), (5, "request")],
+        )
+        self.assertEqual(lines[0], 'def view(request: "_crt_boundary_0.Request", x=1):')
+        self.assertEqual(
+            lines[4], 'async def handler(ctx, request: "_crt_boundary_0.Request"=None):'
+        )
+        self.assertEqual(lines[2], "def typed(request: int):")
+        self.assertEqual(len(lines), 7)
+        self.assertEqual(
+            lines[6], "import web.req as _crt_boundary_0  # crt boundary overlay"
+        )
+        self.assertEqual(applied["unmatched"], ["nobody"])
+
+    def test_explicit_sites_from_untyped_boundaries(self):
+        with TempProject({"pkg/__init__.py": "", "pkg/v.py": _BOUNDARY_SRC}) as root:
+            export = root.parent / (root.name + "-export")
+            try:
+                mod._export_tree(root, export)
+                applied = mod.apply_boundary_overlay(
+                    export,
+                    root,
+                    [root / "pkg/v.py"],
+                    [
+                        {
+                            "file": "pkg/v.py",
+                            "line": 5,
+                            "param": "ctx",
+                            "annotation": "a.Ctx",
+                        }
+                    ],
+                )
+            finally:
+                shutil.rmtree(export, ignore_errors=True)
+        self.assertEqual(
+            [(e["line"], e["param"], e["type"]) for e in applied["sites_annotated"]],
+            [(5, "ctx", "a.Ctx")],
+        )
+
+    def test_overlay_pass_reports_what_the_annotation_exposes(self):
+        files = {"pkg/__init__.py": "", "pkg/m.py": _BOUNDARY_SRC}
+        exposed = (
+            'pkg/m.py:2: error: "Request" has no attribute "missing"  [attr-defined]\n'
+        )
+        artifact = (
+            "pkg/m.py:5: error: Incompatible default for argument "
+            '"request"  [assignment]\n'
+        )
+        with (
+            TempProject(files) as root,
+            FakeMypy(
+                {
+                    "": _CLEAN_RUN[""],
+                    "overlay": exposed + artifact + _TWO_ERRORS,
+                }
+            ) as fake,
+        ):
+            result = mod.analyze(
+                str(root / "pkg"),
+                mypy_bin=str(fake.bin),
+                boundary_map={"request": "web.req.Request"},
+                boundary_stubs="/stubs/dir",
+            )
+            overlay_calls = [
+                c
+                for c in fake.calls()
+                if any("boundary-overlay" in a for a in c["argv"])
+            ]
+            # The reviewed tree is never edited.
+            self.assertEqual((root / "pkg/m.py").read_text(), _BOUNDARY_SRC)
+        self.assertEqual(len(overlay_calls), 1)
+        self.assertTrue(overlay_calls[0]["mypypath"].startswith("/stubs/dir"))
+        summary = result["summary"]["boundary_overlay"]
+        self.assertTrue(summary["ran"])
+        self.assertEqual(summary["sites_annotated"], 2)
+        self.assertEqual(summary["added"], 1)
+        found = result["boundary_overlay_findings"]
+        self.assertEqual([f["overlay_artifact"] for f in found], [False, True])
+        self.assertEqual(found[0]["pass"], "boundary-overlay")
+        self.assertEqual(result["summary"]["total"], 0)
+
+    def test_paths_under_the_callers_cwd_map_back_to_the_project(self):
+        files = {"pkg/__init__.py": "", "pkg/m.py": _BOUNDARY_SRC}
+        exposed = '{TARGET_REL}/m.py:2: error: "Request" has no attribute "x"  [attr-defined]\n'
+        with (
+            tempfile.TemporaryDirectory() as cwd,
+            TempProject(files) as root,
+            FakeMypy({"": _CLEAN_RUN[""], "overlay": exposed + _ONE_ERROR}) as fake,
+        ):
+            result = run_in(
+                cwd,
+                mod.analyze,
+                str(root / "pkg"),
+                mypy_bin=str(fake.bin),
+                cache_dir=str(Path(cwd) / "cache"),
+                boundary_map={"request": "web.req.Request"},
+            )
+            self.assertEqual(
+                result["boundary_overlay_findings"][0]["file"],
+                str((root / "pkg" / "m.py").resolve()),
+            )
+
+    def test_overlay_flags_subtract_the_matching_labelled_pass(self):
+        files = {"pkg/__init__.py": "", "pkg/m.py": _BOUNDARY_SRC}
+        body = "pkg/m.py:6: error: Unsupported operand  [operator]\n"
+        exposed = 'pkg/m.py:2: error: "Request" has no attribute "x"  [attr-defined]\n'
+        with (
+            TempProject(files) as root,
+            FakeMypy(
+                {
+                    "": _CLEAN_RUN[""],
+                    "--check-untyped-defs": body + _ONE_ERROR,
+                    "overlay": body + exposed + _TWO_ERRORS,
+                }
+            ) as fake,
+        ):
+            result = mod.analyze(
+                str(root / "pkg"),
+                mypy_bin=str(fake.bin),
+                boundary_map={"request": "web.req.Request"},
+                boundary_flags=["--check-untyped-defs", "--pretty"],
+            )
+            overlay_argv = next(
+                c["argv"]
+                for c in fake.calls()
+                if any("boundary-overlay" in a for a in c["argv"])
+            )
+        self.assertIn("--check-untyped-defs", overlay_argv)
+        self.assertNotIn("--pretty", overlay_argv)
+        self.assertEqual(
+            [f["code"] for f in result["boundary_overlay_findings"]], ["attr-defined"]
+        )
+        self.assertEqual(
+            result["summary"]["extra_passes_rejected"][0]["for"], "boundary-overlay"
+        )
+
+    def test_not_requested_is_null(self):
+        result, _ = _run(_PKG, {"": _BASE_ERR + _ONE_ERROR})
+        self.assertIsNone(result["summary"]["boundary_overlay"])
+        self.assertEqual(result["boundary_overlay_findings"], [])
 
 
 class TestDeriveConfig(unittest.TestCase):
