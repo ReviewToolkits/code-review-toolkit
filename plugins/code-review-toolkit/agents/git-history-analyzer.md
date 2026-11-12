@@ -26,7 +26,8 @@ of explore), use that data directly — do NOT re-run
 run its raw JSON is at
 `<run_dir>/artifacts/git-history-context/analyze_history.json`: read
 `recent_fixes`, `recent_features`, `behavioural_non_code_commits`,
-`co_change_clusters` and `unmerged_branches` from there rather than
+`unknown_touching_source`, `co_change_clusters` and `unmerged_branches`
+from there rather than
 from the prose report. Only run the script yourself if neither the file
 nor the context output was provided, and then save its output to the
 same path.
@@ -65,7 +66,7 @@ This is the highest-value capability.
 **Sources.** A "fix" for this capability is any commit that changed how one place handles a case, not only a commit whose subject says fix. Take, in this order:
 
 1. A list the orchestrator or the caller supplied: commits, PRs or finding ids. Use it as given.
-2. `recent_fixes`.
+2. `recent_fixes`, then the fixes git-history-context found by hand in `unknown_touching_source` (commits the subject-only classifier could not type).
 3. `feat:`, `refactor:` and `docs:` commits that changed **one of several parallel paths**: one handler of a family, one backend of several, one sync/async twin, one of the per-format encoders. A feature that adds validation to one path is a fix for the paths it skipped. Look in `recent_features`, `recent_refactors` and `behavioural_non_code_commits.flagged` (docs or chore commits that changed code). On one validation project these were the most productive sources, and a keyword grep for `fix|race|leak` finds none of them.
 4. Older fixes, read on the **re-introduction** axis (step 5 below).
 
@@ -84,6 +85,14 @@ For each source:
    - Same function call patterns without the same guard
    - Same data flow patterns without the same validation
    - Same resource usage without the same cleanup
+
+   Start with the mechanical sweep, then search by hand for what it cannot see:
+
+   ```bash
+   python3 <plugin_root>/scripts/sweep_fix_pattern.py [scope] --commit <sha> > "$d/sweep-<sha>.json"
+   ```
+
+   Each entry of `removed_forms` is a statement or condition the fix removed or rewrote (`code`, `file`, `line`), with `matches`: every place in the current tree that still has the same form, variable names aside (`function`, `code`; `same_file` marks the fixed file, the likeliest miss; `matches_total` past the cap of 30). Read each match: one that lacks the fix's change for a reason that applies there too is a propagation gap. A fix that only added code (a new guard before an unchanged call) has no removed form, and the `notes` say so: sweep for the guarded call by hand.
 
 3. Prioritize by module relationship:
    - **Same module**: Highest priority — if the fix was in runner.py, check other functions in runner.py first
@@ -161,7 +170,7 @@ python3 <plugin_root>/scripts/annotate_findings.py [scope] --findings "$d/findin
 ```
 
 Per finding it reports:
-- `introduced_by`: the newest change to those lines that is not layout only, from `git log -L`, which follows renames. Re-indents, re-wraps and comment edits are skipped and listed in `skipped_layout_only`.
+- `introduced_by`: the newest change to those lines that is not layout only, from `git log -L`, which follows renames. Re-indents, re-wraps and comment edits are skipped and listed in `skipped_layout_only`; commits listed in the repository's `.git-blame-ignore-revs` (mass reformats) are skipped and listed in `skipped_ignore_revs` (`blame_ignore_revs` names the file, null when there is none); merge commits are never candidates. `bulk: true` (with `bulk_reasons`) marks an empty-subject, very large or sizeable first commit (an import, a squash, a code move): the lines arrived there, so write "introduced at or before <commit>", never "introduced by".
 - `blame` (`git blame -w -C -C`) as a cross-check.
 - `pickaxe`, when you gave a `pattern`.
 - `first_release`: the first tag matching `--release-pattern`.

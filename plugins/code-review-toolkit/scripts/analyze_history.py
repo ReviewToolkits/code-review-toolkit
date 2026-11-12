@@ -90,6 +90,7 @@ CLASSIFICATION_RULES: list[tuple[str, list[str]]] = [
             "leak(?:s|ed|ing)?",
             "races?",
             "segfaults?",
+            "deadlocks?",
             "fail(?:s|ed|ing|ure|ures)?",
         ],
     ),
@@ -210,7 +211,21 @@ _TYPE_WORDS: dict[str, str] = {
 }
 
 # The scope may be left unclosed (`feat(api: ...`): the type is still stated.
-_CONVENTIONAL_RE = re.compile(r"^\s*([A-Za-z]+)(?:\([^)]*\)?)?!?:\s")
+_CONVENTIONAL_RE = re.compile(r"^\s*([A-Za-z]+)(?:\(([^)]*)\)?)?!?:\s")
+
+# A `fix` whose scope names docs, styling or translations fixes no behaviour of
+# the program: `fix(docs): correct the install command`, `fix(style): align the footer`.
+# On a validation project they were counted as fixes and crowded real fixes
+# out of recent_fixes.
+_DOC_SCOPE_WORDS = "docs doc documentation readme changelog typo typos blog"
+_CHORE_SCOPE_WORDS = (
+    "style styles css scss sass less theme i18n l10n translation translations "
+    "locale locales"
+)
+_NON_CODE_FIX_SCOPES: dict[str, str] = {
+    **dict.fromkeys(_DOC_SCOPE_WORDS.split(), "docs"),
+    **dict.fromkeys(_CHORE_SCOPE_WORDS.split(), "chore"),
+}
 _LEADING_TAGS_RE = re.compile(r"^\s*((?:\[[^\[\]\n]+\]\s*)+)")
 _TAG_RE = re.compile(r"\[([^\[\]]+)\]")
 # Tracker keys: `ABC-123` (Jira style) or a single capital followed by digits,
@@ -279,6 +294,44 @@ _LEADING_VERBS: dict[str, str] = {
     for category, verbs in _VERBS_BY_TYPE.items()
     for verb in verbs.split()
 }
+# Hardening subjects state a fix as the rule now enforced: "Reject invites that
+# end before they start", "Require a confirmed calendar before sharing it",
+# "Verify the rule before expanding it". None names a bug, so on a
+# validation project many real fixes were left `unknown` and missing from
+# recent_fixes. They are a weaker signal than "fix" (source `hardening`), and
+# yield to the tie-breaks below.
+_HARDENING_VERB_WORDS = (
+    "reject rejects require requires restore restores validate validates "
+    "verify verifies ensure ensures guard guards disallow disallows enforce "
+    "enforces pin pins escape escapes forbid forbids sanitize sanitizes "
+    "sanitise sanitises harden hardens deny denies handle handles never"
+)
+_HARDENING_VERBS = frozenset(_HARDENING_VERB_WORDS.split())
+# Past tenses are left out: "Verified-sender icon in the inbox" and "Pinned projects
+# list" open with an adjective, not a verb.
+_DEPENDENCY_VERBS = frozenset(("pin", "pins", "require", "requires"))
+# "Don't drop the cache on reload", "Do not retry a rejected payment".
+_NEGATED_IMPERATIVE_RE = re.compile(r"^(?:don'?t|do\s+not)\b", re.IGNORECASE)
+# "Keep the sync cursor across reconnects": keeping state through an event is
+# a fix; "Keep a changelog" is not.
+_KEEP_WHEN_RE = re.compile(
+    r"^keeps?\b.*\b(?:when|across|after|during|if|until|while|between)\b",
+    re.IGNORECASE,
+)
+# Tie-breaks for a hardening verb. "Handle the new export format" and "Validate
+# the new --strict option" add capability; "Pin pytest to 8.2" and "Require
+# Python 3.10" are dependency chores; "Ensure the tests pass on Windows" is
+# test or CI work, left to the keyword fallback.
+_HARDENING_FEATURE_RE = re.compile(
+    r"\b(?:new(?!\s*lines?\b)|support|options?|flags?|features?|settings?"
+    r"|configurable)\b",
+    re.IGNORECASE,
+)
+_DEPENDENCY_WORDS_RE = re.compile(r"\b(?:dependenc(?:y|ies)|deps)\b", re.IGNORECASE)
+_VERSION_RE = re.compile(r"\b\d+(?:\.\d+)+\b|[<>=~!]=\s*\d|[<>]\s*\d")
+_HARDENING_SKIP_RE = re.compile(
+    r"\b(?:tests?|ci|workflows?|pipelines?|builds?)\b", re.IGNORECASE
+)
 _EXPLICIT_FIX_RE = re.compile(
     r"\b(?:fix(?:es|ed|ing)?|bugs?|bugfix(?:es)?|hotfix(?:es)?|crash(?:es|ed|ing)?"
     r"|regressions?|segfaults?|leak(?:s|ed|ing)?)\b",
@@ -304,6 +357,33 @@ def _leading_verb_type(subject: str) -> str | None:
     if category == "feature" and _EXPLICIT_FIX_RE.search(subject):
         return "fix"
     return category
+
+
+def _hardening_type(subject: str) -> str | None:
+    """The type of a hardening subject ("Reject X when Y"), or None.
+
+    Returns "fix", or "feature"/"chore" when a tie-break overrides the verb,
+    or None when the subject does not open with a hardening verb.
+    """
+    stripped = subject.strip()
+    words = re.findall(r"[A-Za-z][\w-]*", stripped[:80])
+    if not words:
+        return None
+    if not (
+        words[0].lower() in _HARDENING_VERBS
+        or _NEGATED_IMPERATIVE_RE.match(stripped)
+        or _KEEP_WHEN_RE.match(stripped)
+    ):
+        return None
+    if _HARDENING_SKIP_RE.search(stripped):
+        return None
+    if _DEPENDENCY_WORDS_RE.search(stripped) or (
+        words[0].lower() in _DEPENDENCY_VERBS and _VERSION_RE.search(stripped)
+    ):
+        return "chore"
+    if _HARDENING_FEATURE_RE.search(stripped):
+        return "feature"
+    return "fix"
 
 
 # Precedence when one commit carries several typed signals of equal rank.
@@ -409,9 +489,12 @@ def classify_commit_detail(
     leading bracketed tag that names a type (`[fix][cli] ...`), a tracker key
     mapped by `key_types` (`... (K7)` with `K=fix`, or the whole key `K7=fix`),
     a strong word (`docstrings`, `flake8`, "add tests"), the subject's leading
-    verb, and last a word-boundary keyword match. Returns
-    {"type", "source", "tags", "keys"}; source is one of conventional / tag /
-    key / strong / verb / keyword / None.
+    verb, a leading hardening verb ("Reject X when Y"), and last a
+    word-boundary keyword match. Returns {"type", "source", "tags", "keys"};
+    source is one of conventional / tag / key / strong / verb / hardening /
+    keyword / None. A conventional `fix` whose scope names docs, styling or
+    translations (`fix(docs): ...`) is reclassified as docs or chore, and the
+    result then also carries `demoted_from: "fix"` and `demoted_by: "scope"`.
     """
     tags: list[str] = []
     tag_match = _LEADING_TAGS_RE.match(message)
@@ -424,6 +507,11 @@ def classify_commit_detail(
     conv = _CONVENTIONAL_RE.match(message)
     if conv and conv.group(1).lower() in _TYPE_WORDS:
         detail.update(type=_TYPE_WORDS[conv.group(1).lower()], source="conventional")
+        scope = (conv.group(2) or "").strip().lower()
+        if detail["type"] == "fix" and scope in _NON_CODE_FIX_SCOPES:
+            detail.update(
+                type=_NON_CODE_FIX_SCOPES[scope], demoted_from="fix", demoted_by="scope"
+            )
         return detail
     tag_type = _best_type(_TYPE_WORDS.get(t, "") for t in tags)
     if tag_type:
@@ -448,6 +536,10 @@ def classify_commit_detail(
     verb_type = _leading_verb_type(rest)
     if verb_type:
         detail.update(type=verb_type, source="verb")
+        return detail
+    hardening = _hardening_type(rest)
+    if hardening:
+        detail.update(type=hardening, source="hardening")
         return detail
     for category, pattern in _KEYWORD_RES:
         if pattern.search(message):
@@ -617,6 +709,14 @@ def parse_git_log(
                 "type": detail["type"],
                 "type_source": detail["source"],
                 "keys": detail["keys"],
+                **(
+                    {
+                        "demoted_from": detail["demoted_from"],
+                        "demoted_by": detail["demoted_by"],
+                    }
+                    if "demoted_from" in detail
+                    else {}
+                ),
                 # Paths as they were at this commit (what `git show` needs).
                 "files": [],
                 # The same files under their newest name, following renames.
@@ -673,6 +773,9 @@ def parse_git_log(
     if current_commit is not None and commit_count <= max_commits:
         commits.append(current_commit)
 
+    for commit in commits:
+        demote_non_code_fix(commit)
+
     # Build file_stats list.
     head_files = _files_at_head(project_root) if project_root is not None else None
     file_stats: list[dict] = []
@@ -709,6 +812,72 @@ def parse_git_log(
     # Sort by commits descending.
     file_stats.sort(key=lambda x: x["commits"], reverse=True)
     return commits, file_stats
+
+
+# Files that carry no program behaviour: prose, stylesheets, translation
+# catalogs, images and fonts. Templates and JavaScript are code and stay out.
+_DOC_SUFFIXES = frozenset((".md", ".markdown", ".rst", ".txt", ".adoc"))
+_NON_DOC_ASSET_SUFFIXES = (
+    ".css .scss .sass .less .styl .po .pot .mo .png .jpg .jpeg .gif .svg .ico "
+    ".webp .woff .woff2 .ttf .otf .eot"
+)
+_NON_CODE_SUFFIXES = _DOC_SUFFIXES | frozenset(_NON_DOC_ASSET_SUFFIXES.split())
+
+
+def demote_non_code_fix(commit: dict) -> bool:
+    """Reclassify a `fix` whose in-scope files are all non-code as docs/chore.
+
+    "Fix the header colour in dark mode" touching one stylesheet, or "Fix
+    the French plural forms" touching only `.po` catalogs, fixes nothing a
+    code review can propagate. The commit keeps its `type_source` and gains
+    `demoted_from` and `demoted_by: "files"`. A commit with no listed files is left alone: no
+    evidence. Returns whether the commit was changed.
+    """
+    files = commit.get("files") or []
+    if commit.get("type") != "fix" or not files:
+        return False
+    suffixes = [Path(f).suffix.lower() for f in files]
+    if not all(s in _NON_CODE_SUFFIXES for s in suffixes):
+        return False
+    commit["type"] = "docs" if all(s in _DOC_SUFFIXES for s in suffixes) else "chore"
+    commit["demoted_from"] = "fix"
+    commit["demoted_by"] = "files"
+    return True
+
+
+_MAX_UNKNOWN_LISTED = 50
+
+
+def unknown_touching_source(
+    commits: list[dict], limit: int = _MAX_UNKNOWN_LISTED
+) -> dict:
+    """The `unknown` commits that change Python files, for hand triage.
+
+    The classifier reads subjects only. A fix worded as neither a fix nor a
+    hardening rule ("Make the scheduler honour quiet hours") stays
+    `unknown`, and is then missing from recent_fixes and from every fix-based
+    count. These are the commits to read by hand before quoting a ratio.
+    """
+    listed: list[dict] = []
+    total = 0
+    for commit in commits:
+        if commit.get("type") != "unknown":
+            continue
+        py_files = [f for f in commit.get("files", []) if f.endswith(".py")]
+        if not py_files:
+            continue
+        total += 1
+        if len(listed) < limit:
+            listed.append(
+                {
+                    "commit_short": commit["hash"][:7],
+                    "date": commit["date"],
+                    "message": commit["message"],
+                    "python_files": py_files[:10],
+                    "python_files_total": len(py_files),
+                }
+            )
+    return {"total": total, "commits": listed, "truncated": total > len(listed)}
 
 
 def _files_at_head(project_root: Path) -> set[str] | None:
@@ -1654,6 +1823,226 @@ def _default_branch(git_root: Path) -> str | None:
     return None
 
 
+_MAX_SQUASH_SCAN = 500
+_MAX_OMITTED_LISTED = 200
+
+
+def _split_diff_by_file(diff_text: str) -> list[tuple[str, str]]:
+    """[(path, chunk)] for each file section of a unified diff.
+
+    The path is the new name (`+++ b/...`), or the old one for a deletion.
+    Sections with no text change (mode-only, binary) are skipped.
+    """
+    sections: list[list[str]] = []
+    for line in diff_text.splitlines(keepends=True):
+        if line.startswith("diff --git ") or not sections:
+            sections.append([])
+        sections[-1].append(line)
+    result = []
+    for lines in sections:
+        new = old = None
+        for line in lines:
+            if line.startswith("+++ b/"):
+                new = line[6:].rstrip("\n")
+            elif line.startswith("--- a/"):
+                old = line[6:].rstrip("\n")
+            elif line.startswith("@@"):
+                break
+        path = new or old
+        if path:
+            result.append((path, "".join(lines)))
+    return result
+
+
+class SquashDetector:
+    """Says whether a branch's combined change already landed on base.
+
+    A squash merge lands a branch as one commit, so the per-commit patch ids
+    of `--cherry-mark` never match it, and the branch keeps looking like
+    unmerged work. Read-only checks, against the branch's combined diff
+    (merge-base to tip):
+
+    - `files-identical`: every file the branch changes is identical at base's
+      tip (blob ids compare equal), so base already has the branch's version.
+    - `patch-id`: one base commit made after the branch's last commit carries,
+      file by file, the same patch (`git patch-id --stable`, which ignores
+      line numbers and whitespace) for every file the branch changes. This
+      names the squash commit; extra files in it (a regenerated catalog) do
+      not matter.
+
+    When only some files match one base commit, `partly_landed` names that
+    commit and the files: the branch was likely landed in another form, or
+    superseded. Compare before citing it as unmerged work.
+
+    Nothing is written to the repository. Base commits' patch ids are
+    computed once and shared across branches.
+    """
+
+    def __init__(self, git_root: Path, base: str, max_scan: int = _MAX_SQUASH_SCAN):
+        self.git_root = git_root
+        self.base = base
+        self.max_scan = max_scan
+        # Base commit sha -> {path: per-file patch id}.
+        self._file_pids: dict[str, dict[str, str]] = {}
+
+    def _patch_ids(self, chunks: list[tuple[str, str]]) -> list[str | None]:
+        """Per-chunk patch ids, from one `git patch-id` run."""
+        if not chunks:
+            return []
+        stream = "".join(
+            f"commit {i + 1:040x}\n\n{chunk}" for i, (_, chunk) in enumerate(chunks)
+        )
+        result = subprocess.run(
+            ["git", "patch-id", "--stable"],
+            cwd=str(self.git_root),
+            input=stream,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=_GIT_TIMEOUT,
+            check=False,
+        )
+        pids: list[str | None] = [None] * len(chunks)
+        if result.returncode != 0:
+            return pids
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) == 2:
+                index = int(fields[1], 16) - 1
+                if 0 <= index < len(chunks):
+                    pids[index] = fields[0]
+        return pids
+
+    def _load_base(self, shas: list[str]) -> None:
+        todo = [sha for sha in shas if sha not in self._file_pids]
+        if not todo:
+            return
+        for sha in todo:
+            self._file_pids[sha] = {}
+        shown = _run_git(
+            ["show", "--no-color", "--no-ext-diff", "--format=%x00%H", *todo],
+            self.git_root,
+            timeout=_GIT_TIMEOUT * 4,
+        )
+        if shown.returncode != 0:
+            return
+        owners: list[tuple[str, str]] = []
+        chunks: list[tuple[str, str]] = []
+        for block in shown.stdout.split("\x00")[1:]:
+            sha, _, diff_text = block.partition("\n")
+            for path, chunk in _split_diff_by_file(diff_text):
+                owners.append((sha.strip(), path))
+                chunks.append((path, chunk))
+        for (sha, path), pid in zip(owners, self._patch_ids(chunks)):
+            if pid:
+                self._file_pids.setdefault(sha, {})[path] = pid
+
+    def _files_identical(self, branch: str, files: list[str]) -> bool:
+        def blobs(ref: str) -> dict[str, str] | None:
+            out = _run_git(["ls-tree", "-z", ref, "--", *files], self.git_root)
+            if out.returncode != 0:
+                return None
+            entries = {}
+            for item in out.stdout.split("\x00"):
+                meta, _, path = item.partition("\t")
+                if path:
+                    entries[path] = meta.split()[-1]
+            return entries
+
+        at_branch, at_base = blobs(branch), blobs(self.base)
+        return at_branch is not None and at_branch == at_base
+
+    def check(self, branch: str) -> dict:
+        """{"squash_merged", "squash_evidence", "squash_commit", "partly_landed"}.
+
+        `squash_merged` is None when the checks could not run.
+        """
+        result: dict = {
+            "squash_merged": None,
+            "squash_evidence": None,
+            "squash_commit": None,
+            "partly_landed": None,
+        }
+        try:
+            mb = _run_git(["merge-base", self.base, branch], self.git_root)
+            if mb.returncode != 0 or not mb.stdout.strip():
+                return result
+            merge_base = mb.stdout.strip()
+            combined = _run_git(
+                [
+                    "diff",
+                    "--no-color",
+                    "--no-ext-diff",
+                    "--no-renames",
+                    merge_base,
+                    branch,
+                ],
+                self.git_root,
+            )
+            if combined.returncode != 0:
+                return result
+            sections = _split_diff_by_file(combined.stdout)
+            if not sections:
+                return result
+            files = [path for path, _ in sections]
+            if self._files_identical(branch, files):
+                result.update(squash_merged=True, squash_evidence="files-identical")
+                return result
+            branch_pids = dict(zip(files, self._patch_ids(sections)))
+            tip_date = _run_git(
+                ["log", "-1", "--format=%cI", branch], self.git_root
+            ).stdout.strip()
+            # The squash lands after the branch's last commit; a day of slack
+            # covers clock skew.
+            since = []
+            try:
+                when = datetime.fromisoformat(tip_date) - timedelta(days=1)
+                since = [f"--since={when.isoformat()}"]
+            except ValueError:
+                pass
+            listed = _run_git(
+                [
+                    "rev-list",
+                    "--no-merges",
+                    "--reverse",
+                    *since,
+                    f"{merge_base}..{self.base}",
+                ],
+                self.git_root,
+            )
+            if listed.returncode != 0:
+                return result
+            shas = listed.stdout.split()[: self.max_scan]
+            self._load_base(shas)
+        except subprocess.TimeoutExpired:
+            return result
+        best_sha, best = None, []
+        for sha in shas:
+            landed = self._file_pids.get(sha, {})
+            matched = [
+                f
+                for f in files
+                if branch_pids.get(f) and landed.get(f) == branch_pids[f]
+            ]
+            if len(matched) > len(best):
+                best_sha, best = sha, matched
+        result["squash_merged"] = False
+        if best_sha and len(best) == len(files):
+            result.update(
+                squash_merged=True,
+                squash_evidence="patch-id",
+                squash_commit=best_sha[:9],
+            )
+        elif best_sha:
+            result["partly_landed"] = {
+                "commit": best_sha[:9],
+                "files_matched": best[:_MAX_UNMERGED_FILES],
+                "files_matched_total": len(best),
+                "files_total": len(files),
+            }
+        return result
+
+
 def find_unmerged_branches(
     git_root: Path,
     rel_scope: str = ".",
@@ -1711,8 +2100,10 @@ def find_unmerged_branches(
     scope_args = ["--", rel_scope] if rel_scope != "." else []
     branches: list[dict] = []
     examined = 0
+    squash = SquashDetector(git_root, base)
+    live = 0  # unmerged branches not already squash-merged: what the cap counts
     for name, date in candidates:
-        if len(branches) >= max_branches or _check_script_timeout():
+        if live >= max_branches or _check_script_timeout():
             break
         examined += 1
         try:
@@ -1779,9 +2170,16 @@ def find_unmerged_branches(
         changed = (
             [f for f in files.stdout.splitlines() if f] if files.returncode == 0 else []
         )
+        squashed = squash.check(name)
+        if not squashed["squash_merged"]:
+            live += 1
         branches.append(
             {
                 "branch": name,
+                # True: the branch's combined change is already on base (a
+                # squash merge, or the same files landed another way), so it
+                # is not unmerged work even though `ahead` > 0.
+                **squashed,
                 # Raw commit count (`rev-list base..branch`). A branch rebased
                 # or cherry-picked onto base still counts every copy here;
                 # `ahead_patch_unique` is the work base does not have.
@@ -1804,20 +2202,31 @@ def find_unmerged_branches(
                 "files_in_scope": changed[:_MAX_UNMERGED_FILES],
             }
         )
+    omitted = [name for name, _ in candidates[examined:]]
     return {
         "available": True,
         "base": base,
         "remote_branches_total": len(candidates),
         "remote_branches_examined": examined,
         "unmerged_count": len(branches),
+        "squash_merged_count": sum(1 for b in branches if b["squash_merged"]),
         "truncated": examined < len(candidates),
+        # Branches are examined newest first (by last commit date), and the
+        # listing stops after `max_branches` unmerged ones that are not
+        # squash-merged, or at the script timeout. The rest are named here, unexamined: they may or may not
+        # be merged.
+        "max_branches": max_branches,
+        "omitted_branches": omitted[:_MAX_OMITTED_LISTED],
+        "omitted_branches_total": len(omitted),
         "note": (
             "Commits on remote branches that are not in the base branch, as "
             "of the last fetch (this script never fetches). Treat them as "
             "prior art: a finding may already be fixed, or attempted, there. "
             "A commit with patch_in_base true is a copy of a commit base "
             "already has (cherry-pick or rebase), so it is not unmerged work; "
-            "`ahead_patch_unique` counts the rest."
+            "`ahead_patch_unique` counts the rest. A branch with "
+            "squash_merged true already landed as a whole (squash merge): "
+            "compare only what it gained after `squash_commit`, if anything."
         ),
         "branches": branches,
     }
@@ -1949,6 +2358,31 @@ def filter_log_lines(lines: Iterable[str], spec: dict, stats: dict) -> Iterable[
     yield from flush()
 
 
+def unknown_note(commits: list[dict], unknown: int) -> str:
+    """The note for a history with many `unknown` commits.
+
+    --key-type only helps when the unknown commits carry tracker keys. On a
+    history whose commits reference pull requests as `(#123)`, the advice sent
+    a reviewer looking for a key scheme that did not exist; there the limit is
+    the subject-only classifier, and the way forward is reading the commits.
+    """
+    keyed = sum(1 for c in commits if c["type"] == "unknown" and c.get("keys"))
+    head = f"{unknown} of {len(commits)} commits are `unknown`. "
+    if keyed and keyed * 10 >= unknown:
+        return head + (
+            f"{keyed} of them carry tracker keys (see tracker_keys.by_prefix): "
+            "find what each prefix means and re-run with --key-type "
+            "PREFIX=TYPE (e.g. --key-type B=fix,F=feature) before quoting a "
+            "fix:feature ratio."
+        )
+    return head + (
+        f"Tracker keys are on only {keyed} of them, so --key-type will not "
+        "help. The classifier reads subjects only; read the commits in "
+        "unknown_touching_source (unknown commits that change Python files) "
+        "and classify them by hand before quoting a fix:feature ratio."
+    )
+
+
 def parse_args(argv: list[str]) -> dict:
     """Parse command-line arguments."""
     args: dict = {
@@ -2063,8 +2497,16 @@ def parse_args(argv: list[str]) -> dict:
     return args
 
 
-def analyze(argv: list[str] | None = None) -> dict:
-    """Main analysis function. Returns the result dict."""
+def analyze(
+    argv: list[str] | None = None,
+    *,
+    max_branches: int = _MAX_UNMERGED_BRANCHES,
+) -> dict:
+    """Main analysis function. Returns the result dict.
+
+    `max_branches` caps how many unmerged remote branches are listed (the
+    rest are named in `unmerged_branches.omitted_branches`).
+    """
     global _SCRIPT_START
     _SCRIPT_START = time.monotonic()
 
@@ -2146,10 +2588,13 @@ def analyze(argv: list[str] | None = None) -> dict:
     # Classify commits.
     commits_by_type: dict[str, int] = defaultdict(int)
     classified_by: dict[str, int] = defaultdict(int)
+    fixes_demoted: dict[str, int] = defaultdict(int)
     authors: set[str] = set()
     for commit in commits:
         commits_by_type[commit["type"]] += 1
         classified_by[commit.get("type_source") or "none"] += 1
+        if commit.get("demoted_from"):
+            fixes_demoted[commit["demoted_by"]] += 1
         authors.add(commit["author"])
 
     git_root = git_toplevel(project_root)
@@ -2239,6 +2684,7 @@ def analyze(argv: list[str] | None = None) -> dict:
             git_root,
             _relative_scope(scan_root, git_root),
             key_types,
+            max_branches=max_branches,
         )
 
     # Build result.
@@ -2269,9 +2715,14 @@ def analyze(argv: list[str] | None = None) -> dict:
             "total_commits": len(commits),
             "commits_by_type": dict(commits_by_type),
             # Which signal decided each commit's type: conventional / tag /
-            # key / keyword / none (= unknown).
+            # key / key-majority / strong / verb / hardening / keyword /
+            # none (= unknown).
             "classified_by": dict(classified_by),
             "key_types": key_types,
+            # `fix` commits reclassified as docs/chore, by reason: `scope`
+            # (`fix(docs): ...`) or `files` (only docs, stylesheets,
+            # translations or images changed).
+            "fixes_demoted": dict(fixes_demoted),
             "files_changed": len(file_churn),
             "functions_changed": len(function_churn),
             "authors": len(authors),
@@ -2284,6 +2735,7 @@ def analyze(argv: list[str] | None = None) -> dict:
         "function_churn": function_churn,
         "function_attribution": attribution_meta,
         "recent_fixes": recent_fixes,
+        "unknown_touching_source": unknown_touching_source(commits),
         "recent_features": recent_features,
         "recent_refactors": recent_refactors,
         "behavioural_non_code_commits": behavioural,
@@ -2351,12 +2803,7 @@ def analyze(argv: list[str] | None = None) -> dict:
         )
     unknown = commits_by_type.get("unknown", 0)
     if commits and unknown / len(commits) > 0.15:
-        result["notes"].append(
-            f"{unknown} of {len(commits)} commits are `unknown`. If the project "
-            "marks commits with tracker keys (see tracker_keys.by_prefix), "
-            "re-run with --key-type PREFIX=TYPE (e.g. --key-type B=fix,F=feature) "
-            "before quoting a fix:feature ratio."
-        )
+        result["notes"].append(unknown_note(commits, unknown))
 
     if function_churn_note:
         result["function_churn_note"] = function_churn_note

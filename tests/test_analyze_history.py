@@ -1031,7 +1031,7 @@ class TestTaggedAndKeyedClassification(unittest.TestCase):
         self.assertEqual((detail["type"], detail["source"]), ("feature", "verb"))
 
     def test_unmapped_key_stays_unknown(self):
-        subject = "[db] Validate column types (T1-33)"
+        subject = "[db] Batch column reads (T1-33)"
         self.assertEqual(mod.classify_commit(subject), "unknown")
 
     def test_mapped_key_decides(self):
@@ -1099,7 +1099,10 @@ class TestTaggedAndKeyedClassification(unittest.TestCase):
     def test_key_types_reach_the_analysis(self):
         with GitTempProject(
             [
-                {"files": {"a.py": "x = 1\n"}, "message": "[db] Validate rows (T1-65)"},
+                {
+                    "files": {"a.py": "x = 1\n"},
+                    "message": "[db] Batch the row writes (T1-65)",
+                },
                 {
                     "files": {"a.py": "x = 2\n"},
                     "message": "[api] Keep query options (K24)",
@@ -1500,11 +1503,372 @@ class TestUnmergedBranches(unittest.TestCase):
         self.assertEqual([b["branch"] for b in unmerged["branches"]], ["origin/work"])
         self.assertFalse(unmerged["truncated"])
 
+    def _squash_into_main(self, root: Path) -> str:
+        _git(root, "merge", "-q", "--squash", "origin/work")
+        _git(root, "commit", "-qm", "Guard a and add notes (#41)")
+        _git(root, "update-ref", "refs/remotes/origin/main", "HEAD")
+        return _git(root, "rev-parse", "HEAD")
+
+    def _work(self, result):
+        branches = result["unmerged_branches"]["branches"]
+        return next(b for b in branches if b["branch"] == "origin/work")
+
+    def test_live_branch_is_not_squash_merged(self):
+        root = self._repo()
+        work = self._work(mod.analyze([str(root), *_WINDOW, "--no-function"]))
+        self.assertIs(work["squash_merged"], False)
+        self.assertIsNone(work["squash_commit"])
+
+    def test_squash_merged_branch_is_flagged(self):
+        root = self._repo()
+        self._squash_into_main(root)
+        result = mod.analyze([str(root), *_WINDOW, "--no-function"])
+        work = self._work(result)
+        # Per-commit patch ids cannot see a squash.
+        self.assertEqual(work["ahead_patch_unique"], 2)
+        self.assertIs(work["squash_merged"], True)
+        self.assertEqual(work["squash_evidence"], "files-identical")
+        self.assertEqual(result["unmerged_branches"]["squash_merged_count"], 1)
+
+    def test_squash_found_by_patch_id_after_base_moved_on(self):
+        root = self._repo()
+        squash_sha = self._squash_into_main(root)
+        (root / "src" / "a.py").write_text("x = 4\n", encoding="utf-8")
+        _git(root, "commit", "-qam", "Change a again")
+        _git(root, "update-ref", "refs/remotes/origin/main", "HEAD")
+        work = self._work(mod.analyze([str(root), *_WINDOW, "--no-function"]))
+        self.assertIs(work["squash_merged"], True)
+        self.assertEqual(work["squash_evidence"], "patch-id")
+        self.assertEqual(work["squash_commit"], squash_sha[:9])
+
+    def test_branch_with_work_after_the_squash_is_not_merged(self):
+        root = self._repo()
+        self._squash_into_main(root)
+        _git(root, "checkout", "-q", "origin/work")
+        (root / "src" / "b.py").write_text("y = 1\n", encoding="utf-8")
+        _git(root, "add", "src/b.py")
+        _git(root, "commit", "-qm", "Follow-up after review")
+        _git(root, "update-ref", "refs/remotes/origin/work", "HEAD")
+        _git(root, "checkout", "-q", "main")
+        work = self._work(mod.analyze([str(root), *_WINDOW, "--no-function"]))
+        self.assertIs(work["squash_merged"], False)
+
+    def test_branch_landed_in_another_form_is_partly_landed(self):
+        root = self._repo()
+        # Only the code change lands on main; the notes file never does.
+        _git(root, "checkout", "origin/work", "--", "src/a.py")
+        _git(root, "commit", "-qm", "Guard a (#42)")
+        landed = _git(root, "rev-parse", "HEAD")
+        _git(root, "update-ref", "refs/remotes/origin/main", "HEAD")
+        work = self._work(mod.analyze([str(root), *_WINDOW, "--no-function"]))
+        self.assertIs(work["squash_merged"], False)
+        self.assertEqual(
+            work["partly_landed"],
+            {
+                "commit": landed[:9],
+                "files_matched": ["src/a.py"],
+                "files_matched_total": 1,
+                "files_total": 2,
+            },
+        )
+
+    def test_split_diff_by_file(self):
+        diff = (
+            "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n"
+            "diff --git a/gone.py b/gone.py\ndeleted file mode 100644\n"
+            "--- a/gone.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-c\n"
+            "diff --git a/img.png b/img.png\nBinary files differ\n"
+        )
+        self.assertEqual(
+            [path for path, _ in mod._split_diff_by_file(diff)], ["x.py", "gone.py"]
+        )
+
+    def test_branch_cap_names_the_omitted_branches(self):
+        root = self._repo()
+        for name in ("extra1", "extra2"):
+            _git(root, "checkout", "-q", "-b", name, "origin/main")
+            (root / f"{name}.py").write_text("z = 1\n", encoding="utf-8")
+            _git(root, "add", f"{name}.py")
+            _git(root, "commit", "-qm", f"Start {name}")
+            _git(root, "update-ref", f"refs/remotes/origin/{name}", "HEAD")
+        _git(root, "checkout", "-q", "main")
+        result = mod.analyze([str(root), *_WINDOW, "--no-function"], max_branches=1)
+        unmerged = result["unmerged_branches"]
+        self.assertEqual(len(unmerged["branches"]), 1)
+        self.assertTrue(unmerged["truncated"])
+        self.assertEqual(unmerged["max_branches"], 1)
+        listed = {b["branch"] for b in unmerged["branches"]}
+        omitted = set(unmerged["omitted_branches"])
+        self.assertEqual(unmerged["omitted_branches_total"], len(omitted))
+        self.assertTrue(omitted)
+        # Every remote branch is either examined or named as omitted.
+        self.assertLessEqual(
+            {"origin/work", "origin/extra1", "origin/extra2"}, listed | omitted
+        )
+        self.assertFalse(listed & omitted)
+
+    def test_squash_merged_branches_do_not_use_up_the_cap(self):
+        root = self._repo()
+        self._squash_into_main(root)
+        _git(root, "checkout", "-q", "-b", "live", "origin/main")
+        (root / "live.py").write_text("z = 1\n", encoding="utf-8")
+        _git(root, "add", "live.py")
+        # Older than the squashed branch, so it is examined after it.
+        env = {**os.environ, "GIT_COMMITTER_DATE": "2001-01-01T12:00:00+00:00"}
+        subprocess.run(
+            ["git", "commit", "-qm", "Start live work"],
+            cwd=str(root),
+            env=env,
+            check=True,
+            capture_output=True,
+        )
+        _git(root, "update-ref", "refs/remotes/origin/live", "HEAD")
+        _git(root, "checkout", "-q", "main")
+        result = mod.analyze([str(root), *_WINDOW, "--no-function"], max_branches=1)
+        names = {b["branch"] for b in result["unmerged_branches"]["branches"]}
+        self.assertEqual(names, {"origin/work", "origin/live"})
+
     def test_no_branches_flag_skips(self):
         root = self._repo()
         result = mod.analyze([str(root), *_WINDOW, "--no-function", "--no-branches"])
         self.assertFalse(result["unmerged_branches"]["available"])
         self.assertIn("--no-branches", result["unmerged_branches"]["reason"])
+
+
+class TestHardeningSubjects(unittest.TestCase):
+    """Fixes worded as the rule now enforced ("Reject X when Y")."""
+
+    def _detail(self, subject):
+        detail = mod.classify_commit_detail(subject)
+        return detail["type"], detail["source"]
+
+    def test_hardening_verbs_are_fixes(self):
+        for subject in (
+            "Reject meeting invites that end before they start",
+            "Require a confirmed calendar before sharing it",
+            "restore the reminder queue after a worker restart",
+            "Validate time zones in imported events",
+            "Verifies the recurrence rule before expanding it",
+            "Ensure the sync never deletes a newer copy",
+            "Guard against a missing organizer field",
+            "Disallow overlapping room bookings",
+            "Enforce the attendee limit on public events",
+            "Pin each device to its first sync folder",
+            "Escape event titles in the agenda view",
+            "Handle a None duration",
+            "import: reject calendars with a bad header",
+        ):
+            with self.subTest(subject=subject):
+                self.assertEqual(self._detail(subject), ("fix", "hardening"))
+
+    def test_negated_imperative_and_keep_when_are_fixes(self):
+        self.assertEqual(
+            self._detail("Don't resend a cancelled invite"), ("fix", "hardening")
+        )
+        self.assertEqual(
+            self._detail("do not cache free/busy data for guests"),
+            ("fix", "hardening"),
+        )
+        self.assertEqual(
+            self._detail("keep the sync cursor across reconnects"),
+            ("fix", "hardening"),
+        )
+
+    def test_keep_without_an_event_is_not_a_fix(self):
+        self.assertNotEqual(mod.classify_commit("Keep a changelog"), "fix")
+
+    def test_new_capability_breaks_the_tie_towards_feature(self):
+        self.assertEqual(
+            self._detail("Handle the new export format"), ("feature", "hardening")
+        )
+        self.assertEqual(
+            self._detail("Validate the --strict option"), ("feature", "hardening")
+        )
+
+    def test_dependency_pins_are_chores(self):
+        self.assertEqual(
+            self._detail("Pin the http client to 2.31.0"), ("chore", "hardening")
+        )
+        self.assertEqual(self._detail("Require Python 3.10"), ("chore", "hardening"))
+        self.assertEqual(
+            self._detail("Pin dependencies for the docs job"), ("chore", "hardening")
+        )
+
+    def test_a_number_alone_does_not_make_a_chore(self):
+        # Only pin/require read a version; a size limit is still a fix.
+        self.assertEqual(
+            self._detail("Enforce a 2.5 second gap between reminders"),
+            ("fix", "hardening"),
+        )
+
+    def test_test_and_ci_work_is_not_hardening(self):
+        self.assertNotEqual(
+            mod.classify_commit_detail("Ensure the tests pass on Windows")["source"],
+            "hardening",
+        )
+        self.assertNotEqual(
+            mod.classify_commit("Verify the release workflow runs"), "fix"
+        )
+
+    def test_past_tense_adjectives_are_not_hardening(self):
+        self.assertNotEqual(
+            mod.classify_commit("Verified-sender icon in the inbox"), "fix"
+        )
+        self.assertNotEqual(mod.classify_commit("Pinned tabs survive a restart"), "fix")
+
+    def test_feature_verb_still_wins_over_a_later_hardening_word(self):
+        self.assertEqual(
+            self._detail("Add an option to reject unsigned invites"),
+            ("feature", "verb"),
+        )
+
+
+class TestNonCodeFixes(unittest.TestCase):
+    """`fix` commits that change no program behaviour."""
+
+    def test_docs_and_style_scopes_are_demoted(self):
+        detail = mod.classify_commit_detail("fix(docs): correct the install command")
+        self.assertEqual(detail["type"], "docs")
+        self.assertEqual(detail["source"], "conventional")
+        self.assertEqual(detail["demoted_from"], "fix")
+        self.assertEqual(detail["demoted_by"], "scope")
+        self.assertEqual(
+            mod.classify_commit("fix(style): align the footer columns"), "chore"
+        )
+        self.assertEqual(
+            mod.classify_commit("fix(i18n): translate the date picker"), "chore"
+        )
+
+    def test_code_scope_stays_a_fix(self):
+        detail = mod.classify_commit_detail("fix(cli): exit 1 on a bad flag")
+        self.assertEqual(detail["type"], "fix")
+        self.assertNotIn("demoted_from", detail)
+
+    def _commit(self, files, ctype="fix"):
+        return {"hash": "a" * 40, "type": ctype, "files": files}
+
+    def test_stylesheet_only_fix_is_demoted_to_chore(self):
+        commit = self._commit(["static/css/site.scss", "static/img/logo.svg"])
+        self.assertTrue(mod.demote_non_code_fix(commit))
+        self.assertEqual(commit["type"], "chore")
+        self.assertEqual(commit["demoted_by"], "files")
+
+    def test_prose_only_fix_is_demoted_to_docs(self):
+        commit = self._commit(["docs/guide.md", "README.rst"])
+        self.assertTrue(mod.demote_non_code_fix(commit))
+        self.assertEqual(commit["type"], "docs")
+
+    def test_code_templates_and_scripts_keep_the_fix(self):
+        for files in (
+            ["app/views.py", "static/css/site.css"],
+            ["templates/account.html"],
+            ["static/js/menu.js"],
+            [],
+        ):
+            with self.subTest(files=files):
+                commit = self._commit(files)
+                self.assertFalse(mod.demote_non_code_fix(commit))
+                self.assertEqual(commit["type"], "fix")
+
+    def test_non_fix_is_untouched(self):
+        commit = self._commit(["static/css/site.css"], ctype="feature")
+        self.assertFalse(mod.demote_non_code_fix(commit))
+        self.assertEqual(commit["type"], "feature")
+
+    def test_analysis_drops_demoted_fixes_and_lists_unknown_source_commits(self):
+        with GitTempProject(
+            [
+                {
+                    "files": {"app.py": "x = 1\n", "site.css": "a {}\n"},
+                    "message": "Initial import",
+                },
+                {
+                    "files": {"site.css": "a { color: red }\n"},
+                    "message": "Fix the header colour in dark mode",
+                },
+                {
+                    "files": {"app.py": "x = 2\n"},
+                    "message": "Make the scheduler honour quiet hours",
+                },
+                {
+                    "files": {"app.py": "x = 3\n"},
+                    "message": "Reject empty calendars",
+                },
+            ]
+        ) as root:
+            result = mod.analyze([str(root), *_WINDOW, "--no-function"])
+        fixes = [c["message"] for c in result["recent_fixes"]]
+        self.assertEqual(fixes, ["Reject empty calendars"])
+        self.assertEqual(result["summary"]["fixes_demoted"], {"files": 1})
+        unknown = result["unknown_touching_source"]
+        self.assertEqual(
+            [c["message"] for c in unknown["commits"]],
+            ["Make the scheduler honour quiet hours", "Initial import"],
+        )
+        self.assertEqual(unknown["total"], 2)
+        self.assertFalse(unknown["truncated"])
+        self.assertEqual(unknown["commits"][0]["python_files"], ["app.py"])
+
+    def test_unknown_listing_is_capped(self):
+        commits = [
+            {
+                "hash": f"{i:040x}",
+                "date": "2025-01-01",
+                "message": f"Change {i}",
+                "type": "unknown",
+                "files": ["a.py", "notes.txt"],
+            }
+            for i in range(5)
+        ]
+        commits.append(
+            {
+                "hash": "f" * 40,
+                "date": "",
+                "message": "x",
+                "type": "unknown",
+                "files": ["notes.txt"],
+            }
+        )
+        listing = mod.unknown_touching_source(commits, limit=3)
+        self.assertEqual(listing["total"], 5)
+        self.assertEqual(len(listing["commits"]), 3)
+        self.assertTrue(listing["truncated"])
+
+
+class TestUnknownNote(unittest.TestCase):
+    """The --key-type advice appears only when unknown commits carry keys."""
+
+    def _commits(self, keyed):
+        commits = [{"type": "unknown", "keys": []} for _ in range(10)]
+        for commit in commits[:keyed]:
+            commit["keys"] = ["K12"]
+        return commits
+
+    def test_no_keys_points_at_the_classifier_not_key_type(self):
+        note = mod.unknown_note(self._commits(0), 10)
+        self.assertNotIn("re-run with --key-type", note)
+        self.assertIn("unknown_touching_source", note)
+
+    def test_a_stray_key_is_not_enough(self):
+        commits = self._commits(1) + [{"type": "unknown", "keys": []}] * 20
+        note = mod.unknown_note(commits, 30)
+        self.assertNotIn("re-run with --key-type", note)
+
+    def test_keyed_unknowns_get_the_key_type_advice(self):
+        note = mod.unknown_note(self._commits(4), 10)
+        self.assertIn("re-run with --key-type", note)
+
+    def test_analysis_without_keys_omits_the_key_type_advice(self):
+        with GitTempProject(
+            [
+                {"files": {"a.py": "x = 1\n"}, "message": "Tweak things (#12)"},
+                {"files": {"a.py": "x = 2\n"}, "message": "More tweaks (#13)"},
+            ]
+        ) as root:
+            result = mod.analyze([str(root), *_WINDOW, "--no-function"])
+        notes = " ".join(result["notes"])
+        self.assertIn("are `unknown`", notes)
+        self.assertNotIn("re-run with --key-type", notes)
 
 
 if __name__ == "__main__":
