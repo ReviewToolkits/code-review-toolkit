@@ -957,3 +957,83 @@ class TestProtocolDefaultBodies(unittest.TestCase):
         self.assertTrue(found["Sink"]["bodies_inherited"])
         self.assertEqual(result["summary"]["protocols_with_default_bodies"], 2)
         self.assertEqual(result["summary"]["protocols_with_uninherited_bodies"], 1)
+
+
+class TestAnnotationAccuracy(unittest.TestCase):
+    """The annotation-accuracy line (N annotated, M with type errors) needed a
+    join of mypy errors to functions that no script did."""
+
+    _FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/m.py": (
+            "def typed(a: int) -> str:\n"  # 1
+            "    return a\n"  # 2
+            "def bare(a):\n"  # 3
+            "    return a + 'x'\n"  # 4
+            "class C:\n"  # 5
+            "    def method(self, x: int) -> int:\n"  # 6
+            "        def inner(y: int) -> int:\n"  # 7
+            "            return y.nope\n"  # 8
+            "        return x\n"  # 9
+            "    @property\n"  # 10
+            "    def ok(self) -> int:\n"  # 11
+            "        return 1\n"  # 12
+            "X: int = 'a'\n"  # 13
+        ),
+    }
+
+    def _with(self, name: str, payload: str) -> dict:
+        with TempProject({**self._FILES, name: payload}) as root:
+            return mod.analyze(str(root / "pkg"), mypy_json=str(root / name))
+
+    def test_errors_go_to_the_innermost_function(self):
+        check_typing_output = {
+            "mypy_version": "1.0",
+            "summary": {},
+            "findings": [
+                {"file": "pkg/m.py", "line": 2, "code": "return-value", "severity": "error"},
+                {"file": "pkg/m.py", "line": 4, "code": "operator", "severity": "error"},
+                {"file": "pkg/m.py", "line": 8, "code": "attr-defined", "severity": "error"},
+                {"file": "pkg/m.py", "line": 13, "code": "assignment", "severity": "error"},
+                {"file": "pkg/m.py", "line": 3, "code": "no-untyped-def", "severity": "error"},
+                {"file": "other/x.py", "line": 1, "code": "misc", "severity": "error"},
+            ],
+        }
+        result = self._with("ct.json", json.dumps(check_typing_output))
+        acc = result["annotation_accuracy"]
+        self.assertEqual(
+            [(f["name"], f["fully_annotated"]) for f in acc["functions"]],
+            [("typed", True), ("bare", False), ("C.method.inner", True)],
+        )
+        self.assertEqual(acc["annotated_functions_with_type_errors"], 2)
+        self.assertEqual(acc["functions_with_type_errors"], 3)
+        self.assertEqual(acc["errors_outside_functions"], 1)
+        self.assertEqual(acc["errors_outside_scan"], 1)
+        # typed, C.method, inner, C.ok
+        self.assertEqual(acc["fully_annotated_functions"], 4)
+        self.assertEqual(result["summary"]["annotated_functions_with_type_errors"], 2)
+
+    def test_external_tools_and_mypy_json_lines(self):
+        ext = {"mypy": {"findings": [{"file": "pkg/m.py", "line": 12, "code": "x"}]}}
+        result = self._with("ext.json", json.dumps(ext))
+        self.assertEqual(result["annotation_accuracy"]["functions"][0]["name"], "C.ok")
+        lines = "\n".join(
+            json.dumps(e)
+            for e in (
+                {"file": "pkg/m.py", "line": 2, "code": "return-value", "severity": "error"},
+                {"file": "pkg/m.py", "line": 2, "code": None, "severity": "note"},
+            )
+        )
+        result = self._with("mypy.jsonl", lines)
+        self.assertEqual(result["annotation_accuracy"]["errors_read"], 1)
+
+    def test_not_given_is_null_with_a_reason(self):
+        result = _analyze_tree(self._FILES)
+        self.assertIsNone(result["annotation_accuracy"])
+        self.assertIsNone(result["summary"]["annotated_functions_with_type_errors"])
+        self.assertIn("not measured", result["summary"]["annotation_accuracy_reason"])
+
+    def test_unreadable_input_is_not_a_zero(self):
+        result = self._with("bad.json", "this is not json\n")
+        self.assertIsNone(result["annotation_accuracy"])
+        self.assertIn("not measured", result["summary"]["annotation_accuracy_reason"])

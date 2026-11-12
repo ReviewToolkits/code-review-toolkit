@@ -129,6 +129,8 @@ _FINDING_LISTS: dict[str, dict[str, _Key]] = {
         "inconsistent_parameters": ("param",),
         "untyped_boundaries": ("file", "callee", "param"),
         "protocols_with_default_bodies": ("file", "name"),
+        # Functions holding mypy errors (only when count_types read mypy output).
+        "annotation_accuracy.functions": ("file", "name"),
     },
     "extract_test_invariants": {
         "invariants": ("file", "function"),

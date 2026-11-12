@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import ast
+import json
 import re
 import sys
 from pathlib import Path
@@ -1462,7 +1463,201 @@ def _count_alias_uses(index: _SymbolIndex) -> dict:
     return uses
 
 
-def analyze(target: str, *, max_files: int = 0) -> dict:
+# ---------------------------------------------------------------------------
+# Annotation accuracy: mypy errors joined to the functions they are in
+# ---------------------------------------------------------------------------
+
+# Codes that say an annotation is MISSING, not wrong (as in check_typing).
+_MISSING_ANNOTATION_CODES = frozenset(
+    {"no-untyped-def", "no-untyped-call", "no-any-return", "var-annotated", "type-arg"}
+)
+
+
+def load_mypy_errors(path: str) -> tuple[list[dict] | None, str | None]:
+    """mypy errors from *path*: `(errors, None)` or `(None, reason)`.
+
+    Accepts check_typing's output (its baseline `findings`), the mypy section
+    of run_external_tools (`mypy.findings`; a capped list is read as given),
+    mypy's own `--output json` (one object per line), or a JSON list. Each
+    error is `{file, line, code}`; notes and missing-annotation codes are
+    dropped: they say nothing about whether an annotation is right.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, f"could not read {path}: {exc.strerror or exc}"
+    items: list | None = None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+        items = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                items.append(json.loads(line))
+            except ValueError:
+                return None, f"{path} is neither JSON nor mypy's JSON lines"
+    if data is not None:
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict) and isinstance(data.get("findings"), list):
+            items = data["findings"]
+        elif isinstance(data, dict) and isinstance(
+            (data.get("mypy") or {}).get("findings"), list
+        ):
+            items = data["mypy"]["findings"]
+        elif isinstance(data, dict) and "file" in data:
+            items = [data]
+        else:
+            return None, f"no mypy findings in {path}"
+    errors = []
+    for item in items or []:
+        if not isinstance(item, dict) or "file" not in item or "line" not in item:
+            continue
+        if str(item.get("severity", "error")) != "error":
+            continue
+        code = item.get("code") or ""
+        if code in _MISSING_ANNOTATION_CODES:
+            continue
+        try:
+            line = int(item["line"])
+        except (TypeError, ValueError):
+            continue
+        errors.append({"file": str(item["file"]), "line": line, "code": code})
+    return errors, None
+
+
+def _collect_spans(
+    node: ast.AST, prefix: str, in_class: bool, found: list[dict]
+) -> None:
+    """Append every def under *node* to *found* (see `_function_spans`)."""
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            a = child.args
+            params = [
+                x
+                for x in a.posonlyargs + a.args + a.kwonlyargs
+                if x.arg not in ("self", "cls")
+            ]
+            found.append(
+                {
+                    "name": prefix + child.name,
+                    "line": child.lineno,
+                    "start": min(
+                        [child.lineno] + [d.lineno for d in child.decorator_list]
+                    ),
+                    "end": child.end_lineno or child.lineno,
+                    "fully_annotated": child.returns is not None
+                    and all(x.annotation is not None for x in params),
+                    "method": in_class,
+                }
+            )
+            _collect_spans(child, prefix + child.name + ".", False, found)
+        elif isinstance(child, ast.ClassDef):
+            _collect_spans(child, prefix + child.name + ".", True, found)
+        else:
+            _collect_spans(child, prefix, in_class, found)
+
+
+def _function_spans(index: _SymbolIndex) -> dict[str, list[dict]]:
+    """Per scanned file: every def's span, qualified name and annotation state."""
+    spans: dict[str, list[dict]] = {}
+    for info in index.modules.values():
+        tree = info.get("tree")
+        if tree is None:
+            continue
+        found: list[dict] = []
+        _collect_spans(tree, "", False, found)
+        spans[info["file"]] = found
+    return spans
+
+
+def annotation_accuracy(
+    index: _SymbolIndex, errors: list[dict], project_root: Path, scan_root: Path
+) -> dict:
+    """How many fully annotated functions contain at least one mypy error.
+
+    Each error goes to the innermost function whose span holds its line.
+    `errors_outside_scan` are errors in files this run did not scan;
+    `errors_outside_functions` are module- or class-level ones.
+    """
+    spans = _function_spans(index)
+    scanned = set(spans)
+
+    def rel_of(file: str) -> str | None:
+        path = Path(file)
+        candidates = (
+            [path]
+            if path.is_absolute()
+            else [project_root / path, scan_root / path, Path.cwd() / path]
+        )
+        for cand in candidates:
+            try:
+                rel = str(cand.resolve().relative_to(project_root))
+            except (OSError, ValueError):
+                continue
+            if rel in scanned:
+                return rel
+        hits = [r for r in scanned if r.endswith("/" + file.lstrip("./"))]
+        return hits[0] if len(hits) == 1 else None
+
+    per_function: dict[tuple[str, str], dict] = {}
+    outside_scan = outside_functions = 0
+    for err in errors:
+        rel = rel_of(err["file"])
+        if rel is None:
+            outside_scan += 1
+            continue
+        holders = [s for s in spans[rel] if s["start"] <= err["line"] <= s["end"]]
+        if not holders:
+            outside_functions += 1
+            continue
+        fn = min(holders, key=lambda s: s["end"] - s["start"])
+        entry = per_function.setdefault(
+            (rel, fn["name"]),
+            {
+                "file": rel,
+                "name": fn["name"],
+                "line": fn["line"],
+                "fully_annotated": fn["fully_annotated"],
+                "errors": 0,
+                "codes": {},
+            },
+        )
+        entry["errors"] += 1
+        code = err["code"] or "(none)"
+        entry["codes"][code] = entry["codes"].get(code, 0) + 1
+    functions = sorted(
+        per_function.values(), key=lambda e: (-e["errors"], e["file"], e["line"])
+    )
+    annotated = sum(1 for fs in spans.values() for s in fs if s["fully_annotated"])
+    return {
+        "errors_read": len(errors),
+        "errors_in_functions": sum(e["errors"] for e in functions),
+        "errors_outside_functions": outside_functions,
+        "errors_outside_scan": outside_scan,
+        # Nested defs and methods included, so the denominator can be larger
+        # than summary.fully_annotated_functions.
+        "fully_annotated_functions": annotated,
+        "annotated_functions_with_type_errors": sum(
+            1 for e in functions if e["fully_annotated"]
+        ),
+        "functions_with_type_errors": len(functions),
+        "functions_capped": len(functions) > _LIST_CAP,
+        "functions": functions[:_LIST_CAP],
+    }
+
+
+def analyze(target: str, *, max_files: int = 0, mypy_json: str | None = None) -> dict:
+    """Annotation coverage and type design inventory for *target*.
+
+    *mypy_json* (check_typing's output, run_external_tools', or mypy's own
+    `--output json`) adds `annotation_accuracy`: mypy errors joined to the
+    functions that contain them.
+    """
     target_path = Path(target).resolve()
     project_root = find_project_root(target_path)
     scan_root = target_path if target_path.is_dir() else project_root
@@ -1572,6 +1767,19 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
     alias_uses = _count_alias_uses(index)
     aliases = _alias_inventory(index, alias_uses)
 
+    accuracy = None
+    accuracy_reason = "not measured: no mypy output was given (mypy_json)"
+    if mypy_json:
+        errors, why = load_mypy_errors(mypy_json)
+        if errors is None:
+            accuracy_reason = f"not measured: {why}"
+        else:
+            accuracy = {
+                "source": str(mypy_json),
+                **annotation_accuracy(index, errors, project_root, scan_root),
+            }
+            accuracy_reason = None
+
     output = {
         **build_envelope(project_root, scan_root, files_total, len(all_files)),
         "summary": {
@@ -1616,6 +1824,15 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
             "container_types": {k: len(v) for k, v in container_types.items()},
             # Protocols with non-stub method bodies, and how many of them no
             # class in scope subclasses explicitly (their bodies never run).
+            # Fully annotated functions with at least one mypy error in their
+            # body (mypy_json given); null when not measured -- see
+            # annotation_accuracy_reason.
+            "annotated_functions_with_type_errors": (
+                None
+                if accuracy is None
+                else accuracy["annotated_functions_with_type_errors"]
+            ),
+            "annotation_accuracy_reason": accuracy_reason,
             "protocols_with_default_bodies": len(protocols),
             "protocols_with_uninherited_bodies": sum(
                 1 for p in protocols if not p["bodies_inherited"]
@@ -1641,6 +1858,7 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
         "untyped_boundaries_capped": len(boundaries) > _LIST_CAP,
         "untyped_boundaries": boundaries[:_LIST_CAP],
         "protocols_with_default_bodies": protocols,
+        "annotation_accuracy": accuracy,
         "files": file_analyses,
     }
     return output
