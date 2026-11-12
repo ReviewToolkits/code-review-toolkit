@@ -878,6 +878,33 @@ class TestEnumsThroughProjectBases(unittest.TestCase):
         self.assertIsNone(classes["Shade"]["container_type"])
 
 
+class TestPrivateClassMembers(unittest.TestCase):
+    """Methods of a private class were counted as unannotated public functions."""
+
+    def test_methods_of_a_private_class_are_private(self):
+        result = _analyze_tree(
+            {
+                "pkg/__init__.py": "",
+                "pkg/m.py": (
+                    "class _Ref:\n"
+                    "    def __init__(self, x):\n"
+                    "        self.x = x\n"
+                    "    def __call__(self):\n"
+                    "        return self.x\n"
+                    "    def run(self):\n"
+                    "        return 1\n"
+                    "class Public:\n"
+                    "    def run(self):\n"
+                    "        return 1\n"
+                ),
+            }
+        )
+        names = [f["name"] for f in result["unannotated_public_functions"]]
+        self.assertEqual(names, ["Public.run"])
+        self.assertEqual(result["summary"]["public_functions"], 1)
+        self.assertEqual(result["summary"]["total_functions"], 4)
+
+
 class TestProtocolDefaultBodies(unittest.TestCase):
     """A Protocol's default method bodies run only for explicit subclasses;
     neither the bodies nor the absence of such subclasses was reported."""

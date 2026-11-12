@@ -793,9 +793,14 @@ def analyze_file(
         class_name: str | None = None,
         qualname: str | None = None,
         nested: bool = False,
+        private_scope: bool = False,
     ) -> dict:
         name = qualname or (f"{class_name}.{node.name}" if class_name else node.name)
-        is_public = not node.name.startswith("_") or node.name in _PUBLIC_DUNDERS
+        # A method of a private class is private whatever its own name: no
+        # caller outside the module is meant to reach `_Helper.run`.
+        is_public = not private_scope and (
+            not node.name.startswith("_") or node.name in _PUBLIC_DUNDERS
+        )
 
         # Check parameter annotations.
         all_args = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
@@ -986,7 +991,9 @@ def analyze_file(
         method_nodes = []
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                methods.append(_analyze_func(child, node.name))
+                methods.append(
+                    _analyze_func(child, node.name, private_scope=not is_public)
+                )
                 method_nodes.append(child)
 
         info: dict = {
