@@ -354,6 +354,7 @@ For each:
 - **Python-specific**: Python's exception model has unique pitfalls (bare except catching SystemExit, StopIteration semantics, exception chaining). Flag these specifically.
 - **Cap output**: Report at most 10 critical, 10 high, and 15 medium issues in the summary. If there are more, note the total count. When run as part of `explore` with a run directory, write **every** critical and high finding to your report file: the consolidation step needs them all.
 - **Be actionable**: Every finding should include a specific fix, not just "handle this error better."
+- **Proving "nothing was logged"**: `caplog.set_level(logging.DEBUG)` sets only the root logger. A project logger that sets its own level at import still drops lower records, so a "nothing logged" assertion passes without capturing anything. Pass `logger="<the module's logger name>"`, or assert at WARNING and above, and first show one record you know is emitted (see `<plugin_root>/docs/reproduction-convention.md`).
 
 ### Classification Guide
 - **FIX**: Silent failure that hides bugs, causes data corruption, or produces silently wrong results (e.g., bare except with pass, swallowed exception in data pipeline)
