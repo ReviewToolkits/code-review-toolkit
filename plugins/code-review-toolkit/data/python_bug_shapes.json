@@ -3139,6 +3139,28 @@
       "differential": "A wrapper whose parameter is passed straight through (`def t(msg): return localizer.translate(msg)`, called with literals) is fine: check its callers instead. A project with no message catalogs is not translating anything.",
       "detected_by": "scan_python_pitfalls.py",
       "detectability": "implemented"
+    },
+    {
+      "id": "fixture-value-outside-producer-domain",
+      "title": "A test fixture supplies a value (or a value type) the real producer never generates, so the bug survives behind it",
+      "agent": "test-investigation-agent",
+      "severity": "CONSIDER",
+      "pattern": "A test injects an already-parsed or differently typed value where production delivers a raw one: a UUID object in a router's match dict that is always a string in production, a dict where the column returns a JSON string (or the reverse), a library-wrapped exception where the real listener re-raises the raw driver error, a placeholder where a real hex digest goes. The code under test is correct for the fixture and wrong for production, so the test passes; or a correct fix fails the test and gets rejected.",
+      "guarded_twin": "Fixtures that build the value exactly as the production boundary does (the router's string, `str(user_id)`, the ORM's real column type, a real digest), or an integration test through the real producer.",
+      "hunt": "For each fixture field and each injected request attribute (match dict, POST, session), find the production producer (router, security policy, ORM column, driver) and compare the value's type and domain. Then check whether the code under test branches on that type or domain (str vs UUID comparison, a missing parse, a key lookup).",
+      "expected": "tests exercise the code with values production can produce, so type- and domain-dependent bugs fail them.",
+      "caught_as": "SILENT -- a passing test that masks a production bug, or a correct fix that fails CI.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): fixtures supplied UUID objects where the router delivers strings, and dict payloads where production stored JSON text, hiding several defects and making correct fixes fail."
+      ],
+      "validation": "confirmed",
+      "references": [],
+      "differential": "A fixture value outside the producer's domain on purpose, in a test about rejecting bad input, is the point of that test.",
+      "detected_by": null,
+      "detectability": "agent-only",
+      "aliases": [
+        "fixture-type-divergence"
+      ]
     }
   ]
 }
