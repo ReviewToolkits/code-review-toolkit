@@ -49,6 +49,11 @@ Usage:
     python scan_concurrency.py [path] [--max-files N] [--check ID[,ID...]]
         [--exclude PAT[,PAT...]] [--blocking NAME[,NAME...]] [--all-blocking]
 
+``--exclude`` (repeatable, comma list) drops files by project-relative path: a
+plain pattern as a substring, a glob (``vendor/*``) at any depth. Excluded files
+are neither counted nor charged to ``--max-files``; see ``files_excluded`` and
+``exclude_matches`` in the envelope.
+
 ``--all-blocking`` reports every file-I/O and pipe wait under a lock as a
 finding; by default they are summarized per lock in
 ``summary.blocking_low_signal``, because they are mostly by design.
@@ -66,12 +71,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scan_common import (  # noqa: E402
     build_envelope,
-    collect_python_files,
     emit,
     find_project_root,
-    parse_common_args,
+    parse_scan_args,
     parse_source,
     relative_to_root,
+    select_python_files,
+    split_patterns,
 )
 
 # --------------------------------------------------------------------------
@@ -3422,12 +3428,13 @@ def analyze(
     resolved = Path(target).resolve()
     project_root = find_project_root(resolved)
     scan_root = resolved
-    files, files_total = collect_python_files(scan_root, max_files)
+    selection = select_python_files(
+        scan_root, project_root=project_root, max_files=max_files, exclude=exclude
+    )
+    files, files_total = selection.files, selection.files_total
     corpus: list[tuple[str, ast.Module]] = []
     for path in files:
         rel = relative_to_root(path, project_root)
-        if exclude and any(pattern in rel for pattern in exclude):
-            continue
         tree = parse_source(path)
         if tree is not None:
             corpus.append((rel, tree))
@@ -3506,14 +3513,14 @@ def analyze(
             lock_kinds[kind] = lock_kinds.get(kind, 0) + 1
 
     module_state = _module_state(project)
-    result = build_envelope(project_root, scan_root, files_total, len(files))
+    result = build_envelope(project_root, scan_root, files_total, len(files), selection)
     result["summary"] = {
         "total_findings": len(findings),
         "by_shape": dict(sorted(by_shape.items())),
         "by_severity": dict(sorted(by_severity.items())),
         "by_confidence": dict(sorted(by_confidence.items())),
         "checks_run": sorted(selected & set(_CHECKS)),
-        "excluded_patterns": sorted(exclude or []),
+        "excluded_patterns": sorted(selection.exclude_patterns),
         "functions_indexed": len(project.funcs),
         "locks_declared": dict(sorted(lock_kinds.items())),
         "lock_context_managers": sorted(
@@ -3566,32 +3573,15 @@ def _dedupe(findings: list[dict]) -> list[dict]:
     return out
 
 
-def _extract_options(argv: list[str]) -> tuple[list[str], dict[str, list[str] | None]]:
-    rest: list[str] = []
-    opts: dict[str, list[str] | None] = {
-        "check": None,
-        "exclude": None,
-        "blocking": None,
-    }
-    i = 0
-    while i < len(argv):
-        flag = argv[i][2:] if argv[i].startswith("--") else ""
-        if flag in opts and i + 1 < len(argv):
-            opts[flag] = [x.strip() for x in argv[i + 1].split(",") if x.strip()]
-            i += 2
-        else:
-            rest.append(argv[i])
-            i += 1
-    return rest, opts
-
-
 def main() -> None:
-    argv = sys.argv[1:]
-    all_blocking = "--all-blocking" in argv
-    argv = [a for a in argv if a != "--all-blocking"]
-    argv, opts = _extract_options(argv)
-    target, max_files = parse_common_args(argv)
-    checks = opts["check"]
+    args = parse_scan_args(
+        sys.argv[1:],
+        __doc__,
+        flags={"--all-blocking"},
+        value_flags={"--check", "--blocking"},
+    )
+    target, max_files = args.target, args.max_files
+    checks = split_patterns(args.values.get("--check")) or None
     if checks:
         unknown = [c for c in checks if c not in _CHECKS]
         if unknown:
@@ -3607,9 +3597,9 @@ def main() -> None:
             target,
             max_files=max_files,
             checks=checks,
-            exclude=opts["exclude"],
-            blocking=opts["blocking"],
-            all_blocking=all_blocking,
+            exclude=args.exclude,
+            blocking=split_patterns(args.values.get("--blocking")) or None,
+            all_blocking="--all-blocking" in args.flags,
         )
     )
 

@@ -14,6 +14,11 @@ Confidence levels:
 
 Usage:
     python scan_python_pitfalls.py [path] [--max-files N] [--check ID[,ID...]] [--exclude PAT[,PAT...]]
+
+``--exclude`` is repeatable and takes a comma list: a plain pattern matches as
+a substring of the project-relative path, a glob (``migrations/*``) at any
+depth. Excluded files are not counted and do not use up ``--max-files``; the
+envelope reports ``files_excluded`` and ``exclude_matches`` per pattern.
 """
 
 from __future__ import annotations
@@ -28,11 +33,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scan_common import (  # noqa: E402
     build_envelope,
-    collect_python_files,
     emit,
-    parse_common_args,
+    parse_scan_args,
     parse_source,
     relative_to_root,
+    select_python_files,
+    split_patterns,
 )
 
 # --------------------------------------------------------------------------
@@ -4988,8 +4994,9 @@ def analyze(
 ) -> dict:
     """Scan *target* for catalogued Python pitfalls.
 
-    ``exclude`` drops files whose project-relative path contains any of the given
-    substrings. Real-world runs show generated content (report artifacts, golden
+    ``exclude`` drops files whose project-relative path matches any of the given
+    patterns (a substring, or a glob -- see ``scan_common.path_matches``), before
+    counting and before the ``max_files`` cap. Real-world runs show generated content (report artifacts, golden
     fixtures, vendored trees) is the dominant false-positive source, and it is
     project-specific enough that it cannot be hardcoded -- hence the option, plus
     the ``by_directory`` breakdown below so such clustering is visible at a glance.
@@ -5003,14 +5010,14 @@ def analyze(
     # into "scan everything" -- a trap worth not reproducing. discover_python_files
     # handles a file path directly, so no special-casing is needed.)
     scan_root = resolved
-    files, files_total = collect_python_files(scan_root, max_files)
+    selection = select_python_files(
+        scan_root, project_root=project_root, max_files=max_files, exclude=exclude
+    )
+    files, files_total = selection.files, selection.files_total
 
     findings: list[dict] = []
     corpus: list[tuple[str, ast.AST]] = []
     for path in files:
-        rel = relative_to_root(path, project_root)
-        if exclude and any(pattern in rel for pattern in exclude):
-            continue
         findings.extend(analyze_file(path, project_root, checks, corpus))
 
     for name in checks or list(_PROJECT_CHECKS):
@@ -5051,7 +5058,7 @@ def analyze(
         top = directory.lstrip("/").split("/")[0] or "."
         by_top_directory[top] = by_top_directory.get(top, 0) + 1
 
-    result = build_envelope(project_root, scan_root, files_total, len(files))
+    result = build_envelope(project_root, scan_root, files_total, len(files), selection)
     result["summary"] = {
         "total_findings": len(findings),
         "by_shape": dict(sorted(by_shape.items())),
@@ -5071,37 +5078,17 @@ def analyze(
         ),
         "suppressed_by_differential": dict(sorted(suppressed_counts.items())),
         "checks_run": sorted(checks or (set(_CHECKS) | set(_PROJECT_CHECKS))),
-        "excluded_patterns": sorted(exclude or []),
+        "excluded_patterns": sorted(selection.exclude_patterns),
     }
     result["findings"] = findings
     result["suppressed"] = suppressed
     return result
 
 
-def _extract_options(
-    argv: list[str],
-) -> tuple[list[str], list[str] | None, list[str] | None]:
-    """Pull ``--check`` and ``--exclude`` out of argv, returning the remainder."""
-    rest: list[str] = []
-    checks: list[str] | None = None
-    exclude: list[str] | None = None
-    i = 0
-    while i < len(argv):
-        if argv[i] == "--check" and i + 1 < len(argv):
-            checks = [c.strip() for c in argv[i + 1].split(",") if c.strip()]
-            i += 2
-        elif argv[i] == "--exclude" and i + 1 < len(argv):
-            exclude = [p.strip() for p in argv[i + 1].split(",") if p.strip()]
-            i += 2
-        else:
-            rest.append(argv[i])
-            i += 1
-    return rest, checks, exclude
-
-
 def main() -> None:
-    argv, checks, exclude = _extract_options(sys.argv[1:])
-    target, max_files = parse_common_args(argv)
+    args = parse_scan_args(sys.argv[1:], __doc__, value_flags={"--check"})
+    target, max_files = args.target, args.max_files
+    checks = split_patterns(args.values.get("--check")) or None
     if checks:
         known = set(_CHECKS) | set(_PROJECT_CHECKS)
         unknown = [c for c in checks if c not in known]
@@ -5113,7 +5100,7 @@ def main() -> None:
                 }
             )
             sys.exit(2)
-    emit(analyze(target, max_files=max_files, checks=checks, exclude=exclude))
+    emit(analyze(target, max_files=max_files, checks=checks, exclude=args.exclude))
 
 
 if __name__ == "__main__":
