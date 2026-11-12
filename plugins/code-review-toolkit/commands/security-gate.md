@@ -56,8 +56,11 @@ Run both with a 300000 ms Bash timeout. Then:
 - **Read every URL in `external_policy_urls`** (a `SECURITY.md` often only points to a web page) and
   add what it says about scope to `threat-model.md` under a `## From <url>` heading.
 - **Look for audits outside the tree.** Search the web for "<project> security audit" and the
-  audit-firm publication repositories. If you find one, add its finding table (id, title,
-  severity, status) to `threat-model.md`, and its rows to `precedents` in `threat-model.json`.
+  audit-firm publication repositories. If you find one, save it in `<run_dir>/gate/audits/` (an
+  HTML page as is; for a PDF, copy its findings summary into a Markdown table with ID, Title,
+  Severity and Status columns) and re-run both commands with `--audit-doc <file>` for each: its
+  rows become `precedents`. Pipe, RST and HTML tables are read; read `errors` for a file with no
+  table found.
 - `status: missing` stops here with `BLOCKED`. Ask the user for the project's threat model, or for
   explicit permission to proceed without one, which then caps every severity at low and needs sign-off.
 

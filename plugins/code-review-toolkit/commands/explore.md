@@ -254,6 +254,26 @@ hundreds of kilobytes. Dispatch **one consolidation agent** that reads every `ag
 | `publication_sensitive` | `true` when publication should wait for coordination with the project. Cheap and right under doubt; it never makes a finding a security claim |
 | `notes` | dedup decisions, corrections |
 
+Two rules for the consolidation agent, because `findings.json` is what reaches maintainers:
+
+- **Prose is for the maintainer.** `title`, `mechanism`, `failure_scenario` and `introduced_by` carry
+  no agent names, no agent-internal ids (`SFH-3`, an earlier run's labels) and no `||` merge
+  separators. Attribution goes in `agents` and `source_refs`, and merge history in `notes`. A
+  finding may cite another one by its consolidated `id`.
+- **A sensitive id stays private.** A finding without `publication_sensitive` never mentions the id
+  of one that has it, in any field (`notes` and `propagation_gap_of` included): publishing the first
+  would reveal that the second exists. Describe the relation without the id, or mark both sensitive.
+
+Check both mechanically before the file goes anywhere:
+
+```bash
+python3 <plugin_root>/scripts/security_gate.py lint <run_dir>/findings.json
+```
+
+It exits 1 and lists every `agent-name`, `merge-separator`, `internal-id` and `sensitive-ref`
+problem. Fix the text. For an id-like token that isn't an id (a standard's number, a format name),
+pass `--allow TOKEN,TOKEN`.
+
 Tell the consolidation agent to work **report by report into an on-disk working file**
 (`<run_dir>/consolidation-work.json`), appending and merging as it goes, rather than reading every
 report first: 19 reports came to 545 KB, at the edge of one agent's context. Above ~300 KB of
@@ -264,9 +284,35 @@ final pass merges the partials.
 [`security-gate`](security-gate.md) has signed it off.** The consolidation step records claims; the
 gate judges them blind against the project's own threat model and precedents.
 
-Then **spot-check it yourself**: re-read a sample of locations (all FIX findings if feasible), and
-every finding whose agents disagreed. The deduplication and contradiction rules below are the
+Then **check the locations mechanically**: run `check_locations.py` (in the plugin's `scripts/`
+directory) on `findings.json`. It validates every finding's `path:line` range at the reviewed
+commit, whatever its classification. Then **spot-check it yourself**: re-read a sample of locations
+(all FIX findings if feasible), and every finding whose agents disagreed. The deduplication and contradiction rules below are the
 consolidation agent's instructions.
+
+**Labels that leave the run carry the run id.** Short ids repeat across runs and projects (two
+reviews can each have an `SF-1`), and one handed over bare can bring a fact from the wrong review
+into a slice agent's prompt. In every handoff (reproduction slices, prior art, the security gate,
+a later run's memory), cite a finding as `<run_id>/<id>`, e.g. `proj_v3/PRJ-014`, and give its
+title with it. Agent-internal ids never leave the run: map them to the consolidated id first.
+
+**Second look at single-finder findings.** A finding only one agent reached is the least likely to
+be found again: in one measured re-run, about half of the single-finder items came back (77% of the
+FIX ones), against about 90% of the items two or more agents had found. A miss on re-run means the
+area wasn't covered well, so its siblings probably weren't either. After consolidation:
+
+1. List the FIX findings, and the findings with a `security_claim`, whose `agents` has one entry.
+2. Group them by area (module or package).
+3. Dispatch one targeted agent per area, preferably of a different type from the finder (a
+   silent-failure-hunter over a python-pitfall-scanner finding on an error path, a
+   pattern-consistency-checker over a consistency-auditor one). Give it the area and the shapes of
+   the findings there, not the findings themselves, and ask for defects of those shapes and their
+   siblings.
+4. Consolidate its report like any other. A re-found finding gains the second agent in `agents`;
+   a new one is a new finding. Note in `notes` which findings stayed single-finder.
+
+When the review is planned up front, the cheaper version is overlap: give each high-risk area
+(auth, payments, data deletion, anything security-relevant) two agents whose scopes both cover it.
 
 #### Step 2: Check locations, then re-anchor against unmerged branches
 

@@ -120,6 +120,142 @@ class TestBlind(unittest.TestCase):
         )
 
 
+class TestPrecedentHintRanking(unittest.TestCase):
+    """Hints rank by distinctive words and mechanism class, and stay few."""
+
+    # A domain where most audit titles share the same nouns.
+    PRECEDENTS: ClassVar[list] = [
+        {"id": "P-1", "title": "Account token expiry not enforced", "severity": "low"},
+        {"id": "P-2", "title": "Account token shown in logs", "severity": "low"},
+        {"id": "P-3", "title": "Account settings form lacks CSRF protection"},
+        {"id": "P-4", "title": "Denial of service on compressed archive uploads"},
+        {"id": "P-5", "title": "Token reuse after account deletion", "severity": "low"},
+    ]
+
+    def test_shared_domain_nouns_alone_give_no_hint(self):
+        # "account" and "token" are in most titles: sharing them says nothing.
+        finding = {"id": "X", "title": "Account token count is wrong on the dashboard"}
+        self.assertEqual(mod.precedent_hints(finding, self.PRECEDENTS), [])
+
+    def test_mechanism_class_matches_across_wording(self):
+        finding = {
+            "id": "X",
+            "title": "Archive upload has no decompressed-size cap (decompression bomb)",
+        }
+        hints = mod.precedent_hints(finding, self.PRECEDENTS)
+        self.assertEqual([h["id"] for h in hints], ["P-4"])
+        self.assertEqual(hints[0]["shared_mechanisms"], ["denial-of-service"])
+        self.assertIn("score", hints[0])
+
+    def test_at_most_two_hints(self):
+        precedents = [
+            {"id": f"R-{i}", "title": f"Replay of signed webhook payloads variant {i}"}
+            for i in range(5)
+        ]
+        finding = {"id": "X", "title": "Signed webhook payloads accept replay"}
+        self.assertEqual(len(mod.precedent_hints(finding, precedents)), 2)
+
+    def test_blind_weights_words_across_all_claims(self):
+        findings = [
+            {
+                "id": f"F-{i}",
+                "title": f"Account token problem number {i}",
+                "security_claim": {"attacker": "a", "preconditions": "p", "gain": "g"},
+            }
+            for i in range(3)
+        ]
+        claims = mod.blind(findings, precedents=self.PRECEDENTS)
+        self.assertTrue(all(c["precedent_hints"] == [] for c in claims))
+
+
+class TestLint(unittest.TestCase):
+    """Publication hygiene of a consolidated findings.json."""
+
+    def _kinds(self, findings, **kw):
+        return sorted(
+            (p["id"], p["kind"], p["detail"])
+            for p in mod.lint(findings, agent_names=["silent-failure-hunter"], **kw)[
+                "problems"
+            ]
+        )
+
+    def test_clean_findings_pass(self):
+        findings = [
+            {
+                "id": "PRJ-001",
+                "title": "Retry drops the task after a timeout",
+                "failure_scenario": "a UTF-8 body over HTTP2 and a SHA1 digest; see PRJ-002",
+                "agents": ["silent-failure-hunter"],
+                "source_refs": ["agents/silent-failure-hunter.md#SFH-3"],
+            },
+            {"id": "PRJ-002", "title": "Base64 field is parsed as ZIP64"},
+        ]
+        result = mod.lint(findings, agent_names=["silent-failure-hunter"])
+        self.assertTrue(result["clean"], result["problems"])
+
+    def test_agent_names_ids_and_separators_in_prose(self):
+        findings = [
+            {
+                "id": "PRJ-001",
+                "title": "Lost retry || swallowed error",
+                "mechanism": "silent-failure-hunter saw this as SFH-3 (same as SF1)",
+            }
+        ]
+        self.assertEqual(
+            self._kinds(findings),
+            [
+                ("PRJ-001", "agent-name", "silent-failure-hunter"),
+                ("PRJ-001", "internal-id", "SF1"),
+                ("PRJ-001", "internal-id", "SFH-3"),
+                ("PRJ-001", "merge-separator", "`||` in maintainer-facing text"),
+            ],
+        )
+
+    def test_suffixed_finding_id_is_a_known_id(self):
+        findings = [
+            {"id": "PRJ-001", "title": "Split from PRJ-002a"},
+            {"id": "PRJ-002", "title": "Original"},
+        ]
+        self.assertEqual(self._kinds(findings), [])
+
+    def test_allow_list(self):
+        findings = [{"id": "PRJ-001", "title": "Breaks on WCAG-21 and on KV9"}]
+        self.assertEqual(self._kinds(findings), [("PRJ-001", "internal-id", "KV9")])
+        self.assertEqual(self._kinds(findings, allow={"KV9"}), [])
+
+    def test_public_finding_citing_a_sensitive_one(self):
+        findings = [
+            {
+                "id": "PRJ-001",
+                "title": "Public",
+                "notes": "merged the twin into PRJ-007a",
+            },
+            {"id": "PRJ-002", "title": "Public", "propagation_gap_of": ["PRJ-007"]},
+            {"id": "PRJ-007", "title": "Private", "publication_sensitive": True},
+            # Sensitive findings may cite each other, and themselves.
+            {
+                "id": "PRJ-008",
+                "title": "Private",
+                "notes": "sibling of PRJ-007, see PRJ-008",
+                "publication_sensitive": True,
+            },
+            # PRJ-0070 is a different finding.
+            {"id": "PRJ-009", "title": "Public", "notes": "unlike PRJ-0070"},
+        ]
+        problems = mod.lint(findings, agent_names=[])["problems"]
+        self.assertEqual(
+            sorted((p["id"], p["field"], p["kind"], p["detail"]) for p in problems),
+            [
+                ("PRJ-001", "notes", "sensitive-ref", "PRJ-007"),
+                ("PRJ-002", "propagation_gap_of", "sensitive-ref", "PRJ-007"),
+            ],
+        )
+
+    def test_default_agent_names_come_from_the_plugin(self):
+        findings = [{"id": "PRJ-001", "title": "Seen by the concurrency-auditor"}]
+        self.assertEqual(mod.lint(findings)["counts"], {"agent-name": 1})
+
+
 class TestSignoff(unittest.TestCase):
     def test_pass(self):
         result = mod.signoff(
@@ -372,6 +508,21 @@ class TestCli(unittest.TestCase):
             )
             self.assertEqual(code, 1)  # BLOCKED exits non-zero
             self.assertEqual(result["state"], "BLOCKED")
+
+    def test_lint_exit_codes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "findings.json"
+            path.write_text(json.dumps({"findings": [{"id": "A-1", "title": "ok"}]}))
+            code, result = self._run(["lint", str(path)])
+            self.assertEqual(code, 0)
+            self.assertTrue(result["clean"])
+            path.write_text(
+                json.dumps({"findings": [{"id": "A-1", "title": "dup of SF-2"}]})
+            )
+            code, result = self._run(["lint", str(path)])
+            self.assertEqual(code, 1)
+            code, result = self._run(["lint", str(path), "--allow", "SF-2"])
+            self.assertEqual(code, 0)
 
     def test_bad_subcommand(self):
         code, result = self._run(["frobnicate"])
