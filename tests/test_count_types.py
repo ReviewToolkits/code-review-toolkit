@@ -590,6 +590,87 @@ class TestContainerCategories(unittest.TestCase):
         )
 
 
+class TestOrmAndInterfaceCategories(unittest.TestCase):
+    """ORM models and interface declarations are inventoried, not left null."""
+
+    def _types(self, source: str) -> dict[str, str | None]:
+        with TempProject({"mod.py": source}) as root:
+            classes = mod.analyze_file(root / "mod.py", root)["classes"]
+        return {c["name"]: c["container_type"] for c in classes}
+
+    def test_declarative_base_and_mapped_models(self):
+        types = self._types(
+            "from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column\n"
+            "class Base(DeclarativeBase):\n    pass\n"
+            "class Widget(Base):\n"
+            "    __tablename__ = 'widgets'\n"
+            "    id: Mapped[int] = mapped_column(primary_key=True)\n"
+            "class Gadget(Base):\n"
+            "    label: 'Mapped[str | None]'\n"
+        )
+        self.assertEqual(
+            types, {"Base": "orm_model", "Widget": "orm_model", "Gadget": "orm_model"}
+        )
+
+    def test_legacy_declarative_base_subclass_by_its_columns(self):
+        # The base is a `declarative_base()` variable: recognised by the body.
+        types = self._types(
+            "from sqlalchemy import Column, Integer\n"
+            "from sqlalchemy.orm import declarative_base\n"
+            "ModelBase = declarative_base()\n"
+            "class Part(ModelBase):\n"
+            "    serial = Column(Integer, nullable=False)\n"
+            "class Stamped:\n"
+            "    created = Column(Integer)\n"
+        )
+        self.assertEqual(types, {"Part": "orm_model", "Stamped": "orm_model"})
+
+    def test_django_style_model(self):
+        types = self._types(
+            "from django.db import models\n"
+            "class Shelf(models.Model):\n    pass\n"
+            "class Book(Shelf):\n    title = models.CharField(max_length=10)\n"
+        )
+        self.assertEqual(types, {"Shelf": "orm_model", "Book": "orm_model"})
+
+    def test_interface_declarations(self):
+        types = self._types(
+            "from zope.interface import Interface, Attribute\n"
+            "class IStorage(Interface):\n"
+            "    def get(key):\n        '''Return the value.'''\n"
+            "class IBlobStorage(IStorage):\n"
+            "    def put(key, blob):\n        pass\n"
+        )
+        self.assertEqual(types, {"IStorage": "interface", "IBlobStorage": "interface"})
+
+    def test_true_negatives(self):
+        types = self._types(
+            "class Model:\n    pass\n"
+            "class Thing(Model):\n    size = 3\n"
+            "class IOHandler(IOBase):\n"
+            "    def read(self):\n        return b''\n"
+            "class Impl(IStorage):\n"
+            "    def get(self, key):\n        return key\n"
+            "class Columns:\n    names = list()\n"
+        )
+        self.assertEqual(
+            types,
+            {
+                "Model": None,
+                "Thing": None,
+                "IOHandler": None,
+                "Impl": None,
+                "Columns": None,
+            },
+        )
+
+    def test_protocol_keeps_priority(self):
+        types = self._types(
+            "from typing import Protocol\nclass HasId(Protocol):\n    id: 'Mapped[int]'\n"
+        )
+        self.assertEqual(types, {"HasId": "Protocol"})
+
+
 class TestModuleCompleteness(unittest.TestCase):
     def test_modules_fully_annotated_is_counted(self):
         out = _analyze_tree(
