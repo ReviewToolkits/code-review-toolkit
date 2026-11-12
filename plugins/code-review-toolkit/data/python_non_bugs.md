@@ -514,3 +514,17 @@ before the work. A comment that calls the first check optimistic is the usual te
 
 **Real bug:** no atomic limiter is charged first on that path, or the limiter guards guessing
 (passwords, one-time codes, recovery codes), where a burst is the attack.
+
+### 51. A task enqueued inside a request transaction, where the task base class defers publishing
+
+**Looks like:** `external-side-effect-inside-db-transaction` -- `task.delay(...)` called before the
+request commits, so the worker could run before the data it needs exists, or run for a change that
+rolled back.
+
+**Why it is not a bug:** many projects give their task base class an `apply_async` that defers
+publishing to an after-commit hook whenever a request transaction is active. The call site looks
+early; the message leaves only after a successful commit.
+
+**Real bug:** the deferral itself has the residual risks -- the hook swallows publish errors
+(`after-commit-hook-swallows-errors`), and the task's own retries go through the same deferral
+(`task-retry-dropped-by-after-commit-publish`). Read the base class before dismissing.

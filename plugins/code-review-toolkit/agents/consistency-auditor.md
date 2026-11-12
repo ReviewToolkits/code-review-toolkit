@@ -107,6 +107,33 @@ The majority behavior is the project's own standard; the outlier is the candidat
 general "same concern, different approach" analysis across modules to pattern-consistency-checker:
 this agent's job is the side-by-side comparison of close siblings, within a module or class.
 
+### Phase 2c: Error exits after a mutation (transaction-per-request frameworks)
+
+Where the framework commits every request that returns normally (`pyramid_tm`, Django
+`ATOMIC_REQUESTS`, a task wrapper), how a handler *exits* after a mutation decides what commits.
+For each view or task that changes state, list its exits after the first mutation, including
+mutations inside the services it calls:
+
+- An error response, redirect or flash that is **returned** commits the half-done change; one that
+  is **raised** aborts it (`error-exit-after-flushed-mutation`). Compare with sibling views: the
+  majority usually raise, or roll back before returning.
+- A caught `IntegrityError`/`UniqueViolation` with no `rollback()` or savepoint leaves the session
+  unusable, so the friendly error path ends in a 500 (`integrity-error-caught-without-rollback`;
+  the pitfall scanner flags the plain form). Follow a converted exception to the caller that
+  catches it.
+- A broad `except` around a write, an audit event and an email that flashes "unexpected error" and
+  returns: whatever ran before the failure commits.
+
+Check the framework's commit veto (abort on 4xx/5xx) before reporting: with one, an error response
+commits nothing.
+
+The same sibling comparison applies to the data layer: a child fetched by id without checking it
+belongs to the URL's parent (`child-by-id-without-parent-check`), a group-owned object deletable
+only by its creator (`creator-scoped-delete-of-group-scoped-object`), and a container delete that
+skips the per-member events its single-member twin emits
+(`aggregate-delete-skips-per-member-side-effects`). These are the catalogued shapes this agent
+owns; in informed mode, hunt them first.
+
 ### Phase 3: Check Against Explicit Rules
 
 If CLAUDE.md (or equivalent project configuration) exists, compare the discovered conventions against the documented rules:

@@ -2684,6 +2684,139 @@
       "differential": "A short wait on a lock held only for milliseconds is fine. A dropped attempt that is retried later by a working retry path is a latency issue, not a lost update.",
       "detected_by": null,
       "detectability": "agent-only"
+    },
+    {
+      "id": "external-side-effect-inside-db-transaction",
+      "title": "An external call made inside the database transaction of the change it accompanies",
+      "agent": "silent-failure-hunter",
+      "severity": "FIX",
+      "pattern": "A request handler or task changes database state and, before commit, calls an external system (email provider, chat webhook, helpdesk, payment API, object store). Either the external call raises and the framework rolls back the essential change (a cosmetic notification blocks the real work), or the external effect lands and a later failure rolls the database back, so the two systems disagree (an email sent for an action that never committed; a subscription cancelled at the provider but still active locally).",
+      "guarded_twin": "Run the external call from an after-commit hook or a task enqueued after commit, so it happens only when the change committed; or wrap a genuinely optional call in its own except-and-log; or compensate (undo the external effect) on rollback.",
+      "hunt": "List every client of an external system. For each call site, find the enclosing transaction boundary (transaction-per-request middleware, a task wrapper, an explicit `with transaction`). Classify the call as essential, optional or irreversible. Report optional calls that can raise inside the transaction, and irreversible calls followed by other fallible work before commit. A remote failure that recurs on every attempt (a deleted remote object) makes it permanent.",
+      "expected": "the database change and the external effect either both happen or neither does; an optional side effect never blocks the essential change.",
+      "caught_as": "SILENT when the systems diverge; a 500 that discards the real work when an optional call fails.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): a task recorded a sent email after the provider accepted it, and a later failure in the same task rolled the record back, so the provider's delivery notifications for that message were then rejected.",
+        "The same review (reproduced): a plan downgrade cancelled the payment provider's subscriptions mid-transaction, and a later failure rolled back the database but not the provider."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "zope.transaction / Django docs: after-commit hooks (`addAfterCommitHook`, `transaction.on_commit`) exist to run side effects only after a successful commit"
+      ],
+      "differential": "When the external call IS the operation and its failure must abort (a charge before granting access), it belongs inside. A call already dispatched from an after-commit hook or a post-commit task is the guarded twin.",
+      "detected_by": null,
+      "detectability": "agent-only",
+      "aliases": [
+        "notification-failure-rolls-back-action",
+        "side-effect-before-commit"
+      ]
+    },
+    {
+      "id": "task-retry-dropped-by-after-commit-publish",
+      "title": "A task base class defers publishing to an after-commit hook, so a task's own `retry()` is discarded when its transaction aborts",
+      "agent": "silent-failure-hunter",
+      "severity": "FIX",
+      "pattern": "A task-queue `Task` subclass overrides `apply_async` to defer publishing to the current transaction's after-commit hook, and the worker runs each task body inside that transaction. `Task.retry()` publishes through `apply_async`, so the retry message is parked on the transaction that the `Retry` exception then aborts; after-commit hooks never run on abort. `autoretry_for` variants run after the transaction ended and fail with a no-transaction error instead. Every retry is logged and none is sent.",
+      "guarded_twin": "Publish retries with the base implementation (`super().apply_async`) or defer only when the caller is a web request, not the worker's own task context; or run the retry decision outside the body's transaction.",
+      "hunt": "Grep task base classes for `apply_async` overrides that call `addAfterCommitHook`/`on_commit`, and the worker wrapper that runs task bodies inside a transaction. Then list every `retry(`, `autoretry_for` and `max_retries` in the project: each one depends on this path. Run one task through the real tracer (not eager mode) with the broker publish recorded.",
+      "expected": "a task that calls retry() is re-published with its countdown.",
+      "caught_as": "SILENT -- the task state says RETRY and the log says 'Retry in Ns', but no message reaches the broker; unit tests mock retry().",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): every retry from the project's task base class was parked on an after-commit hook of the transaction the Retry aborted; autoretry variants were rejected with a no-transaction error."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "Celery docs, Task.retry: retry() re-sends the task through apply_async",
+        "transaction package docs: after-commit hooks run only after a successful commit"
+      ],
+      "differential": "An override that bypasses the hook when no request transaction is active, or when called from the worker's task context, is the guarded twin. A project with no retries configured has nothing to drop.",
+      "detected_by": null,
+      "detectability": "implementable"
+    },
+    {
+      "id": "after-commit-hook-swallows-errors",
+      "title": "Work moved into an after-commit hook fails silently, because the transaction manager logs and swallows hook exceptions",
+      "agent": "silent-failure-hunter",
+      "severity": "CONSIDER",
+      "pattern": "Task publishing, cache purges or notifications run from `addAfterCommitHook` / `on_commit(robust=True)` callbacks. The commit has already succeeded when they run, so the manager catches their exceptions, logs them and returns normally. A broker outage or a bad payload at commit time drops the work with only a log line; the request returns success and nothing retries.",
+      "guarded_twin": "An outbox: write the intent to a table in the same transaction and let a worker deliver it; or a hook that records failures somewhere a retry job reads; or alerting on the swallowed-exception log line.",
+      "hunt": "List every after-commit hook the project registers and what each one does. For each, ask what happens when it raises: who notices, and what retries it. Pay attention to hooks that publish tasks: every task dispatched from a request goes through them.",
+      "expected": "work deferred to commit time is delivered, or its failure is recorded somewhere that retries it.",
+      "caught_as": "SILENT -- a warning or exception log line at commit; the side effect never happens.",
+      "confirmed_examples": [],
+      "validation": "documented",
+      "references": [
+        "transaction package docs: after-commit hook exceptions are logged and not propagated",
+        "Django docs, transaction.on_commit(robust=True): exceptions are logged and swallowed"
+      ],
+      "differential": "A hook whose failure is genuinely harmless (a best-effort cache warm) is fine. A hook that writes failures to a retry queue is the guarded twin.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "int-max-str-digits-escapes-parser-validation",
+      "title": "A parser `int()`s an unbounded digit run; more than 4300 digits raises a plain ValueError the caller does not catch",
+      "agent": "silent-failure-hunter",
+      "severity": "FIX",
+      "pattern": "A version, id, port or enumerator parser validates syntax with a regex like `\\d+` and then calls `int()` on the match. Since the integer string conversion length limit (3.11, also backported), `int()` on more than 4300 digits raises `ValueError: Exceeds the limit (4300 digits)`. The parser's documented error type (an InvalidVersion-style class, or a 'returns None on bad input' contract) does not cover it, so callers that catch only the documented type leak a 500 or crash a batch.",
+      "guarded_twin": "Bound the digit run in the regex (`\\d{1,N}`), cap the input length before parsing, or catch `ValueError` at the boundary (wider-than-documented catches elsewhere in the codebase show the house idiom).",
+      "hunt": "Grep for `int(` applied to regex groups or `isdigit()`-checked strings in parsers of untrusted input, including third-party parsers the project calls on request data. Feed `'1' * 4301` to every untrusted-input entry point: URL segments, form fields, uploaded metadata.",
+      "expected": "oversized numeric input is rejected with the parser's own error, or a 4xx.",
+      "caught_as": "A 500 (or a crashed batch job) instead of a validation error; reachable without authentication when the parser runs on URL segments or upload metadata.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): an identifier with a numeric component over 4300 digits raised a plain ValueError from a third-party parser instead of the parser's documented error type, and the endpoint answered 500."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "Python docs, Integer string conversion length limitation (sys.set_int_max_str_digits); CVE-2020-10735"
+      ],
+      "differential": "Input whose length is bounded well below 4300 characters before parsing, or a process that sets `sys.set_int_max_str_digits(0)` on purpose, is fine.",
+      "detected_by": null,
+      "detectability": "implementable"
+    },
+    {
+      "id": "error-exit-after-flushed-mutation",
+      "title": "An error path returns normally after a mutation was flushed, and transaction-per-request commits the partial change",
+      "agent": "consistency-auditor",
+      "severity": "FIX",
+      "pattern": "In a framework that commits at the end of every request that returns normally (pyramid_tm, Django ATOMIC_REQUESTS, a task wrapper), a handler mutates rows (often via a service that flushes), then detects a problem and RETURNS an error response, redirect or flash instead of raising. The return is a success to the transaction manager, so the half-done change commits. The same happens when a broad `except` around a DB write, an audit event and an email flashes 'unexpected error' and returns.",
+      "guarded_twin": "RAISE the error response (frameworks treat a raised HTTP exception as an abort), call `request.tm.abort()` / `transaction.set_rollback(True)` / `session.rollback()` before returning, or validate everything before the first mutation. A sibling view that raises its redirect is the house idiom.",
+      "hunt": "For each view or task that mutates state, list its exits after the first mutation (including mutations inside called services). Mark each exit as raise (aborts) or return (commits). An error-shaped return after a mutation is a candidate: build the input that reaches it and check what the database holds afterwards. Then compare with sibling views of the same family.",
+      "expected": "an operation that reports failure leaves no partial change behind.",
+      "caught_as": "SILENT -- the user sees an error message, and the database holds half of the change (a rename applied, an event recorded for an action that 'failed').",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): callbacks that link an external account caught Exception around a database write, an audit event and an email, flashed 'unexpected error' and returned, so the request committed whatever had already been written."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "pyramid_tm docs: the transaction is committed unless the view raises or the response status matches the abort criteria",
+        "Django docs, Tying transactions to HTTP requests (ATOMIC_REQUESTS)"
+      ],
+      "differential": "A return after a mutation that the error message describes as done (partial success reported as such) is fine. A framework configured to abort on 4xx/5xx responses (a commit veto) commits nothing for an error response: check the veto before reporting.",
+      "detected_by": null,
+      "detectability": "agent-only"
+    },
+    {
+      "id": "integrity-error-caught-without-rollback",
+      "title": "An IntegrityError from a flush is caught and handled without rolling back the session",
+      "agent": "python-pitfall-scanner",
+      "severity": "FIX",
+      "pattern": "`try: session.flush() except IntegrityError: return error / raise ValueError(...)`, with no `session.rollback()` and no savepoint (`begin_nested()`). After a failed flush the transaction is aborted: SQLAlchemy raises `PendingRollbackError` on the next use of the session, and PostgreSQL refuses every further statement. The friendly error path the handler intends ends in a 500 when the response renders, the end-of-request commit runs, or a caller that catches the converted exception keeps using the session.",
+      "guarded_twin": "`session.rollback()` first thing in the handler, or `with session.begin_nested(): session.flush()` so only the savepoint rolls back. Sibling handlers of the same error in the project usually do one of these.",
+      "hunt": "List every handler of `IntegrityError`/`UniqueViolation` and the database work in its `try`. Keep those with no rollback or savepoint. For each, follow the exception the handler raises (if any) to the caller that catches it, and check whether that caller uses the session again.",
+      "expected": "a constraint violation becomes the intended error response, and the session stays usable.",
+      "caught_as": "LOUD but misleading -- a 500 with PendingRollbackError (or 'current transaction is aborted') where the code meant to show a validation error.",
+      "confirmed_examples": [
+        "A private review of a large web application with an ORM and a task queue (reproduced): a rename service caught the unique violation from its flush and raised ValueError without rolling back; the admin view caught the ValueError, flashed an error, and the next database use raised PendingRollbackError."
+      ],
+      "validation": "confirmed",
+      "references": [
+        "SQLAlchemy docs, 'This Session's transaction has been rolled back due to a previous exception during flush' (PendingRollbackError)",
+        "SQLAlchemy docs, Using SAVEPOINT (Session.begin_nested)"
+      ],
+      "differential": "A handler that re-raises the same exception (bare `raise`) lets the framework roll back, which is fine. A try whose database work runs inside `begin_nested()`, or a handler whose caller always discards the session, is fine.",
+      "detected_by": "scan_python_pitfalls.py",
+      "detectability": "implemented"
     }
   ]
 }

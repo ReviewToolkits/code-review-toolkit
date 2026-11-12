@@ -4934,6 +4934,71 @@ def _check_unformatted_format_string(tree: ast.AST) -> list[dict]:
     return out
 
 
+# --------------------------------------------------------------------------
+# Web / ORM shapes
+# --------------------------------------------------------------------------
+
+_INTEGRITY_ERRORS = frozenset({"IntegrityError", "UniqueViolation"})
+# Calls that leave the session usable (or hand the abort to the framework).
+_SESSION_RECOVERY_CALLS = frozenset(
+    {"rollback", "begin_nested", "abort", "set_rollback", "savepoint"}
+)
+
+
+def _caught_tails(handler: ast.ExceptHandler) -> set[str]:
+    if handler.type is None:
+        return set()
+    parts = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    return {_dotted_name(p).split(".")[-1] for p in parts}
+
+
+def _call_tails(stmts: list[ast.stmt]) -> set[str]:
+    return {
+        _call_tail(node)
+        for stmt in stmts
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.Call)
+    }
+
+
+def _check_integrity_error_without_rollback(tree: ast.AST) -> list[dict]:
+    """`except IntegrityError:` handled without a rollback or a savepoint."""
+    out: list[dict] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try) or "begin_nested" in _call_tails(node.body):
+            continue
+        for handler in node.handlers:
+            caught = _caught_tails(handler) & _INTEGRITY_ERRORS
+            if not caught or _call_tails(handler.body) & _SESSION_RECOVERY_CALLS:
+                continue
+            reraises = any(
+                isinstance(sub, ast.Raise)
+                and (
+                    sub.exc is None
+                    or (isinstance(sub.exc, ast.Name) and sub.exc.id == handler.name)
+                )
+                for stmt in handler.body
+                for sub in ast.walk(stmt)
+            )
+            if reraises:
+                continue  # the framework sees the error and rolls back
+            out.append(
+                _finding(
+                    "integrity-error-caught-without-rollback",
+                    "FIX",
+                    "medium",
+                    handler,
+                    f"{min(caught)} is handled without session.rollback() or a "
+                    f"savepoint: the transaction is aborted, so the next use of the "
+                    f"session raises PendingRollbackError",
+                    "roll back first in the handler, or flush inside "
+                    "session.begin_nested(); dismiss if the caller always discards the "
+                    "session",
+                )
+            )
+    return out
+
+
 _PROJECT_CHECKS = {
     "divergent-sentinel-across-parallel-modules": _check_divergent_sentinel,
     "unguarded-inverse-of-guarded-operation": _check_unguarded_inverse,
@@ -4984,6 +5049,7 @@ _CHECKS = {
     "cleanup-inside-try-triggers-rollback": _check_cleanup_inside_try_triggers_rollback,
     "side-channel-raise-in-finally": _check_side_channel_raise_in_finally,
     "wide-suppress-exception-block": _check_wide_suppress_exception,
+    "integrity-error-caught-without-rollback": _check_integrity_error_without_rollback,
 }
 
 

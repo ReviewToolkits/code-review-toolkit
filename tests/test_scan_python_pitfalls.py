@@ -2238,5 +2238,69 @@ class TestUnformattedFormatString(unittest.TestCase):
         )
 
 
+class TestIntegrityErrorWithoutRollback(unittest.TestCase):
+    shape = "integrity-error-caught-without-rollback"
+
+    def test_converted_without_rollback(self):
+        src = (
+            "def retitle(db, folder, title):\n"
+            "    folder.title = title\n"
+            "    try:\n"
+            "        db.flush()\n"
+            "    except UniqueViolation:\n"
+            "        raise ValueError('title in use')\n"
+        )
+        found = [f for f in scan(src) if f["shape"] == self.shape]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["line"], 5)
+
+    def test_returned_error_without_rollback(self):
+        src = (
+            "from sqlalchemy.exc import IntegrityError\n"
+            "def add(request, row):\n"
+            "    try:\n"
+            "        request.db.add(row)\n"
+            "        request.db.flush()\n"
+            "    except (KeyError, IntegrityError):\n"
+            "        request.session.flash('already exists')\n"
+            "        return default_response\n"
+        )
+        self.assertIn(self.shape, shapes(src))
+
+    def test_rollback_in_handler_is_the_guarded_twin(self):
+        src = (
+            "def add(db, row):\n"
+            "    try:\n"
+            "        db.add(row)\n"
+            "        db.flush()\n"
+            "    except IntegrityError:\n"
+            "        db.rollback()\n"
+            "        raise ValueError('taken') from None\n"
+        )
+        self.assertNotIn(self.shape, shapes(src))
+
+    def test_savepoint_and_reraise_are_silent(self):
+        savepoint = (
+            "def add(db, row):\n"
+            "    try:\n"
+            "        with db.begin_nested():\n"
+            "            db.add(row)\n"
+            "    except IntegrityError:\n"
+            "        return None\n"
+        )
+        reraise = (
+            "def add(db, row):\n"
+            "    try:\n"
+            "        db.flush()\n"
+            "    except IntegrityError as exc:\n"
+            "        log(exc)\n"
+            "        raise\n"
+        )
+        self.assertNotIn(self.shape, shapes(savepoint))
+        self.assertNotIn(self.shape, shapes(reraise))
+
+
+
+
 if __name__ == "__main__":
     unittest.main()
