@@ -177,6 +177,243 @@ class TestSuppressionDetails(unittest.TestCase):
         self.assertEqual(result["summary"]["suppression_dismissal_signals"], 0)
 
 
+PYPROJECT_SELECT_ALL = """\
+[project]
+name = "x"
+
+[tool.ruff.lint]
+# select everything, then opt out
+select = ["ALL"]
+ignore = [
+  "B019",  # we have a few of these, should fix them
+  "DTZ",  # naive datetimes need manual review
+  # complexity metrics we do not use
+  "C901",
+  "PLR0912",
+
+  "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# T201: command-line entry points may print
+"app/cli/**/*.py" = ["T201"]
+
+# INP001: these are scripts
+"bin/*.py" = ["INP001"]
+"dev/*.py" = ["INP001"]
+"models.py" = ["N805"]  # declarative classes, not methods
+"""
+
+
+class TestProjectRuffConfig(unittest.TestCase):
+    """The project's own select/ignore list, with each ignore's stated reason."""
+
+    def _config(self, files):
+        from helpers import TempProject
+
+        with TempProject({}) as root:
+            # Written after TempProject, which writes its own pyproject.toml.
+            for name, text in files.items():
+                (root / name).write_text(text, encoding="utf-8")
+            return mod.parse_project_ruff_config(root)
+
+    def test_select_all_and_each_ignore_reason(self):
+        config = self._config({"pyproject.toml": PYPROJECT_SELECT_ALL})
+        self.assertTrue(config["selects_all"])
+        reasons = {e["rule"]: e["reason"] for e in config["ignore"]}
+        self.assertEqual(reasons["B019"], "we have a few of these, should fix them")
+        self.assertEqual(reasons["DTZ"], "naive datetimes need manual review")
+        # A comment line above a group explains the group.
+        self.assertEqual(reasons["C901"], "complexity metrics we do not use")
+        self.assertEqual(reasons["PLR0912"], "complexity metrics we do not use")
+        # A blank line ends the group: no reason is invented.
+        self.assertIsNone(reasons["E501"])
+
+    def test_per_file_ignores_and_their_reasons(self):
+        config = self._config({"pyproject.toml": PYPROJECT_SELECT_ALL})
+        pfi = {
+            (e["pattern"], e["rule"]): e["reason"] for e in config["per_file_ignores"]
+        }
+        self.assertEqual(
+            pfi[("app/cli/**/*.py", "T201")],
+            "T201: command-line entry points may print",
+        )
+        # One comment block above consecutive keys explains all of them.
+        self.assertEqual(pfi[("bin/*.py", "INP001")], "INP001: these are scripts")
+        self.assertEqual(pfi[("dev/*.py", "INP001")], "INP001: these are scripts")
+        self.assertEqual(pfi[("models.py", "N805")], "declarative classes, not methods")
+
+    def test_ruff_toml_and_extend_select(self):
+        config = self._config(
+            {
+                "ruff.toml": (
+                    "[lint]\n"
+                    'extend-select = ["B"]  # bugbear too\n'
+                    'ignore = ["E721"]  # kept from the old flake8 config\n'
+                ),
+            }
+        )
+        self.assertEqual(config["source"], "ruff.toml")
+        self.assertIsNone(config["select"])
+        self.assertEqual(config["extend_select"], ["B"])
+        self.assertFalse(config["selects_all"])
+        self.assertEqual(
+            mod.project_rule_status("E721", "m.py", config),
+            {
+                "status": "ignored-by-project",
+                "entry": "E721",
+                "reason": "kept from the old flake8 config",
+            },
+        )
+        self.assertEqual(
+            mod.project_rule_status("B006", "m.py", config)["status"],
+            "selected-by-project",
+        )
+        self.assertEqual(
+            mod.project_rule_status("F821", "m.py", config)["status"],
+            "project-default-selection",
+        )
+
+    def test_no_ruff_config(self):
+        self.assertIsNone(self._config({"m.py": "x = 1\n"}))
+        self.assertIsNone(mod.project_rule_status("F821", "m.py", None))
+
+    def test_rule_status_precedence(self):
+        config = self._config({"pyproject.toml": PYPROJECT_SELECT_ALL})
+
+        def status(code, path):
+            return mod.project_rule_status(code, path, config)
+
+        self.assertEqual(status("DTZ005", "app/a.py")["entry"], "DTZ")
+        self.assertEqual(status("F821", "app/a.py")["status"], "selected-by-project")
+        self.assertEqual(
+            status("T201", "app/cli/sub/run.py")["status"], "ignored-for-file"
+        )
+        self.assertEqual(status("T201", "app/cli/run.py")["status"], "ignored-for-file")
+        self.assertEqual(status("T201", "app/web.py")["status"], "selected-by-project")
+        # A pattern without a slash matches the file name anywhere.
+        self.assertEqual(
+            status("N805", "app/x/models.py")["status"], "ignored-for-file"
+        )
+        # A more specific select beats a broader ignore.
+        narrow = {
+            "select": ["DTZ005"],
+            "extend_select": [],
+            "selects_all": False,
+            "ignore": [{"rule": "DTZ", "reason": None}],
+            "per_file_ignores": [],
+        }
+        self.assertEqual(
+            mod.project_rule_status("DTZ005", "a.py", narrow)["status"],
+            "selected-by-project",
+        )
+        self.assertEqual(
+            mod.project_rule_status("DTZ001", "a.py", narrow)["status"],
+            "ignored-by-project",
+        )
+
+
+def _analyze_with_noqa_pass(root, hits, noqa_hits, **kwargs):
+    """Like _analyze_with_fake_ruff, but the --ignore-noqa pass adds hits."""
+    from unittest.mock import patch
+
+    def fake_run_ruff(*args, ignore_noqa=False, **kw):
+        return (list(hits) + (list(noqa_hits) if ignore_noqa else []), "", None)
+
+    with (
+        patch.object(mod, "_run_project_ruff", return_value=([], None)),
+        patch.object(mod, "ruff_version", return_value=mod.PINNED_RUFF_VERSION),
+        patch.object(
+            mod,
+            "validate_rules",
+            return_value={"ok": [], "unknown": [], "removed": [], "preview_gated": []},
+        ),
+        patch.object(mod, "_run_ruff", side_effect=fake_run_ruff),
+    ):
+        return mod.analyze(str(root), **kwargs)
+
+
+class TestNoqaPass(unittest.TestCase):
+    """Hits ruff drops on `# noqa` lines are surfaced as claims to verify."""
+
+    SOURCE = (
+        "import datetime\n"
+        "if x == None:  # noqa: E711\n"
+        "    q = f'select {t}'  # noqa: S608\n"
+        "stamp = datetime.datetime.now()\n"
+    )
+
+    def test_noqa_only_hits_are_listed_apart_from_findings(self):
+        from helpers import TempProject
+
+        with TempProject({"m.py": self.SOURCE}) as root:
+            (root / "pyproject.toml").write_text(PYPROJECT_SELECT_ALL, encoding="utf-8")
+            live = [_fake_hit(root, "m.py", 4, "datetime.now", code="DTZ005")]
+            noqa = [
+                _fake_hit(root, "m.py", 2, "None", code="E711"),
+                _fake_hit(root, "m.py", 3, "f'", code="S608"),
+            ]
+            result = _analyze_with_noqa_pass(root, live, noqa)
+        summary = result["summary"]
+        self.assertEqual(summary["reported"], 1)  # calibrated counts unchanged
+        self.assertEqual(summary["noqa_suppressed"], 2)
+        self.assertEqual(summary["noqa_suppressed_by_code"], {"E711": 1, "S608": 1})
+        # The S608 noqa is a security claim to check.
+        self.assertEqual(summary["noqa_suppressed_needs_verification"], 1)
+        codes = {f["code"]: f for f in result["noqa_suppressed"]}
+        self.assertTrue(codes["E711"]["noqa_suppressed"])
+        self.assertTrue(codes["E711"]["suppression_is_dismissal_signal"])
+        self.assertFalse(codes["S608"]["suppression_is_dismissal_signal"])
+        self.assertTrue(result["noqa_pass"]["ran"])
+
+    def test_the_project_config_labels_every_hit(self):
+        from helpers import TempProject
+
+        with TempProject({"m.py": self.SOURCE}) as root:
+            (root / "pyproject.toml").write_text(PYPROJECT_SELECT_ALL, encoding="utf-8")
+            live = [_fake_hit(root, "m.py", 4, "datetime.now", code="DTZ005")]
+            result = _analyze_with_noqa_pass(root, live, [])
+        hit = result["findings"][0]
+        self.assertEqual(hit["project_config"]["status"], "ignored-by-project")
+        self.assertEqual(
+            hit["project_config"]["reason"], "naive datetimes need manual review"
+        )
+        self.assertIn("selects ALL", result["project_selects_all_note"])
+        self.assertEqual(
+            result["summary"]["project_ignored_rules"],
+            [
+                {
+                    "status": "ignored-by-project",
+                    "entry": "DTZ",
+                    "reason": "naive datetimes need manual review",
+                    "hits": 1,
+                }
+            ],
+        )
+        self.assertEqual(
+            result["summary"]["by_project_status"], {"ignored-by-project": 1}
+        )
+
+    def test_without_a_project_config_nothing_is_claimed(self):
+        from helpers import TempProject
+
+        with TempProject({"m.py": self.SOURCE}) as root:
+            live = [_fake_hit(root, "m.py", 4, "datetime.now", code="DTZ005")]
+            result = _analyze_with_noqa_pass(root, live, [])
+        self.assertIsNone(result["project_ruff_config"])
+        self.assertIsNone(result["summary"]["by_project_status"])
+        self.assertNotIn("project_selects_all_note", result)
+
+    def test_ruff_is_asked_to_ignore_noqa(self):
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+
+        with patch.object(mod.subprocess, "run") as run:
+            run.return_value = MagicMock(stdout="[]", stderr="")
+            mod._run_ruff("ruff", ["F821"], Path("/p"), preview=False, ignore_noqa=True)
+        self.assertIn("--ignore-noqa", run.call_args.args[0])
+
+
 class TestShapeEligibility(unittest.TestCase):
     """Metric and policy rules are not harvested as novel shapes."""
 

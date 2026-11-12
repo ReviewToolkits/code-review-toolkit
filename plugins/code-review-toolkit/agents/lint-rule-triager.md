@@ -94,6 +94,22 @@ the rule exists for. For these hits `suppression_is_dismissal_signal` is false. 
 3. `summary.suppression_needs_verification` is how many hits need this. Say in the report how many
    you checked.
 
+**The project's own ruff config is a signal too.** Every hit carries `project_config` (null when the
+project has no ruff config): `ignored-by-project` or `ignored-for-file` with the `entry` it falls
+under and the `reason` the maintainers wrote next to it, `selected-by-project`,
+`not-selected-by-project`, or `project-default-selection`. `summary.project_ignored_rules` groups
+the ignored hits by entry. Read the reason before triaging: "impossible for us to fix here" argues
+for dismissal; "we should probably fix these" or "needs manual review" is the maintainers asking
+for exactly the review you are doing, so verify those hits rather than dismiss them. When
+`project_selects_all_note` is present, the project selects ALL: every hit is a rule it ignores, a
+`# noqa` site, or an excluded file, never something its lint missed. Say so in the report.
+
+**`noqa_suppressed` lists the hits ruff drops on `# noqa` lines** (found by a second
+`--ignore-noqa` pass; `summary.noqa_suppressed` is null if that pass did not run). They are not in
+`findings` or the calibrated counts. Apply the suppression rules above to each: a noqa naming the
+rule on a non-security hit is the author's considered exception; a security rule, a `nosec`, or a
+noqa naming other rules is a claim to verify (`summary.noqa_suppressed_needs_verification`).
+
 **The script has already dismissed some mechanical classes.** `dismissed` holds hits moved out of
 `findings`, each with a `dismissal_reason` that `dismissal_reasons` explains. `summary.total`
 still counts them, so it stays comparable with the calibrated totals. `summary.reported` is what is

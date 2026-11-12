@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import fnmatch
 import json
 import re
 import subprocess
@@ -1395,14 +1396,228 @@ def detect_target_version(project_root: Path) -> str:
     return f"py3{sys.version_info.minor}"
 
 
+# ---------------------------------------------------------------------------
+# The project's own ruff configuration: what it selects, what it ignores, and
+# the reason written next to each ignore. Read as text, not with tomllib, so
+# the comments survive (and so Python 3.10 works).
+# ---------------------------------------------------------------------------
+
+_TOML_SECTION = re.compile(r"^\s*\[+\s*([^\]]+?)\s*\]+\s*(?:#.*)?$")
+_TOML_KEY = re.compile(r"^\s*([A-Za-z0-9_\"'.*/-]+?)\s*=\s*(.*)$")
+_TOML_STRING = re.compile(r'"([^"\n]*)"|\'([^\'\n]*)\'')
+_RULE_SELECTOR = re.compile(r"^(?:ALL|[A-Z]+[0-9]*)$")
+
+
+def _split_comment(line: str) -> tuple[str, str | None]:
+    """(code part, trailing comment text or None), ignoring `#` in strings."""
+    quote = None
+    for i, ch in enumerate(line):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#":
+            return line[:i], line[i + 1 :].strip() or None
+    return line, None
+
+
+def _strings(text: str) -> list[str]:
+    return [a or b for a, b in _TOML_STRING.findall(text)]
+
+
+def _ruff_config_file(project_root: Path) -> tuple[Path, str] | None:
+    """(config file, the section prefix ruff's settings live under), or None."""
+    for name in ("ruff.toml", ".ruff.toml"):
+        if (project_root / name).is_file():
+            return project_root / name, ""
+    pyproject = project_root / "pyproject.toml"
+    if re.search(r"(?m)^\s*\[tool\.ruff", _read(pyproject)):
+        return pyproject, "tool.ruff"
+    return None
+
+
+def parse_project_ruff_config(project_root: Path) -> dict | None:
+    """The project's ruff `select` / `ignore` / `per-file-ignores`, with reasons.
+
+    Each ignore entry carries the comment written next to it: the trailing
+    comment on its own line, or else the comment lines just above it. A
+    maintainer's "this lint triggers where it's impossible for us to fix it"
+    is a dismissal signal; "we should probably fix them" asks for
+    verification. None when the project has no ruff config.
+    """
+    found = _ruff_config_file(project_root)
+    if found is None:
+        return None
+    path, prefix = found
+    lint = f"{prefix}.lint" if prefix else "lint"
+    main_sections = {prefix, lint}
+    pfi_sections = {f"{prefix}.per-file-ignores" if prefix else "per-file-ignores"}
+    pfi_sections.add(f"{lint}.per-file-ignores")
+    pfi_sections.update(
+        s.replace("per-file-ignores", "extend-per-file-ignores")
+        for s in list(pfi_sections)
+    )
+    lists: dict[str, list[dict]] = {
+        "select": [],
+        "extend-select": [],
+        "ignore": [],
+        "extend-ignore": [],
+    }
+    per_file: list[dict] = []
+    section = None
+    # The comment-only lines just above (a reason for what follows them),
+    # and whether the previous line was one.
+    comments: list[str] = []
+    after_comment = False
+    key = None  # the array being read: (kind, key name, reason on its key line)
+    # A comment block above several consecutive keys explains all of them.
+    group: str | None = None
+    for raw in _read(path).splitlines():
+        code, comment = _split_comment(raw)
+        stripped = code.strip()
+        if not stripped:
+            if comment:
+                comments = (comments if after_comment else []) + [comment]
+                after_comment = True
+            else:
+                comments, after_comment, group = [], False, None
+            continue
+        after_comment = False
+        if key is None:
+            header = _TOML_SECTION.match(stripped)
+            if header:
+                section, comments, group = header.group(1).strip(), [], None
+                continue
+            m = _TOML_KEY.match(code)
+            if not m:
+                comments, group = [], None
+                continue
+            name, code = m.group(1).strip("\"'"), m.group(2)
+            if section in main_sections and name in lists:
+                kind = "main"
+            elif section in pfi_sections:
+                kind = "pfi"
+            else:
+                comments, group = [], None
+                continue
+            rules_here = bool(_strings(code))
+            block = " ".join(comments) or None
+            if kind == "pfi":
+                group = block = block or group
+            key = (kind, name, (None if rules_here else comment) or block)
+            comments = []
+        kind, name, key_reason = key
+        block = " ".join(comments) or None
+        for rule in _strings(code):
+            if not _RULE_SELECTOR.match(rule):
+                continue
+            reason = comment or block or key_reason
+            if kind == "main":
+                lists[name].append({"rule": rule, "reason": reason})
+            else:
+                per_file.append({"pattern": name, "rule": rule, "reason": reason})
+        if "]" in code:
+            key, comments = None, []
+    select = [e["rule"] for e in lists["select"]]
+    extend = [e["rule"] for e in lists["extend-select"]]
+    return {
+        "source": path.name,
+        # None: no `select`, so ruff's default selection is in place (plus
+        # `extend_select`).
+        "select": select or None,
+        "extend_select": extend,
+        "selects_all": "ALL" in select + extend,
+        "ignore": lists["ignore"] + lists["extend-ignore"],
+        "per_file_ignores": per_file,
+    }
+
+
+def _prefix_match(code: str, entries: list[dict]) -> dict | None:
+    """The most specific selector in *entries* matching *code*, or None."""
+    best = None
+    for entry in entries:
+        rule = entry["rule"]
+        if rule == "ALL" or code.startswith(rule):
+            length = 0 if rule == "ALL" else len(rule)
+            if best is None or length > best[0]:
+                best = (length, entry)
+    return best[1] if best else None
+
+
+def _pattern_matches(relpath: str, pattern: str) -> bool:
+    """ruff's per-file-ignores glob against a project-relative path."""
+    candidates = {pattern, pattern.replace("**/", "")}
+    if "/" not in pattern:
+        candidates.add("**/" + pattern)
+        candidates.add(pattern)
+        if fnmatch.fnmatch(relpath.rsplit("/", 1)[-1], pattern):
+            return True
+    return any(fnmatch.fnmatch(relpath, c) for c in candidates)
+
+
+def project_rule_status(code: str, relpath: str, config: dict | None) -> dict | None:
+    """What the project's own ruff config says about *code* in *relpath*.
+
+    ``status`` is ``ignored-for-file`` (a per-file-ignores entry),
+    ``ignored-by-project`` (the ignore list), ``selected-by-project``,
+    ``not-selected-by-project``, or ``project-default-selection`` (no
+    explicit select). ``entry`` and ``reason`` come from the matching line.
+    """
+    if config is None:
+        return None
+    for entry in config["per_file_ignores"]:
+        if (entry["rule"] == "ALL" or code.startswith(entry["rule"])) and (
+            _pattern_matches(relpath, entry["pattern"])
+        ):
+            return {
+                "status": "ignored-for-file",
+                "entry": entry["rule"],
+                "pattern": entry["pattern"],
+                "reason": entry["reason"],
+            }
+    ignored = _prefix_match(code, config["ignore"])
+    selectors = (config["select"] or []) + config["extend_select"]
+    selected = _prefix_match(code, [{"rule": r} for r in selectors])
+    if config["select"] is None and selected is None:
+        if ignored:
+            return {
+                "status": "ignored-by-project",
+                "entry": ignored["rule"],
+                "reason": ignored["reason"],
+            }
+        return {"status": "project-default-selection"}
+    select_len = (
+        -1
+        if selected is None
+        else 0
+        if selected["rule"] == "ALL"
+        else len(selected["rule"])
+    )
+    if ignored and len(ignored["rule"]) >= select_len:
+        return {
+            "status": "ignored-by-project",
+            "entry": ignored["rule"],
+            "reason": ignored["reason"],
+        }
+    if selected is None:
+        return {"status": "not-selected-by-project"}
+    return {"status": "selected-by-project", "entry": selected["rule"]}
+
+
 def _run_ruff(
     ruff_bin: str,
     codes: list[str],
     target: Path,
     preview: bool,
     target_version: str | None = None,
+    ignore_noqa: bool = False,
 ) -> tuple[list[dict], str, str | None]:
-    """Run ruff over *target*; return (findings, stderr, error)."""
+    """Run ruff over *target*; return (findings, stderr, error).
+
+    *ignore_noqa* reports hits on `# noqa` lines too, which ruff otherwise
+    drops before anything can see them.
+    """
     cmd = [
         ruff_bin,
         "check",
@@ -1421,6 +1636,8 @@ def _run_ruff(
         cmd.extend(["--target-version", target_version])
     if preview:
         cmd.append("--preview")
+    if ignore_noqa:
+        cmd.append("--ignore-noqa")
     cmd.append(str(target))
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=_RUFF_TIMEOUT)
@@ -1520,6 +1737,23 @@ def project_autofix_check(
     }
 
 
+def _hit_key(raw: dict) -> tuple:
+    location = raw.get("location") or {}
+    return (
+        raw.get("filename"),
+        location.get("row"),
+        location.get("column"),
+        raw.get("code"),
+    )
+
+
+def _count_codes(findings: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for f in findings:
+        counts[f["code"]] = counts.get(f["code"], 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
+
+
 def analyze(
     target: str,
     *,
@@ -1580,6 +1814,37 @@ def analyze(
             finding.update(closure_argument_hint(finding, path, trees, cache))
             findings.append(finding)
 
+    # ruff drops a hit on a `# noqa` line before anything can see it, so the
+    # suppressions themselves were invisible -- on a project that selects ALL,
+    # most of its considered exceptions. A second pass with --ignore-noqa
+    # finds them; a hit that appears only there is a suppressed claim to
+    # verify, kept apart from `findings` so the calibrated counts hold.
+    noqa_suppressed: list[dict] = []
+    noqa_pass: dict = {"ran": False}
+    if not error:
+        nraw, _, nerror = _run_ruff(
+            ruff_bin,
+            runnable,
+            scan_root,
+            preview=False,
+            target_version=target_version,
+            ignore_noqa=True,
+        )
+        if nerror:
+            noqa_pass = {"ran": False, "error": nerror}
+        else:
+            seen = {_hit_key(r) for r in raw}
+            for raw_finding in nraw:
+                if _hit_key(raw_finding) in seen:
+                    continue
+                noqa_suppressed.append(
+                    {
+                        **normalize(raw_finding, project_root, cache),
+                        "noqa_suppressed": True,
+                    }
+                )
+            noqa_pass = {"ran": True}
+
     preview_findings: list[dict] = []
     preview_stderr = ""
     if preview_pass:
@@ -1606,13 +1871,33 @@ def analyze(
 
     autofix = project_autofix_check(ruff_bin, findings, project_root)
 
+    # What the project's own ruff config says about each hit's rule, with the
+    # reason its maintainers wrote next to an ignore.
+    project_config = parse_project_ruff_config(project_root)
+    by_project_status: dict[str, int] = {}
+    ignored_entries: dict[tuple, dict] = {}
+    for f in noqa_suppressed:
+        f["project_config"] = project_rule_status(f["code"], f["file"], project_config)
+    for f in findings + dismissed + preview_findings:
+        status = project_rule_status(f["code"], f["file"], project_config)
+        f["project_config"] = status
+        if status is None:
+            continue
+        by_project_status[status["status"]] = (
+            by_project_status.get(status["status"], 0) + 1
+        )
+        if status["status"].startswith("ignored"):
+            key = (status["status"], status["entry"], status.get("pattern"))
+            entry = ignored_entries.setdefault(key, {**status, "hits": 0})
+            entry["hits"] += 1
+
     merged = [f for f in findings if f["shape_id"]]
     suppressed = [f for f in findings if f["has_suppression_comment"]]
 
     unlinted = unlinted_paths(stderr) + unlinted_paths(preview_stderr)
     error = error or unlinted_error(unlinted)
 
-    return {
+    result = {
         "project_root": str(project_root),
         "scan_root": str(scan_root),
         "ruff_version": version,
@@ -1637,6 +1922,9 @@ def analyze(
         # Paths ruff reported it could not read ("Failed to lint"). Non-empty
         # means `error` is set: their absence of findings is not a clean result.
         "unlinted": unlinted,
+        # The project's ruff `select` / `ignore` / `per-file-ignores`, each
+        # ignore with the comment written next to it; null with no config.
+        "project_ruff_config": project_config,
         "summary": {
             # Every hit ruff returned, dismissed ones included (the calibrated
             # number); `reported` is what is left in `findings` to triage.
@@ -1681,6 +1969,31 @@ def analyze(
             "suppression_needs_verification": sum(
                 1 for f in suppressed if not f["suppression_is_dismissal_signal"]
             ),
+            # Hits on `# noqa` lines, found by the --ignore-noqa pass (see
+            # `noqa_suppressed`); null when that pass did not run.
+            "noqa_suppressed": len(noqa_suppressed) if noqa_pass["ran"] else None,
+            "noqa_suppressed_by_code": (
+                _count_codes(noqa_suppressed) if noqa_pass["ran"] else None
+            ),
+            # Of those, the ones whose noqa is a claim to check (a security
+            # rule, or a noqa naming other rules), not a dismissal signal.
+            "noqa_suppressed_needs_verification": (
+                sum(
+                    1
+                    for f in noqa_suppressed
+                    if not f["suppression_is_dismissal_signal"]
+                )
+                if noqa_pass["ran"]
+                else None
+            ),
+            # Each hit's `project_config.status`, counted (null: no config).
+            "by_project_status": by_project_status if project_config else None,
+            # The project ignore entries this run's hits fall under, with the
+            # maintainers' reason and the hit count: one line per entry to
+            # verify or dismiss, instead of one per hit.
+            "project_ignored_rules": sorted(
+                ignored_entries.values(), key=lambda e: -e["hits"]
+            ),
             # Hits matching a known ruff false-positive mode (see each hit's
             # `known_tool_issue` and `tool_bug_note`). Flagged, not dismissed.
             "suspect_tool_bug": sum(1 for f in findings if f.get("suspect_tool_bug")),
@@ -1695,7 +2008,21 @@ def analyze(
         # (explained in `dismissal_reasons`). Not triaged, but not hidden.
         "dismissed": dismissed,
         "dismissal_reasons": {k: DISMISSAL_REASONS[k] for k in dismissed_by_reason},
+        # Hits ruff reports only with --ignore-noqa: each sits on a `# noqa`
+        # line, with its `suppression_*` fields. Claims to verify, not findings.
+        "noqa_pass": noqa_pass,
+        "noqa_suppressed": noqa_suppressed[:max_findings],
     }
+    if project_config and project_config["selects_all"]:
+        result["project_selects_all_note"] = (
+            "The project's ruff config selects ALL, so its own lint already "
+            "reports every rule here except the ones it ignores (see each "
+            "hit's `project_config` and `summary.project_ignored_rules`), the "
+            "hits on `# noqa` lines (`noqa_suppressed`), and files it excludes. "
+            "Each hit is a rule the maintainers chose to ignore: read their "
+            "stated reason before re-litigating it."
+        )
+    return result
 
 
 def main() -> None:
