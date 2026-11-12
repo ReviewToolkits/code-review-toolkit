@@ -267,8 +267,12 @@ class TestReformatsAndMerges(unittest.TestCase):
         (root / "pkg" / "m.py").write_text("v = 3\n", encoding="utf-8")
         _git(root, "commit", "-qam", "Set v to three")
         _git(root, "checkout", "-q", "feat")
+        # Conflicts on purpose; the resolution is committed below.
         subprocess.run(
-            ["git", "merge", "-q", "main"], cwd=str(root), capture_output=True
+            ["git", "merge", "-q", "main"],
+            cwd=str(root),
+            capture_output=True,
+            check=False,
         )
         (root / "pkg" / "m.py").write_text("v = 4\n", encoding="utf-8")
         _git(root, "commit", "-qam", "Merge branch 'main' into feat")
