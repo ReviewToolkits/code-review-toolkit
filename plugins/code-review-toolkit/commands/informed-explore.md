@@ -137,12 +137,26 @@ the briefing to every agent's instructions**, followed by:
 >    what is *not* yet known.
 > 6. **Then** do your own open-ended analysis for anything the catalog does not cover — a new shape
 >    is the most valuable thing you can return, because it extends the catalog.
+>
+> If the briefing lists no shapes for you, steps 1–3 don't apply: skip them, and hunt the
+> adjacent agents' shapes it lists instead (report a hit under that shape's id). Then carry on
+> from step 4.
+>
+> Your report's findings are split into **Catalogued**, **Novel** and **Proposed shapes** (below).
+> This structure overrides the findings layout of your own output format; keep that format's
+> other sections (summary, metrics, strengths) as they are, and give every finding the fields
+> your format asks for.
 
-Agents must clearly separate the two kinds of output:
+Agents must clearly separate the kinds of output:
 
 - **Catalogued** — instances of a known shape (cite the shape `id`).
-- **Novel** — something no shape covers. Propose it as a *new* shape using the
+- **Novel** — something no shape covers.
+- **Proposed shapes** — each novel finding that generalizes, written as a *new* shape in the
   `python_bug_shapes.json` field structure so it can be added to the catalog.
+
+A zero-shape agent (the builder says so in its briefing, and names the adjacent agents whose
+shapes it lists) still produces all three sections; its Catalogued section holds the hits on
+adjacent shapes, or says there were none.
 
 ### Phase 3: Synthesis (+ record to the project memory)
 
