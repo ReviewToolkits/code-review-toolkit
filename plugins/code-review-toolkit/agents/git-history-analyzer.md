@@ -86,6 +86,14 @@ For each source:
    - Same data flow patterns without the same validation
    - Same resource usage without the same cleanup
 
+   Start with the mechanical sweep, then search by hand for what it cannot see:
+
+   ```bash
+   python3 <plugin_root>/scripts/sweep_fix_pattern.py [scope] --commit <sha> > "$d/sweep-<sha>.json"
+   ```
+
+   Each entry of `removed_forms` is a statement or condition the fix removed or rewrote (`code`, `file`, `line`), with `matches`: every place in the current tree that still has the same form, variable names aside (`function`, `code`; `same_file` marks the fixed file, the likeliest miss; `matches_total` past the cap of 30). Read each match: one that lacks the fix's change for a reason that applies there too is a propagation gap. A fix that only added code (a new guard before an unchanged call) has no removed form, and the `notes` say so: sweep for the guarded call by hand.
+
 3. Prioritize by module relationship:
    - **Same module**: Highest priority — if the fix was in runner.py, check other functions in runner.py first
    - **Related modules**: Second priority — modules that import from or are imported by the fixed module (use architecture-mapper output)
