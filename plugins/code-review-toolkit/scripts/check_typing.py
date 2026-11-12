@@ -124,6 +124,42 @@ _DEFECT_CODES = frozenset(
     }
 )
 
+# `misc` is a grab bag, so it is split by message. "Invalid base class" and
+# "Class cannot subclass ... (has type "Any")" make the class an Any subclass:
+# every attribute access on its instances stops being checked, which is the
+# finding. `"None" not callable` is mostly a narrowing mypy lost (a callable
+# probed through a bool alias), so it is triaged before it is believed.
+_MISC_FAMILIES = (
+    (
+        "any-subclass",
+        re.compile(r'^(Invalid base class|Class cannot subclass .*"Any")'),
+    ),
+    ("none-not-callable", re.compile(r'^"None" not callable')),
+)
+
+# Errors whose RESULT silently becomes Any, so the code after them is unchecked
+# even when the error itself is ignored or baselined: an Any base class, and a
+# call no overload accepts (mypy types the result as Any or a guess).
+_SILENT_ANY_OVERLOAD = "failed-overload"
+
+
+def misc_family(message: str) -> str:
+    """The family of a `misc` message: any-subclass, none-not-callable or other."""
+    for family, pattern in _MISC_FAMILIES:
+        if pattern.search(message):
+            return family
+    return "other"
+
+
+def silent_any(code: str, message: str) -> str | None:
+    """Why this error's result is silently Any, or None if it is not."""
+    if code == "misc" and misc_family(message) == "any-subclass":
+        return "any-subclass"
+    if code == "call-overload":
+        return _SILENT_ANY_OVERLOAD
+    return None
+
+
 # Codes that describe MISSING typing rather than wrong typing.
 _ANNOTATION_CODES = frozenset(
     {"no-untyped-def", "no-untyped-call", "no-any-return", "var-annotated", "type-arg"}
@@ -313,6 +349,11 @@ def parse_output(
             ),
             "notes": pending_context,
         }
+        if code == "misc":
+            current["misc_family"] = misc_family(m["message"])
+        why_any = silent_any(code, m["message"])
+        if why_any:
+            current["silent_any"] = why_any
         findings.append(current)
         pending_context = []
     if standalone_notes is not None:
@@ -1159,8 +1200,12 @@ def _analyze_with_cache(
     )
 
     by_code: dict[str, int] = {}
+    misc_by_family: dict[str, int] = {}
     for f in findings:
         by_code[f["code"] or "(none)"] = by_code.get(f["code"] or "(none)", 0) + 1
+        if "misc_family" in f:
+            family = f["misc_family"]
+            misc_by_family[family] = misc_by_family.get(family, 0) + 1
 
     return {
         **envelope,
@@ -1208,6 +1253,13 @@ def _analyze_with_cache(
                 {(f["file"], f["line"]) for f in findings if f["kind"] == "defect"}
             ),
             "by_code": dict(sorted(by_code.items(), key=lambda kv: -kv[1])),
+            # `misc` split by message (see _MISC_FAMILIES): any-subclass is a
+            # real loss of checking, none-not-callable mostly lost narrowing.
+            "misc_by_family": dict(sorted(misc_by_family.items())),
+            # Findings whose result is silently Any (`silent_any` on each):
+            # an Any base class, or a call no overload accepts. Code after
+            # them is unchecked even if the error is ignored.
+            "silent_any": sum(1 for f in findings if f.get("silent_any")),
             # Only mypy's own unused-ignore counts. A grep for `# type: ignore`
             # measures how many ignores EXIST, not how many are stale. null when
             # nothing measured it -- see stale_ignores_reason.

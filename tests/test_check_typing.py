@@ -224,6 +224,49 @@ class TestParseOutput(unittest.TestCase):
         self.assertEqual([f["kind"] for f in findings], ["defect"] * 3)
 
 
+class TestMiscFamiliesAndSilentAny(unittest.TestCase):
+    """`misc` mixed an Any base class (checking silently stops) with
+    lost-narrowing noise, and a failed overload's Any result was not flagged."""
+
+    _OUT = (
+        'a.py:3: error: Variable "lib.Base" is not valid as a type  [valid-type]\n'
+        'a.py:3: error: Invalid base class "Base"  [misc]\n'
+        'a.py:5: error: Class cannot subclass "Model" (has type "Any")  [misc]\n'
+        'a.py:9: error: "None" not callable  [misc]\n'
+        "a.py:11: error: Cannot determine type of x  [misc]\n"
+        'a.py:12: error: No overload variant of "get" of "dict" matches '
+        'argument type "int"  [call-overload]\n'
+    )
+
+    def test_misc_is_split_by_message(self):
+        findings, _ = mod.parse_output(self._OUT)
+        self.assertEqual(
+            [f.get("misc_family") for f in findings],
+            [None, "any-subclass", "any-subclass", "none-not-callable", "other", None],
+        )
+
+    def test_silent_any_cases_are_tagged(self):
+        findings, _ = mod.parse_output(self._OUT)
+        self.assertEqual(
+            [f.get("silent_any") for f in findings],
+            [None, "any-subclass", "any-subclass", None, None, "failed-overload"],
+        )
+
+    def test_summary_counts_them(self):
+        files = {"pkg/__init__.py": "", "pkg/m.py": "x = 1\n"}
+        out = (
+            'pkg/m.py:1: error: Invalid base class "Base"  [misc]\n'
+            'pkg/m.py:2: error: "None" not callable  [misc]\n'
+            "Found 2 errors in 1 file (checked 2 source files)\n"
+        )
+        result, _ = _run(files, {"": out})
+        self.assertEqual(
+            result["summary"]["misc_by_family"],
+            {"any-subclass": 1, "none-not-callable": 1},
+        )
+        self.assertEqual(result["summary"]["silent_any"], 1)
+
+
 class TestFailureIsNeverClean(unittest.TestCase):
     """The single most important behaviour: analyzed-nothing is not clean."""
 
