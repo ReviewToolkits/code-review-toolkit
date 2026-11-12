@@ -53,11 +53,32 @@ d=$(mktemp -d "${TMPDIR:-/tmp}/crt-informed-explore.XXXXXX") && echo "$d" &&
 python3 <plugin_root>/scripts/build_informed_briefing.py [scope] > "$d/briefing.md"; echo "exit=$?"
 ```
 
-For a per-agent briefing scoped to just the shapes that agent owns (shorter, more focused):
+For a per-agent briefing scoped to just the shapes that agent owns (shorter, more focused), and the
+full do-not-re-derive list written once as a file to grep:
 
 ```bash
-python3 <plugin_root>/scripts/build_informed_briefing.py [scope] --agent silent-failure-hunter
+python3 <plugin_root>/scripts/build_informed_briefing.py [scope] --agent silent-failure-hunter \
+    [--area pkg/billing/] --known-out "$d/known.tsv" > "$d/silent-failure-hunter.md"
 ```
+
+Use per-agent briefings whenever the project has a findings memory: a full briefing over a few
+hundred recorded findings runs to 100–200 KB and gets read in pages. Per agent, the builder:
+
+- keeps the established findings whose shape the agent owns (through `shape`, `family` or
+  `agents`, see the memory schema in Phase 3), plus those under any `--area` prefix you give it
+  (repeatable, for an agent assigned to a slice of the tree). The rest are counted, and the
+  briefing points at `known.tsv` (one tab-separated line per finding: label, severity,
+  locations, shape/family, title, evidence);
+- includes the false-positive sections of the agent's topic in full and lists the others by entry
+  title, with the path to `data/python_non_bugs.md`;
+- caps the briefing at `--budget` bytes (default 80000 per agent, `0` turns it off). Over budget it
+  trims cross-project findings first, then shortens implemented shapes to their triage lines (the
+  scanner hands the agent those candidates), then drops established findings, then lists the
+  agent's own false-positive sections by title, and last shortens every shape. Whatever it trims
+  is stated at the end of the briefing and on stderr.
+
+Tell every agent: **before reporting a finding, grep `known.tsv` for its file and symbol.** A hit
+is an established finding: confirm it, don't report it as new.
 
 The briefing assembles three things:
 
@@ -85,9 +106,10 @@ python3 <plugin_root>/scripts/build_informed_briefing.py [scope] \
 
 It splits what it finds in two, and the distinction matters:
 
-- **Findings recorded for THIS project** — settled. Verify each still exists, then move on. Never
-  narrowed by `--agent`, because an entry dropped from the do-not-re-derive set is one the agent will
-  cheerfully re-derive.
+- **Findings recorded for THIS project** — settled. Verify each still exists, then move on.
+  Narrowed by `--agent` and `--area` like the memory, with every dropped entry counted and the
+  briefing pointing at the full list: an entry the agent can't find is one it will cheerfully
+  re-derive.
 - **Findings from OTHER projects** — *not* claims about this codebase. Each is a shape confirmed
   somewhere else, so it is worth a targeted look here. A hit is a new finding; a miss is not a
   finding at all, so absence is never reported. This list IS narrowed to the requested agent's
@@ -158,12 +180,30 @@ automatically:
       "title": "Mutable default argument in load_config()",
       "location": "pkg/config.py:42",
       "shape": "mutable-default-argument",
+      "family": "shared-state-across-calls",
+      "agents": ["python-pitfall-scanner"],
+      "run": "proj_v2",
       "status": "confirmed",
       "evidence": "calling load_config() twice accumulates entries from the first call"
     }
-  ]
+  ],
+  "families": {"shared-state-across-calls": ["mutable-default-argument"]}
 }
 ```
+
+- `shape` is a catalog shape id, or absent. Never put a consolidation family there: the briefing
+  matches `shape` against the shapes an agent owns, and a family name matches nothing.
+- `family` is the consolidation family (the run's own grouping, e.g. `retry-lost`). The top-level
+  `families` object maps each family to the catalog shapes it belongs to; the builder also infers
+  the map from findings that carry both fields. Per-agent briefings use `shape`, `family` and
+  `agents` to decide which established findings an agent sees.
+- `run` is the run id (e.g. `<project>_v<N>`; a top-level `run` applies to every entry). The
+  briefing labels each finding `<run>/<id>`.
+- **`title` and `evidence` are self-contained.** Write the observation itself, never a pointer to
+  another report: no agent finding ids (`SFH-3`), no "see PC-1", no "as in the v1 report". Earlier
+  runs' reports are off-limits to the next run's agents, so a reference into them resolves to
+  nothing. Cite another memory entry only by its `<run>/<id>` label. The builder resolves ids it
+  can match to labels and replaces the rest with `[earlier-run ref]` (listed on stderr).
 
 `status` is one of `confirmed` (verified true positive), `reported` (raised upstream), `fixed`, or
 `candidate` (unverified — **not** folded into future briefings). Only the first three are treated as

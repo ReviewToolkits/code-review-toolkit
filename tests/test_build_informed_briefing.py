@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import ClassVar
 
 from helpers import TempProject, import_script
 
@@ -316,10 +317,300 @@ class TestExternalCatalog(unittest.TestCase):
         # The dropped count must be stated, not silently omitted.
         self.assertIn("1 further cross-project finding(s) were omitted", rendered)
 
-    def test_target_findings_are_never_narrowed_by_agent(self):
+    def test_target_findings_without_a_scope_are_kept(self):
         mine = [{"_is_target": True, "_project": "p", "id": "A", "shape": "not-owned"}]
         rendered = "\n".join(mod._render_catalog_section(mine, {"something-else"}))
         self.assertIn("**A**", rendered)
+
+
+def _shape(sid, agent, detectability="agent-only", **over):
+    shape = {
+        "id": sid,
+        "title": f"Title of {sid}",
+        "agent": agent,
+        "severity": "FIX",
+        "pattern": "PATTERN-" + "p" * 400,
+        "guarded_twin": "TWIN",
+        "hunt": "HUNT-" + "h" * 400,
+        "expected": "E",
+        "caught_as": "C",
+        "validation": "documented",
+        "detectability": detectability,
+    }
+    shape.update(over)
+    return shape
+
+
+def _mine(fid, **over):
+    finding = {
+        "_is_target": True,
+        "_project": "proj",
+        "_source": "/memory/findings.json",
+        "id": fid,
+        "severity": "CONSIDER",
+        "title": f"Finding {fid}",
+        "location": "pkg/other.py:1",
+        "status": "confirmed",
+    }
+    finding.update(over)
+    return finding
+
+
+class TestNarrowing(unittest.TestCase):
+    """Per-agent and per-area briefings carry only the relevant established findings."""
+
+    SHAPES: ClassVar[list] = [
+        _shape("owned-shape", "silent-failure-hunter"),
+        _shape("their-shape", "dead-code-finder"),
+    ]
+
+    def _brief(self, catalog, **kw):
+        kw.setdefault("budget", 0)
+        return mod.build_briefing(self.SHAPES, "", [], catalog_findings=catalog, **kw)
+
+    def test_this_project_list_is_narrowed_to_the_agents_shapes(self):
+        catalog = [_mine("P-1", shape="owned-shape"), _mine("P-2", shape="their-shape")]
+        out = self._brief(catalog, agent="silent-failure-hunter")
+        self.assertIn("**P-1**", out)
+        self.assertNotIn("**P-2**", out)
+        self.assertIn("(1 of 2)", out)
+        # The omission is counted and points at the full list.
+        self.assertIn("1 further established finding(s) omitted", out)
+        self.assertIn("/memory/findings.json", out)
+
+    def test_area_prefix_keeps_findings_under_it(self):
+        catalog = [
+            _mine("P-1", location="pkg/billing/charge.py:10"),
+            _mine("P-2", locations=["./pkg/billing/refund.py:3"]),
+            _mine("P-3", location="pkg/auth/login.py:5"),
+        ]
+        out = self._brief(catalog, areas=["pkg/billing/"])
+        self.assertIn("**P-1**", out)
+        self.assertIn("**P-2**", out)
+        self.assertNotIn("**P-3**", out)
+
+    def test_agent_listed_in_agents_is_kept(self):
+        catalog = [_mine("P-1", agents=["silent-failure-hunter"])]
+        out = self._brief(catalog, agent="silent-failure-hunter")
+        self.assertIn("**P-1**", out)
+
+    def test_no_agent_and_no_area_keeps_everything(self):
+        catalog = [_mine("P-1", shape="their-shape"), _mine("P-2")]
+        out = self._brief(catalog)
+        self.assertIn("**P-1**", out)
+        self.assertIn("**P-2**", out)
+
+    def test_project_memory_is_narrowed_too(self):
+        memory = [_mine("M-1", shape="owned-shape"), _mine("M-2", shape="their-shape")]
+        out = mod.build_briefing(
+            self.SHAPES, "", memory, agent="silent-failure-hunter", budget=0
+        )
+        self.assertIn("**M-1**", out)
+        self.assertNotIn("**M-2**", out)
+        self.assertIn("2 confirmed of 2 recorded", out)
+
+    def test_fixes_are_listed_first(self):
+        catalog = [_mine("P-1"), _mine("P-2", severity="FIX")]
+        out = self._brief(catalog)
+        self.assertLess(out.index("**P-2**"), out.index("**P-1**"))
+
+
+class TestFamilies(unittest.TestCase):
+    """A finding's consolidation family maps to catalog shapes."""
+
+    SHAPES: ClassVar[list] = [
+        _shape("owned-shape", "silent-failure-hunter", aliases=["old-name"]),
+        _shape("their-shape", "dead-code-finder"),
+    ]
+
+    def _kept(self, catalog):
+        out = mod.build_briefing(
+            self.SHAPES, "", [], "silent-failure-hunter", catalog, budget=0
+        )
+        return sorted(f["id"] for f in catalog if f"**{f['id']}**" in out)
+
+    def test_explicit_family_map(self):
+        families = {"retry-lost": ["owned-shape"]}
+        catalog = [
+            _mine("P-1", family="retry-lost", _families=families),
+            _mine("P-2", family="docs-drift", _families=families),
+        ]
+        self.assertEqual(self._kept(catalog), ["P-1"])
+
+    def test_map_inferred_from_findings_carrying_both(self):
+        catalog = [
+            _mine("P-1", family="retry-lost", shape="owned-shape"),
+            _mine("P-2", family="retry-lost"),
+            _mine("P-3", family="docs-drift"),
+        ]
+        self.assertEqual(self._kept(catalog), ["P-1", "P-2"])
+
+    def test_legacy_family_in_the_shape_field(self):
+        # Older memories put the family in `shape`; it is read as a family.
+        catalog = [
+            _mine("P-1", shape="retry-lost", _families={"retry-lost": ["old-name"]}),
+            _mine("P-2", shape="docs-drift"),
+        ]
+        self.assertEqual(self._kept(catalog), ["P-1"])
+
+    def test_family_rendered(self):
+        out = mod.build_briefing(
+            self.SHAPES, "", [], catalog_findings=[_mine("P-1", family="retry-lost")]
+        )
+        self.assertIn("family `retry-lost`", out)
+
+
+class TestBudget(unittest.TestCase):
+    """A size budget trims in a fixed order and says what it trimmed."""
+
+    def test_established_findings_are_trimmed_with_a_count(self):
+        catalog = [_mine(f"P-{i}", title="x" * 200) for i in range(200)]
+        out = mod.build_briefing([], "", [], catalog_findings=catalog, budget=12_000)
+        self.assertLessEqual(len(out.encode()), 12_000)
+        self.assertIn("omitted (size budget)", out)
+        self.assertIn("Briefing trimmed to a 12000-byte budget", out)
+
+    def test_implemented_shapes_are_shortened_before_findings_are_dropped(self):
+        shapes = [
+            _shape(f"s{i}", "python-pitfall-scanner", "implemented") for i in range(6)
+        ] + [_shape("by-hand", "python-pitfall-scanner", "implementable")]
+        catalog = [_mine("P-1", agents=["python-pitfall-scanner"])]
+        report: dict = {}
+        out = mod.build_briefing(
+            shapes,
+            "",
+            [],
+            "python-pitfall-scanner",
+            catalog,
+            budget=8_000,
+            report=report,
+        )
+        self.assertEqual(report["trimmed"], ["implemented shapes shortened"])
+        self.assertIn("**P-1**", out)
+        # The shape to hunt by hand keeps its full template.
+        self.assertEqual(out.count("HUNT-"), 1)
+
+    def test_agent_mode_has_a_default_budget(self):
+        catalog = [_mine(f"P-{i}", agents=["x"], title="y" * 500) for i in range(400)]
+        out = mod.build_briefing([], "", [], "x", catalog)
+        self.assertLessEqual(len(out.encode()), mod.DEFAULT_AGENT_BUDGET)
+
+    def test_zero_disables_the_budget(self):
+        catalog = [_mine(f"P-{i}", agents=["x"], title="y" * 500) for i in range(400)]
+        out = mod.build_briefing([], "", [], "x", catalog, budget=0)
+        self.assertGreater(len(out.encode()), mod.DEFAULT_AGENT_BUDGET)
+
+
+class TestFalsePositiveNarrowing(unittest.TestCase):
+    TAXONOMY = (
+        "# T\nintro\n\n---\n\n## Dead code / unused symbols\n\n### 1. Dynamic name\n"
+        "- body one\n\n---\n\n## Error handling\n\n### 5. Narrow suppression\n"
+        "- body five\n"
+    )
+
+    def test_agent_reads_its_topic_in_full_and_titles_of_the_rest(self):
+        out = mod.build_briefing([], self.TAXONOMY, [], "dead-code-finder")
+        self.assertIn("- body one", out)
+        self.assertNotIn("- body five", out)
+        self.assertIn("- 5. Narrow suppression", out)
+        self.assertIn("python_non_bugs.md", out)
+
+    def test_full_briefing_keeps_the_whole_taxonomy(self):
+        out = mod.build_briefing([], self.TAXONOMY, [])
+        self.assertIn("- body one", out)
+        self.assertIn("- body five", out)
+
+
+class TestZeroShapeAgent(unittest.TestCase):
+    def test_fallback_names_adjacent_shapes(self):
+        shapes = [_shape("pattern-shape", "pattern-consistency-checker")]
+        out = mod.build_briefing(shapes, "", [], "consistency-auditor")
+        self.assertIn("steps 1–3 of the informed instructions", out)
+        self.assertIn("`pattern-shape`", out)
+        self.assertNotIn("PATTERN-", out)  # titles only, not the templates
+
+
+class TestReferences(unittest.TestCase):
+    """Cross-run labels are run-prefixed; ids nothing resolves are replaced."""
+
+    def test_run_prefix_and_resolution(self):
+        catalog = [
+            _mine("CRT-0001", run="v2", title="Same root as CRT-0002 and SF-7"),
+            _mine("CRT-0002", run="v2", title="Retry dropped over UTF-8 input"),
+        ]
+        report: dict = {}
+        out = mod.build_briefing(
+            [], "", [], catalog_findings=catalog, budget=0, report=report
+        )
+        self.assertIn("**v2/CRT-0001**", out)
+        self.assertIn("Same root as v2/CRT-0002 and [earlier-run ref]", out)
+        self.assertIn("over UTF-8 input", out)
+        self.assertEqual(report["unresolved_refs"], ["SF-7"])
+
+    def test_file_level_run_is_applied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "findings.json"
+            path.write_text(
+                json.dumps(
+                    {"project": "proj", "run": "r3", "findings": [{"id": "A-1"}]}
+                )
+            )
+            findings, _ = mod._load_catalog_findings(str(path), "/x/proj")
+        self.assertEqual(findings[0]["run"], "r3")
+
+
+class TestKnownOut(unittest.TestCase):
+    def test_writes_every_established_finding(self):
+        memory = {
+            "project": "proj",
+            "findings": [
+                {
+                    "id": f"M-{i}",
+                    "status": "confirmed",
+                    "title": f"t{i}",
+                    "location": f"pkg/m{i}.py:1",
+                    "evidence": "multi\nline",
+                }
+                for i in range(3)
+            ]
+            + [{"id": "M-9", "status": "candidate", "title": "unproven"}],
+        }
+        with (
+            TempProject({".code-review/findings.json": json.dumps(memory)}) as root,
+            tempfile.TemporaryDirectory() as tmp,
+        ):
+            known = Path(tmp) / "known.tsv"
+            result = mod.analyze(
+                str(root), agent="dead-code-finder", known_out=str(known)
+            )
+            lines = known.read_text().splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(lines[0].split("\t")[:3], ["M-0", "?", "pkg/m0.py:1"])
+        self.assertTrue(lines[0].endswith("multi line"))
+        self.assertIn(f"grep -i <file-or-symbol> {known}", result["briefing_markdown"])
+
+
+class TestNarrowingFlags(unittest.TestCase):
+    def test_extracts_area_budget_and_known_out(self):
+        rest, areas, budget, known = mod._extract_narrowing_flags(
+            [
+                "p",
+                "--area",
+                "a/",
+                "--agent",
+                "x",
+                "--area",
+                "b/",
+                "--budget",
+                "500",
+                "--known-out",
+                "/k.tsv",
+            ]
+        )
+        self.assertEqual(rest, ["p", "--agent", "x"])
+        self.assertEqual(areas, ["a/", "b/"])
+        self.assertEqual(budget, 500)
+        self.assertEqual(known, "/k.tsv")
 
 
 if __name__ == "__main__":
