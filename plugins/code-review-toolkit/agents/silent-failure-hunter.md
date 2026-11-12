@@ -250,6 +250,16 @@ them in the code that produces a verdict, a count, a report or an exit status:
 Report these with the same severity scale. A false success in a verdict (a test runner, a
 validator, a health check) is usually CRITICAL.
 
+### Step 3d: Error mapping under mutated input (validators)
+
+For code that validates uploaded or structured input (archives, metadata, manifests, request
+payloads), reading each handler does not show which bad inputs escape the error mapping. Mutate a
+valid fixture instead, with the harness in `<plugin_root>/docs/mutation-fuzzer.md`: it drops,
+retypes, resizes and corrupts one part at a time, submits each mutation through the project's own
+entry point in an export, and classifies the outcome as accepted, rejected (the documented
+4xx-style failure) or crashed. A crash on a client mistake is a finding; so is a mutation that is
+accepted although the spec forbids it. Keep the harness output as the reproduction.
+
 ### Step 4: Assess Impact
 
 For each finding, consider:
