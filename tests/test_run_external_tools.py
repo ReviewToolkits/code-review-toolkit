@@ -1419,6 +1419,79 @@ class TestVultureConfidence(unittest.TestCase):
         self.assertIn("--min-confidence=80", cmd)
 
 
+class TestMypyNotes(unittest.TestCase):
+    """mypy notes are not findings; the parse is cross-checked."""
+
+    def _mypy_out(self, stdout):
+        with (
+            TempProject({"a.py": "x = 1\n"}) as root,
+            patch.object(mod.subprocess, "run") as run,
+        ):
+            run.return_value = MagicMock(stdout=stdout, stderr="")
+            return mod.run_mypy(mod.parse_args([str(root)]), root, root)
+
+    def test_mypy_notes_are_not_findings(self):
+        # A run mypy calls a success, with only annotation-unchecked notes,
+        # must report zero findings and count the notes on their own.
+        note = json.dumps(
+            {
+                "file": "a.py",
+                "line": 2,
+                "column": 4,
+                "hint": None,
+                "message": "By default the bodies of untyped functions are not "
+                "checked, consider using --check-untyped-defs",
+                "code": "annotation-unchecked",
+                "severity": "note",
+            }
+        )
+        out = self._mypy_out(f"{note}\n{note}\n")
+        self.assertEqual(out["total_findings"], 0)
+        self.assertEqual(out["findings"], [])
+        self.assertEqual(out["notes_total"], 2)
+        self.assertEqual(out["notes_by_code"], {"annotation-unchecked": 2})
+        # JSON output states no summary: not stated, never zero.
+        self.assertIsNone(out["summary_errors"])
+
+    def test_mypy_errors_still_count_and_keep_their_hint(self):
+        err = json.dumps(
+            {
+                "file": "a.py",
+                "line": 6,
+                "column": 11,
+                "message": "Bad override",
+                "hint": "This violates the Liskov substitution principle",
+                "code": "override",
+                "severity": "error",
+            }
+        )
+        out = self._mypy_out(err + "\n")
+        self.assertEqual(out["total_findings"], 1)
+        self.assertEqual(out["notes_total"], 0)
+        self.assertIn("Liskov", out["findings"][0]["hint"])
+
+    def test_mypy_text_notes_attach_to_their_error(self):
+        out = self._mypy_out(
+            "a.py:5: error: Signature incompatible  [override]\n"
+            "a.py:5: note:      Superclass:\n"
+            "a.py:5: note:          def m(self) -> int\n"
+            "a.py:9: note: By default the bodies...  [annotation-unchecked]\n"
+            "Found 1 error in 1 file (checked 1 source file)\n"
+        )
+        self.assertEqual(out["total_findings"], 1)
+        self.assertEqual(len(out["findings"][0]["notes"]), 2)
+        self.assertEqual(out["notes_total"], 1)
+        self.assertEqual(out["summary_errors"], 1)
+        self.assertIsNone(out["count_mismatch"])
+
+    def test_mypy_summary_disagreeing_with_the_parse_is_flagged(self):
+        out = self._mypy_out(
+            "garbled error line\nFound 3 errors in 1 file (checked 1 source file)\n"
+        )
+        self.assertEqual(out["summary_errors"], 3)
+        self.assertIn("parsed 0 error(s)", out["count_mismatch"])
+
+
 class TestEarlyStopParsing(unittest.TestCase):
     """Test early-stop parsing at max_findings limit."""
 

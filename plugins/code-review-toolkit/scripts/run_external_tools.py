@@ -732,9 +732,59 @@ def parse_mypy_output(
     return findings
 
 
+_MYPY_SUMMARY_RE = re.compile(
+    r"Found (\d+) errors? in \d+ files? \(checked \d+ source files?\)"
+)
+_MYPY_CLEAN_RE = re.compile(r"Success: no issues found in \d+ source files?")
+
+
+def parse_mypy_summary(stdout: str) -> int | None:
+    """The error count mypy states in its own summary line, or None.
+
+    The text output ends with ``Found N errors in ...`` or ``Success: no
+    issues found ...``; the JSON output has no summary line at all, so None
+    means "not stated", never "zero".
+    """
+    count = None
+    for line in stdout.splitlines():
+        m = _MYPY_SUMMARY_RE.search(line)
+        if m:
+            count = int(m.group(1))
+        elif _MYPY_CLEAN_RE.search(line):
+            count = 0
+    return count
+
+
+def split_mypy_notes(findings: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Separate mypy's ``note`` records from its errors and warnings.
+
+    A note is not a finding. One without an error code that follows an error
+    (the text output's Superclass/Subclass lines) belongs to that error and is
+    attached to it as ``notes``; one with a code of its own
+    (``annotation-unchecked``) or with no error before it stands alone. The
+    JSON output already folds attached notes into the error's ``hint``.
+    Counting notes as findings made a run mypy reported as a success show a
+    nonzero total that disagreed with check_typing's.
+    """
+    errors: list[dict] = []
+    standalone: list[dict] = []
+    current: dict | None = None
+    for finding in findings:
+        if finding.get("severity") == "note":
+            if current is not None and not finding.get("code"):
+                current.setdefault("notes", []).append(finding)
+            else:
+                standalone.append(finding)
+                current = None
+            continue
+        current = finding
+        errors.append(finding)
+    return errors, standalone
+
+
 def normalize_mypy_finding(finding: dict, project_root: Path) -> dict:
     """Normalize a single mypy finding."""
-    return {
+    normalized = {
         "code": finding.get("code", ""),
         "severity": finding.get("severity", "error"),
         "file": make_relative(finding.get("file", ""), project_root),
@@ -745,6 +795,11 @@ def normalize_mypy_finding(finding: dict, project_root: Path) -> dict:
         "fixable": False,
         "significance": "normal",
     }
+    if finding.get("hint"):
+        normalized["hint"] = finding["hint"]
+    if finding.get("notes"):
+        normalized["notes"] = [note.get("message", "") for note in finding["notes"]]
+    return normalized
 
 
 def run_mypy(
@@ -792,21 +847,43 @@ def run_mypy(
 
     # Parse everything, then cap: stopping the parse at max_findings made
     # `total_findings` equal the cap and `findings_capped` never true.
-    findings = parse_mypy_output(result.stdout)
+    findings, notes = split_mypy_notes(parse_mypy_output(result.stdout))
 
     normalized = [
-        normalize_mypy_finding(f, project_root)
-        for f in findings[:args.max_findings]
+        normalize_mypy_finding(f, project_root) for f in findings[: args.max_findings]
     ]
+    notes_by_code: dict[str, int] = {}
+    for note in notes:
+        key = note.get("code") or "(no code)"
+        notes_by_code[key] = notes_by_code.get(key, 0) + 1
+
+    # Cross-check the parse against what mypy itself said. The text output
+    # states its error count; the JSON output does not, so `summary_errors`
+    # is None there (not stated, not zero).
+    summary_errors = parse_mypy_summary(result.stdout)
+    errors = sum(1 for f in findings if f.get("severity") == "error")
+    count_mismatch = None
+    if summary_errors is not None and summary_errors != errors:
+        count_mismatch = (
+            f"parsed {errors} error(s) but mypy's summary line reported "
+            f"{summary_errors}: output format not understood"
+        )
 
     return {
         "config_source": config_source,
         # The config file mypy was told to read (None for the curated run).
         "config_file": config_used,
         "strict_mode": args.mypy_strict,
+        # Errors and warnings only: notes are counted separately below.
         "total_findings": len(findings),
         "findings_capped": len(findings) > args.max_findings,
         "findings": normalized,
+        # Standalone notes (e.g. `annotation-unchecked`: an untyped body mypy
+        # skipped). Not findings; a count of what mypy did NOT check.
+        "notes_total": len(notes),
+        "notes_by_code": dict(sorted(notes_by_code.items())),
+        "summary_errors": summary_errors,
+        "count_mismatch": count_mismatch,
     }
 
 
