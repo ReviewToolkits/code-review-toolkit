@@ -585,6 +585,14 @@ def _returns(name: str, body: list[ast.stmt]) -> bool:
 # apart from "nothing considered". analyze() resets it; a check that records
 # nothing reports `considered: null` (not instrumented), never 0.
 _STATS: dict[str, dict] = {}
+# The checks that call _note(): for these, no entry means "considered 0".
+_COUNTED_CHECKS = frozenset(
+    {
+        "class-level-mutable-attribute",
+        "eq-without-hash",
+        "except-exception-too-broad",
+    }
+)
 
 
 def _note(shape: str, event: str, reason: str = "") -> None:
@@ -788,19 +796,77 @@ def _check_return_in_finally(tree: ast.AST) -> list[dict]:
     return out
 
 
+# Calls that hash their argument: a set or dict key needs `__hash__`.
+_HASHING_CALLS = frozenset(
+    {"hash", "set", "frozenset", "add", "fromkeys", "setdefault"}
+)
+# Methods that mark a class as a value type, one whose instances are compared
+# (and so plausibly hashed) by content.
+_VALUE_TYPE_METHODS = frozenset({"__lt__", "__le__", "__gt__", "__ge__", "__iter__"})
+
+
+def _instances_hashed(tree: ast.AST, name: str) -> bool:
+    """True if `name(...)` instances visibly reach a set, a dict key or hash()."""
+
+    def builds(node: ast.AST | None) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and _dotted_name(node.func).split(".")[-1] == name
+        )
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Set, ast.SetComp)):
+            elts = node.elts if isinstance(node, ast.Set) else [node.elt]
+            if any(builds(e) for e in elts):
+                return True
+        elif isinstance(node, ast.Dict):
+            if any(builds(k) for k in node.keys):
+                return True
+        elif isinstance(node, ast.DictComp):
+            if builds(node.key):
+                return True
+        elif isinstance(node, ast.Subscript) and builds(node.slice):
+            return True  # mapping[Name(...)]
+        elif isinstance(node, ast.Call) and _call_tail(node) in _HASHING_CALLS:
+            if any(builds(arg) for arg in node.args):
+                return True
+    return False
+
+
+def _is_value_type(cls: ast.ClassDef) -> bool:
+    """Ordering/iteration methods, `__slots__`, or a tuple-like base."""
+    for stmt in cls.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if stmt.name in _VALUE_TYPE_METHODS:
+                return True
+        elif isinstance(stmt, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "__slots__" for t in stmt.targets
+        ):
+            return True
+    return any(
+        _dotted_name(b).split(".")[-1] in ("tuple", "NamedTuple", "Enum")
+        for b in cls.bases
+    )
+
+
 def _check_eq_without_hash(tree: ast.AST) -> list[dict]:
     out: list[dict] = []
+    shape = "eq-without-hash"
     for cls in ast.walk(tree):
         if not isinstance(cls, ast.ClassDef):
             continue
-        decorators = _decorator_names(cls)
-        if decorators & _DATACLASS_DECORATORS:
-            continue  # eq/hash are derived
         methods = {
             m.name
             for m in cls.body
             if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
+        if "__eq__" not in methods:
+            continue
+        _note(shape, "considered")
+        decorators = _decorator_names(cls)
+        if decorators & _DATACLASS_DECORATORS:
+            _note(shape, "skipped", "dataclass")
+            continue  # eq/hash are derived
         # An explicit `__hash__ = None` is a deliberate opt-out.
         explicit = {
             t.id
@@ -809,22 +875,38 @@ def _check_eq_without_hash(tree: ast.AST) -> list[dict]:
             for t in stmt.targets
             if isinstance(t, ast.Name)
         }
-        if (
-            "__eq__" in methods
-            and "__hash__" not in methods
-            and "__hash__" not in explicit
-        ):
-            out.append(
-                _finding(
-                    "eq-without-hash",
-                    "CONSIDER",
-                    "medium",
-                    cls,
-                    f"class {cls.name} defines __eq__ but not __hash__; instances become "
-                    f"unhashable (Python sets __hash__ = None)",
-                    "only a problem if instances are used in a set or as dict keys -- check",
-                )
+        if "__hash__" in methods or "__hash__" in explicit:
+            _note(shape, "skipped", "defines-hash")
+            continue
+        # Unhashable instances are a defect only where something hashes them.
+        # Five of five hits on one web app were service and factory classes
+        # nothing ever puts in a set: report those at low.
+        if _instances_hashed(tree, cls.name):
+            conf = "medium"
+            why = "instances reach a set, a dict key or hash() in this module"
+        elif _is_value_type(cls):
+            conf = "medium"
+            why = (
+                "a value type (ordering, __slots__ or a tuple-like base): its "
+                "instances are likely to end up in a set or as dict keys"
             )
+        else:
+            conf = "low"
+            why = (
+                "no instance is seen in a set, as a dict key or in hash() in this "
+                "module -- only a problem if some caller hashes one"
+            )
+        out.append(
+            _finding(
+                shape,
+                "CONSIDER",
+                conf,
+                cls,
+                f"class {cls.name} defines __eq__ but not __hash__; instances become "
+                f"unhashable (Python sets __hash__ = None)",
+                why,
+            )
+        )
     return out
 
 
@@ -5210,6 +5292,7 @@ def analyze(
 
     findings: list[dict] = []
     corpus: list[tuple[str, ast.AST]] = []
+    _STATS.clear()
     for path in files:
         rel = relative_to_root(path, project_root)
         if exclude and any(pattern in rel for pattern in exclude):
@@ -5254,6 +5337,22 @@ def analyze(
         top = directory.lstrip("/").split("/")[0] or "."
         by_top_directory[top] = by_top_directory.get(top, 0) + 1
 
+    # One line per check that ran: what it reported and suppressed, and --
+    # for the checks that count their candidates -- what it considered and
+    # why it passed some over. `considered: null` means "not counted", so a
+    # zero is never mistaken for "checked and clean" or the reverse.
+    per_check: dict[str, dict] = {}
+    for name in sorted(checks or (set(_CHECKS) | set(_PROJECT_CHECKS))):
+        stats = _STATS.get(name)
+        if stats is None and name in _COUNTED_CHECKS:
+            stats = {"considered": 0, "skipped": {}}
+        per_check[name] = {
+            "reported": by_shape.get(name, 0),
+            "suppressed": suppressed_counts.get(name, {}),
+            "considered": stats["considered"] if stats else None,
+            "skipped": dict(sorted(stats["skipped"].items())) if stats else None,
+        }
+
     result = build_envelope(project_root, scan_root, files_total, len(files))
     result["summary"] = {
         "total_findings": len(findings),
@@ -5275,6 +5374,7 @@ def analyze(
         "suppressed_by_differential": dict(sorted(suppressed_counts.items())),
         "checks_run": sorted(checks or (set(_CHECKS) | set(_PROJECT_CHECKS))),
         "excluded_patterns": sorted(exclude or []),
+        "per_check": per_check,
     }
     result["findings"] = findings
     result["suppressed"] = suppressed
