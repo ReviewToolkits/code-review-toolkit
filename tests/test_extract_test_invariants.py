@@ -8,12 +8,12 @@ mod = import_script("extract_test_invariants")
 
 
 SIMPLE_SOURCE = """\
-def validate_input(data):
+def sanitize_input(data):
     if not data:
         raise ValueError("empty input")
     return data.strip()
 
-def validate_config(config):
+def sanitize_config(config):
     if not config:
         return None
     return config.strip()
@@ -25,17 +25,17 @@ def process_data(items):
 SIMPLE_TESTS = """\
 import unittest
 
-class TestValidateInput(unittest.TestCase):
-    def test_validate_input_empty(self):
+class TestSanitizeInput(unittest.TestCase):
+    def test_sanitize_input_empty(self):
         with self.assertRaises(ValueError):
-            validate_input("")
+            sanitize_input("")
 
-    def test_validate_input_normal(self):
-        result = validate_input("  hello  ")
+    def test_sanitize_input_normal(self):
+        result = sanitize_input("  hello  ")
         self.assertEqual(result, "hello")
 
-    def test_validate_input_not_none(self):
-        result = validate_input("x")
+    def test_sanitize_input_not_none(self):
+        result = sanitize_input("x")
         self.assertIsNotNone(result)
 """
 
@@ -196,25 +196,25 @@ class TestSimilarFunctions(unittest.TestCase):
     def test_finds_same_prefix(self):
         """Functions with same verb prefix are ranked higher."""
         all_funcs = {
-            "validate_input": [{"file": "a.py", "line": 1, "param_count": 1,
-                                "is_method": False, "is_async": False, "name": "validate_input"}],
-            "validate_config": [{"file": "b.py", "line": 1, "param_count": 1,
-                                 "is_method": False, "is_async": False, "name": "validate_config"}],
+            "sanitize_input": [{"file": "a.py", "line": 1, "param_count": 1,
+                                "is_method": False, "is_async": False, "name": "sanitize_input"}],
+            "sanitize_config": [{"file": "b.py", "line": 1, "param_count": 1,
+                                 "is_method": False, "is_async": False, "name": "sanitize_config"}],
             "process_data": [{"file": "c.py", "line": 10, "param_count": 1,
                               "is_method": False, "is_async": False, "name": "process_data"}],
         }
         similar = mod.find_similar_functions(
-            "validate_input",
-            all_funcs["validate_input"][0],
+            "sanitize_input",
+            all_funcs["sanitize_input"][0],
             all_funcs,
         )
         names = [s["function"] for s in similar]
-        self.assertIn("validate_config", names)
-        # validate_config should rank higher than process_data (prefix match)
+        self.assertIn("sanitize_config", names)
+        # sanitize_config should rank higher than process_data (prefix match)
         if "process_data" in names:
-            vc_idx = names.index("validate_config")
+            vc_idx = names.index("sanitize_config")
             pd_idx = names.index("process_data")
-            self.assertLess(vc_idx, pd_idx, "validate_config should rank above process_data")
+            self.assertLess(vc_idx, pd_idx, "sanitize_config should rank above process_data")
 
     def test_respects_max_similar(self):
         """At most max_similar results returned."""
@@ -271,6 +271,21 @@ class TestSimilarFunctionPrecision(unittest.TestCase):
             "get_config_path": _fn("get_config_path", "pkg/c.py"),
         }
         self.assertEqual(self._similar("get_config", funcs), ["get_config_path"])
+
+    def test_a_shared_generic_verb_is_not_enough(self):
+        """`verify_token` and `verify_signature` share a word, not an operation."""
+        funcs = {
+            "verify_token": _fn("verify_token", "pkg/a.py"),
+            "verify_signature": _fn("verify_signature", "pkg/b.py"),
+            "validate_input": _fn("validate_input", "pkg/c.py"),
+            "validate_config": _fn("validate_config", "pkg/d.py"),
+            "handle_upload": _fn("handle_upload", "pkg/e.py"),
+            "handle_delete": _fn("handle_delete", "pkg/f.py"),
+            "verify_token_expiry": _fn("verify_token_expiry", "pkg/g.py"),
+        }
+        self.assertEqual(self._similar("verify_token", funcs), ["verify_token_expiry"])
+        self.assertEqual(self._similar("validate_input", funcs), [])
+        self.assertEqual(self._similar("handle_upload", funcs), [])
 
     def test_other_top_level_dirs_and_private_helpers_skipped(self):
         funcs = {
@@ -448,8 +463,8 @@ class TestAnalyze(unittest.TestCase):
             self.assertGreater(result["summary"]["test_files"], 0)
             self.assertGreater(result["summary"]["total_test_functions"], 0)
 
-    def test_finds_similar_validate_functions(self):
-        """validate_input test invariants are propagated to validate_config."""
+    def test_finds_similar_sanitize_functions(self):
+        """sanitize_input test invariants are propagated to sanitize_config."""
         with TempProject({
             "pkg/__init__.py": "",
             "pkg/validator.py": SIMPLE_SOURCE,
@@ -462,10 +477,10 @@ class TestAnalyze(unittest.TestCase):
             for inv in result["invariants"]:
                 all_similar.extend(inv.get("similar_functions", []))
             similar_names = [s["function"] for s in all_similar]
-            # validate_config should be found as similar to validate_input
+            # sanitize_config should be found as similar to sanitize_input
             self.assertTrue(
-                any("validate_config" in n for n in similar_names),
-                f"Expected validate_config in similar functions, got: {similar_names}"
+                any("sanitize_config" in n for n in similar_names),
+                f"Expected sanitize_config in similar functions, got: {similar_names}"
             )
 
     def test_handles_syntax_error(self):
@@ -934,6 +949,74 @@ class TestEntryPointSiblings(unittest.TestCase):
         self.assertIn("Registry.import_from_archive", names)
         # The deeper layer of the same operation is not its own sibling.
         self.assertNotIn("Registry.create_record", names)
+
+
+_RANKING_SRC = (
+    "def require_owner(user):\n    return user\n"
+    "def validate_name(name):\n    return name\n"
+    "def _check_archive(blob):\n    return blob\n"
+    "def _write_lock():\n    return None\n"
+    "def _install_row(row):\n    return row\n"
+    "def _record_path(row):\n    return row\n"
+    "def create_record(user, name):\n"
+    "    require_owner(user)\n"
+    "    validate_name(name)\n"
+    "    with _write_lock():\n"
+    "        _install_row(name)\n"
+    "        return _record_path(name)\n"
+    # Validates its input, but with none of the tested guards.
+    "def import_record(blob):\n"
+    "    _check_archive(blob)\n"
+    "    with _write_lock():\n"
+    "        _install_row(blob)\n"
+    # Applies one of the two.
+    "def rename_record(name):\n"
+    "    validate_name(name)\n"
+    "    with _write_lock():\n"
+    "        _install_row(name)\n"
+    # No guard of its own, but the most shared helpers.
+    "def purge_record(name):\n"
+    "    with _write_lock():\n"
+    "        _install_row(name)\n"
+    "        _record_path(name)\n"
+    # Keeps every tested guard.
+    "def bulk_create(user, names):\n"
+    "    require_owner(user)\n"
+    "    validate_name(names)\n"
+    "    with _write_lock():\n"
+    "        _install_row(names)\n"
+    "        _record_path(names)\n"
+)
+
+
+class TestEntryPointSiblingRanking(unittest.TestCase):
+    """The true sibling ranked 12th: helper overlap put no-guard internals
+    and siblings that already keep the guard ahead of an entry point that
+    validates its input, just not with the tested guard."""
+
+    def _siblings(self, max_results: int = 5) -> list[dict]:
+        with TempProject({"pkg/__init__.py": "", "pkg/ops.py": _RANKING_SRC}) as root:
+            sources = [root / "pkg/__init__.py", root / "pkg/ops.py"]
+            functions = mod.extract_source_functions(sources, root)
+            index = mod.CallIndex(sources, root, functions)
+            return index.siblings(("pkg/ops.py", "create_record"), max_results)
+
+    def test_a_differing_guard_set_ranks_first(self):
+        siblings = self._siblings()
+        self.assertEqual(
+            [(s["function"], s["guard_relation"]) for s in siblings],
+            [
+                ("import_record", "disjoint"),
+                ("rename_record", "partial"),
+                ("purge_record", "unguarded"),
+                ("bulk_create", "keeps"),
+            ],
+        )
+        self.assertEqual(siblings[0]["missing_guards"], ["require_owner", "validate_name"])
+
+    def test_the_cap_drops_the_least_telling_first(self):
+        names = [s["function"] for s in self._siblings(max_results=3)]
+        self.assertEqual(names, ["import_record", "rename_record", "purge_record"])
 
 
 class TestFixCommitClassification(unittest.TestCase):

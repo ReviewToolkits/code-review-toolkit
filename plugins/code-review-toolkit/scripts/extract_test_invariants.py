@@ -297,6 +297,9 @@ _GENERIC_TOKENS = frozenset({
     "get", "set", "run", "add", "new", "make", "main", "call", "init", "load",
     "save", "read", "write", "open", "close", "start", "stop", "test", "check",
     "update", "create", "delete", "list", "is", "has", "to", "from", "do",
+    # Verbs that open half the names in a service layer: `verify_token` and
+    # `verify_signature` share a word, not an operation.
+    "verify", "validate", "handle", "process",
 })
 _SKIP_CALLS = frozenset({
     "setUp", "tearDown", "patch", "MagicMock", "Mock", "AsyncMock",
@@ -1211,7 +1214,18 @@ class CallIndex:
         return found
 
     def siblings(self, key: tuple[str, str], max_results: int = 5) -> list[dict]:
-        """Other entry points into the operation *key* performs."""
+        """Other entry points into the operation *key* performs.
+
+        Ranked by how the sibling's guards relate to the tested path's
+        (`guard_relation`): first an entry point that validates its input
+        but applies NONE of the tested guards (`disjoint`: it checks, just
+        not this), then one that applies some (`partial`), then one with no
+        guards of its own (`unguarded`), and last one that keeps every
+        tested guard (`keeps`). Within a tier, public functions come first,
+        then siblings sharing more of the sinks the tested path calls under a
+        guard, then those sharing the rarer helpers. Every sibling missing a
+        guard therefore comes before any that keeps them all.
+        """
         if key not in self.calls:
             return []
         chain = self.chain(key)
@@ -1223,6 +1237,11 @@ class CallIndex:
                     sinks[name] = fan_in
         chain_names = {member[1].rsplit(".", 1)[-1] for member in chain}
         tested_guards = set().union(*(self.guards[m] for m in chain))
+        # Sinks a guard-applying member of the chain calls: the operation the
+        # guard protects.
+        guarded_sinks = {
+            name for m in chain if self.guards[m] for name in self.calls[m]
+        }
         shared: dict[tuple[str, str], list[str]] = defaultdict(list)
         for name in sinks:
             for caller in self.callers[name]:
@@ -1237,6 +1256,15 @@ class CallIndex:
             if len(names) < 2 and sinks[names[0]] > _RARE_SINK_FAN_IN:
                 continue
             missing = sorted(tested_guards - self.guards[caller] - self.calls[caller])
+            own = self.guards[caller]
+            if not missing:
+                relation = "keeps"
+            elif not own:
+                relation = "unguarded"
+            elif own & tested_guards:
+                relation = "partial"
+            else:
+                relation = "disjoint"
             results.append({
                 "function": caller[1],
                 "file": caller[0],
@@ -1245,14 +1273,28 @@ class CallIndex:
                 # Guards the tested path applies that this entry point does
                 # not: the invariant most likely to be missing here.
                 "missing_guards": missing,
+                "guard_relation": relation,
+                "shared_guarded_sinks": sum(1 for n in names if n in guarded_sinks),
                 "score": round(sum(1 / sinks[n] for n in names), 3),
             })
-        # Public functions first: they are the entry points a caller reaches.
-        results.sort(key=lambda r: (
-            r["function"].rsplit(".", 1)[-1].startswith("_"),
-            -r["score"], r["file"], r["function"],
-        ))
+        results.sort(key=sibling_rank)
         return results[:max_results]
+
+
+_GUARD_RELATION_RANK = {"disjoint": 0, "partial": 1, "unguarded": 2, "keeps": 3}
+
+
+def sibling_rank(r: dict) -> tuple:
+    """Sort key for entry-point siblings (see `CallIndex.siblings`)."""
+    return (
+        _GUARD_RELATION_RANK.get(r.get("guard_relation", "keeps"), 3),
+        # Public functions first: they are the entry points a caller reaches.
+        r["function"].rsplit(".", 1)[-1].startswith("_"),
+        -r.get("shared_guarded_sinks", 0),
+        -r["score"],
+        r["file"],
+        r["function"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1802,21 +1844,27 @@ def analyze(target: str, *, max_files: int = 0, with_git: bool = False) -> dict:
     untested_similar_total = len(deduped)
     untested_similar = deduped[:20]
 
-    entry_points: list[dict] = []
-    seen_entry: set[tuple[str, str]] = set()
+    pairs: list[dict] = []
     for inv in invariants:
         for sib in inv["entry_point_siblings"]:
             key = (sib["file"], sib["function"])
-            if key in seen_entry:
-                continue
-            seen_entry.add(key)
-            entry_points.append({
+            pairs.append({
                 **sib,
                 "sibling_of": inv["tested_function"]["function"],
                 "tested_in": inv["file"],
                 "tested": key in tested_funcs,
                 "invariant_types": inv["invariant_types"],
             })
+    # Each sibling once, with its most telling pair, most telling first: the
+    # pairs most likely to be missing a guard come before the cap below.
+    pairs.sort(key=sibling_rank)
+    entry_points: list[dict] = []
+    seen_entry: set[tuple[str, str]] = set()
+    for pair in pairs:
+        key = (pair["file"], pair["function"])
+        if key not in seen_entry:
+            seen_entry.add(key)
+            entry_points.append(pair)
     entry_points_total = len(entry_points)
 
     return {
