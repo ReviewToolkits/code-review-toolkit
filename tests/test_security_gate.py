@@ -120,6 +120,54 @@ class TestBlind(unittest.TestCase):
         )
 
 
+class TestPrecedentHintRanking(unittest.TestCase):
+    """Hints rank by distinctive words and mechanism class, and stay few."""
+
+    # A domain where most audit titles share the same nouns.
+    PRECEDENTS: ClassVar[list] = [
+        {"id": "P-1", "title": "Account token expiry not enforced", "severity": "low"},
+        {"id": "P-2", "title": "Account token shown in logs", "severity": "low"},
+        {"id": "P-3", "title": "Account settings form lacks CSRF protection"},
+        {"id": "P-4", "title": "Denial of service on compressed archive uploads"},
+        {"id": "P-5", "title": "Token reuse after account deletion", "severity": "low"},
+    ]
+
+    def test_shared_domain_nouns_alone_give_no_hint(self):
+        # "account" and "token" are in most titles: sharing them says nothing.
+        finding = {"id": "X", "title": "Account token count is wrong on the dashboard"}
+        self.assertEqual(mod.precedent_hints(finding, self.PRECEDENTS), [])
+
+    def test_mechanism_class_matches_across_wording(self):
+        finding = {
+            "id": "X",
+            "title": "Archive upload has no decompressed-size cap (decompression bomb)",
+        }
+        hints = mod.precedent_hints(finding, self.PRECEDENTS)
+        self.assertEqual([h["id"] for h in hints], ["P-4"])
+        self.assertEqual(hints[0]["shared_mechanisms"], ["denial-of-service"])
+        self.assertIn("score", hints[0])
+
+    def test_at_most_two_hints(self):
+        precedents = [
+            {"id": f"R-{i}", "title": f"Replay of signed webhook payloads variant {i}"}
+            for i in range(5)
+        ]
+        finding = {"id": "X", "title": "Signed webhook payloads accept replay"}
+        self.assertEqual(len(mod.precedent_hints(finding, precedents)), 2)
+
+    def test_blind_weights_words_across_all_claims(self):
+        findings = [
+            {
+                "id": f"F-{i}",
+                "title": f"Account token problem number {i}",
+                "security_claim": {"attacker": "a", "preconditions": "p", "gain": "g"},
+            }
+            for i in range(3)
+        ]
+        claims = mod.blind(findings, precedents=self.PRECEDENTS)
+        self.assertTrue(all(c["precedent_hints"] == [] for c in claims))
+
+
 class TestSignoff(unittest.TestCase):
     def test_pass(self):
         result = mod.signoff(

@@ -9,8 +9,9 @@ would anchor the skeptic on the finder's opinion: severity, classification,
 locations, the evidence, and the claim itself (``security_claim: {attacker,
 preconditions, gain}``), which the skeptic must check rather than accept. With
 ``--threat-model``, each claim also gets the project's precedents whose wording
-overlaps it most (``precedent_hints``): the cheapest way to catch a claim that
-repeats an audit finding the project already published or accepted.
+overlaps it most (``precedent_hints``, at most two, ranked by distinctive words
+and shared mechanism class): the cheapest way to catch a claim that repeats an
+audit finding the project already published or accepted.
 
 ``signoff`` -- validate the verdicts against the threat model and print the
 machine-readable line, the first line of `SECURITY-GATE.md`:
@@ -56,6 +57,7 @@ vulnerability or hardening; ``--all`` takes every finding.
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -197,33 +199,121 @@ def _words(text: str) -> set[str]:
     return {_stem(w) for w in _WORD_RE.findall(text.lower()) if w not in _STOP}
 
 
-def precedent_hints(
-    finding: dict, precedents: list[dict], limit: int = 3
-) -> list[dict]:
-    """Precedents whose title shares the most words with the claim (Jaccard-like)."""
-    text = " ".join(
+# Mechanism classes: the vulnerability mechanism a title names, whatever the
+# wording ("decompression bomb" and "denial of service" are one class). A shared
+# class weighs more than a shared noun: two claims about tokens share a domain,
+# two claims about a replay share a mechanism.
+MECHANISM_CLASSES = {
+    "denial-of-service": ("denial", "dos", "bomb", "exhaust", "redos", "unbounded"),
+    "race": ("race", "toctou", "concurren"),
+    "authorization": ("authoriz", "permission", "privileg", "escalat", "idor", "acl"),
+    "authentication": ("authent", "mfa", "totp", "2fa"),
+    "injection": ("inject", "xss", "escap", "unescap", "sanitiz", "shell"),
+    "disclosure": ("leak", "disclos", "expos", "reveal", "enumerat"),
+    "replay": ("replay", "nonce"),
+    "bypass": ("bypass", "circumvent", "evad"),
+    "rate-limit": ("rate", "throttl", "brute"),
+    "signature": ("signatur", "hmac", "verif"),
+    "redirect": ("redirect", "ssrf"),
+    "audit-trail": ("audit",),
+    "parser-mismatch": ("parser", "confus", "mismatch", "normaliz"),
+    "weak-crypto": ("hash", "sha1", "md5", "weak"),
+}
+# A hint must carry this much of the precedent title's (weighted) wording.
+HINT_MIN_SCORE = 0.4
+# Hints scoring below this fraction of the best one for the same claim are noise.
+HINT_RELATIVE_CUTOFF = 0.6
+HINT_LIMIT = 2
+
+
+def _mechanisms(words: set[str]) -> set[str]:
+    return {
+        name
+        for name, stems in MECHANISM_CLASSES.items()
+        if any(w.startswith(stems) for w in words)
+    }
+
+
+def _claim_text(finding: dict) -> str:
+    return " ".join(
         str(finding.get(k) or "") for k in ("title", "mechanism", "failure_scenario")
     )
+
+
+def _terms(text: str) -> set[str]:
+    """Words of *text* plus a ``~class`` term for each mechanism class it names."""
     words = _words(text)
+    return words | {f"~{m}" for m in _mechanisms(words)}
+
+
+def term_weights(documents: list[str]) -> dict[str, float]:
+    """Inverse document frequency over *documents* (precedent titles and claims).
+
+    A word in half the documents ("token", "account" in a web application's
+    audit) tells two texts apart far less than a word in two of them.
+    """
+    df: dict[str, int] = {}
+    for doc in documents:
+        for term in _terms(doc):
+            df[term] = df.get(term, 0) + 1
+    n = len(documents)
+    return {t: math.log((n + 1) / (c + 1)) + 0.1 for t, c in df.items()}
+
+
+def precedent_hints(
+    finding: dict,
+    precedents: list[dict],
+    limit: int = HINT_LIMIT,
+    *,
+    weights: dict[str, float] | None = None,
+) -> list[dict]:
+    """Precedents whose title shares the most distinctive wording with the claim.
+
+    Each shared word counts by its rarity (``weights``, IDF over the precedent
+    titles and claims), and a shared mechanism class counts double. A hint needs
+    two shared words, a score of at least ``HINT_MIN_SCORE`` (the weighted
+    fraction of the precedent title covered), and a score within
+    ``HINT_RELATIVE_CUTOFF`` of the claim's best hint; at most *limit* are kept.
+    """
+    if weights is None:
+        weights = term_weights(
+            [p.get("title", "") for p in precedents] + [_claim_text(finding)]
+        )
+    default = max(weights.values(), default=1.0)
+
+    def weight(term: str) -> float:
+        w = weights.get(term, default)
+        return 2 * w if term.startswith("~") else w
+
+    words = _terms(_claim_text(finding))
     scored = []
     for p in precedents:
-        pw = _words(p.get("title", ""))
+        pw = _terms(p.get("title", ""))
         if not pw or not words:
             continue
         shared = pw & words
-        score = len(shared) / len(pw)
-        if len(shared) >= 2 and score >= 0.33:  # two of a six-word title
-            scored.append((score, p, sorted(shared)))
+        plain = sorted(t for t in shared if not t.startswith("~"))
+        if len(plain) < 2:
+            continue
+        score = sum(weight(t) for t in shared) / sum(weight(t) for t in pw)
+        if score >= HINT_MIN_SCORE:
+            mechanisms = sorted(t[1:] for t in shared if t.startswith("~"))
+            scored.append((score, p, plain, mechanisms))
     scored.sort(key=lambda t: -t[0])
+    if scored:
+        best = scored[0][0]
+        scored = [t for t in scored if t[0] >= HINT_RELATIVE_CUTOFF * best]
     return [
         {
             "id": p.get("id"),
             "title": p.get("title"),
             "severity": p.get("severity"),
             "status": p.get("status") or p.get("state"),
-            "shared_words": shared,
+            "score": round(score, 2),
+            "shared_words": plain,
+            "shared_mechanisms": mechanisms,
         }
-        for _, p, shared in scored[:limit]
+        for score, p, plain, mechanisms in scored[:limit]
     ]
 
 
@@ -234,6 +324,14 @@ def blind(
     take_all: bool = False,
 ) -> list[dict]:
     out = []
+    weights = (
+        term_weights(
+            [p.get("title", "") for p in precedents]
+            + [_claim_text(f) for f in findings]
+        )
+        if precedents
+        else None
+    )
     for f in findings:
         if not take_all and not makes_claim(f):
             continue
@@ -244,7 +342,7 @@ def blind(
             "security_claim", {"attacker": "", "preconditions": "", "gain": ""}
         )
         if precedents:
-            record["precedent_hints"] = precedent_hints(f, precedents)
+            record["precedent_hints"] = precedent_hints(f, precedents, weights=weights)
         out.append(record)
     return out
 
