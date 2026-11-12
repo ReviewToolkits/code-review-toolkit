@@ -67,7 +67,7 @@ code-review-toolkit/
 │   ├── .claude-plugin/plugin.json
 │   ├── agents/                      # 20 agent prompt definitions (markdown)
 │   ├── commands/                    # 9 command definitions (markdown)
-│   ├── scripts/                     # 25 Python scripts (the core code) + a pytest plugin
+│   ├── scripts/                     # 36 Python scripts (the core code) + a pytest plugin
 │   ├── data/                        # bug-shape catalog + FP taxonomy
 │   └── docs/                        # docs the prompts cite (shipped with the plugin)
 └── tests/                           # unittest suite
@@ -83,8 +83,8 @@ candidates, and prints JSON to stdout.
 | Script | Purpose |
 |---|---|
 | `scan_common.py` | **Shared utilities — every other script imports from here** |
-| `scan_python_pitfalls.py` | Correctness defects; 45 checks mapping 1:1 to `data/python_bug_shapes.json` (2 of them project-level) |
-| `scan_concurrency.py` | Concurrency defects; 13 project-level checks (lock-guard inference, lock discipline, slot lifecycle, blocking under locks and in `async def`, through the call graph), plus a `module_state` inventory |
+| `scan_python_pitfalls.py` | Correctness defects; 49 checks mapping 1:1 to `data/python_bug_shapes.json` (3 of them project-level) |
+| `scan_concurrency.py` | Concurrency defects; 16 project-level checks (lock-guard inference, lock discipline, slot lifecycle, blocking under locks and in `async def`, through the call graph; database- and cache-level races), plus a `module_state` inventory |
 | `analyze_imports.py` | Import graph, module boundaries, circular dependencies |
 | `analyze_history.py` | Git history: churn, co-change, fix density |
 | `measure_complexity.py` | Per-function complexity metrics |
@@ -107,11 +107,22 @@ candidates, and prints JSON to stdout.
 | `survey_conventions.py` | Convention variants, majority and minority sites (formatting, logging, typing generics, exits, prints) |
 | `pytest_plugins/crt_leaktrack.py` | pytest plugin (not counted as a script): attributes unclosed sqlite3 connections |
 | `find_threat_model.py` | A project's own security record: policy and scope, published audit tables as severity precedents, advisories, security issues/commits, rules of engagement (`security-gate`) |
-| `security_gate.py` | `blind` (strip the finder's opinion from security claims), `signoff` (compute the `SECURITY-GATE:` line), `score` (agreement with reference verdicts) |
+| `security_gate.py` | `blind` (strip the finder's opinion from security claims), `signoff` (compute the `SECURITY-GATE:` line), `score` (agreement with reference verdicts), `lint` (publication hygiene of a findings.json) |
+| `sweep_fix_pattern.py` | Current sites of the statements or conditions a fix commit removed (fix propagation) |
+| `map_wiring.py` | Static web-framework cross-reference: settings, routes, templates, tasks (with call-site arguments), signals, request methods, permissions |
+| `map_orm_schema.py` | ORM nullability vs annotations, model constraints vs migration history, sibling lookups vs unique keys |
+| `diff_siblings.py` | Sibling call-set outliers and helper bypasses (consistency) |
+| `check_doc_refs.py` | Doc links and anchors, links the app emits, names, paths, make targets (project-docs-auditor) |
+| `dump_tracker.py` | Dumps an issue tracker in time windows and searches it locally (whole-catalog prior art) |
+| `merge_fragments.py` / `apply_verdicts.py` | Phase 3: fold reproduction-slice fragments and verdicts into findings.json, with coverage checks |
+| `build_public_tree.py` | Phase 3: a public findings tree with stable ids and id rewriting; refuses to write on a leak |
+| `leak_scan.py` | Word-bounded leak and internal-id scan, and a sensitive-reference check |
+| `check_locations.py` | Every finding's `path:line` exists at the reviewed commit |
 
 **Dependency graph:** `scan_common.py` is at the center; every other script imports from it.
-`measure_complexity.py` also imports `analyze_history.py` (to attribute fixes to functions as they
-were at each commit). No circular dependencies.
+`measure_complexity.py` and `extract_test_invariants.py` also import `analyze_history.py` (fix
+attribution, and one shared commit classifier); `build_informed_briefing.py` imports
+`security_gate.py`. No circular dependencies.
 
 **Script calling convention:** each analysis script exposes `analyze(target: str, *, max_files: int
 = 0) -> dict` and a `main()` that prints JSON. Exceptions: `analyze_history.py` takes `argv`;
@@ -151,9 +162,9 @@ is the calibration loop.**
 no analysis logic — they run a script, read the JSON, then do the qualitative review the script
 cannot. Scripts find candidates (with a real false-positive rate); agents confirm or dismiss them.
 
-Three agents are **qualitative** (no backing script — they use Grep/Read directly):
-api-surface-reviewer, project-docs-auditor and security-claims-skeptic (its scripts are run by the
-`security-gate` command, not by the agent). The other seventeen are
+Two agents are **qualitative** (no backing script — they use Grep/Read directly):
+api-surface-reviewer and security-claims-skeptic (its scripts are run by the `security-gate`
+command, not by the agent). The other eighteen are
 script-backed, and each ends with a `## Running the script` section (timeout, private `mktemp -d`
 output, no retry after a failure); `test_release_discipline` fails if a new one omits it.
 
@@ -171,7 +182,8 @@ output, no retry after a failure); `test_release_discipline` fails if a new one 
 
 ### Classification system
 
-Every finding is tagged:
+Every finding is tagged, by the one rubric in `docs/finding-fields.md` (which also lists the fields
+every finding carries):
 - **FIX** — a real defect: wrong behavior, silent data loss, a crash
 - **CONSIDER** — likely improvement, may carry migration cost
 - **POLICY** — a design decision for the maintainer
@@ -228,11 +240,14 @@ Tracked honestly so the next session does not have to re-derive them:
    is young and takes chances, coverage.py is a large third-party project. A threaded/async
    application has since been reviewed privately for its maintainer; its report stays outside this
    repo, so the threading shapes it motivated are `documented` until its findings can be cited.
-2. **82 of 125 shapes are `confirmed`; 43 remain `documented`**, including all 14 threading
-   shapes.
-3. **59 of 125 shapes are executable.** `scan_python_pitfalls.py` implements 45 (43 per-file, 2
-   project-level), `scan_concurrency.py` 13 (all project-level) and `run_lint_rules.py` 1. The rest are `implementable` or
-   `agent-only` — `detectability` in the catalog says which.
+   A large web application with an ORM and a task queue was then reviewed privately in three
+   passes; the web/ORM shapes and scripts of 1.17 come from it, under the same rule.
+2. **108 of 159 shapes are `confirmed`; 51 remain `documented`**, including the threading shapes
+   and every web/ORM shape whose only instance is still under coordinated disclosure.
+3. **67 of 159 shapes are executable.** `scan_python_pitfalls.py` implements 49 (46 per-file, 3
+   project-level), `scan_concurrency.py` 16 (all project-level), `run_lint_rules.py` 1 and
+   `survey_docstrings.py` 1. The rest are `implementable` or `agent-only` — `detectability` in the
+   catalog says which.
 4. **The companion findings repository is `devdanzin/code-review-findings`** (`coveragepy/`,
    `cpython-idlelib/`, `cpython-pyrepl/`). The `.code-review/findings.json` schema written by
    `informed-explore` is wire-compatible with its `project-local/findings.json`, so a project's

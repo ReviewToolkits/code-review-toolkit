@@ -329,6 +329,11 @@ code-review-toolkit/
 │   ├── python_bug_shapes.json
 │   └── python_non_bugs.md
 ├── docs/
+│   ├── finding-fields.md
+│   ├── mutation-fuzzer.md
+│   ├── orm-schema-diff.md
+│   ├── probe-harness.md
+│   ├── registry-diff.md
 │   ├── reproduction-convention.md
 │   └── searching-trackers.md
 └── scripts/
@@ -337,19 +342,29 @@ code-review-toolkit/
     ├── analyze_history.py
     ├── analyze_imports.py
     ├── annotate_findings.py
+    ├── apply_verdicts.py
     ├── build_informed_briefing.py
+    ├── build_public_tree.py
+    ├── check_doc_refs.py
     ├── check_known_findings.py
+    ├── check_locations.py
     ├── check_typing.py
     ├── collect_debt.py
     ├── correlate_tests.py
     ├── count_types.py
     ├── diff_findings.py
+    ├── diff_siblings.py
+    ├── dump_tracker.py
     ├── extract_test_invariants.py
     ├── find_dead_symbols.py
     ├── find_threat_model.py
+    ├── leak_scan.py
     ├── map_exceptions.py
     ├── map_findings_coverage.py
+    ├── map_orm_schema.py
+    ├── map_wiring.py
     ├── measure_complexity.py
+    ├── merge_fragments.py
     ├── run_external_tools.py
     ├── run_lint_rules.py
     ├── scan_common.py
@@ -358,7 +373,8 @@ code-review-toolkit/
     ├── security_gate.py
     ├── survey_conventions.py
     ├── survey_docstrings.py
-    └── survey_error_handling.py
+    ├── survey_error_handling.py
+    └── sweep_fix_pattern.py
 ```
 
 ## Author

@@ -6,6 +6,155 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fix round: feedback from three review runs (#93–#101)
+
+The open feedback from a three-pass review of a large web application with an ORM and a task
+queue, plus the items still open from the threaded/async service and the API-testing CLI, was
+consolidated into one ledger: 215 verified rows, 116 still open, fixed here in nine groups. All
+three targets were reviewed privately.
+
+#### Added
+
+- **New scripts.**
+  - `map_wiring.py` is a static web-framework cross-reference covering settings, routes,
+    templates, tasks (with call-site arguments bound to parameters), signals, request methods and
+    permissions.
+  - `map_orm_schema.py` checks ORM nullability against annotations, model constraints against the
+    migration history, and sibling lookups against unique keys.
+  - `diff_siblings.py` reports sibling call-set outliers and helper bypasses.
+  - `check_doc_refs.py` checks doc links and anchors, links the app emits, names, paths and make
+    targets.
+  - `sweep_fix_pattern.py` lists the current sites of the forms a fix commit removed.
+  - `dump_tracker.py` dumps an issue tracker in time windows and searches it locally, for
+    whole-catalog prior art.
+  - The Phase 3 pipeline:
+    - `merge_fragments.py` and `apply_verdicts.py` fold reproduction-slice fragments and verdicts
+      into findings.json, with coverage checks;
+    - `build_public_tree.py` builds a public tree with stable ids and id rewriting, and refuses
+      to write on a leak;
+    - `leak_scan.py` runs word-bounded leak and id scans plus a sensitive-reference check;
+    - `check_locations.py` checks that every finding's `path:line` exists at the reviewed commit.
+  - `security_gate.py lint` checks findings.json for publication hygiene: agent names, internal
+    ids, `||` merge separators, and references to sensitive ids.
+  - `find_threat_model.py --audit-doc` reads audit reports saved outside the tree. RST and HTML
+    audit tables are parsed.
+- **Catalog.**
+  - 34 new shapes for web apps:
+    - database- and cache-level concurrency;
+    - framework failure paths;
+    - ORM pitfalls and data-layer consistency;
+    - wire API;
+    - docs that claim more than access control grants;
+    - clocks and string interpolation in translations;
+    - unrealistic fixtures;
+    - non-finite floats passing range guards.
+  - 6 new false-positive classes. consistency-auditor now owns shapes.
+  - Now 159 shapes: 108 confirmed, 67 executable.
+- **Checks.**
+  - scan_concurrency gains `rate-limiter-test-then-hit`, `read-modify-write-on-shared-store` and
+    `session-level-set-leaks-through-pooled-connection`.
+  - scan_python_pitfalls gains `integrity-error-caught-without-rollback`,
+    `in-place-mutation-of-untracked-json-column` (project-level),
+    `translation-lookup-of-interpolated-string` and `non-finite-float-passes-range-guard`.
+- **Scope flags.**
+  - A shared `--exclude` (repeatable, comma list) works in 13 scripts and analyze_history, which
+    also gains `--exclude-author` and a default generated-file filter. The envelope reports
+    `files_excluded`.
+  - Migration revision files are recognised: they are entry points for find_dead_symbols and
+    skipped elsewhere unless `--include-migrations`.
+  - correlate_tests honours the project's coverage `omit`.
+  - measure_complexity and extract_test_invariants take `--git-dir`/`--repo` for exports.
+  - extract_test_invariants takes cap flags (`--max-tests`, `--max-commits`, ..., `--all`) and
+    `--key-type`; analyze_history takes `--max-branches`.
+  - check_typing takes `--extra-pass`, `--cache-dir`, `--boundary-map`, `--boundary-stubs` and
+    `--boundary-flag` (the typed-boundary overlay). count_types takes `--mypy-json`
+    (`annotation_accuracy`). run_external_tools takes `--dead-symbols`, which tags vulture hits
+    with find_dead_symbols' verdict.
+- **New fields.**
+  - check_typing: `stale_stub_packages`, and phantom imports split by origin.
+  - count_types: `orm_model`/`interface` categories and `protocols_with_default_bodies`.
+  - find_dead_symbols: `write_only_attributes`.
+  - survey_docstrings: `dead_references`.
+  - collect_debt: `dependency_specs`, `overdue_planned_items`, `key_variants` and `unaccounted`.
+  - run_lint_rules: a noqa-ignoring pass, the project's select/ignore list with reasons, and
+    `candidate_shapes`.
+  - scan_python_pitfalls: `summary.per_check`.
+  - scan_concurrency: `model_applicable`, `distributed_locks` and `slow_lock_holders`.
+- **Recipes** in `docs/`:
+  - `registry-diff.md`, `orm-schema-diff.md`, `probe-harness.md` (server-mode endpoint × case
+    matrix) and `mutation-fuzzer.md`;
+  - `finding-fields.md`: the fields every finding carries, and the one FIX/CONSIDER rubric, cited
+    by every agent and enforced by a test.
+
+#### Fixed
+
+- **Commit classification.** Hardening subjects ("Reject…", "Require…", "Validate…") count as
+  fixes; `fix(docs|style|i18n)` and non-code fixes don't. extract_test_invariants uses the same
+  classifier. The `--key-type` note fires only when unknown commits carry keys. Squash-merged and
+  partly landed branches are detected, and omitted branches are named.
+- **Blame.** collect_debt and annotate_findings honour `.git-blame-ignore-revs`, and annotate skips
+  merges. collect_debt blames once per file.
+- **Precision.**
+  - mypy notes are no longer counted as findings.
+  - Type-ignore and pragma comments no longer count as a ruff dismissal.
+  - Class-level mutables: annotated forms and calls are caught, and dunder/declarative attributes
+    are not flagged.
+  - Broad handlers that notify (`flash`, `capture_exception`) are reported.
+  - raise-without-from and eq-without-hash have calibrated confidence.
+  - lru-cache-on-method reads `maxsize`.
+  - Metric and policy rules are kept out of the shape harvest.
+  - The ruff pin is 0.17.3, run with `RUFF_NO_CACHE`.
+- **Counts.**
+  - Scanners count files after `--exclude`.
+  - vulture is sorted by confidence before the cap.
+  - Missing history warns on stderr instead of reading as zero.
+  - Unknown flags warn on stderr.
+- **Matching.**
+  - find_dead_symbols counts dotted-path references, keeps noqa-F401 re-exports, and reports
+    commented-out code only when it parses.
+  - correlate_tests matches same-named sources by mirrored directory.
+  - count_types resolves enums and Protocols through project bases, and treats methods of private
+    classes as private.
+- **diff_findings** covers every script's lists, enforced by a test that runs them all.
+- **build_informed_briefing**:
+  - folds in `reproduced` memory entries;
+  - narrows per agent and `--area`, with a size budget and a greppable `--known-out` list;
+  - maps consolidation families to shapes;
+  - labels findings by run;
+  - gives agents that own no shapes their adjacent shapes.
+- **Precedent hints** in the security gate are ranked by distinctive words and mechanism class,
+  at most two per claim.
+
+#### Enhanced
+
+- **Prompts.**
+  - Server-mode probing and the cache-header caveat (api-surface-reviewer).
+  - Framework failure paths and validator mutation (silent-failure-hunter).
+  - Error exits after a mutation, and framework wiring (consistency-auditor).
+  - Database/cache concurrency (concurrency-auditor).
+  - ORM models and autogenerate blind spots (type-design-analyzer).
+  - Decorator and deriver invariants (test-investigation-agent).
+  - An import-first smoke run (architecture-mapper).
+  - Behavioural doc claims and the port vs bind host (project-docs-auditor).
+  - A dependency bisect (tech-debt-inventory).
+  - Callers and callees of hotspots, plus a slot for defects found while reading them
+    (complexity-simplifier).
+  - Scope hints across the script-backed agents.
+- **The reproduction convention** covers:
+  - run-owned scratch under `<run_dir>/tmp`;
+  - environment traps: `filterwarnings = error`, `python -I`, SAVEPOINT fixtures, shared-session
+    poisoning, view calls that skip derivers, logger levels;
+  - parallel database isolation;
+  - branch runs with vendored test dependencies;
+  - the fragment format.
+- **explore**:
+  - the Phase 3 pipeline and a queue pattern for the subagent cap;
+  - run-id labels in handoffs;
+  - a second look at single-finder findings;
+  - a `branch_status` column.
+
+  informed-explore gains a zero-shape fallback and states which output structure wins.
+
 ### Added — security-claims gate
 
 A review run labelled findings "security" far more readily than the project's maintainers would. In
