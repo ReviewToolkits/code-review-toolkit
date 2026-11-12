@@ -2,6 +2,7 @@
 
 import json
 import unittest
+from typing import ClassVar
 
 from helpers import TempProject, import_script
 
@@ -160,7 +161,8 @@ class TestSourceTestMatching(unittest.TestCase):
             self.assertEqual(len(matches), 0)
 
     def test_multiple_matches(self):
-        # If two source files have the same stem in different packages.
+        # Two same-named sources and a test that mirrors neither: matching
+        # both claimed each was tested by the other's tests.
         with TempProject({
             "pkg1/utils.py": "",
             "pkg2/utils.py": "",
@@ -168,10 +170,72 @@ class TestSourceTestMatching(unittest.TestCase):
         }) as root:
             source_files = [root / "pkg1/utils.py", root / "pkg2/utils.py"]
             test_file = root / "tests/test_utils.py"
-            matches = mod._match_test_to_source(
-                test_file, source_files, root
-            )
-            self.assertEqual(len(matches), 2)
+            match = mod._name_match(test_file, source_files, root)
+            self.assertEqual(match["matches"], [])
+            self.assertEqual(match["how"], "ambiguous")
+            self.assertEqual(match["candidates"], ["pkg1/utils.py", "pkg2/utils.py"])
+
+
+class TestSameNamedSources(unittest.TestCase):
+    """`views.py` in every app was name-matched to every `test_views.py`."""
+
+    _FILES: ClassVar[dict[str, str]] = {
+        "pkg/__init__.py": "",
+        "pkg/views.py": "def index(): pass\n",
+        "pkg/accounts/__init__.py": "",
+        "pkg/accounts/views.py": "def login(): pass\n",
+        "pkg/billing/__init__.py": "",
+        "pkg/billing/views.py": "def pay(): pass\n",
+        "pkg/runner.py": "def run(): pass\n",
+        "tests/unit/test_views.py": "def test_index(): pass\n",
+        "tests/unit/accounts/test_views.py": "def test_login(): pass\n",
+        "tests/unit/billing/test_views.py": "def test_pay(): pass\n",
+        "tests/unit/deep/place/test_runner.py": "def test_run(): pass\n",
+        "pkg/admin/__init__.py": "",
+        "pkg/admin/views/__init__.py": "",
+        "pkg/admin/views/audit.py": "def show(): pass\n",
+        "pkg/cli/__init__.py": "",
+        "pkg/cli/audit.py": "def main(): pass\n",
+        "tests/functional/admin/test_audit.py": "def test_show(): pass\n",
+    }
+
+    def test_directory_mirroring_picks_the_one_source(self):
+        with TempProject(self._FILES) as root:
+            result = mod.analyze(str(root))
+        by_src = {c["source_file"]: c["name_matched_test_files"] for c in result["source_coverage"]}
+        self.assertEqual(by_src["pkg/accounts/views.py"], ["tests/unit/accounts/test_views.py"])
+        self.assertEqual(by_src["pkg/billing/views.py"], ["tests/unit/billing/test_views.py"])
+        self.assertEqual(by_src["pkg/views.py"], ["tests/unit/test_views.py"])
+        # The test's directory appears in one candidate's path only.
+        self.assertEqual(by_src["pkg/admin/views/audit.py"], ["tests/functional/admin/test_audit.py"])
+        self.assertEqual(by_src["pkg/cli/audit.py"], [])
+        details = result["test_details"]["tests/unit/accounts/test_views.py"]
+        self.assertEqual(details["name_match"], "mirrored")
+        self.assertEqual(len(details["name_match_candidates"]), 3)
+        self.assertEqual(result["summary"]["mirrored_name_matches"], 4)
+        self.assertEqual(result["summary"]["ambiguous_name_matches"], 0)
+        runner = result["test_details"]["tests/unit/deep/place/test_runner.py"]
+        self.assertEqual(runner["name_match"], "unique")
+
+    def test_a_unique_stem_still_matches_from_anywhere(self):
+        with TempProject(self._FILES) as root:
+            result = mod.analyze(str(root))
+        details = result["test_details"]["tests/unit/deep/place/test_runner.py"]
+        self.assertEqual(details["matched_sources"], ["pkg/runner.py"])
+
+    def test_no_mirror_is_reported_as_ambiguous(self):
+        files = {
+            "a/__init__.py": "",
+            "a/views.py": "def x(): pass\n",
+            "b/__init__.py": "",
+            "b/views.py": "def y(): pass\n",
+            "tests/functional/test_views.py": "def test_x(): pass\n",
+        }
+        with TempProject(files) as root:
+            result = mod.analyze(str(root))
+        self.assertEqual(result["summary"]["ambiguous_name_matches"], 1)
+        untested = set(result["untested_sources"])
+        self.assertTrue({"a/views.py", "b/views.py"} <= untested)
 
 
 class TestExtractSourceInfo(unittest.TestCase):

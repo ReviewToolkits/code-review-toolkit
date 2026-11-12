@@ -313,23 +313,55 @@ _LAYER_DIR_NAMES = frozenset({
 })
 
 
-def _match_test_to_source(
-    test_file: Path, source_files: list[Path], project_root: Path
-) -> list[str]:
-    """Find source files that a test file likely corresponds to.
+def _dir_parts(path: Path, project_root: Path) -> list[str]:
+    return list(path.parent.relative_to(project_root).parts)
+
+
+def _mirror_score(test_dirs: list[str], source: Path, project_root: Path) -> tuple:
+    """How well a test file's directories mirror a source file's.
+
+    `(exact, shared_tail, shared)`: whether the directories are the same once
+    the test layer (`tests/unit/`) and the source's package root (`src/`, the
+    top package) are dropped, how many trailing directories they share, and
+    how many of the test's directories appear in the source's path at all.
+    `tests/unit/accounts/test_views.py` mirrors `pkg/accounts/views.py`
+    exactly; `tests/test_views.py` mirrors `pkg/views.py`;
+    `tests/admin/test_audit.py` prefers `pkg/admin/views/audit.py` to
+    `pkg/cli/audit.py`.
+    """
+    full = _dir_parts(source, project_root)
+    inner = full[1:] if full[:1] == ["src"] else full
+    inner = inner[1:]
+    tail = 0
+    for a, b in zip(reversed(test_dirs), reversed(full)):
+        if a != b:
+            break
+        tail += 1
+    shared = sum(1 for d in test_dirs if d in full)
+    return (test_dirs in (inner, full), tail, shared)
+
+
+def _name_match(test_file: Path, source_files: list[Path], project_root: Path) -> dict:
+    """The source files a test file corresponds to by name, and how.
 
     Heuristics:
-    - test_runner.py → runner.py (any directory; several same-stem sources
-      all match)
+    - test_runner.py → runner.py
     - tests/<stem>/test_*.py → <stem>.py: a directory per source module,
       holding one test file per method or behaviour
+
+    One candidate matches outright (`how: "unique"`). Several same-named
+    sources (`views.py` in every app) are told apart by which one the test's
+    directories mirror (`"mirrored"`); when none does, or several mirror it
+    equally, nothing matches by name and the candidates are reported
+    (`"ambiguous"`) -- an import or route match may still find the module.
 
     Only test-named files (`test_*.py`, `*_test.py`) name-match: a test
     package's `__init__.py` or a `helpers.py` corresponds to no module, and
     a package `__init__.py` is never matched by name.
     """
+    none = {"matches": [], "how": None, "candidates": []}
     if not _test_named(test_file):
-        return []
+        return none
     test_name = test_file.stem  # e.g. "test_runner"
     source_stem = test_name[5:] if test_name.startswith("test_") else test_name[:-5]
     parent = test_file.parent.name
@@ -338,14 +370,42 @@ def _match_test_to_source(
         and parent not in _LAYER_DIR_NAMES
         and parent != "__init__"
     )
+    test_dirs = [
+        d for d in _dir_parts(test_file, project_root) if d not in _LAYER_DIR_NAMES
+    ]
 
-    matches: list[str] = []
+    candidates: list[tuple[Path, list[str]]] = []
     for sf in source_files:
         if sf.stem == "__init__":
             continue
-        if sf.stem == source_stem or (by_directory and sf.stem == parent):
-            matches.append(str(sf.relative_to(project_root)))
-    return list(dict.fromkeys(matches))
+        if sf.stem == source_stem:
+            candidates.append((sf, test_dirs))
+        elif by_directory and sf.stem == parent:
+            # The directory names the module; what is above it is the mirror.
+            candidates.append((sf, test_dirs[:-1]))
+    rels = list(
+        dict.fromkeys(str(sf.relative_to(project_root)) for sf, _ in candidates)
+    )
+    if len(rels) <= 1:
+        return {"matches": rels, "how": "unique" if rels else None, "candidates": []}
+    scored: dict[str, tuple] = {}
+    for sf, dirs in candidates:
+        rel = str(sf.relative_to(project_root))
+        scored[rel] = max(
+            scored.get(rel, (False, 0, 0)), _mirror_score(dirs, sf, project_root)
+        )
+    best = max(scored.values())
+    winners = [rel for rel in rels if scored[rel] == best]
+    if best > (False, 0, 0) and len(winners) == 1:
+        return {"matches": winners, "how": "mirrored", "candidates": rels}
+    return {"matches": [], "how": "ambiguous", "candidates": rels}
+
+
+def _match_test_to_source(
+    test_file: Path, source_files: list[Path], project_root: Path
+) -> list[str]:
+    """Source files a test file corresponds to by name (see `_name_match`)."""
+    return _name_match(test_file, source_files, project_root)["matches"]
 
 
 # ---------------------------------------------------------------------------
@@ -889,7 +949,14 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
                 kind = "helper"
             support_info[rel] = {"kind": kind, "imported_sources": imported_sources}
             continue
-        tinfo["matched_sources"] = _match_test_to_source(tf, source_files, project_root)
+        name_match = _name_match(tf, source_files, project_root)
+        tinfo["matched_sources"] = name_match["matches"]
+        # "unique", "mirrored" (one of several same-named sources, picked by
+        # directory), "ambiguous" (several, none picked: see
+        # name_match_candidates) or null.
+        tinfo["name_match"] = name_match["how"]
+        if name_match["how"] in ("mirrored", "ambiguous"):
+            tinfo["name_match_candidates"] = name_match["candidates"]
         tinfo["imported_modules"] = _read_test_imports(tf, project_root)
         # Import-based correspondence. Feature-named suites (`test_*_race.py`
         # for `storage/engine.py`) never match by file name, but they import
@@ -1024,6 +1091,15 @@ def analyze(target: str, *, max_files: int = 0) -> dict:
             "source_files_with_tests": tested,
             "source_files_without_tests": len(untested),
             "source_files_with_tests_by_name": sum(1 for v in by_name.values() if v),
+            # Test files named after several same-named sources (`test_views.py`
+            # with a `views.py` in every app) whose directories mirror none of
+            # them: not name-matched at all rather than matched to every one.
+            "ambiguous_name_matches": sum(
+                1 for t in test_info.values() if t.get("name_match") == "ambiguous"
+            ),
+            "mirrored_name_matches": sum(
+                1 for t in test_info.values() if t.get("name_match") == "mirrored"
+            ),
             "source_files_with_tests_by_import_only": sum(
                 1 for s in source_info if by_import[s] and not by_name[s]
             ),
