@@ -257,8 +257,108 @@ def _is_pseudo_enum(class_node: ast.ClassDef) -> bool:
     return constants >= 2
 
 
+# Declarative bases that make a subclass an ORM model by inheritance alone.
+_ORM_BASE_NAMES = frozenset({"DeclarativeBase", "DeclarativeBaseNoMeta"})
+# `models.Model` (Django) and `db.Model` (Flask-SQLAlchemy style): the
+# attribute form only, so a project's own unrelated `Model` class is not caught.
+_ORM_MODEL_ATTR_BASES = frozenset({("models", "Model"), ("db", "Model")})
+# Class-body calls that declare a mapped column or relationship.
+_ORM_COLUMN_CALLS = frozenset(
+    {"Column", "mapped_column", "relationship", "column_property", "composite"}
+)
+_ORM_DUNDERS = frozenset({"__tablename__", "__table__"})
+_INTERFACE_NAME = re.compile(r"^I[A-Z]\w*$")
+
+
+def _call_name(node: ast.AST | None) -> str | None:
+    return _terminal_name(node.func) if isinstance(node, ast.Call) else None
+
+
+def _is_mapped_annotation(annotation: ast.AST) -> bool:
+    """`Mapped[...]`, also as a string annotation."""
+    annotation = _parse_string_annotation(annotation) or annotation
+    return (
+        isinstance(annotation, ast.Subscript)
+        and _terminal_name(annotation.value) == "Mapped"
+    )
+
+
+def _is_django_field_call(node: ast.AST | None) -> bool:
+    """`models.CharField(...)`, `models.ForeignKey(...)` and the like."""
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+        return False
+    owner, attr = node.func.value, node.func.attr
+    return (
+        isinstance(owner, ast.Name)
+        and owner.id == "models"
+        and (attr.endswith("Field") or attr in ("ForeignKey", "ManyToManyField"))
+    )
+
+
+def _is_orm_model(class_node: ast.ClassDef) -> bool:
+    """A declarative ORM model (SQLAlchemy or Django), its base, or a mapped mixin.
+
+    Detected from what the class body declares (`__tablename__`, `Mapped[...]`
+    annotations, `Column()` / `mapped_column()` / `models.XField()` values)
+    or from a declarative base (`DeclarativeBase`, `models.Model`). A subclass
+    of a `declarative_base()` result is recognised by its body, because the
+    base is a variable this per-class check cannot resolve.
+    """
+    for base in class_node.bases:
+        if _terminal_name(base) in _ORM_BASE_NAMES:
+            return True
+        if (
+            isinstance(base, ast.Attribute)
+            and isinstance(base.value, ast.Name)
+            and (base.value.id, base.attr) in _ORM_MODEL_ATTR_BASES
+        ):
+            return True
+    for stmt in class_node.body:
+        if isinstance(stmt, ast.AnnAssign):
+            if _is_mapped_annotation(stmt.annotation):
+                return True
+        elif isinstance(stmt, ast.Assign):
+            if any(
+                isinstance(t, ast.Name) and t.id in _ORM_DUNDERS for t in stmt.targets
+            ):
+                return True
+        else:
+            continue
+        if _call_name(stmt.value) in _ORM_COLUMN_CALLS or _is_django_field_call(
+            stmt.value
+        ):
+            return True
+    return False
+
+
+def _is_interface(class_node: ast.ClassDef) -> bool:
+    """A zope-style interface declaration.
+
+    Either it subclasses `Interface`, or it is an `IName` class whose bases
+    are all `IName` classes and whose methods take no `self` (interface
+    methods are specifications, not implementations).
+    """
+    if not class_node.bases:
+        return False
+    if any(_terminal_name(b) == "Interface" for b in class_node.bases):
+        return True
+    if not _INTERFACE_NAME.match(class_node.name):
+        return False
+    if not all(
+        _INTERFACE_NAME.match(_terminal_name(b) or "") for b in class_node.bases
+    ):
+        return False
+    for stmt in class_node.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            params = stmt.args.posonlyargs + stmt.args.args
+            if params and params[0].arg in ("self", "cls"):
+                return False
+    return True
+
+
 def _detect_container_type(class_node: ast.ClassDef) -> str | None:
     """Detect if a class is a dataclass, TypedDict, NamedTuple, Protocol, Enum, ABC,
+    an ORM model (`orm_model`), an interface declaration (`interface`),
     a pseudo-enum constants class, or a subclass of dict/list/set."""
     # Check decorators for @dataclass.
     for dec in class_node.decorator_list:
@@ -302,6 +402,10 @@ def _detect_container_type(class_node: ast.ClassDef) -> str | None:
         elif base_name in _CONTAINER_BASES and container_subclass is None:
             container_subclass = _CONTAINER_BASES[base_name]
 
+    if _is_orm_model(class_node):
+        return "orm_model"
+    if _is_interface(class_node):
+        return "interface"
     if container_subclass:
         return container_subclass
     if _is_pseudo_enum(class_node):

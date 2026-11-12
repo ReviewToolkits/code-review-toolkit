@@ -227,6 +227,12 @@ For an HTTP API, compare the documented contract (OpenAPI schema, docs) with beh
   user-facing defect.)
 - Response-model changes that only break **generated clients** (a field becoming optional, an enum
   gaining a value): a breaking-change category of its own.
+- Headers (`Content-Type`, `Allow`, CORS, caching): compare them across sibling routes, not only
+  against the docs. **Cache and surrogate headers** (`Cache-Control`, `Surrogate-Key`,
+  `Surrogate-Control`, `ETag`) are often added by a cache or CDN integration that the test settings
+  disable: configure the project's cache backend (or the stub its own cache tests use) in the test
+  app before asserting on them, and if the baseline response still lacks them, report the caching
+  headers as not observable rather than as correct or missing.
 
 ### 6d. A client contract that lives in another package
 
@@ -243,6 +249,29 @@ generated client, or a CLI wrapper. Its interface is still part of what users ex
 - Don't file findings against the other package's code. Report the defect where this project
   can fix it (its pin, its server, its docs). If the bug really is in the client, add it as an
   upstream note.
+
+### 6e. Server mode: the wire surface (web applications)
+
+When the project is a web server rather than a library, its API is what goes over the wire, and
+the library-first questions above miss most of it. Switch to a wire-surface review:
+
+1. **Enumerate the routes.** `map_wiring.py`'s `routes.declared` lists each route with its
+   pattern, methods, permissions and views (`<plugin_root>/docs/probe-harness.md` gives the
+   command); fall back to the live route table or the OpenAPI document when its `status` is
+   `not_detected`. Group the routes by the resource they take.
+2. **Build the endpoint × case matrix** and run it through the project's own in-process test
+   client in an export, with the harness in `<plugin_root>/docs/probe-harness.md`. The cases:
+   missing, duplicate and malformed parameters; wrong method; unauthenticated and under-privileged
+   callers; wrong or missing content type; CORS preflight; normalisation (trailing slash, case,
+   Unicode-equivalent names); and objects that are meant to be hidden (deleted, archived,
+   private, another tenant's) requested through every route that can name them.
+3. **Read the matrix by rows.** Any 5xx for a client mistake is a finding. A row where routes of one
+   resource disagree is a lead; decide which route is right from the documented contract. Hidden
+   objects visible on any route are usually the most serious rows.
+
+For validators of uploaded or structured input, the matrix's "malformed" column has a dedicated
+harness: `<plugin_root>/docs/mutation-fuzzer.md` mutates a valid fixture many ways and classifies
+each outcome as accepted, rejected (4xx-style) or crashed.
 
 ### 7. Breaking Change Classification
 

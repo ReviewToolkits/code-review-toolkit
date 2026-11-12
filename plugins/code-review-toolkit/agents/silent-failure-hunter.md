@@ -279,6 +279,16 @@ middleware such as `pyramid_tm` or Django `ATOMIC_REQUESTS`, a task base class, 
   `int()` of an unbounded digit run raises a plain `ValueError` above 4300 digits, which a handler
   for the parser's own error class does not catch.
 
+### Step 3e: Error mapping under mutated input (validators)
+
+For code that validates uploaded or structured input (archives, metadata, manifests, request
+payloads), reading each handler does not show which bad inputs escape the error mapping. Mutate a
+valid fixture instead, with the harness in `<plugin_root>/docs/mutation-fuzzer.md`: it drops,
+retypes, resizes and corrupts one part at a time, submits each mutation through the project's own
+entry point in an export, and classifies the outcome as accepted, rejected (the documented
+4xx-style failure) or crashed. A crash on a client mistake is a finding; so is a mutation that is
+accepted although the spec forbids it. Keep the harness output as the reproduction.
+
 ### Step 4: Assess Impact
 
 For each finding, consider:

@@ -113,6 +113,35 @@ Lines executed by the tests but missing from the real run are candidates: read e
 whether real input can ever reach it. One run is one input; report these as CONSIDER with the
 command you ran, never as FIX.
 
+### Framework Wiring (web applications)
+On a web application most real dead code is wiring, which a name-reference scan cannot see: a
+route with no view, a setting written but never read, a template nothing renders, a task nobody
+enqueues, a request method nobody reads, a permission granted but never required. When the
+project imports a web framework or a task queue, also run the wiring cross-reference:
+
+```bash
+python3 <plugin_root>/scripts/map_wiring.py [scope]
+```
+
+Read `frameworks`, then each section's `status`: a `not_detected` section means "not checked",
+never "clean". The leads, by section:
+- `settings`: `written_never_read`; `written_read_only_indirectly` (the key appears as a literal
+  elsewhere, or an anchored dynamic read could match it: check before calling it dead);
+  `read_never_written` (`default_at_every_read: false` means a missing key raises;
+  `framework_default` marks keys a library supplies)
+- `routes`: `routes_without_view`, `views_for_undeclared_routes`, `url_names_not_declared`;
+  `declared_never_linked` is informational (API routes are rarely linked from the app)
+- `templates`: `unreferenced`, `missing`, and `matched_only_dynamically` entries whose
+  `captured_mentioned` is false (nothing visibly supplies the name the dynamic pattern needs)
+- `tasks.never_called`, `request_methods.declared_never_read`, `signals.declared_unused` and
+  `handled_never_emitted`, `permissions.granted_never_required` and `declared_never_used`
+
+Before reporting one, Grep for the name in JavaScript, configuration and deployment files, and for
+a dynamically built form of it. When a lead still cannot be settled by reading, confirm it against
+the booted app with `<plugin_root>/docs/registry-diff.md`: boot the app in an export with the
+project's own test fixture and diff its live registries against the static output. A gap
+confirmed both ways is FIX-grade; a static-only lead is CONSIDER.
+
 ### Stale Conditional Code
 Not covered by the script — check manually:
 - `if False:` blocks or `if 0:` blocks
