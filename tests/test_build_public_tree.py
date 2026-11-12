@@ -176,10 +176,72 @@ class TestBuildPublicTree(unittest.TestCase):
         )
         self.assertEqual(code, 0, report["errors"])
         idmap = json.loads((self.run_dir / "new.json").read_text())
+        # The withdrawn RV-005 keeps PUB-0002 in the saved map: a published id
+        # is never reassigned, and RV-005 gets it back if it becomes public.
         self.assertEqual(
-            idmap, {"RV-003": "PUB-0003", "RV-001": "PUB-0001", "RV-007": "PUB-0004"}
+            idmap,
+            {
+                "RV-005": "PUB-0002",
+                "RV-003": "PUB-0003",
+                "RV-001": "PUB-0001",
+                "RV-007": "PUB-0004",
+            },
         )
         self.assertEqual(report["withdrawn"], ["RV-005"])
+
+    def test_reproducers_with_one_basename_are_both_kept(self):
+        for sub in ("slice-a", "slice-b"):
+            (self.run_dir / "artifacts" / sub).mkdir()
+            (self.run_dir / "artifacts" / sub / "repro.py").write_text(f"# {sub}\n")
+        findings = _findings()
+        findings[0]["repro"] = [
+            "artifacts/slice-a/repro.py",
+            "artifacts/slice-b/repro.py",
+        ]
+        report, code = self.build(findings=findings)
+        self.assertEqual(code, 0, report["errors"])
+        reproducers = sorted(
+            p.name for p in self.out.rglob("*.py") if "repro" in p.name
+        )
+        self.assertEqual(reproducers, ["repro.py", "slice-b-repro.py"])
+
+    def test_withdrawn_id_is_not_reused_on_the_next_run(self):
+        # RV-005 held the highest public id and is withdrawn in run 2. Run 3
+        # adds a finding: it must not be handed RV-005's PUB-0004.
+        (self.run_dir / "old.json").write_text(
+            json.dumps(
+                {
+                    "RV-001": "PUB-0001",
+                    "RV-003": "PUB-0002",
+                    "RV-007": "PUB-0003",
+                    "RV-005": "PUB-0004",
+                }
+            )
+        )
+        report, code = self.build(
+            "--idmap",
+            str(self.run_dir / "old.json"),
+            "--idmap-out",
+            str(self.run_dir / "run2.json"),
+        )
+        self.assertEqual(code, 0, report["errors"])
+        self.assertEqual(report["withdrawn"], ["RV-005"])
+        self.out = self.run_dir / "out2"
+        findings = _findings()
+        extra = dict(findings[0], id="RV-009")
+        extra.pop("repro", None)
+        findings.append(extra)
+        report, code = self.build(
+            "--idmap",
+            str(self.run_dir / "run2.json"),
+            "--idmap-out",
+            str(self.run_dir / "run3.json"),
+            findings=findings,
+        )
+        self.assertEqual(code, 0, report["errors"])
+        run3 = json.loads((self.run_dir / "run3.json").read_text())
+        self.assertEqual(run3["RV-005"], "PUB-0004")
+        self.assertEqual(run3["RV-009"], "PUB-0005")
 
     def test_text_naming_a_withheld_finding_is_an_error(self):
         findings = _findings()

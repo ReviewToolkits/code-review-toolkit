@@ -628,7 +628,7 @@ def lint(
     sensitive = {
         str(f["id"]): _id_pattern(str(f["id"]))
         for f in findings
-        if f.get("id") and f.get("publication_sensitive") is True
+        if f.get("id") and f.get("publication_sensitive")
     }
     problems: list[dict] = []
 
@@ -648,7 +648,7 @@ def lint(
                     base = re.sub(r"(?<=\d)[a-z]$", "", token)
                     if token not in ids and base not in ids and token not in allow:
                         add(fid, field, "internal-id", token)
-        if f.get("publication_sensitive") is True:
+        if f.get("publication_sensitive"):
             continue
         for field, value in f.items():
             if field == "id":

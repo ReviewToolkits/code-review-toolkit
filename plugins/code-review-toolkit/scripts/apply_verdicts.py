@@ -113,10 +113,10 @@ def apply(
         prop = v.get("proposed_classification")
         cur = f.get("classification")
         if prop and prop != cur:
-            if f["id"] in reject:
+            if str(f["id"]) in reject:
                 log["proposal-rejected"] += 1
                 f["classification_decision"] = (
-                    f"kept {cur} (proposed {prop}): {reject[f['id']]}"
+                    f"kept {cur} (proposed {prop}): {reject[str(f['id'])]}"
                 )
                 rejected.append({"id": f["id"], "kept": cur, "proposed": prop})
             else:

@@ -309,6 +309,14 @@ def build(
                 errors.append(f"{where}: reproducer {src} is binary")
                 continue
             name, _ = rewrite_ids(path.name, idmap, prefixes)
+            if name in repro_files:
+                # Two reproducers with one basename (slice-a/repro.py and
+                # slice-b/repro.py): keep both, named after their directory.
+                parent, _ = rewrite_ids(path.parent.name or "repro", idmap, prefixes)
+                base, n = f"{parent}-{name}", 2
+                name = base
+                while name in repro_files:
+                    name, n = f"{n}-{base}", n + 1
             text = _rewrite(
                 data.decode("utf-8", errors="replace"),
                 idmap,
@@ -465,7 +473,10 @@ def run(argv: list[str]) -> tuple[dict, int]:
     write_tree(out, built["files"])
     if "--idmap-out" in opts:
         Path(opts["--idmap-out"]).write_text(
-            json.dumps(built["idmap"], indent=1) + "\n", encoding="utf-8"
+            # Withdrawn findings keep their entries: a published id is never
+            # reassigned, and a finding that becomes public again gets it back.
+            json.dumps({**(previous or {}), **built["idmap"]}, indent=1) + "\n",
+            encoding="utf-8",
         )
         report["idmap_out"] = opts["--idmap-out"]
     report["written"] = True

@@ -109,7 +109,7 @@ def id_regex(
         public = rf"(?P<public>(?<![A-Za-z0-9])(?i:{spelled})[-_]\d+)|"
     return re.compile(
         public
-        + rf"(?<![A-Za-z0-9-])(?P<prefix>{names})-(?P<num>\d+)(?!\d)"
+        + rf"(?<![A-Za-z0-9-])(?P<prefix>(?i:{names}))-(?P<num>\d+)(?!\d)"
         + rf"|(?<![A-Za-z0-9])(?P<iprefix>(?i:{names}))_(?P<inum>\d+)(?!\d)"
     )
 
@@ -149,7 +149,7 @@ def iter_ids(
         if "public" in rx.groupindex and m.group("public") is not None:
             continue
         if m.group("prefix") is not None:
-            yield m, (m.group("prefix"), int(m.group("num")))
+            yield m, (_canonical_prefix(m.group("prefix"), prefixes), int(m.group("num")))
         else:
             yield (
                 m,
@@ -191,7 +191,7 @@ def rewrite_ids(
         if "public" in rx.groupindex and m.group("public") is not None:
             return m.group(0)
         if m.group("prefix") is not None:
-            key = (m.group("prefix"), int(m.group("num")))
+            key = (_canonical_prefix(m.group("prefix"), prefixes), int(m.group("num")))
             public = table.get(key)
             if public is None:
                 unmapped.append(m.group(0))
@@ -265,12 +265,50 @@ def _line_of(starts: list[int], offset: int) -> int:
     return lo + 1
 
 
+# Containers whose content a byte scan cannot see (compressed or encoded).
+# A public tree holding one is not clean until it is unpacked and scanned.
+UNSCANNABLE_SUFFIXES = (
+    ".gz",
+    ".tgz",
+    ".bz2",
+    ".xz",
+    ".zst",
+    ".zip",
+    ".whl",
+    ".egg",
+    ".7z",
+    ".rar",
+    ".jar",
+    ".pdf",
+    ".docx",
+    ".xlsx",
+    ".pptx",
+    ".odt",
+)
+
+
 def read_text_file(path: Path) -> str | None:
     """The file's text, or None for a binary file (a NUL in the first 8 KB)."""
     data = path.read_bytes()
     if b"\0" in data[:8192]:
         return None
     return data.decode("utf-8", errors="replace")
+
+
+def read_binary_text(path: Path) -> str | None:
+    """Text a byte scan can still check in a binary file, or None if it can't.
+
+    UTF-16 text (a BOM) is decoded; other binaries are read as Latin-1 so an
+    ASCII leak inside them (a PNG text chunk, an uncompressed tar member)
+    still matches. Compressed or encoded containers return None: their
+    content is invisible to a byte scan.
+    """
+    if path.name.lower().endswith(UNSCANNABLE_SUFFIXES):
+        return None
+    data = path.read_bytes()
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16", errors="replace")
+    return data.decode("latin-1")
 
 
 def _walk(paths: Iterable[Path]) -> Iterator[tuple[Path, str]]:
@@ -292,7 +330,7 @@ def scan_paths(
 ) -> dict:
     """Scan every file under *paths*, contents and relative path both."""
     allow = list(allow)
-    hits, binary = [], []
+    hits, binary, unscanned = [], [], []
     scanned = 0
     for path, shown in _walk(paths):
         for h in scan_text(shown, matchers, allow):
@@ -300,7 +338,10 @@ def scan_paths(
         text = read_text_file(path)
         if text is None:
             binary.append(shown)
-            continue
+            text = read_binary_text(path)
+            if text is None:
+                unscanned.append(shown)
+                continue
         scanned += 1
         hits.extend(
             {"file": shown, "where": "content", **h}
@@ -309,8 +350,10 @@ def scan_paths(
     return {
         "files_scanned": scanned,
         "files_binary": binary,
+        # Never read (compressed or encoded): the gate cannot vouch for them.
+        "files_unscanned": unscanned,
         "hits": hits,
-        "clean": not hits,
+        "clean": not hits and not unscanned,
     }
 
 

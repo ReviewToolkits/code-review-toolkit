@@ -139,6 +139,20 @@ class TestSiblingOutliers(unittest.TestCase):
         self.assertEqual(out["parameters"]["min_group"], 5)
         self.assertEqual(out["sibling_outliers"], [])  # 4 views < 5
 
+    def test_include_tests_is_not_reported_unknown(self):
+        from contextlib import redirect_stderr
+
+        with TempProject({"pkg/views.py": _VIEWS}) as root:
+            argv = sys.argv
+            sys.argv = ["diff_siblings.py", str(root), "--include-tests"]
+            out, err = io.StringIO(), io.StringIO()
+            try:
+                with redirect_stdout(out), redirect_stderr(err):
+                    mod.main()
+            finally:
+                sys.argv = argv
+        self.assertNotIn("unknown flag", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

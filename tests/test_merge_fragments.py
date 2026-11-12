@@ -398,6 +398,21 @@ class TestApply(_RunDir):
             [{"id": "RV-002", "kept": "CONSIDER", "proposed": "FIX"}],
         )
 
+    def test_reject_matches_a_numeric_id(self):
+        # decisions.json keys are strings; a finding id may be an int.
+        findings = [{"id": 12, "classification": "CONSIDER"}]
+        verdicts = [
+            {
+                "id": 12,
+                "verdict": "reproduced",
+                "main": "BUG",
+                "proposed_classification": "FIX",
+            }
+        ]
+        log = av.apply(findings, verdicts, [], {"reject": {"12": "kept on review"}})
+        self.assertEqual(findings[0]["classification"], "CONSIDER")
+        self.assertEqual(log["rejected"][0]["kept"], "CONSIDER")
+
     def test_repeatable_from_the_same_input(self):
         self.good_fragments()
         _, _, first = self._apply()

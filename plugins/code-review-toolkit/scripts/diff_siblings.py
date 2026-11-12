@@ -425,6 +425,7 @@ def main() -> None:
         a
         for i, a in enumerate(argv)
         if a not in own
+        and a != "--include-tests"
         and not a.startswith(tuple(f"{f}=" for f in own))
         and not (i > 0 and argv[i - 1] in own)
     ]

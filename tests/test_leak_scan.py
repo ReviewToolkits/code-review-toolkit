@@ -121,9 +121,38 @@ class TestScan(unittest.TestCase):
             {
                 ("notes.md", "content", "term", 2),
                 ("sub/AB-004.py", "path", "internal-id", 1),
+                # A binary is still byte-scanned: ASCII inside it matches.
+                ("blob.bin", "content", "term", 1),
             },
         )
         self.assertEqual(result["files_binary"], ["blob.bin"])
+        self.assertEqual(result["files_unscanned"], [])
+
+    def test_compressed_container_is_never_clean(self):
+        # A gzip's content is invisible to a byte scan: the gate can't vouch.
+        import gzip
+
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "bundle.tar.gz").write_bytes(gzip.compress(b"reports/ secret"))
+            result, code = _run(["scan", d, "--term", "reports/"])
+        self.assertEqual(code, 1)
+        self.assertEqual(result["hits"], [])
+        self.assertEqual(result["files_unscanned"], ["bundle.tar.gz"])
+        self.assertFalse(result["clean"])
+
+    def test_utf16_text_is_scanned(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "notes.txt").write_bytes("see reports/x".encode("utf-16"))
+            result, code = _run(["scan", d, "--term", "reports/"])
+        self.assertEqual(code, 1)
+        self.assertEqual(len(result["hits"]), 1)
+
+    def test_lowercase_hyphen_id_is_found(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "r.md").write_text("same root cause as ab-3\n")
+            result, code = _run(["scan", d, "--id-prefix", "AB"])
+        self.assertEqual(code, 1)
+        self.assertEqual(result["hits"][0]["kind"], "internal-id")
 
     def test_public_prefix_hides_ids_inside_public_spellings(self):
         with tempfile.TemporaryDirectory() as d:

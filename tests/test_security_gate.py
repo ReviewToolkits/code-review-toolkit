@@ -193,6 +193,15 @@ class TestLint(unittest.TestCase):
         result = mod.lint(findings, agent_names=["silent-failure-hunter"])
         self.assertTrue(result["clean"], result["problems"])
 
+    def test_truthy_publication_sensitive_counts(self):
+        # build_public_tree withholds on truthiness; lint must agree.
+        findings = [
+            {"id": "PRJ-001", "title": "x", "publication_sensitive": "yes"},
+            {"id": "PRJ-002", "title": "see PRJ-001", "mechanism": "like PRJ-001"},
+        ]
+        kinds = {p["kind"] for p in mod.lint(findings)["problems"]}
+        self.assertIn("sensitive-ref", kinds)
+
     def test_agent_names_ids_and_separators_in_prose(self):
         findings = [
             {
